@@ -1,0 +1,383 @@
+/* ========================================
+   Settings v2 - 优化版样式
+   ======================================== */
+
+.settings-v2 {
+  width: 100%;
+  height: 100%;
+  background: #F5F5F7;
+  overflow-y: auto;
+}
+
+/* 标题栏 */
+.settings-v2__header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 24px;
+  background: linear-gradient(135deg, #007AFF 0%, #0051D5 100%);
+  color: white;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.settings-v2__title-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-v2__title {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.settings-v2__close-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.settings-v2__close-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+  transform: scale(1.1);
+}
+
+.settings-v2__close-btn:active {
+  transform: scale(0.95);
+}
+
+/* 内容区域 */
+.settings-v2__content {
+  padding: 24px;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+/* 卡片 */
+.settings-v2__card {
+  background: white;
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  transition: all 0.2s ease;
+}
+
+.settings-v2__card:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  transform: translateY(-2px);
+}
+
+/* 卡片头部 */
+.settings-v2__card-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.settings-v2__card-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.settings-v2__card-icon--blue {
+  background: rgba(0, 122, 255, 0.1);
+  color: #007AFF;
+}
+
+.settings-v2__card-icon--purple {
+  background: rgba(175, 82, 222, 0.1);
+  color: #AF52DE;
+}
+
+.settings-v2__card-icon--green {
+  background: rgba(52, 199, 89, 0.1);
+  color: #34C759;
+}
+
+.settings-v2__card-icon--orange {
+  background: rgba(255, 149, 0, 0.1);
+  color: #FF9500;
+}
+
+.settings-v2__card-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #000000;
+  margin: 0 0 4px 0;
+}
+
+.settings-v2__card-desc {
+  font-size: 14px;
+  color: #6E6E73;
+  margin: 0;
+}
+
+/* 表单组 */
+.settings-v2__form-group {
+  margin-bottom: 20px;
+}
+
+.settings-v2__form-group:last-child {
+  margin-bottom: 0;
+}
+
+.settings-v2__label {
+  display: block;
+  font-size: 14px;
+  font-weight: 500;
+  color: #000000;
+  margin-bottom: 8px;
+}
+
+/* 输入框组 */
+.settings-v2__input-group {
+  display: flex;
+  gap: 8px;
+}
+
+.settings-v2__input {
+  flex: 1;
+  padding: 10px 12px;
+  font-size: 14px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 6px;
+  background: white;
+  transition: all 0.2s ease;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+}
+
+.settings-v2__input:focus {
+  outline: none;
+  border-color: #007AFF;
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+}
+
+.settings-v2__input:disabled {
+  background: #F5F5F7;
+  color: #AEAEB2;
+  cursor: not-allowed;
+}
+
+/* 按钮 */
+.settings-v2__btn {
+  padding: 10px 20px;
+  font-size: 14px;
+  font-weight: 500;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.settings-v2__btn--primary {
+  background: #007AFF;
+  color: white;
+}
+
+.settings-v2__btn--primary:hover {
+  background: #0051D5;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 122, 255, 0.3);
+}
+
+.settings-v2__btn--primary:active {
+  transform: translateY(0);
+}
+
+.settings-v2__btn--secondary {
+  background: #F5F5F7;
+  color: #000000;
+}
+
+.settings-v2__btn--secondary:hover {
+  background: #E5E5EA;
+}
+
+.settings-v2__btn--full {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+/* 成功消息 */
+.settings-v2__success-msg {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(52, 199, 89, 0.1);
+  color: #34C759;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* 错误消息 */
+.settings-v2__error-msg {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(255, 59, 48, 0.1);
+  color: #FF3B30;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* 加载状态 */
+.settings-v2__loading {
+  text-align: center;
+  padding: 20px;
+  color: #6E6E73;
+  font-size: 14px;
+}
+
+/* 偏好设置项 */
+.settings-v2__pref-item {
+  padding: 12px 0;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.settings-v2__pref-item:last-child {
+  border-bottom: none;
+}
+
+.settings-v2__pref-key {
+  font-size: 13px;
+  color: #6E6E73;
+  margin-bottom: 6px;
+  font-family: 'SF Mono', Monaco, monospace;
+}
+
+/* 版本信息 */
+.settings-v2__version-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.settings-v2__version-item:last-child {
+  border-bottom: none;
+}
+
+.settings-v2__version-label {
+  font-size: 14px;
+  color: #000000;
+  font-weight: 500;
+}
+
+.settings-v2__version-value {
+  font-size: 14px;
+  color: #6E6E73;
+  font-family: 'SF Mono', Monaco, monospace;
+}
+
+/* 提示文字 */
+.settings-v2__hint {
+  font-size: 13px;
+  color: #6E6E73;
+  margin: 12px 0 0 0;
+  line-height: 1.5;
+}
+
+/* 深色模式 */
+@media (prefers-color-scheme: dark) {
+  .settings-v2 {
+    background: #1C1C1E;
+  }
+
+  .settings-v2__card {
+    background: #2C2C2E;
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .settings-v2__card-title {
+    color: #FFFFFF;
+  }
+
+  .settings-v2__card-desc {
+    color: #AEAEB2;
+  }
+
+  .settings-v2__label {
+    color: #FFFFFF;
+  }
+
+  .settings-v2__input {
+    background: #3A3A3C;
+    border-color: rgba(255, 255, 255, 0.15);
+    color: #FFFFFF;
+  }
+
+  .settings-v2__input:focus {
+    border-color: #0A84FF;
+    box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.1);
+  }
+
+  .settings-v2__btn--primary {
+    background: #0A84FF;
+  }
+
+  .settings-v2__btn--primary:hover {
+    background: #0077ED;
+  }
+
+  .settings-v2__btn--secondary {
+    background: #3A3A3C;
+    color: #FFFFFF;
+  }
+
+  .settings-v2__btn--secondary:hover {
+    background: #48484A;
+  }
+
+  .settings-v2__version-label {
+    color: #FFFFFF;
+  }
+
+  .settings-v2__version-value {
+    color: #AEAEB2;
+  }
+
+  .settings-v2__pref-key {
+    color: #AEAEB2;
+  }
+
+  .settings-v2__pref-item {
+    border-bottom-color: rgba(255, 255, 255, 0.06);
+  }
+
+  .settings-v2__version-item {
+    border-bottom-color: rgba(255, 255, 255, 0.06);
+  }
+
+  .settings-v2__hint {
+    color: #AEAEB2;
+  }
+}

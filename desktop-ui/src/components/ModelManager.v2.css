@@ -1,0 +1,513 @@
+/* ========================================
+   ModelManager v2 - 优化版样式
+   ======================================== */
+
+.model-manager-v2 {
+  width: 100%;
+  height: 100%;
+  background: #F5F5F7;
+  overflow-y: auto;
+}
+
+/* 标题栏 */
+.model-manager-v2__header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 24px;
+  background: linear-gradient(135deg, #AF52DE 0%, #8E44AD 100%);
+  color: white;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.model-manager-v2__title-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.model-manager-v2__title {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.model-manager-v2__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.model-manager-v2__refresh-btn,
+.model-manager-v2__close-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.model-manager-v2__refresh-btn {
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+}
+
+.model-manager-v2__refresh-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.model-manager-v2__close-btn {
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+}
+
+.model-manager-v2__close-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* 内容区域 */
+.model-manager-v2__content {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+/* 标签页 */
+.model-manager-v2__tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 24px;
+  background: white;
+  padding: 8px;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.model-manager-v2__tab {
+  flex: 1;
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #6E6E73;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.model-manager-v2__tab:hover {
+  background: #F5F5F7;
+  color: #000000;
+}
+
+.model-manager-v2__tab--active {
+  background: #007AFF;
+  color: white;
+}
+
+.model-manager-v2__tab--active:hover {
+  background: #0051D5;
+}
+
+/* 加载状态 */
+.model-manager-v2__loading {
+  text-align: center;
+  padding: 40px;
+  color: #6E6E73;
+}
+
+/* 错误提示 */
+.model-manager-v2__error {
+  background: rgba(255, 59, 48, 0.1);
+  color: #FF3B30;
+  padding: 16px;
+  border-radius: 12px;
+  margin-bottom: 24px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* 模型列表 */
+.model-manager-v2__list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* 模型卡片 */
+.model-manager-v2__card {
+  background: white;
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  transition: all 0.2s ease;
+}
+
+.model-manager-v2__card:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  transform: translateY(-2px);
+}
+
+.model-manager-v2__card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.model-manager-v2__card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.model-manager-v2__card-name {
+  font-size: 16px;
+  font-weight: 600;
+  color: #000000;
+  margin: 0;
+}
+
+.model-manager-v2__status {
+  flex-shrink: 0;
+  align-self: flex-start;
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.model-manager-v2__status--not_installed {
+  background: rgba(174, 174, 178, 0.2);
+  color: #6E6E73;
+}
+
+.model-manager-v2__status--downloading {
+  background: rgba(0, 122, 255, 0.1);
+  color: #007AFF;
+}
+
+.model-manager-v2__status--installed {
+  background: rgba(52, 199, 89, 0.1);
+  color: #34C759;
+}
+
+.model-manager-v2__status--active {
+  background: rgba(175, 82, 222, 0.1);
+  color: #AF52DE;
+}
+
+.model-manager-v2__card-provider {
+  font-size: 13px;
+  color: #6E6E73;
+  margin: 0;
+}
+
+.model-manager-v2__status-badge {
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.model-manager-v2__status-badge--not_installed {
+  background: rgba(174, 174, 178, 0.2);
+  color: #6E6E73;
+}
+
+.model-manager-v2__status-badge--downloading {
+  background: rgba(0, 122, 255, 0.1);
+  color: #007AFF;
+}
+
+.model-manager-v2__status-badge--installed {
+  background: rgba(52, 199, 89, 0.1);
+  color: #34C759;
+}
+
+.model-manager-v2__status-badge--active {
+  background: rgba(175, 82, 222, 0.1);
+  color: #AF52DE;
+}
+
+.model-manager-v2__card-desc {
+  font-size: 14px;
+  color: #6E6E73;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.model-manager-v2__card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.model-manager-v2__meta-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #6E6E73;
+  white-space: nowrap;
+}
+
+.model-manager-v2__badge {
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  background: rgba(255, 149, 0, 0.1);
+  color: #FF9500;
+  white-space: nowrap;
+}
+
+.model-manager-v2__info-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #6E6E73;
+}
+
+.model-manager-v2__card-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.model-manager-v2__btn {
+  flex: 1;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.model-manager-v2__btn--primary {
+  background: #007AFF;
+  color: white;
+}
+
+.model-manager-v2__btn--primary:hover {
+  background: #0051D5;
+}
+
+.model-manager-v2__btn--primary:disabled {
+  background: #E5E5EA;
+  color: #AEAEB2;
+  cursor: not-allowed;
+}
+
+.model-manager-v2__btn--success {
+  background: #34C759;
+  color: white;
+}
+
+.model-manager-v2__btn--success:hover {
+  background: #28A745;
+}
+
+.model-manager-v2__btn--danger {
+  background: #FF3B30;
+  color: white;
+}
+
+.model-manager-v2__btn--danger:hover {
+  background: #D32F2F;
+}
+
+.model-manager-v2__btn--secondary {
+  background: #F5F5F7;
+  color: #000000;
+}
+
+.model-manager-v2__btn--secondary:hover {
+  background: #E5E5EA;
+}
+
+/* API Key 对话框 */
+.model-manager-v2__dialog-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.model-manager-v2__dialog {
+  background: white;
+  border-radius: 16px;
+  padding: 24px;
+  width: 90%;
+  max-width: 500px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+
+.model-manager-v2__dialog-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.model-manager-v2__dialog-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #000000;
+  margin: 0;
+}
+
+.model-manager-v2__dialog-body {
+  margin-bottom: 20px;
+}
+
+.model-manager-v2__dialog-label {
+  display: block;
+  font-size: 14px;
+  font-weight: 500;
+  color: #000000;
+  margin-bottom: 8px;
+}
+
+.model-manager-v2__dialog-input {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 14px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 6px;
+  font-family: 'SF Mono', Monaco, monospace;
+}
+
+.model-manager-v2__dialog-input:focus {
+  outline: none;
+  border-color: #007AFF;
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+}
+
+.model-manager-v2__dialog-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* 空状态 */
+.model-manager-v2__empty {
+  text-align: center;
+  padding: 60px 20px;
+  color: #6E6E73;
+}
+
+.model-manager-v2__empty svg {
+  margin-bottom: 16px;
+  opacity: 0.5;
+}
+
+.model-manager-v2__empty-text {
+  font-size: 16px;
+  margin: 0;
+}
+
+/* 深色模式 */
+@media (prefers-color-scheme: dark) {
+  .model-manager-v2 {
+    background: #1C1C1E;
+  }
+
+  .model-manager-v2__tabs {
+    background: #2C2C2E;
+  }
+
+  .model-manager-v2__tab {
+    color: #AEAEB2;
+  }
+
+  .model-manager-v2__tab:hover {
+    background: #3A3A3C;
+    color: #FFFFFF;
+  }
+
+  .model-manager-v2__tab--active {
+    background: #0A84FF;
+  }
+
+  .model-manager-v2__card {
+    background: #2C2C2E;
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .model-manager-v2__card-title {
+    color: #FFFFFF;
+  }
+
+  .model-manager-v2__card-provider,
+  .model-manager-v2__card-desc,
+  .model-manager-v2__info-item {
+    color: #AEAEB2;
+  }
+
+  .model-manager-v2__btn--primary {
+    background: #0A84FF;
+  }
+
+  .model-manager-v2__btn--secondary {
+    background: #3A3A3C;
+    color: #FFFFFF;
+  }
+
+  .model-manager-v2__btn--secondary:hover {
+    background: #48484A;
+  }
+
+  .model-manager-v2__dialog {
+    background: #2C2C2E;
+  }
+
+  .model-manager-v2__dialog-title {
+    color: #FFFFFF;
+  }
+
+  .model-manager-v2__dialog-label {
+    color: #FFFFFF;
+  }
+
+  .model-manager-v2__dialog-input {
+    background: #3A3A3C;
+    border-color: rgba(255, 255, 255, 0.15);
+    color: #FFFFFF;
+  }
+}

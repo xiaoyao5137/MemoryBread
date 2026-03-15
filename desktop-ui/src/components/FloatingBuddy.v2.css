@@ -1,0 +1,117 @@
+/* ========================================
+   FloatingBuddy v2 - 优化版样式
+   ======================================== */
+
+.floating-buddy-v2 {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* 主按钮 - AI 助手 */
+.buddy-main-btn {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #007AFF 0%, #0051D5 100%);
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  cursor: pointer;
+  box-shadow: 0 8px 20px rgba(0, 122, 255, 0.3);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.buddy-main-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 28px rgba(0, 122, 255, 0.4);
+}
+
+.buddy-main-btn:active {
+  transform: translateY(0);
+  box-shadow: 0 6px 16px rgba(0, 122, 255, 0.3);
+}
+
+/* 状态指示点 */
+.buddy-status-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #34C759;
+  border: 2px solid white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  animation: pulse-dot 2s infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
+/* 次要按钮组 */
+.buddy-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-radius: 24px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+/* 次要按钮 */
+.buddy-action-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: transparent;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6E6E73;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.buddy-action-btn:hover {
+  background: #F5F5F7;
+  color: #007AFF;
+  transform: scale(1.1);
+}
+
+.buddy-action-btn:active {
+  transform: scale(0.95);
+}
+
+/* 深色模式支持 */
+@media (prefers-color-scheme: dark) {
+  .buddy-actions {
+    background: rgba(44, 44, 46, 0.95);
+  }
+
+  .buddy-action-btn {
+    color: #AEAEB2;
+  }
+
+  .buddy-action-btn:hover {
+    background: #3A3A3C;
+    color: #0A84FF;
+  }
+}

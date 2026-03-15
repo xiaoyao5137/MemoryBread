@@ -147,12 +147,21 @@ body {
   justify-content: space-between;
   align-items: center;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  flex-wrap: nowrap; /* 防止标题和图标换行 */
+}
+
+.rag-panel__title-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: nowrap;
 }
 
 .rag-panel__title {
   font-size: 24px;
   font-weight: 600;
   margin: 0;
+  white-space: nowrap;
 }
 
 .rag-panel__close {
@@ -305,10 +314,20 @@ body {
   color: #718096;
 }
 
+.rag-panel__empty svg {
+  margin-bottom: 24px; /* 增加图标和文字之间的距离 */
+}
+
 .rag-panel__empty p {
   font-size: 18px;
   margin-bottom: 24px;
   color: #4a5568;
+}
+
+.rag-panel__empty-hint {
+  font-size: 14px;
+  color: #718096;
+  margin-top: 8px;
 }
 
 .rag-panel__empty ul {

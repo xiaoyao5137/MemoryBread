@@ -53,7 +53,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
       {/* 标题栏 */}
       <div className="rag-panel__header" data-testid="rag-panel-header">
         <div className="rag-panel__title-group">
-          {/* 消息图标 - message-circle */}
+          {/* 工作图标 - briefcase */}
           <svg
             width="24"
             height="24"
@@ -65,7 +65,8 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
             strokeLinejoin="round"
             className="rag-panel__icon"
           >
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            <rect width="20" height="14" x="2" y="7" rx="2" ry="2" />
+            <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16" />
           </svg>
           <h2 className="rag-panel__title">工作搭子</h2>
         </div>

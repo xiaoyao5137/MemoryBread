@@ -121,9 +121,8 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
 
   const handleClose = () => setWindowMode('buddy')
 
-  const formatTimestamp = (ts: number | undefined) => {
-    if (!ts) return '无'
-    const date = new Date(ts * 1000) // 假设 ts 是秒级时间戳，需要转换为毫秒
+  const formatTimestamp = (ts: number) => {
+    const date = new Date(ts)
     return date.toLocaleTimeString('zh-CN', {
       hour: '2-digit',
       minute: '2-digit',
@@ -362,17 +361,17 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
                       }
                     >
                       <td className="px-3 py-2">{cap.id}</td>
-                      <td className="px-3 py-2">{formatTimestamp(cap.ts)}</td>
+                      <td className="px-3 py-2">{formatTimestamp(cap.timestamp)}</td>
                       <td className="px-3 py-2">{cap.app_name || '-'}</td>
-                      <td className="px-3 py-2 max-w-xs truncate">{cap.win_title || '-'}</td>
+                      <td className="px-3 py-2 max-w-xs truncate">{cap.window_title || '-'}</td>
                       <td className="px-3 py-2 text-center">
-                        {cap.ax_text ? `✓ ${cap.ax_text.length}字` : '-'}
+                        {cap.ax_text ? '✓' : '-'}
                       </td>
                       <td className="px-3 py-2 text-center">
-                        {cap.ocr_text ? `✓ ${cap.ocr_text.length}字` : '-'}
+                        {cap.ocr_text ? '✓' : '-'}
                       </td>
                       <td className="px-3 py-2 text-center">
-                        {cap.input_text ? `✓ ${cap.input_text.length}字` : '-'}
+                        {cap.user_input ? '✓' : '-'}
                       </td>
                       <td className="px-3 py-2 text-center">
                         {vs?.vectorized ? (
@@ -396,7 +395,7 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
             <div className="space-y-2 text-sm">
               {selectedCapture.ax_text && (
                 <div>
-                  <strong>AX 文本 (字符数: {selectedCapture.ax_text.length}):</strong>
+                  <strong>AX 文本:</strong>
                   <pre className="mt-1 p-2 bg-white rounded text-xs overflow-auto max-h-40">
                     {selectedCapture.ax_text}
                   </pre>
@@ -404,17 +403,17 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
               )}
               {selectedCapture.ocr_text && (
                 <div>
-                  <strong>OCR 文本 (字符数: {selectedCapture.ocr_text.length}):</strong>
+                  <strong>OCR 文本:</strong>
                   <pre className="mt-1 p-2 bg-white rounded text-xs overflow-auto max-h-40">
                     {selectedCapture.ocr_text}
                   </pre>
                 </div>
               )}
-              {selectedCapture.input_text && (
+              {selectedCapture.user_input && (
                 <div>
-                  <strong>用户输入 (字符数: {selectedCapture.input_text.length}):</strong>
+                  <strong>用户输入:</strong>
                   <pre className="mt-1 p-2 bg-white rounded text-xs overflow-auto max-h-40">
-                    {selectedCapture.input_text}
+                    {selectedCapture.user_input}
                   </pre>
                 </div>
               )}

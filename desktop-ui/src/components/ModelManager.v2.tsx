@@ -56,7 +56,8 @@ const ModelManager: React.FC = () => {
       }
     } catch (err) {
       console.error('获取模型列表失败:', err)
-      // 静默失败，使用模拟数据，不显示错误提示
+      setError('无法连接到模型服务，显示模拟数据')
+      // 使用模拟数据
       setModels(getMockModels())
     } finally {
       setLoading(false)

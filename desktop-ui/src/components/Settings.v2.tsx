@@ -12,7 +12,6 @@ import React, { useCallback, useEffect, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { useFetchPreferences, useUpdatePreference } from '../hooks/useApi'
 import type { PreferenceRecord } from '../types'
-import './Settings.v2.css'
 
 interface SettingsProps {
   className?: string
