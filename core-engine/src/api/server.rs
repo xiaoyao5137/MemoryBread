@@ -16,6 +16,7 @@ use super::{
         debug::{system_stats, vector_status},
         health::health_handler,
         knowledge::{delete_knowledge, list_knowledge, verify_knowledge},
+        monitor::monitor_overview,
         pii::pii_scrub,
         preferences::{list_preferences, update_preference},
         query::rag_query,
@@ -52,6 +53,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/tasks/:id",         get(get_task).put(update_task).delete(delete_task))
         .route("/api/tasks/:id/executions", get(list_executions))
         .route("/api/tasks/:id/trigger", post(trigger_task))
+        // 监控
+        .route("/api/monitor/overview",  get(monitor_overview))
         .layer(cors)
         .with_state(state)
 }

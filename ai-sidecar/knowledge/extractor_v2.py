@@ -211,20 +211,29 @@ class KnowledgeExtractorV2:
             # 1. 构建 prompt
             prompt = self._build_prompt(capture_data)
 
-            # 2. 调用本地 LLM
+            # 2. 调用本地 LLM（带埋点）
             logger.info(f"开始提炼采集记录 {capture_data.get('id')}")
-            response = self.client.chat(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                format="json",
-                options={
-                    "temperature": 0.3,
-                    "num_predict": 1024,  # 增加到 1024 tokens 以支持详细内容
-                }
-            )
+            from monitor.llm_tracker import LLMCallTracker, estimate_tokens
+            with LLMCallTracker(
+                caller="knowledge",
+                model_name=self.model,
+                caller_id=str(capture_data.get('id')),
+            ) as tracker:
+                response = self.client.chat(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    format="json",
+                    options={"temperature": 0.3, "num_predict": 1024},
+                )
+                tracker.set_response(response)
+                if tracker._prompt_tokens == 0:
+                    tracker.set_tokens(
+                        prompt=estimate_tokens(SYSTEM_PROMPT + prompt),
+                        completion=estimate_tokens(response['message']['content']),
+                    )
 
             # 3. 解析结果
             content = response['message']['content']
@@ -348,17 +357,30 @@ class KnowledgeExtractorV2:
 
             user_prompt = f"以下是一段连续工作片段的采集记录，请提炼：\n\n{merged_text}"
 
-            # 2. 调用 LLM
+            # 2. 调用 LLM（带埋点）
             logger.info(f"合并提炼 {len(captures)} 条 captures")
-            response = self.client.chat(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": MERGE_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                format="json",
-                options={"temperature": 0.3, "num_predict": 1024},
-            )
+            from monitor.llm_tracker import LLMCallTracker, estimate_tokens
+            capture_ids_str = ",".join(str(c['id']) for c in captures[:5])
+            with LLMCallTracker(
+                caller="knowledge",
+                model_name=self.model,
+                caller_id=f"merge:{capture_ids_str}",
+            ) as tracker:
+                response = self.client.chat(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": MERGE_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    format="json",
+                    options={"temperature": 0.3, "num_predict": 1024},
+                )
+                tracker.set_response(response)
+                if tracker._prompt_tokens == 0:
+                    tracker.set_tokens(
+                        prompt=estimate_tokens(MERGE_SYSTEM_PROMPT + user_prompt),
+                        completion=estimate_tokens(response['message']['content']),
+                    )
 
             # 3. 解析结果
             content = response['message']['content']

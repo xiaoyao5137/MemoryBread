@@ -196,6 +196,7 @@ class TaskExecutor:
             result_text = self._llm_generate(
                 user_instruction=task['user_instruction'],
                 context=context_text,
+                task_id=task_id,
             )
 
             # 6. 更新执行记录为成功
@@ -321,24 +322,40 @@ class TaskExecutor:
 
         return context, estimated_tokens
 
-    def _llm_generate(self, user_instruction: str, context: str) -> str:
+    def _llm_generate(self, user_instruction: str, context: str, task_id: int = None) -> str:
         """调用 LLM 生成报告"""
+        from monitor.llm_tracker import LLMCallTracker, estimate_tokens
+
         system_prompt = (
             "你是用户的个人工作助手。以下是用户近期的工作记录摘要（按时间顺序）。"
             "请严格按照用户的指令，基于这些工作记录生成相应的报告或总结。"
             "输出使用 Markdown 格式，语言简洁专业。"
         )
         user_prompt = f"## 工作记录\n\n{context}\n\n---\n\n## 用户指令\n\n{user_instruction}"
+        model = "qwen2.5:3b"
 
         client = self._get_llm_client()
-        response = client.chat(
-            model="qwen2.5:3b",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            options={"temperature": 0.5, "num_predict": 2048},
-        )
+        with LLMCallTracker(
+            caller="task",
+            model_name=model,
+            caller_id=str(task_id) if task_id else None,
+            db_path=self.db_path,
+        ) as tracker:
+            response = client.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                options={"temperature": 0.5, "num_predict": 2048},
+            )
+            tracker.set_response(response)
+            # 如果 Ollama 没返回 token 信息，用估算补充
+            if tracker._prompt_tokens == 0:
+                tracker.set_tokens(
+                    prompt=estimate_tokens(system_prompt + user_prompt),
+                    completion=estimate_tokens(response['message']['content']),
+                )
         return response['message']['content']
 
     # ─────────────────────────────────────────────────────────────────────────

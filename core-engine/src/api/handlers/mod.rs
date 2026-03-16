@@ -5,6 +5,7 @@ pub mod captures;
 pub mod debug;
 pub mod health;
 pub mod knowledge;
+pub mod monitor;
 pub mod pii;
 pub mod preferences;
 pub mod query;

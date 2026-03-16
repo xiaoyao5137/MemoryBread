@@ -69,7 +69,41 @@ export interface ActionResult {
   action_id:   string
 }
 
-export type WindowMode = 'buddy' | 'rag' | 'knowledge' | 'models' | 'settings' | 'debug' | 'tasks'
+export type WindowMode = 'buddy' | 'rag' | 'knowledge' | 'models' | 'settings' | 'debug' | 'tasks' | 'monitor'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 监控模块
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface MonitorOverview {
+  token_usage: {
+    total_period:  number
+    total_today:   number
+    by_model:      { model: string; total: number; calls: number }[]
+    by_caller:     { caller: string; total: number; calls: number }[]
+    trend:         { date: string; tokens: number; calls: number }[]
+  }
+  capture_flow: {
+    today_count:    number
+    period_count:   number
+    knowledge_rate: number
+    by_hour:        { hour: number; count: number }[]
+    by_app:         { app: string; count: number }[]
+  }
+  rag_sessions: {
+    today_count:    number
+    period_count:   number
+    avg_latency_ms: number
+    recent:         { id: number; ts: number; query: string; latency_ms: number | null; context_count: number }[]
+  }
+  task_executions: {
+    total:        number
+    success:      number
+    failed:       number
+    success_rate: number
+    recent:       { id: number; task_name: string; status: string; started_at: number; latency_ms: number | null; knowledge_count: number | null }[]
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 定时任务

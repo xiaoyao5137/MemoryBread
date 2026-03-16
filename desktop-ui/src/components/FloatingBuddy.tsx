@@ -43,6 +43,11 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
     setWindowMode('tasks')
   }
 
+  const handleMonitorClick = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setWindowMode('monitor')
+  }
+
   return (
     <div
       className={`floating-buddy-v2 ${className}`}
@@ -111,6 +116,22 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
             <path d="M2 15h2"/><path d="M2 9h2"/>
             <path d="M20 15h2"/><path d="M20 9h2"/>
             <path d="M9 2v2"/><path d="M9 20v2"/>
+          </svg>
+        </button>
+
+        {/* 监控 */}
+        <button
+          className="buddy-action-btn"
+          data-testid="monitor-btn"
+          onClick={handleMonitorClick}
+          aria-label="监控"
+          title="监控"
+          type="button"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="18" y1="20" x2="18" y2="10"/>
+            <line x1="12" y1="20" x2="12" y2="4"/>
+            <line x1="6" y1="20" x2="6" y2="14"/>
           </svg>
         </button>
 
