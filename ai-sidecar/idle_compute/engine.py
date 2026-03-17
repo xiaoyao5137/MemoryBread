@@ -11,6 +11,7 @@ from typing import Optional
 from .idle_detector import IdleDetector
 from .task_scheduler import TaskScheduler, Task, TaskType, TaskPriority
 from .model_manager import ModelManager, ModelType
+from monitor.system_sampler import SystemMetricsSampler, snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +24,12 @@ class IdleComputeEngine:
         idle_detector: IdleDetector,
         task_scheduler: TaskScheduler,
         model_manager: ModelManager,
+        metrics_sampler: Optional[SystemMetricsSampler] = None,
     ):
         self.idle_detector = idle_detector
         self.task_scheduler = task_scheduler
         self.model_manager = model_manager
+        self._sampler = metrics_sampler or SystemMetricsSampler()
 
         self._running = False
         self._idle_worker_task: Optional[asyncio.Task] = None
@@ -40,6 +43,7 @@ class IdleComputeEngine:
             return
 
         self._running = True
+        await self._sampler.start()
         logger.info("闲时计算引擎已启动")
 
         # 启动闲时工作线程
@@ -63,6 +67,7 @@ class IdleComputeEngine:
 
         # 卸载所有模型
         self.model_manager.unload_all()
+        await self._sampler.stop()
 
         logger.info("闲时计算引擎已停止")
 
@@ -86,8 +91,14 @@ class IdleComputeEngine:
                 logger.info("进入闲时模式，开始批量处理任务")
                 logger.info("=" * 60)
 
+                self._sampler.set_idle_mode(True)
+                snapshot(context="idle_start")
+
                 # 串行处理闲时任务
                 await self._process_idle_tasks()
+
+                snapshot(context="idle_end")
+                self._sampler.set_idle_mode(False)
 
                 # 标记执行完成
                 self.idle_detector.mark_execution()

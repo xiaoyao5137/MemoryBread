@@ -144,3 +144,32 @@ export interface TaskTemplate {
   category:         string
   user_instruction: string
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 系统资源监控
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SystemResources {
+  cpu_trend:    { ts: number; value: number }[]
+  mem_trend:    { ts: number; value: number }[]
+  disk_trend:   { ts: number; read_mb: number; write_mb: number }[]
+  model_events: {
+    ts:            number
+    event_type:    string
+    model_type:    string
+    model_name:    string
+    duration_ms:   number | null
+    memory_mb:     number | null
+    mem_before_mb: number | null
+    mem_after_mb:  number | null
+    error_msg:     string | null
+  }[]
+  latest: {
+    cpu_total:      number
+    cpu_process:    number
+    mem_total_mb:   number
+    mem_used_mb:    number
+    mem_percent:    number
+    mem_process_mb: number
+  } | null
+}

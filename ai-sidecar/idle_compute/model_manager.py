@@ -8,11 +8,53 @@
 import asyncio
 import gc
 import logging
+import sqlite3
+import time
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Optional, Dict
 
+import psutil
+
 logger = logging.getLogger(__name__)
+
+DB_PATH = str(Path.home() / ".workbuddy" / "workbuddy.db")
+
+
+def _available_mb() -> int:
+    return int(psutil.virtual_memory().available / 1024 / 1024)
+
+
+def _log_model_event(
+    event_type: str,
+    model_type: str,
+    model_name: str,
+    duration_ms: Optional[int] = None,
+    memory_mb: Optional[int] = None,
+    mem_before_mb: Optional[int] = None,
+    mem_after_mb: Optional[int] = None,
+    error_msg: Optional[str] = None,
+    db_path: str = DB_PATH,
+):
+    """写入 model_events 表，失败不影响主流程"""
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """INSERT INTO model_events
+               (ts, event_type, model_type, model_name, duration_ms,
+                memory_mb, mem_before_mb, mem_after_mb, error_msg)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                int(time.time() * 1000),
+                event_type, model_type, model_name,
+                duration_ms, memory_mb, mem_before_mb, mem_after_mb, error_msg,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"model_event 埋点失败: {e}")
 
 
 class ModelType(Enum):
@@ -55,20 +97,32 @@ class ModelSlot:
             raise RuntimeError(f"模型 {self.name} 正在加载中")
 
         self._loading = True
+        mem_before = _available_mb()
+        _log_model_event("load_start", self.model_type.value, self.name,
+                         memory_mb=self.memory_mb, mem_before_mb=mem_before)
         try:
             logger.info("开始加载模型: %s (预计占用 %d MB)", self.name, self.memory_mb)
-            start_time = datetime.now()
+            start_ms = int(time.time() * 1000)
 
             # 在线程池中加载（避免阻塞事件循环）
             loop = asyncio.get_event_loop()
             self._model = await loop.run_in_executor(None, self._loader)
 
-            elapsed = (datetime.now() - start_time).total_seconds()
+            duration_ms = int(time.time() * 1000) - start_ms
             self._loaded_at = datetime.now()
+            mem_after = _available_mb()
 
-            logger.info("模型加载完成: %s (耗时 %.1f 秒)", self.name, elapsed)
+            logger.info("模型加载完成: %s (耗时 %.1f 秒)", self.name, duration_ms / 1000)
+            _log_model_event("load_done", self.model_type.value, self.name,
+                             duration_ms=duration_ms, memory_mb=self.memory_mb,
+                             mem_before_mb=mem_before, mem_after_mb=mem_after)
             return self._model
 
+        except Exception as e:
+            _log_model_event("load_failed", self.model_type.value, self.name,
+                             memory_mb=self.memory_mb, mem_before_mb=mem_before,
+                             error_msg=str(e))
+            raise
         finally:
             self._loading = False
 
@@ -81,6 +135,7 @@ class ModelSlot:
             logger.debug("模型 %s 设置为常驻，跳过卸载", self.name)
             return
 
+        mem_before = _available_mb()
         logger.info("卸载模型: %s", self.name)
         del self._model
         self._model = None
@@ -88,6 +143,10 @@ class ModelSlot:
 
         # 强制垃圾回收
         gc.collect()
+        mem_after = _available_mb()
+        _log_model_event("unload", self.model_type.value, self.name,
+                         memory_mb=self.memory_mb,
+                         mem_before_mb=mem_before, mem_after_mb=mem_after)
 
     @property
     def is_loaded(self) -> bool:

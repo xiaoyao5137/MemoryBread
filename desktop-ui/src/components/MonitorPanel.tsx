@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import type { MonitorOverview } from '../types'
+import type { MonitorOverview, SystemResources } from '../types'
 import { useAppStore } from '../store/useAppStore'
 
 const API = 'http://localhost:7070'
@@ -12,6 +12,12 @@ const CALLER_COLORS: Record<string, string> = {
 }
 const STATUS_COLOR: Record<string, string> = {
   success: '#34C759', failed: '#FF3B30', running: '#FF9500',
+}
+const EVENT_COLOR: Record<string, string> = {
+  load_done: '#34C759', load_start: '#FF9500', unload: '#6E6E73', load_failed: '#FF3B30',
+}
+const EVENT_LABEL: Record<string, string> = {
+  load_done: '加载完成', load_start: '加载中', unload: '已卸载', load_failed: '加载失败',
 }
 
 function fmt(n: number): string {
@@ -99,13 +105,242 @@ const StatCard: React.FC<{
   </div>
 )
 
+// ── 总览内容 ─────────────────────────────────────────────────────────────────
+const OverviewContent: React.FC<{ data: MonitorOverview }> = ({ data }) => {
+  const { token_usage, capture_flow, rag_sessions, task_executions } = data
+  const trendValues = token_usage.trend.map(t => t.tokens)
+  return (
+    <>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+        <StatCard label="Token 用量" value={fmt(token_usage.total_period)}
+          sub={`今日 ${fmt(token_usage.total_today)}`} color="#007AFF" />
+        <StatCard label="采集记录" value={fmt(capture_flow.period_count)}
+          sub={`今日 ${capture_flow.today_count}`} color="#34C759" />
+        <StatCard label="RAG 问答" value={String(rag_sessions.period_count)}
+          sub={`均 ${fmtMs(rag_sessions.avg_latency_ms)}`} color="#AF52DE" />
+        <StatCard label="任务成功率" value={`${(task_executions.success_rate * 100).toFixed(0)}%`}
+          sub={`共 ${task_executions.total} 次`} color="#FF9500" />
+      </div>
+
+      <div style={cardStyle}>
+        <div style={sectionTitle}>Token 用量趋势</div>
+        {trendValues.length > 1 ? (
+          <>
+            <SparkLine data={trendValues} color="#007AFF" height={50} />
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+              {token_usage.trend.map((t, i) => (
+                (i === 0 || i === Math.floor(token_usage.trend.length / 2) || i === token_usage.trend.length - 1)
+                  ? <span key={i} style={{ fontSize: 10, color: '#AEAEB2' }}>{t.date}</span>
+                  : null
+              ))}
+            </div>
+          </>
+        ) : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无趋势数据</div>}
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+        <div style={{ ...cardStyle, flex: 1 }}>
+          <div style={sectionTitle}>模型用量</div>
+          {token_usage.by_model.length === 0
+            ? <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无数据</div>
+            : token_usage.by_model.map((m, i) => {
+              const pct = token_usage.total_period > 0 ? (m.total / token_usage.total_period * 100).toFixed(0) : '0'
+              return (
+                <div key={i} style={{ marginBottom: 8 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+                    <span style={{ color: '#333', fontWeight: 500 }}>{m.model}</span>
+                    <span style={{ color: '#6E6E73' }}>{fmt(m.total)} ({pct}%)</span>
+                  </div>
+                  <div style={{ height: 4, borderRadius: 2, background: '#E5E5EA' }}>
+                    <div style={{ height: '100%', borderRadius: 2, background: '#007AFF', width: `${pct}%` }} />
+                  </div>
+                </div>
+              )
+            })}
+        </div>
+        <div style={{ ...cardStyle, flex: 1 }}>
+          <div style={sectionTitle}>按来源分布</div>
+          {token_usage.by_caller.length === 0
+            ? <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无数据</div>
+            : token_usage.by_caller.map((c, i) => {
+              const color = CALLER_COLORS[c.caller] || '#6E6E73'
+              const pct = token_usage.total_period > 0 ? (c.total / token_usage.total_period * 100).toFixed(0) : '0'
+              return (
+                <div key={i} style={{ marginBottom: 8 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+                    <span style={{ color, fontWeight: 500 }}>{CALLER_LABELS[c.caller] || c.caller}</span>
+                    <span style={{ color: '#6E6E73' }}>{fmt(c.total)} · {c.calls}次</span>
+                  </div>
+                  <div style={{ height: 4, borderRadius: 2, background: '#E5E5EA' }}>
+                    <div style={{ height: '100%', borderRadius: 2, background: color, width: `${pct}%` }} />
+                  </div>
+                </div>
+              )
+            })}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <span style={sectionTitle as any}>采集流水（今日按小时）</span>
+          <span style={{ fontSize: 11, color: '#6E6E73' }}>知识提炼率 {(capture_flow.knowledge_rate * 100).toFixed(0)}%</span>
+        </div>
+        {capture_flow.by_hour.length > 0
+          ? <BarChart data={Array.from({ length: 24 }, (_, h) => ({
+              label: h % 4 === 0 ? String(h) : '',
+              value: capture_flow.by_hour.find(b => b.hour === h)?.count || 0,
+              color: '#34C759',
+            }))} height={70} />
+          : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>今日暂无采集数据</div>}
+        {capture_flow.by_app.length > 0 && (
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 11, color: '#6E6E73', marginBottom: 6 }}>应用分布（Top 8）</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {capture_flow.by_app.map((a, i) => (
+                <div key={i} style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10,
+                  background: 'rgba(52,199,89,0.1)', color: '#34C759' }}>{a.app} {a.count}</div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div style={cardStyle}>
+        <div style={sectionTitle}>最近问答记录</div>
+        {rag_sessions.recent.length === 0
+          ? <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无问答记录</div>
+          : rag_sessions.recent.map((s, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 0',
+              borderBottom: i < rag_sessions.recent.length - 1 ? '1px solid rgba(0,0,0,0.05)' : 'none' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.query}</div>
+                <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 2 }}>{fmtTs(s.ts)}</div>
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                {s.latency_ms && <span style={{ fontSize: 11, color: '#6E6E73' }}>{fmtMs(s.latency_ms)}</span>}
+                <span style={{ fontSize: 11, padding: '1px 6px', borderRadius: 4,
+                  background: 'rgba(0,122,255,0.08)', color: '#007AFF' }}>{s.context_count} 条</span>
+              </div>
+            </div>
+          ))}
+      </div>
+
+      <div style={{ ...cardStyle, marginBottom: 0 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <span style={sectionTitle as any}>定时任务执行记录</span>
+          <span style={{ fontSize: 11, color: '#6E6E73' }}>成功 {task_executions.success} / 失败 {task_executions.failed}</span>
+        </div>
+        {task_executions.recent.length === 0
+          ? <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无执行记录</div>
+          : task_executions.recent.map((e, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 0',
+              borderBottom: i < task_executions.recent.length - 1 ? '1px solid rgba(0,0,0,0.05)' : 'none' }}>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
+                background: STATUS_COLOR[e.status] || '#AEAEB2' }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.task_name}</div>
+                <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 2 }}>{fmtTs(e.started_at)}</div>
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexShrink: 0, fontSize: 11, color: '#6E6E73' }}>
+                {e.latency_ms && <span>{fmtMs(e.latency_ms)}</span>}
+                {e.knowledge_count && <span>{e.knowledge_count} 条知识</span>}
+              </div>
+            </div>
+          ))}
+      </div>
+    </>
+  )
+}
+
+// ── 系统资源内容 ──────────────────────────────────────────────────────────────
+const SystemContent: React.FC<{ data: SystemResources | null }> = ({ data }) => {
+  if (!data) return <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '24px 0' }}>暂无数据</div>
+  const { latest, cpu_trend, mem_trend, disk_trend, model_events } = data
+  return (
+    <>
+      {/* 当前快照卡片 */}
+      {latest && (
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+          <StatCard label="CPU 总体" value={`${latest.cpu_total.toFixed(1)}%`}
+            sub={`进程 ${latest.cpu_process.toFixed(1)}%`} color="#FF9500" />
+          <StatCard label="内存使用" value={`${latest.mem_percent.toFixed(1)}%`}
+            sub={`${latest.mem_used_mb.toLocaleString()} / ${latest.mem_total_mb.toLocaleString()} MB`} color="#007AFF" />
+          <StatCard label="进程内存" value={`${latest.mem_process_mb} MB`} color="#AF52DE" />
+        </div>
+      )}
+
+      {/* CPU 趋势 */}
+      <div style={cardStyle}>
+        <div style={sectionTitle}>CPU 使用率趋势</div>
+        {cpu_trend.length > 1
+          ? <SparkLine data={cpu_trend.map(p => p.value)} color="#FF9500" height={50} />
+          : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无数据</div>}
+      </div>
+
+      {/* 内存趋势 */}
+      <div style={cardStyle}>
+        <div style={sectionTitle}>内存使用率趋势</div>
+        {mem_trend.length > 1
+          ? <SparkLine data={mem_trend.map(p => p.value)} color="#007AFF" height={50} />
+          : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无数据</div>}
+      </div>
+
+      {/* 磁盘 IO */}
+      <div style={cardStyle}>
+        <div style={sectionTitle}>磁盘 IO（MB）</div>
+        {disk_trend.length > 1 ? (
+          <div style={{ display: 'flex', gap: 8 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, color: '#34C759', marginBottom: 4 }}>读取</div>
+              <SparkLine data={disk_trend.map(p => p.read_mb)} color="#34C759" height={40} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, color: '#FF3B30', marginBottom: 4 }}>写入</div>
+              <SparkLine data={disk_trend.map(p => p.write_mb)} color="#FF3B30" height={40} />
+            </div>
+          </div>
+        ) : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无数据</div>}
+      </div>
+
+      {/* 模型事件 */}
+      <div style={{ ...cardStyle, marginBottom: 0 }}>
+        <div style={sectionTitle}>模型加载/卸载事件</div>
+        {model_events.length === 0
+          ? <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无事件</div>
+          : model_events.map((e, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0',
+              borderBottom: i < model_events.length - 1 ? '1px solid rgba(0,0,0,0.05)' : 'none' }}>
+              <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, flexShrink: 0,
+                background: `${EVENT_COLOR[e.event_type] || '#6E6E73'}18`,
+                color: EVENT_COLOR[e.event_type] || '#6E6E73' }}>
+                {EVENT_LABEL[e.event_type] || e.event_type}
+              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ fontSize: 12, color: '#333' }}>{e.model_name}</span>
+                <span style={{ fontSize: 11, color: '#AEAEB2', marginLeft: 6 }}>{e.model_type}</span>
+              </div>
+              <div style={{ flexShrink: 0, fontSize: 11, color: '#6E6E73', textAlign: 'right' }}>
+                {e.duration_ms && <span>{fmtMs(e.duration_ms)} · </span>}
+                {e.memory_mb && <span>{e.memory_mb} MB · </span>}
+                <span>{fmtTs(e.ts)}</span>
+              </div>
+            </div>
+          ))}
+      </div>
+    </>
+  )
+}
+
 // ── 主组件 ──────────────────────────────────────────────────────────────────
 const MonitorPanel: React.FC = () => {
   const { apiBaseUrl } = useAppStore()
   const base = apiBaseUrl || API
 
+  const [tab, setTab] = useState<'overview' | 'system'>('overview')
   const [data, setData] = useState<MonitorOverview | null>(null)
+  const [sysData, setSysData] = useState<SystemResources | null>(null)
   const [range, setRange] = useState<'1d' | '7d' | '30d'>('7d')
+  const [sysRange, setSysRange] = useState<'1h' | '6h' | '24h'>('6h')
   const [loading, setLoading] = useState(false)
 
   const load = async () => {
@@ -120,209 +355,65 @@ const MonitorPanel: React.FC = () => {
     }
   }
 
-  useEffect(() => { load() }, [range])
+  const loadSys = async () => {
+    setLoading(true)
+    try {
+      const res = await fetch(`${base}/api/monitor/system?range=${sysRange}`)
+      setSysData(await res.json())
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setLoading(false)
+    }
+  }
 
-  if (loading && !data) return (
+  useEffect(() => { if (tab === 'overview') load() }, [range, tab])
+  useEffect(() => { if (tab === 'system') loadSys() }, [sysRange, tab])
+
+  if (loading && !data && !sysData) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
       height: '100%', color: '#AEAEB2', fontSize: 13 }}>加载中...</div>
   )
-
-  if (!data) return (
-    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
-      height: '100%', color: '#AEAEB2', fontSize: 13 }}>暂无数据</div>
-  )
-
-  const { token_usage, capture_flow, rag_sessions, task_executions } = data
-  const trendValues = token_usage.trend.map(t => t.tokens)
 
   return (
     <div style={{ height: '100%', overflow: 'auto', background: '#F5F5F7', padding: '12px 14px' }}>
 
       {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-        <span style={{ fontSize: 15, fontWeight: 600 }}>监控总览</span>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {(['overview', 'system'] as const).map(t => (
+            <button key={t} onClick={() => setTab(t)} style={{
+              fontSize: 12, padding: '4px 10px', borderRadius: 7, border: 'none', cursor: 'pointer',
+              background: tab === t ? '#007AFF' : 'white',
+              color: tab === t ? 'white' : '#6E6E73',
+              fontWeight: tab === t ? 600 : 400,
+            }}>{t === 'overview' ? '总览' : '系统资源'}</button>
+          ))}
+        </div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-          {(['1d', '7d', '30d'] as const).map(r => (
+          {tab === 'overview' && (['1d', '7d', '30d'] as const).map(r => (
             <button key={r} onClick={() => setRange(r)} style={{
               fontSize: 11, padding: '3px 8px', borderRadius: 6, border: 'none', cursor: 'pointer',
               background: range === r ? '#007AFF' : 'white',
               color: range === r ? 'white' : '#6E6E73',
             }}>{r === '1d' ? '今天' : r === '7d' ? '7天' : '30天'}</button>
           ))}
-          <button onClick={load} style={{
+          {tab === 'system' && (['1h', '6h', '24h'] as const).map(r => (
+            <button key={r} onClick={() => setSysRange(r)} style={{
+              fontSize: 11, padding: '3px 8px', borderRadius: 6, border: 'none', cursor: 'pointer',
+              background: sysRange === r ? '#007AFF' : 'white',
+              color: sysRange === r ? 'white' : '#6E6E73',
+            }}>{r}</button>
+          ))}
+          <button onClick={tab === 'overview' ? load : loadSys} style={{
             fontSize: 11, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.1)',
             background: 'white', color: '#6E6E73', cursor: 'pointer',
           }}>刷新</button>
         </div>
       </div>
 
-      {/* 顶部统计卡片 */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-        <StatCard label="Token 用量" value={fmt(token_usage.total_period)}
-          sub={`今日 ${fmt(token_usage.total_today)}`} color="#007AFF" />
-        <StatCard label="采集记录" value={fmt(capture_flow.period_count)}
-          sub={`今日 ${capture_flow.today_count}`} color="#34C759" />
-        <StatCard label="RAG 问答" value={String(rag_sessions.period_count)}
-          sub={`均 ${fmtMs(rag_sessions.avg_latency_ms)}`} color="#AF52DE" />
-        <StatCard label="任务成功率" value={`${(task_executions.success_rate * 100).toFixed(0)}%`}
-          sub={`共 ${task_executions.total} 次`} color="#FF9500" />
-      </div>
-
-      {/* Token 趋势图 */}
-      <div style={cardStyle}>
-        <div style={sectionTitle}>Token 用量趋势</div>
-        {trendValues.length > 1 ? (
-          <>
-            <SparkLine data={trendValues} color="#007AFF" height={50} />
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
-              {token_usage.trend.map((t, i) => (
-                (i === 0 || i === Math.floor(token_usage.trend.length / 2) || i === token_usage.trend.length - 1) ? (
-                  <span key={i} style={{ fontSize: 10, color: '#AEAEB2' }}>{t.date}</span>
-                ) : null
-              ))}
-            </div>
-          </>
-        ) : (
-          <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无趋势数据</div>
-        )}
-      </div>
-
-      {/* 模型用量 + 来源分布 */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
-        <div style={{ ...cardStyle, flex: 1 }}>
-          <div style={sectionTitle}>模型用量</div>
-          {token_usage.by_model.length === 0 ? (
-            <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无数据</div>
-          ) : token_usage.by_model.map((m, i) => {
-            const pct = token_usage.total_period > 0
-              ? (m.total / token_usage.total_period * 100).toFixed(0) : '0'
-            return (
-              <div key={i} style={{ marginBottom: 8 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
-                  <span style={{ color: '#333', fontWeight: 500 }}>{m.model}</span>
-                  <span style={{ color: '#6E6E73' }}>{fmt(m.total)} ({pct}%)</span>
-                </div>
-                <div style={{ height: 4, borderRadius: 2, background: '#E5E5EA' }}>
-                  <div style={{ height: '100%', borderRadius: 2, background: '#007AFF',
-                    width: `${pct}%`, transition: 'width 0.3s' }} />
-                </div>
-              </div>
-            )
-          })}
-        </div>
-
-        <div style={{ ...cardStyle, flex: 1 }}>
-          <div style={sectionTitle}>按来源分布</div>
-          {token_usage.by_caller.length === 0 ? (
-            <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无数据</div>
-          ) : token_usage.by_caller.map((c, i) => {
-            const color = CALLER_COLORS[c.caller] || '#6E6E73'
-            const pct = token_usage.total_period > 0
-              ? (c.total / token_usage.total_period * 100).toFixed(0) : '0'
-            return (
-              <div key={i} style={{ marginBottom: 8 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
-                  <span style={{ color, fontWeight: 500 }}>{CALLER_LABELS[c.caller] || c.caller}</span>
-                  <span style={{ color: '#6E6E73' }}>{fmt(c.total)} · {c.calls}次</span>
-                </div>
-                <div style={{ height: 4, borderRadius: 2, background: '#E5E5EA' }}>
-                  <div style={{ height: '100%', borderRadius: 2, background: color,
-                    width: `${pct}%`, transition: 'width 0.3s' }} />
-                </div>
-              </div>
-            )
-          })}
-        </div>
-      </div>
-
-      {/* 采集流水 */}
-      <div style={cardStyle}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-          <span style={sectionTitle as any}>采集流水（今日按小时）</span>
-          <span style={{ fontSize: 11, color: '#6E6E73' }}>
-            知识提炼率 {(capture_flow.knowledge_rate * 100).toFixed(0)}%
-          </span>
-        </div>
-        {capture_flow.by_hour.length > 0 ? (
-          <BarChart
-            data={Array.from({ length: 24 }, (_, h) => ({
-              label: h % 4 === 0 ? String(h) : '',
-              value: capture_flow.by_hour.find(b => b.hour === h)?.count || 0,
-              color: '#34C759',
-            }))}
-            height={70}
-          />
-        ) : (
-          <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>今日暂无采集数据</div>
-        )}
-        {capture_flow.by_app.length > 0 && (
-          <div style={{ marginTop: 10 }}>
-            <div style={{ fontSize: 11, color: '#6E6E73', marginBottom: 6 }}>应用分布（Top 8）</div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-              {capture_flow.by_app.map((a, i) => (
-                <div key={i} style={{
-                  fontSize: 11, padding: '2px 8px', borderRadius: 10,
-                  background: 'rgba(52,199,89,0.1)', color: '#34C759',
-                }}>{a.app} {a.count}</div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* RAG 问答记录 */}
-      <div style={cardStyle}>
-        <div style={sectionTitle}>最近问答记录</div>
-        {rag_sessions.recent.length === 0 ? (
-          <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无问答记录</div>
-        ) : rag_sessions.recent.map((s, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8,
-            padding: '7px 0', borderBottom: i < rag_sessions.recent.length - 1 ? '1px solid rgba(0,0,0,0.05)' : 'none' }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 12, color: '#333', overflow: 'hidden',
-                textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.query}</div>
-              <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 2 }}>{fmtTs(s.ts)}</div>
-            </div>
-            <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
-              {s.latency_ms && (
-                <span style={{ fontSize: 11, color: '#6E6E73' }}>{fmtMs(s.latency_ms)}</span>
-              )}
-              <span style={{ fontSize: 11, padding: '1px 6px', borderRadius: 4,
-                background: 'rgba(0,122,255,0.08)', color: '#007AFF' }}>
-                {s.context_count} 条
-              </span>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* 定时任务执行记录 */}
-      <div style={{ ...cardStyle, marginBottom: 0 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-          <span style={sectionTitle as any}>定时任务执行记录</span>
-          <span style={{ fontSize: 11, color: '#6E6E73' }}>
-            成功 {task_executions.success} / 失败 {task_executions.failed}
-          </span>
-        </div>
-        {task_executions.recent.length === 0 ? (
-          <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无执行记录</div>
-        ) : task_executions.recent.map((e, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8,
-            padding: '7px 0', borderBottom: i < task_executions.recent.length - 1 ? '1px solid rgba(0,0,0,0.05)' : 'none' }}>
-            <span style={{ width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
-              background: STATUS_COLOR[e.status] || '#AEAEB2' }} />
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 12, color: '#333', overflow: 'hidden',
-                textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.task_name}</div>
-              <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 2 }}>{fmtTs(e.started_at)}</div>
-            </div>
-            <div style={{ display: 'flex', gap: 6, flexShrink: 0, fontSize: 11, color: '#6E6E73' }}>
-              {e.latency_ms && <span>{fmtMs(e.latency_ms)}</span>}
-              {e.knowledge_count && <span>{e.knowledge_count} 条知识</span>}
-            </div>
-          </div>
-        ))}
-      </div>
+      {tab === 'overview' && data && <OverviewContent data={data} />}
+      {tab === 'system' && <SystemContent data={sysData} />}
 
     </div>
   )

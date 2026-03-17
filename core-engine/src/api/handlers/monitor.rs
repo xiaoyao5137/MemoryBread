@@ -358,3 +358,160 @@ pub async fn monitor_overview(
 
     Ok(Json(overview))
 }
+
+// ── 系统资源响应结构 ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct SystemResourcesResponse {
+    pub cpu_trend:     Vec<MetricPoint>,
+    pub mem_trend:     Vec<MetricPoint>,
+    pub disk_trend:    Vec<DiskPoint>,
+    pub model_events:  Vec<ModelEventItem>,
+    pub latest:        Option<LatestMetrics>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MetricPoint {
+    pub ts:    i64,
+    pub value: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiskPoint {
+    pub ts:        i64,
+    pub read_mb:   f64,
+    pub write_mb:  f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelEventItem {
+    pub ts:           i64,
+    pub event_type:   String,
+    pub model_type:   String,
+    pub model_name:   String,
+    pub duration_ms:  Option<i64>,
+    pub memory_mb:    Option<i64>,
+    pub mem_before_mb: Option<i64>,
+    pub mem_after_mb:  Option<i64>,
+    pub error_msg:    Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LatestMetrics {
+    pub cpu_total:      f64,
+    pub cpu_process:    f64,
+    pub mem_total_mb:   i64,
+    pub mem_used_mb:    i64,
+    pub mem_percent:    f64,
+    pub mem_process_mb: i64,
+}
+
+/// GET /api/monitor/system?range=1h|6h|24h
+pub async fn monitor_system(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SystemQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let now_ms = Utc::now().timestamp_millis();
+    let range_ms: i64 = match params.range.as_str() {
+        "1h"  => 3600 * 1000,
+        "6h"  => 6 * 3600 * 1000,
+        _     => 24 * 3600 * 1000,
+    };
+    let from_ms = now_ms - range_ms;
+
+    // 最多返回 120 个点，按时间均匀采样
+    let max_points: i64 = 120;
+    let bucket_ms = range_ms / max_points;
+
+    let result = state.storage.with_conn(|conn| {
+        // CPU 趋势（按 bucket 聚合均值）
+        let mut cpu_stmt = conn.prepare(
+            "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(cpu_total)
+             FROM system_metrics WHERE ts >= ?2
+             GROUP BY bucket ORDER BY bucket"
+        )?;
+        let cpu_trend: Vec<MetricPoint> = cpu_stmt
+            .query_map(rusqlite::params![bucket_ms, from_ms], |r| {
+                Ok(MetricPoint { ts: r.get(0)?, value: r.get(1)? })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // 内存趋势（mem_percent）
+        let mut mem_stmt = conn.prepare(
+            "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(mem_percent)
+             FROM system_metrics WHERE ts >= ?2
+             GROUP BY bucket ORDER BY bucket"
+        )?;
+        let mem_trend: Vec<MetricPoint> = mem_stmt
+            .query_map(rusqlite::params![bucket_ms, from_ms], |r| {
+                Ok(MetricPoint { ts: r.get(0)?, value: r.get(1)? })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // 磁盘 IO 趋势
+        let mut disk_stmt = conn.prepare(
+            "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, SUM(disk_read_mb), SUM(disk_write_mb)
+             FROM system_metrics WHERE ts >= ?2
+             GROUP BY bucket ORDER BY bucket"
+        )?;
+        let disk_trend: Vec<DiskPoint> = disk_stmt
+            .query_map(rusqlite::params![bucket_ms, from_ms], |r| {
+                Ok(DiskPoint { ts: r.get(0)?, read_mb: r.get(1)?, write_mb: r.get(2)? })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // 最新一条指标
+        let latest = conn.query_row(
+            "SELECT cpu_total, cpu_process, mem_total_mb, mem_used_mb, mem_percent, mem_process_mb
+             FROM system_metrics ORDER BY ts DESC LIMIT 1",
+            [],
+            |r| Ok(LatestMetrics {
+                cpu_total:      r.get(0)?,
+                cpu_process:    r.get(1)?,
+                mem_total_mb:   r.get(2)?,
+                mem_used_mb:    r.get(3)?,
+                mem_percent:    r.get(4)?,
+                mem_process_mb: r.get(5)?,
+            }),
+        ).ok();
+
+        // 模型事件（最近 50 条）
+        let mut ev_stmt = conn.prepare(
+            "SELECT ts, event_type, model_type, model_name,
+                    duration_ms, memory_mb, mem_before_mb, mem_after_mb, error_msg
+             FROM model_events WHERE ts >= ?1
+             ORDER BY ts DESC LIMIT 50"
+        )?;
+        let model_events: Vec<ModelEventItem> = ev_stmt
+            .query_map(rusqlite::params![from_ms], |r| {
+                Ok(ModelEventItem {
+                    ts:            r.get(0)?,
+                    event_type:    r.get(1)?,
+                    model_type:    r.get(2)?,
+                    model_name:    r.get(3)?,
+                    duration_ms:   r.get(4)?,
+                    memory_mb:     r.get(5)?,
+                    mem_before_mb: r.get(6)?,
+                    mem_after_mb:  r.get(7)?,
+                    error_msg:     r.get(8)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(SystemResourcesResponse { cpu_trend, mem_trend, disk_trend, model_events, latest })
+    })?;
+
+    Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SystemQuery {
+    #[serde(default = "default_sys_range")]
+    pub range: String,
+}
+
+fn default_sys_range() -> String { "6h".to_string() }
