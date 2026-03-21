@@ -2,6 +2,8 @@
 
 > ⚠️ 本配置的核心行为逻辑（如反馈、音效）依赖于外部脚本，如 `$HOME/.claude/feedback_common.md`。
 
+The project memory and development context is defined in @.claude/MEMORY.md.
+
 <claude_configuration>
 
     <!-- ====================================================================== -->
