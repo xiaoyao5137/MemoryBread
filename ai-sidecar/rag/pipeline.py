@@ -31,6 +31,39 @@ _DEFAULT_SYSTEM_PROMPT = (
     "如果上下文中没有相关信息，请直接说明。"
 )
 
+_WEEKLY_REPORT_SYSTEM_PROMPT = (
+    "你是记忆面包，一个本地运行的 AI 工作助手。"
+    "根据以下本周的工作记录，帮用户生成一份结构清晰的工作周报。"
+    "要求：\n"
+    "1. 用 Markdown 格式输出，按活动类型分组（如：需求/开发、代码评审、会议沟通、文档阅读、其他）\n"
+    "2. 每个分组列出具体工作内容，语言简洁专业\n"
+    "3. 如果某类工作没有记录，省略该分组\n"
+    "4. 最后加一段「本周小结」，用 2-3 句话概括整体工作重心\n"
+    "5. 只基于提供的记录生成，不要编造内容"
+)
+
+_DAILY_REPORT_SYSTEM_PROMPT = (
+    "你是记忆面包，一个本地运行的 AI 工作助手。"
+    "根据以下今天的工作记录，帮用户生成一份工作日报。"
+    "要求：\n"
+    "1. 用 Markdown 格式输出，按活动类型分组（如：开发、会议、沟通、阅读、其他）\n"
+    "2. 每个分组列出具体工作内容，语言简洁专业\n"
+    "3. 如果某类工作没有记录，省略该分组\n"
+    "4. 只基于提供的记录生成，不要编造内容"
+)
+
+_PROJECT_SUMMARY_SYSTEM_PROMPT = (
+    "你是记忆面包，一个本地运行的 AI 工作助手。"
+    "根据以下项目相关的工作记录，帮用户生成一份结构清晰的项目总结报告。"
+    "要求：\n"
+    "1. 用 Markdown 格式输出，包含以下章节：项目背景与目标、主要完成内容、关键决策与方案、"
+    "遇到的挑战及解决方案、成果与数据、经验教训与改进建议\n"
+    "2. 语言简洁专业，聚焦有价值的信息\n"
+    "3. 如果某章节没有足够记录，可简要说明或省略\n"
+    "4. 最后加「下一步计划」章节（如有迹象可循）\n"
+    "5. 只基于提供的记录生成，不要编造内容"
+)
+
 _MAX_CHUNK_LEN = 500   # 单个上下文片段最大字符数
 
 
@@ -57,11 +90,14 @@ class QueryIntent:
     source_types: list[str] = field(default_factory=list)
     category: str | None = None
     target_time_semantics: str = "either"
+    query_mode: str = "lookup"
     activity_types: list[str] = field(default_factory=list)
     content_origins: list[str] = field(default_factory=list)
     history_view: bool | None = None
     is_self_generated: bool | None = None
     evidence_strengths: list[str] = field(default_factory=list)
+    # 任务型意图：weekly_report | daily_report | None
+    task_type: str | None = None
 
 
 class RagPipeline:
@@ -95,6 +131,13 @@ class RagPipeline:
         effective_top_k = top_k or self._top_k
         intent = self._parse_query_intent(user_query)
 
+        # 任务型意图：使用更大的 top_k 做宽松全量召回
+        if intent.task_type in ("weekly_report", "daily_report", "project_summary"):
+            effective_top_k = max(effective_top_k, 50)
+        # 普通 summary 模式（如"总结我本周的工作"）：也扩大 top_k，确保涵盖足够多的记录
+        elif intent.query_mode == "summary":
+            effective_top_k = max(effective_top_k, 30)
+
         query_vector: list[float] = []
         try:
             embed_results = self._embed.encode([user_query])
@@ -103,12 +146,15 @@ class RagPipeline:
         except Exception as exc:
             logger.warning("Query embedding 失败，跳过语义检索: %s", exc)
 
+        # 任务型意图：不按关键词过滤，纯按时间段和活动类型宽松召回
+        knowledge_entity_terms = None if intent.task_type else (intent.entity_terms or None)
+
         knowledge_results = self._knowledge.search(
-            user_query,
+            user_query if not intent.task_type else "",
             top_k=effective_top_k * 2,
             start_ts=intent.start_ts,
             end_ts=intent.end_ts,
-            entity_terms=intent.entity_terms,
+            entity_terms=knowledge_entity_terms,
             observed_start_ts=intent.observed_start_ts,
             observed_end_ts=intent.observed_end_ts,
             event_start_ts=intent.event_start_ts,
@@ -118,6 +164,7 @@ class RagPipeline:
             history_view=intent.history_view,
             is_self_generated=intent.is_self_generated,
             evidence_strengths=intent.evidence_strengths or None,
+            query_mode=intent.query_mode,
         ) if self._knowledge else []
         vector_results = (
             self._vector.search(
@@ -131,7 +178,7 @@ class RagPipeline:
                     event_start_ts=intent.event_start_ts,
                     event_end_ts=intent.event_end_ts,
                     source_types=["knowledge"],
-                    app_names=intent.app_names or intent.entity_terms or None,
+                    app_names=None if (intent.query_mode == "summary" or intent.task_type) else (intent.app_names or intent.entity_terms or None),
                     category=intent.category,
                     activity_types=intent.activity_types or None,
                     content_origins=intent.content_origins or None,
@@ -147,12 +194,22 @@ class RagPipeline:
             [knowledge_results, vector_results],
             top_k=max(effective_top_k * 2, 6),
         )
-        selected_contexts = self._select_contexts(merged, effective_top_k)
+        selected_contexts = self._select_contexts(merged, effective_top_k, query_mode=intent.query_mode)
 
         context_text = self._build_context(selected_contexts)
         prompt = f"工作记录上下文：\n{context_text}\n\n用户问题：{user_query}"
 
-        llm_resp = self._llm.complete(prompt, system=self._system)
+        # 根据意图动态选择 system prompt
+        if intent.task_type == "weekly_report":
+            system = _WEEKLY_REPORT_SYSTEM_PROMPT
+        elif intent.task_type == "daily_report":
+            system = _DAILY_REPORT_SYSTEM_PROMPT
+        elif intent.task_type == "project_summary":
+            system = _PROJECT_SUMMARY_SYSTEM_PROMPT
+        else:
+            system = self._system
+
+        llm_resp = self._llm.complete(prompt, system=system)
 
         return RagResult(
             answer=llm_resp.text,
@@ -193,15 +250,25 @@ class RagPipeline:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _select_contexts(chunks: list[RetrievedChunk], top_k: int) -> list[RetrievedChunk]:
+    def _select_contexts(chunks: list[RetrievedChunk], top_k: int, query_mode: str = "lookup") -> list[RetrievedChunk]:
         selected: list[RetrievedChunk] = []
         selected_keys: set[str] = set()
+        candidate_chunks = sorted(
+            chunks,
+            key=lambda chunk: (
+                0 if query_mode == "summary" and chunk.metadata.get("activity_type") not in {"other", None} else 1,
+                0 if query_mode == "summary" and chunk.metadata.get("evidence_strength") in {"high", "medium"} else 1,
+                -float(chunk.score),
+            ),
+        )
 
-        for chunk in chunks:
+        for chunk in candidate_chunks:
             if len(selected) >= top_k:
                 break
             source_type = chunk.metadata.get("source_type") or chunk.source
             if source_type != "knowledge":
+                continue
+            if _is_noise_chunk(chunk):
                 continue
             doc_key = chunk.doc_key or chunk.metadata.get("doc_key")
             if not doc_key or doc_key in selected_keys:
@@ -222,8 +289,35 @@ class RagPipeline:
         event_start_ts: int | None = None
         event_end_ts: int | None = None
         target_time_semantics = "either"
+        task_type: str | None = None
 
-        if "最近" in user_query:
+        # ── 任务型意图检测（优先级最高）──────────────────────────────────
+        _WEEKLY_REPORT_TOKENS  = ("周报", "工作周报", "weekly report")
+        _DAILY_REPORT_TOKENS   = ("日报", "工作日报", "今日工作总结", "今天工作总结", "daily report")
+        _PROJECT_SUMMARY_TOKENS = ("项目总结", "项目报告", "项目复盘", "项目回顾", "project summary", "项目里程碑", "milestone")
+        _WRITE_TASK_TOKENS     = ("帮我写", "帮我生成", "帮我整理", "生成一份", "写一份", "整理一份", "写下", "生成下", "帮忙写", "帮我做")
+
+        _is_weekly_report   = any(t in user_query for t in _WEEKLY_REPORT_TOKENS)
+        _is_daily_report    = any(t in user_query for t in _DAILY_REPORT_TOKENS)
+        _is_project_summary = any(t in user_query for t in _PROJECT_SUMMARY_TOKENS)
+        _is_write_intent    = any(t in user_query for t in _WRITE_TASK_TOKENS)
+
+        if _is_write_intent and _is_project_summary:
+            task_type = "project_summary"
+        elif _is_write_intent and _is_weekly_report:
+            task_type = "weekly_report"
+        elif _is_write_intent and _is_daily_report:
+            task_type = "daily_report"
+
+        # ── 时间范围解析 ─────────────────────────────────────────────────
+        if "上周" in user_query:
+            # 上周：上周一 00:00 ~ 本周一 00:00 - 1ms
+            this_week_start = _week_start_ms()
+            start_ts = this_week_start - 7 * 24 * 60 * 60 * 1000
+            end_ts = this_week_start - 1
+            observed_start_ts = start_ts
+            observed_end_ts = end_ts
+        elif "最近" in user_query:
             start_ts = now_ms - 7 * 24 * 60 * 60 * 1000
             observed_start_ts = start_ts
             observed_end_ts = end_ts
@@ -240,6 +334,21 @@ class RagPipeline:
             event_end_ts = end_ts
         elif "本周" in user_query:
             start_ts = _week_start_ms()
+            observed_start_ts = start_ts
+            observed_end_ts = end_ts
+        elif task_type == "weekly_report":
+            # 周报默认取本周
+            start_ts = _week_start_ms()
+            observed_start_ts = start_ts
+            observed_end_ts = end_ts
+        elif task_type == "daily_report":
+            # 日报默认取今天
+            start_ts = _day_start_ms(0)
+            observed_start_ts = start_ts
+            observed_end_ts = end_ts
+        elif task_type == "project_summary":
+            # 项目总结默认取本月
+            start_ts = _month_start_ms()
             observed_start_ts = start_ts
             observed_end_ts = end_ts
 
@@ -267,29 +376,49 @@ class RagPipeline:
         history_view: bool | None = None
         is_self_generated: bool | None = False
         evidence_strengths: list[str] = []
+        query_mode = "lookup"
 
-        asks_ai = any(token in lowered for token in ("gemini", "claude", "chatgpt", "ai")) and any(
-            token in user_query for token in ("问", "提问", "聊", "对话")
-        )
-        asks_history = any(token in user_query for token in ("历史消息", "历史记录", "历史对话", "回看", "回顾"))
-        asks_daily_summary = "今天" in user_query and any(token in user_query for token in ("做了什么", "干了什么", "做过什么"))
-
-        if asks_ai:
-            target_time_semantics = "observed"
-            activity_types = ["ask_ai"]
-            history_view = False
-            evidence_strengths = ["medium", "high"]
-        elif asks_history:
-            target_time_semantics = "observed"
-            activity_types = ["reviewing_history", "chat", "reading"]
-            content_origins = ["historical_content"]
-            history_view = True
-            evidence_strengths = ["medium", "high"]
-        elif asks_daily_summary:
+        # ── 任务型意图：统一设置检索参数 ─────────────────────────────────
+        if task_type in ("weekly_report", "daily_report"):
             target_time_semantics = "observed"
             history_view = False
             activity_types = ["coding", "reading", "meeting", "chat", "ask_ai"]
             evidence_strengths = ["medium", "high"]
+            query_mode = "summary"
+        else:
+            # ── 普通查询意图 ──────────────────────────────────────────────
+            asks_ai = any(token in lowered for token in ("gemini", "claude", "chatgpt", "ai")) and any(
+                token in user_query for token in ("问", "提问", "聊", "对话")
+            )
+            asks_history = any(token in user_query for token in ("历史消息", "历史记录", "历史对话", "回看", "回顾"))
+            asks_daily_summary = "今天" in user_query and any(token in user_query for token in ("做了什么", "干了什么", "做过什么"))
+            asks_recent_summary = any(token in user_query for token in ("最近", "本周", "上周")) and any(
+                token in user_query for token in ("关于", "工作有哪些", "工作内容", "进展", "总结", "做了哪些", "回顾", "汇总", "梳理", "有什么")
+            )
+
+            if asks_ai:
+                target_time_semantics = "observed"
+                activity_types = ["ask_ai"]
+                history_view = False
+                evidence_strengths = ["medium", "high"]
+            elif asks_history:
+                target_time_semantics = "observed"
+                activity_types = ["reviewing_history", "chat", "reading"]
+                content_origins = ["historical_content"]
+                history_view = True
+                evidence_strengths = ["medium", "high"]
+            elif asks_daily_summary:
+                target_time_semantics = "observed"
+                history_view = False
+                activity_types = ["coding", "reading", "meeting", "chat", "ask_ai"]
+                evidence_strengths = ["medium", "high"]
+                query_mode = "summary"
+            elif asks_recent_summary:
+                target_time_semantics = "observed"
+                history_view = False
+                activity_types = ["coding", "reading", "meeting", "chat", "ask_ai"]
+                evidence_strengths = ["medium", "high"]
+                query_mode = "summary"
 
         if target_time_semantics == "event" and observed_start_ts is not None:
             observed_start_ts = None
@@ -310,11 +439,13 @@ class RagPipeline:
             source_types=source_types,
             category=category,
             target_time_semantics=target_time_semantics,
+            query_mode=query_mode,
             activity_types=activity_types,
             content_origins=content_origins,
             history_view=history_view,
             is_self_generated=is_self_generated,
             evidence_strengths=evidence_strengths,
+            task_type=task_type,
         )
 
 
@@ -328,6 +459,7 @@ def _extract_query_terms(query: str) -> list[str]:
         "什么", "怎么", "如何", "为什么", "昨天", "今天", "最近", "本周", "那段",
         "提到", "知识", "总结", "里", "了吗", "是否", "有关", "关于", "做了什么",
         "干了什么", "做过什么", "问了什么", "看了什么", "历史消息", "历史记录", "历史对话",
+        "工作", "工作有", "有哪些", "哪些", "进展", "内容",
     }
 
     def _add(term: str) -> None:
@@ -340,14 +472,49 @@ def _extract_query_terms(query: str) -> list[str]:
     for token in tokens:
         if len(token) < 2:
             continue
-        if re.fullmatch(r"[\u4e00-\u9fff]+", token) and len(token) > 4:
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            if len(token) <= 4:
+                _add(token)
+                continue
+            meaningful_subterms: list[str] = []
             for size in (4, 3, 2):
                 for i in range(0, len(token) - size + 1):
-                    _add(token[i:i + size])
+                    candidate = token[i:i + size]
+                    if candidate in stop_terms:
+                        continue
+                    if any(mark in candidate for mark in ("工作", "总结", "哪些", "最近", "今天", "昨天", "本周")):
+                        continue
+                    meaningful_subterms.append(candidate)
+            if meaningful_subterms:
+                for candidate in meaningful_subterms:
+                    _add(candidate)
+            else:
+                _add(token)
         else:
             _add(token)
 
     return terms
+
+
+def _looks_like_noise_chunk(chunk: RetrievedChunk) -> bool:
+    metadata = chunk.metadata or {}
+    text = (chunk.text or "").strip()
+    activity_type = metadata.get("activity_type")
+    content_origin = metadata.get("content_origin")
+    evidence_strength = metadata.get("evidence_strength")
+    return text.startswith("概述：低价值工作片段（") or text.startswith("低价值工作片段（") or (
+        evidence_strength == "low"
+        and activity_type in {None, "other"}
+        and content_origin in {None, "other"}
+    )
+
+
+def _is_noise_chunk(chunk: RetrievedChunk) -> bool:
+    metadata = chunk.metadata or {}
+    overview = str(metadata.get("overview") or "")
+    if overview.startswith("低价值工作片段（"):
+        return True
+    return _looks_like_noise_chunk(chunk)
 
 
 
@@ -372,6 +539,12 @@ def _week_start_ms() -> int:
     now = time.localtime()
     start_today_ms = _day_start_ms(0)
     return start_today_ms - now.tm_wday * 24 * 60 * 60 * 1000
+
+
+def _month_start_ms() -> int:
+    now = time.localtime()
+    month_start = time.mktime((now.tm_year, now.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+    return int(month_start * 1000)
 
 
 

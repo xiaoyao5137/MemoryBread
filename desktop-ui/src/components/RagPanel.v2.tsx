@@ -5,15 +5,21 @@
  * 1. 移除收起功能（不再支持收起到 buddy 模式）
  * 2. 更换图标为工作相关的图标
  * 3. 优化布局和样式
+ * 4. 增加任务模板快捷入口：
+ *    - 空状态：展示全量模板（按分类分组）
+ *    - 有回答时：模板区折叠在参考来源下方，可展开/收起
  */
 
 import React, { useCallback, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { useRagQuery } from '../hooks/useApi'
+import { BUILTIN_TEMPLATES, CATEGORY_COLORS, groupTemplatesByCategory } from '../data/taskTemplates'
 
 interface RagPanelProps {
   className?: string
 }
+
+const GROUPED_TEMPLATES = groupTemplatesByCategory(BUILTIN_TEMPLATES)
 
 const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   const {
@@ -26,6 +32,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   } = useAppStore()
 
   const [inputValue, setInputValue] = useState(ragQuery)
+  const [templatesExpanded, setTemplatesExpanded] = useState(false)
   const doQuery = useRagQuery()
 
   const handleSubmit = useCallback(
@@ -42,6 +49,21 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
     },
     [inputValue, setRagQuery, doQuery]
   )
+
+  const handleTemplateClick = useCallback(
+    async (instruction: string) => {
+      setInputValue(instruction)
+      setRagQuery(instruction)
+      try {
+        await doQuery(instruction)
+      } catch {
+        // error is set in store by useRagQuery
+      }
+    },
+    [setRagQuery, doQuery]
+  )
+
+  const hasResult = !!(ragAnswer || ragError)
 
   return (
     <div
@@ -223,14 +245,19 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
                   相关度: {(ctx.score * 100).toFixed(0)}%
                 </span>
               </div>
-              <div className="rag-panel__context-text">{ctx.text}</div>
+              <div className="rag-panel__context-text">
+                  {ctx.text.split('\n').map((line, i) => (
+                    <React.Fragment key={i}>{line}{i < ctx.text.split('\n').length - 1 && <br />}</React.Fragment>
+                  ))}
+                </div>
             </div>
           ))}
         </div>
       )}
 
-      {/* 空状态 */}
-      {!ragLoading && !ragAnswer && !ragError && (
+      {/* ── 任务模板区 ── */}
+      {/* 空状态：大图标 + 全量模板展示 */}
+      {!ragLoading && !hasResult && (
         <div className="rag-panel__empty" data-testid="rag-panel-empty">
           <svg
             width="48"
@@ -259,8 +286,104 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           </svg>
           <p>你好！我是记忆面包</p>
           <p className="rag-panel__empty-hint">
-            问我任何工作相关的问题，我会基于你的工作记录给出答案
+            问我任何工作相关的问题，或从下方选择一个任务模板快速开始
           </p>
+
+          <div className="rag-panel__templates">
+            {Object.entries(GROUPED_TEMPLATES).map(([category, templates]) => (
+              <div key={category} className="rag-panel__template-group">
+                <div
+                  className="rag-panel__template-category"
+                  style={{ borderColor: CATEGORY_COLORS[category] ?? '#999', color: CATEGORY_COLORS[category] ?? '#999' }}
+                >
+                  {category}
+                </div>
+                <div className="rag-panel__template-chips">
+                  {templates.map((tpl) => (
+                    <button
+                      key={tpl.id}
+                      className="rag-panel__template-chip"
+                      style={{ '--chip-color': CATEGORY_COLORS[category] ?? '#4a90e2' } as React.CSSProperties}
+                      onClick={() => handleTemplateClick(tpl.user_instruction)}
+                      disabled={ragLoading}
+                      title={tpl.user_instruction}
+                    >
+                      {tpl.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 有结果时：模板区折叠在底部，可展开 */}
+      {!ragLoading && hasResult && (
+        <div className="rag-panel__templates-collapsed">
+          <button
+            className="rag-panel__templates-toggle"
+            onClick={() => setTemplatesExpanded((v) => !v)}
+          >
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <rect width="7" height="7" x="3" y="3" rx="1" />
+              <rect width="7" height="7" x="14" y="3" rx="1" />
+              <rect width="7" height="7" x="14" y="14" rx="1" />
+              <rect width="7" height="7" x="3" y="14" rx="1" />
+            </svg>
+            任务模板
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className={`rag-panel__toggle-arrow ${templatesExpanded ? 'rag-panel__toggle-arrow--up' : ''}`}
+            >
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
+
+          {templatesExpanded && (
+            <div className="rag-panel__templates rag-panel__templates--inline">
+              {Object.entries(GROUPED_TEMPLATES).map(([category, templates]) => (
+                <div key={category} className="rag-panel__template-group">
+                  <div
+                    className="rag-panel__template-category"
+                    style={{ borderColor: CATEGORY_COLORS[category] ?? '#999', color: CATEGORY_COLORS[category] ?? '#999' }}
+                  >
+                    {category}
+                  </div>
+                  <div className="rag-panel__template-chips">
+                    {templates.map((tpl) => (
+                      <button
+                        key={tpl.id}
+                        className="rag-panel__template-chip"
+                        style={{ '--chip-color': CATEGORY_COLORS[category] ?? '#4a90e2' } as React.CSSProperties}
+                        onClick={() => handleTemplateClick(tpl.user_instruction)}
+                        disabled={ragLoading}
+                        title={tpl.user_instruction}
+                      >
+                        {tpl.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -1,7 +1,7 @@
 import React, { useEffect } from 'react'
 import { useAppStore }        from './store/useAppStore'
 import FloatingBuddy          from './components/FloatingBuddy'
-import RagPanel               from './components/RagPanel'
+import RagPanel               from './components/RagPanel.v2'
 import KnowledgePanel         from './components/KnowledgePanel'
 import ModelManager           from './components/ModelManager'
 import ActionConfirm          from './components/ActionConfirm'

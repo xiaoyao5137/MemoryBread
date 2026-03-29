@@ -39,7 +39,7 @@ llm_client = None
 
 class QueryRequest(BaseModel):
     query: str
-    top_k: int = 5
+    top_k: int = 20
 
 
 class RagContext(BaseModel):

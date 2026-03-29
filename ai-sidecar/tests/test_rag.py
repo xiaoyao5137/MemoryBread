@@ -54,6 +54,7 @@ class MockLlmBackend(LlmBackend):
         self._available = available
         self.call_count = 0
         self.last_prompt: str = ""
+        self.last_system: str = ""
 
     def is_available(self) -> bool:
         return self._available
@@ -61,6 +62,7 @@ class MockLlmBackend(LlmBackend):
     def complete(self, prompt: str, system: str = "", **kwargs) -> LlmResponse:
         self.call_count += 1
         self.last_prompt = prompt
+        self.last_system = system
         return LlmResponse(text=self._response, model="mock-llm", tokens=10)
 
     @property
@@ -91,6 +93,7 @@ class MockFts5Retriever:
         history_view: bool | None = None,
         is_self_generated: bool | None = None,
         evidence_strengths: list[str] | None = None,
+        query_mode: str = "lookup",
     ) -> list[RetrievedChunk]:
         self.call_count += 1
         self.last_kwargs = {
@@ -108,6 +111,7 @@ class MockFts5Retriever:
             "history_view": history_view,
             "is_self_generated": is_self_generated,
             "evidence_strengths": evidence_strengths,
+            "query_mode": query_mode,
         }
         return self._chunks[:top_k]
 
@@ -490,7 +494,146 @@ class TestRagPipeline:
         assert filters.history_view is True
         assert filters.content_origins == ["historical_content"]
 
-    def test_build_context_contains_observed_and_event_time(self):
+    def test_query_intent_applies_recent_summary_mode(self):
+        knowledge = MockFts5Retriever(chunks=[_chunk(1, source="knowledge")])
+        vector_r = MockVectorRetriever()
+        llm = MockLlmBackend()
+        pipeline = RagPipeline(
+            embedding_model=EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever=vector_r,               # type: ignore[arg-type]
+            fts5_retriever=MockFts5Retriever(),      # type: ignore[arg-type]
+            knowledge_retriever=knowledge,           # type: ignore[arg-type]
+            llm=llm,
+        )
+        pipeline.query("我最近关于aigc的工作有哪些")
+        assert knowledge.last_kwargs["query_mode"] == "summary"
+        assert "aigc" in (knowledge.last_kwargs["entity_terms"] or [])
+        filters = vector_r.last_kwargs["filters"]
+        assert filters.app_names in (None, [])
+
+    def test_weekly_report_intent_detected(self):
+        """'帮我写工作周报' 应识别为 weekly_report 任务型意图"""
+        intent = RagPipeline._parse_query_intent("帮我写下我的工作周报")
+        assert intent.task_type == "weekly_report"
+        assert intent.query_mode == "summary"
+        assert intent.observed_start_ts is not None  # 默认本周
+        assert intent.activity_types == ["coding", "reading", "meeting", "chat", "ask_ai"]
+        assert intent.evidence_strengths == ["medium", "high"]
+        assert intent.history_view is False
+
+    def test_daily_report_intent_detected(self):
+        """'帮我写今天的日报' 应识别为 daily_report 任务型意图"""
+        intent = RagPipeline._parse_query_intent("帮我写今天的工作日报")
+        assert intent.task_type == "daily_report"
+        assert intent.query_mode == "summary"
+        assert intent.observed_start_ts is not None  # 今天
+
+    def test_weekly_report_last_week(self):
+        """'帮我写上周周报' 应识别为 weekly_report + 上周时间范围"""
+        intent = RagPipeline._parse_query_intent("帮我写上周的工作周报")
+        assert intent.task_type == "weekly_report"
+        # 上周 end_ts 应早于本周开始
+        from rag.pipeline import _week_start_ms
+        this_week_start = _week_start_ms()
+        assert intent.observed_end_ts is not None
+        assert intent.observed_end_ts < this_week_start
+
+    def test_weekly_report_uses_large_top_k(self):
+        """周报查询应自动扩大 top_k 到 50"""
+        knowledge = MockFts5Retriever(chunks=[_chunk(1, source="knowledge")])
+        vector_r = MockVectorRetriever()
+        llm = MockLlmBackend()
+        pipeline = RagPipeline(
+            embedding_model=EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever=vector_r,               # type: ignore[arg-type]
+            fts5_retriever=MockFts5Retriever(),      # type: ignore[arg-type]
+            knowledge_retriever=knowledge,           # type: ignore[arg-type]
+            llm=llm,
+        )
+        pipeline.query("帮我写工作周报")
+        # top_k * 2 = 100，knowledge 检索应收到 >= 100 的 top_k
+        assert knowledge.last_kwargs["top_k"] >= 100
+
+    def test_weekly_report_system_prompt_used(self):
+        """周报任务应使用专属 system prompt，而非默认 prompt"""
+        knowledge = MockFts5Retriever(chunks=[_chunk(1, source="knowledge")])
+        llm = MockLlmBackend()
+        pipeline = RagPipeline(
+            embedding_model=EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever=MockVectorRetriever(),  # type: ignore[arg-type]
+            fts5_retriever=MockFts5Retriever(),      # type: ignore[arg-type]
+            knowledge_retriever=knowledge,           # type: ignore[arg-type]
+            llm=llm,
+        )
+        pipeline.query("帮我写工作周报")
+        assert "周报" in llm.last_system
+        assert "活动类型" in llm.last_system
+
+    def test_weekly_report_passes_empty_entity_terms_to_knowledge(self):
+        """周报任务应传空 entity_terms，实现宽松全量时间段召回"""
+        knowledge = MockFts5Retriever(chunks=[_chunk(1, source="knowledge")])
+        vector_r = MockVectorRetriever()
+        llm = MockLlmBackend()
+        pipeline = RagPipeline(
+            embedding_model=EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever=vector_r,               # type: ignore[arg-type]
+            fts5_retriever=MockFts5Retriever(),      # type: ignore[arg-type]
+            knowledge_retriever=knowledge,           # type: ignore[arg-type]
+            llm=llm,
+        )
+        pipeline.query("帮我写工作周报")
+        # 任务型意图不按关键词过滤
+        assert knowledge.last_kwargs.get("entity_terms") is None
+
+    def test_non_write_intent_not_treated_as_report(self):
+        """纯浏览型查询不应识别为任务型意图"""
+        intent = RagPipeline._parse_query_intent("本周工作总结是什么")
+        assert intent.task_type is None
+
+    def test_select_contexts_filters_noise_knowledge(self):
+        llm = MockLlmBackend()
+        noise_chunk = RetrievedChunk(
+            capture_id=1,
+            text="概述：低价值工作片段（invalid_json）",
+            score=0.95,
+            source="knowledge",
+            doc_key="knowledge:1",
+            metadata={
+                "source_type": "knowledge",
+                "doc_key": "knowledge:1",
+                "knowledge_id": 1,
+                "overview": "低价值工作片段（invalid_json）",
+                "activity_type": "other",
+                "content_origin": "other",
+                "evidence_strength": "low",
+            },
+        )
+        good_chunk = RetrievedChunk(
+            capture_id=2,
+            text="概述：本周推进 AIGC 页面方案",
+            score=0.8,
+            source="knowledge",
+            doc_key="knowledge:2",
+            metadata={
+                "source_type": "knowledge",
+                "doc_key": "knowledge:2",
+                "knowledge_id": 2,
+                "overview": "本周推进 AIGC 页面方案",
+                "activity_type": "coding",
+                "content_origin": "live_interaction",
+                "evidence_strength": "high",
+            },
+        )
+        pipeline = RagPipeline(
+            embedding_model=EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever=MockVectorRetriever(chunks=[good_chunk]),  # type: ignore[arg-type]
+            fts5_retriever=MockFts5Retriever(),      # type: ignore[arg-type]
+            knowledge_retriever=MockFts5Retriever(chunks=[noise_chunk]),  # type: ignore[arg-type]
+            llm=llm,
+        )
+        result = pipeline.query("我最近关于aigc的工作有哪些")
+        assert [chunk.doc_key for chunk in result.contexts] == ["knowledge:2"]
+
         llm = MockLlmBackend()
         chunk = RetrievedChunk(
             capture_id=1,
@@ -755,6 +898,26 @@ class TestSqliteRetrievers:
         assert [chunk.metadata["knowledge_id"] for chunk in history_results] == [2]
 
 
+    def test_knowledge_retriever_filters_noise_overview(self, tmp_path):
+        db_path = str(tmp_path / "knowledge.db")
+        _init_knowledge_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.executemany(
+            "INSERT INTO knowledge_entries (id, capture_id, summary, overview, details, start_time, end_time, duration_minutes, frag_app_name, frag_win_title, entities, category, user_verified, observed_at, event_time_start, event_time_end, history_view, content_origin, activity_type, is_self_generated, evidence_strength) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (1, 100, "低价值条目", "低价值工作片段（invalid_json）", "噪声", 1_710_000_000_000, 1_710_000_060_000, 1, "Gemini", "Gemini", "[]", "其他", 0, 1_710_000_060_000, None, None, 0, "other", "other", 0, "low"),
+                (2, 101, "AIGC 方案", "推进 AIGC 选题与页面方案", "整理 AIGC 工作流与页面方案", 1_710_000_100_000, 1_710_000_160_000, 1, "VS Code", "AIGC", "[]", "代码", 1, 1_710_000_160_000, None, None, 0, "live_interaction", "coding", 0, "high"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        retriever = KnowledgeFts5Retriever(db_path)
+        results = retriever.search("我最近关于aigc的工作有哪些", top_k=5, entity_terms=["aigc"], query_mode="summary")
+        assert [chunk.metadata["knowledge_id"] for chunk in results] == [2]
+
+
     def test_knowledge_retriever_falls_back_to_frag_app_name_match(self, tmp_path):
         db_path = str(tmp_path / "knowledge.db")
         _init_knowledge_db(db_path)
@@ -774,8 +937,6 @@ class TestSqliteRetrievers:
         assert results[0].doc_key == "knowledge:1"
         assert results[0].metadata["knowledge_id"] == 1
 
-
-# ── OllamaBackend 接口测试 ────────────────────────────────────────────────────
 
 class TestOllamaBackend:
     def test_model_name(self):

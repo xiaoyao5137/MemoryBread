@@ -361,6 +361,105 @@ body {
   transform: translateX(4px);
 }
 
+/* ── 任务模板区（空状态 / 折叠状态共用） ── */
+.rag-panel__templates {
+  width: 100%;
+  margin-top: 24px;
+  text-align: left;
+}
+
+.rag-panel__templates--inline {
+  margin-top: 12px;
+  padding: 0 32px 16px;
+}
+
+.rag-panel__template-group {
+  margin-bottom: 16px;
+}
+
+.rag-panel__template-category {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  border-left: 3px solid currentColor;
+  padding-left: 8px;
+  margin-bottom: 8px;
+  opacity: 0.85;
+}
+
+.rag-panel__template-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.rag-panel__template-chip {
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--chip-color, #4a90e2);
+  background: color-mix(in srgb, var(--chip-color, #4a90e2) 8%, white);
+  border: 1.5px solid color-mix(in srgb, var(--chip-color, #4a90e2) 25%, transparent);
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rag-panel__template-chip:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--chip-color, #4a90e2) 15%, white);
+  border-color: var(--chip-color, #4a90e2);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--chip-color, #4a90e2) 20%, transparent);
+}
+
+.rag-panel__template-chip:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 折叠条（有结果时） */
+.rag-panel__templates-collapsed {
+  margin: 0 32px 24px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.rag-panel__templates-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: #f7fafc;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: #4a5568;
+  text-align: left;
+  transition: background 0.15s ease;
+}
+
+.rag-panel__templates-toggle:hover {
+  background: #edf2f7;
+}
+
+.rag-panel__toggle-arrow {
+  margin-left: auto;
+  transition: transform 0.2s ease;
+}
+
+.rag-panel__toggle-arrow--up {
+  transform: rotate(180deg);
+}
+
 /* ========================================
    Settings - 设置页面
    ======================================== */

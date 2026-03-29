@@ -18,6 +18,8 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+_NOISE_OVERVIEW_PREFIX = "低价值工作片段（"
+
 
 @dataclass
 class VectorSearchFilter:
@@ -80,6 +82,33 @@ def _build_like_clauses(expression: str, terms: list[str]) -> tuple[str, list[st
     clause = "(" + " OR ".join(f"{expression} LIKE ?" for _ in terms) + ")"
     params = [f"%{term.lower()}%" for term in terms]
     return clause, params
+
+
+
+def _is_app_like_term(term: str) -> bool:
+    lowered = term.lower()
+    return any(ch.isascii() for ch in term) or lowered in {"飞书", "微信", "chrome", "safari", "gemini", "claude", "chatgpt"}
+
+
+
+def _build_fts_or_query(terms: list[str]) -> str:
+    normalized = [term.strip() for term in dict.fromkeys(terms) if term and term.strip()]
+    if not normalized:
+        return ""
+    return " OR ".join(_escape_fts5_term(term) for term in normalized)
+
+
+
+def _apply_noise_filters(sql: str, params: list[object], alias: str = "k") -> tuple[str, list[object]]:
+    sql += f" AND COALESCE({alias}.overview, '') NOT LIKE ?"
+    params.append(f"{_NOISE_OVERVIEW_PREFIX}%")
+    sql += (
+        f" AND NOT (COALESCE({alias}.evidence_strength, '') = ?"
+        f" AND COALESCE({alias}.activity_type, '') IN (?, '')"
+        f" AND COALESCE({alias}.content_origin, '') IN (?, ''))"
+    )
+    params.extend(["low", "other", "other"])
+    return sql, params
 
 
 
@@ -487,6 +516,7 @@ class KnowledgeFts5Retriever:
         history_view: bool | None = None,
         is_self_generated: bool | None = None,
         evidence_strengths: list[str] | None = None,
+        query_mode: str = "lookup",
     ) -> list[RetrievedChunk]:
         try:
             conn = sqlite3.connect(self.db_path)
@@ -517,6 +547,7 @@ class KnowledgeFts5Retriever:
                 history_view=history_view,
                 is_self_generated=is_self_generated,
                 evidence_strengths=evidence_strengths,
+                query_mode=query_mode,
             )
             if chunks:
                 conn.close()
@@ -539,6 +570,7 @@ class KnowledgeFts5Retriever:
                 history_view=history_view,
                 is_self_generated=is_self_generated,
                 evidence_strengths=evidence_strengths,
+                query_mode=query_mode,
             )
             conn.close()
             logger.debug(f"知识库字段回退检索返回 {len(chunks)} 条结果")
@@ -564,7 +596,13 @@ class KnowledgeFts5Retriever:
         history_view: bool | None,
         is_self_generated: bool | None,
         evidence_strengths: list[str] | None,
+        query_mode: str,
     ) -> list[RetrievedChunk]:
+        fts_terms = list(dict.fromkeys([*(entity_terms or []), query.strip()]))
+        fts_query = _build_fts_or_query(fts_terms if query_mode == "summary" else [query.strip(), *(entity_terms or [])])
+        if not fts_query:
+            return []
+
         sql = """
             SELECT
                 k.id,
@@ -592,7 +630,7 @@ class KnowledgeFts5Retriever:
             JOIN knowledge_entries k ON fts.rowid = k.id
             WHERE knowledge_fts MATCH ?
         """
-        params: list[object] = [_escape_fts5_term(query)]
+        params: list[object] = [fts_query]
 
         if start_ts is not None:
             sql += " AND (k.start_time IS NULL OR k.start_time >= ?)"
@@ -633,6 +671,7 @@ class KnowledgeFts5Retriever:
             if clause:
                 sql += f" AND k.evidence_strength IN {clause}"
                 params.extend(clause_params)
+        sql, params = _apply_noise_filters(sql, params)
         if entity_terms:
             clause, clause_params = _build_like_clauses(
                 "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, ''))",
@@ -663,9 +702,16 @@ class KnowledgeFts5Retriever:
         history_view: bool | None,
         is_self_generated: bool | None,
         evidence_strengths: list[str] | None,
+        query_mode: str,
     ) -> list[RetrievedChunk]:
-        terms = list(dict.fromkeys([*(entity_terms or []), *_extract_query_terms(query)]))
-        if not terms:
+        terms = entity_terms or _extract_query_terms(query)
+        if query_mode == "summary":
+            terms = [term for term in terms if not _is_app_like_term(term)] or terms
+        terms = list(dict.fromkeys(terms))
+        # 任务型宽松检索：terms 为空时允许继续，纯按时间段和 activity_types 扫描
+        # 非任务型检索：terms 为空则无意义，直接返回
+        is_time_scan = not terms and (observed_start_ts is not None or start_ts is not None)
+        if not terms and not is_time_scan:
             return []
 
         sql = """
@@ -735,18 +781,20 @@ class KnowledgeFts5Retriever:
                 sql += f" AND k.evidence_strength IN {clause}"
                 params.extend(clause_params)
 
-        clause, clause_params = _build_like_clauses(
-            "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, ''))",
-            terms,
-        )
-        sql += f" AND {clause}"
-        params.extend(clause_params)
+        sql, params = _apply_noise_filters(sql, params)
+        if terms:
+            clause, clause_params = _build_like_clauses(
+                "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, ''))",
+                terms,
+            )
+            sql += f" AND {clause}"
+            params.extend(clause_params)
         sql += " ORDER BY COALESCE(k.observed_at, k.end_time, k.start_time, 0) DESC LIMIT ?"
         params.append(top_k)
         cursor.execute(sql, params)
 
         rows = cursor.fetchall()
-        return [self._row_to_chunk(row, float(len(terms))) for row in rows]
+        return [self._row_to_chunk(row, float(len(terms)) if terms else 1.0) for row in rows]
 
     def _row_to_chunk(self, row: sqlite3.Row, score: float) -> RetrievedChunk:
         knowledge_id = row["id"]
@@ -763,6 +811,8 @@ class KnowledgeFts5Retriever:
                 "source_type": "knowledge",
                 "retrieval_method": "knowledge",
                 "knowledge_id": knowledge_id,
+                "overview": row["overview"],
+                "summary": row["summary"],
                 "start_time": row["start_time"],
                 "end_time": row["end_time"],
                 "observed_at": row["observed_at"],
