@@ -277,6 +277,35 @@ class BackgroundProcessor:
                 return False
 
             conn = sqlite3.connect(self.db_path)
+
+            # 跨批次去重：若新 knowledge 与已有条目高度相似，则合并而非插入
+            overview = knowledge.get('overview') or knowledge.get('summary', '')
+            similar_id = extractor._find_similar_knowledge(overview, conn) if overview else None
+
+            if similar_id:
+                # 合并：occurrence_count+1，追加 details（去重保留新信息）
+                existing = conn.execute(
+                    "SELECT details FROM knowledge_entries WHERE id = ?", (similar_id,)
+                ).fetchone()
+                existing_details = (existing[0] or "") if existing else ""
+                new_details = knowledge.get('details', '')
+                if new_details and new_details not in existing_details:
+                    from datetime import datetime as _dt
+                    merged_details = existing_details + f"\n\n--- 补充 ({_dt.now().strftime('%Y-%m-%d %H:%M')}) ---\n{new_details}"
+                else:
+                    merged_details = existing_details
+                conn.execute(
+                    "UPDATE knowledge_entries SET occurrence_count = occurrence_count + 1, details = ? WHERE id = ?",
+                    (merged_details, similar_id),
+                )
+                conn.commit()
+                self._mark_captures_processed(conn, capture_ids, similar_id)
+                conn.close()
+                logger.info(
+                    f"🔀 知识已合并到已有条目: {len(group)} captures → knowledge_id={similar_id} (重复)"
+                )
+                return True
+
             knowledge_id = self._save_knowledge(conn, knowledge)
             self._mark_captures_processed(conn, capture_ids, knowledge_id)
             conn.close()

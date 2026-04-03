@@ -187,12 +187,12 @@ class RagPipeline:
         effective_top_k = top_k or self._top_k
         intent = self._parse_query_intent(user_query)
 
-        # 任务型意图：使用更大的 top_k 做宽松全量召回
+        # 任务型意图：15 条高质量记录即可，过多会超出 3B 模型上下文导致输出退化
         if intent.task_type in ("weekly_report", "daily_report", "project_summary"):
-            effective_top_k = max(effective_top_k, 50)
-        # 普通 summary 模式（如"总结我本周的工作"）：也扩大 top_k，确保涵盖足够多的记录
+            effective_top_k = max(effective_top_k, 15)
+        # 普通 summary 模式（如"总结我本周的工作"）：适度扩大
         elif intent.query_mode == "summary":
-            effective_top_k = max(effective_top_k, 30)
+            effective_top_k = max(effective_top_k, 15)
 
         query_vector: list[float] = []
         try:
@@ -223,10 +223,10 @@ class RagPipeline:
             query_mode=intent.query_mode,
         ) if self._knowledge else []
 
-        # 周报/日报时间兜底：若本周/今天无数据，自动扩大到最近7天
+        # 周报/日报时间兜底：若本周/今天无数据，自动扩大到最近14天
         if intent.task_type == "weekly_report" and not knowledge_results:
-            logger.info("本周无 knowledge 数据，回退到最近 7 天")
-            fallback_start = int(time.time() * 1000) - 7 * 24 * 60 * 60 * 1000
+            logger.info("本周无 knowledge 数据，回退到最近 14 天")
+            fallback_start = int(time.time() * 1000) - 14 * 24 * 60 * 60 * 1000
             knowledge_results = self._knowledge.search(
                 "",
                 top_k=effective_top_k * 2,

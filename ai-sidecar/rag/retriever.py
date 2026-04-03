@@ -868,8 +868,7 @@ class KnowledgeFts5Retriever:
             parts.append("历史回看：是")
         if row["overview"] or row["summary"]:
             parts.append(f"概述：{row['overview'] or row['summary']}")
-        if row["details"]:
-            parts.append(f"详情：{row['details']}")
+        # details 不放入检索 text，避免 RAG prompt 超长；details 保留在 metadata 中
         return "\n".join(parts)
 
 
