@@ -1,6 +1,7 @@
 //! HTTP 请求处理器（每个文件对应一组路由）
 
 pub mod action;
+pub mod bake;
 pub mod captures;
 pub mod debug;
 pub mod health;

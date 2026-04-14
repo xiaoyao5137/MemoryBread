@@ -30,6 +30,11 @@ static MIGRATIONS: &[(&str, &str)] = &[
     ("006_monitor_metric_scopes", include_str!("../../../shared/db-schema/migrations/006_monitor_metric_scopes.sql")),
     ("007_vector_index_rag_metadata", include_str!("../../../shared/db-schema/migrations/007_vector_index_rag_metadata.sql")),
     ("008_knowledge_semantic_metadata", include_str!("../../../shared/db-schema/migrations/008_knowledge_semantic_metadata.sql")),
+    ("009_bake_templates", include_str!("migrations/009_bake_templates.sql")),
+    ("010_knowledge_entries", include_str!("migrations/010_knowledge_entries.sql")),
+    ("011_bake_pipeline", include_str!("migrations/011_bake_pipeline.sql")),
+    ("012_fix_knowledge_fts_triggers", include_str!("migrations/012_fix_knowledge_fts_triggers.sql")),
+    ("013_rebuild_knowledge_fts", include_str!("migrations/013_rebuild_knowledge_fts.sql")),
 ];
 
 

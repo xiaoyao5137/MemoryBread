@@ -10,6 +10,8 @@ export interface CaptureRecord {
   win_title:      string | null
   event_type:     string
   ax_text:        string | null
+  ax_focused_role?: string | null
+  ax_focused_id?: string | null
   ocr_text:       string | null
   input_text:     string | null
   audio_text:     string | null
@@ -51,6 +53,24 @@ export interface RagContext {
   app_name?:  string | null
 }
 
+export interface DebugLogFile {
+  key: string
+  label: string
+  exists: boolean
+  size_bytes: number
+  modified_at: number | null
+}
+
+export interface DebugLogContent {
+  key: string
+  label: string
+  content: string
+  truncated: boolean
+  total_size_bytes: number
+  returned_bytes: number
+  modified_at: number | null
+}
+
 export interface ActionCommand {
   type:        'click' | 'right_click' | 'double_click' | 'move_to' | 'type_text' | 'hotkey' | 'key_press' | 'scroll' | 'wait' | 'sequence'
   x?:          number
@@ -70,7 +90,151 @@ export interface ActionResult {
   action_id:   string
 }
 
-export type WindowMode = 'buddy' | 'rag' | 'knowledge' | 'models' | 'settings' | 'debug' | 'tasks' | 'monitor'
+export type WindowMode = 'buddy' | 'rag' | 'knowledge' | 'models' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake'
+
+export type BakeTab = 'overview' | 'templates' | 'memories' | 'knowledge' | 'sop' | 'style'
+
+export type BakeBucket = 'extracted' | 'pending'
+
+export type RepositoryTab = 'memory' | 'capture'
+
+export interface BakeOverview {
+  captureCount: number
+  memoryCount: number
+  knowledgeCount: number
+  templateCount: number
+  pendingCandidates: number
+  recentActivities: string[]
+}
+
+export interface EpisodicMemoryItem {
+  id: string
+  title: string
+  url?: string
+  sourceCaptureId?: string
+  sourceKnowledgeId?: string
+  summary?: string
+  weight: number
+  openCount: number
+  dwellSeconds: number
+  hasEditAction: boolean
+  knowledgeRefCount: number
+  status: 'candidate' | 'confirmed' | 'ignored' | 'templated'
+  suggestedAction?: 'template' | 'knowledge' | 'sop'
+  tags: string[]
+  lastVisitedAt?: string
+  createdAt: string
+  createdAtMs: number
+  knowledgeMatchScore?: number
+  knowledgeMatchLevel?: string
+  templateMatchScore?: number
+  templateMatchLevel?: string
+  sopMatchScore?: number
+  sopMatchLevel?: string
+}
+
+export interface BakeKnowledgeItem {
+  id: string
+  captureId: string
+  summary: string
+  overview?: string
+  details?: string
+  entities: string[]
+  category: string
+  importance: number
+  occurrenceCount: number
+  observedAt?: number
+  status: string
+  reviewStatus: string
+  matchScore?: number
+  matchLevel?: string
+  updatedAt: string
+  updatedAtMs: number
+}
+
+export interface BakeCaptureItem {
+  id: string
+  ts: number
+  appName?: string | null
+  appBundleId?: string | null
+  winTitle?: string | null
+  eventType: string
+  semanticTypeLabel: string
+  rawTypeLabel: string
+  axText?: string | null
+  axFocusedRole?: string | null
+  axFocusedId?: string | null
+  ocrText?: string | null
+  inputText?: string | null
+  audioText?: string | null
+  screenshotPath?: string | null
+  isSensitive: boolean
+  piiScrubbed: boolean
+  bestText?: string | null
+  summary?: string | null
+  linkedKnowledgeId?: string | null
+  linkedKnowledgeSummary?: string | null
+}
+
+export interface PaginatedBakeResponse<T> {
+  items: T[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface TemplateSection {
+  title: string
+  keywords: string[]
+  notes?: string
+}
+
+export interface ReplacementRule {
+  from: string
+  to: string
+}
+
+export interface ArticleTemplate {
+  id: string
+  name: string
+  category: string
+  status: 'draft' | 'auto_generated' | 'pending_review' | 'enabled' | 'disabled'
+  tags: string[]
+  applicableTasks: Array<'qa' | 'creation' | 'work_tip'>
+  sourceMemoryIds: string[]
+  linkedKnowledgeIds: string[]
+  structureSections: TemplateSection[]
+  stylePhrases: string[]
+  replacementRules: ReplacementRule[]
+  diagramCode?: string
+  imageAssets?: string[]
+  promptHint?: string
+  usageCount: number
+  reviewStatus: string
+  matchScore?: number
+  matchLevel?: string
+  updatedAt?: string
+}
+
+export interface WritingStyleConfig {
+  preferredPhrases: string[]
+  replacementRules: ReplacementRule[]
+  styleSamples: string[]
+  applyToCreation: boolean
+  applyToTemplateEditing: boolean
+}
+
+export interface SopCandidate {
+  id: string
+  sourceCaptureId: string
+  sourceTitle?: string
+  triggerKeywords: string[]
+  confidence: 'low' | 'medium' | 'high'
+  extractedProblem?: string
+  steps: string[]
+  linkedKnowledgeIds: string[]
+  status: 'candidate' | 'confirmed' | 'ignored'
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 监控模块
@@ -214,6 +378,25 @@ export interface ActiveModels {
 }
 
 
+export interface NamedMetricSeries {
+  key: string
+  label: string
+  points: { ts: number; value: number }[]
+  process_names?: string[]
+  coverage_status?: string | null
+  coverage_note?: string | null
+}
+
+export interface ModelRuntimeBreakdownItem {
+  key: string
+  label: string
+  cpu_percent: number
+  mem_process_mb: number
+  process_count: number
+  coverage_status?: string | null
+  coverage_note?: string | null
+}
+
 export interface SystemResources {
   db_size_bytes: number
   trends: {
@@ -223,11 +406,15 @@ export interface SystemResources {
     suite_mem: { ts: number; value: number }[]
     model_cpu: { ts: number; value: number }[]
     model_mem: { ts: number; value: number }[]
+    model_cpu_series: NamedMetricSeries[]
+    model_mem_series: NamedMetricSeries[]
+    model_estimated_mem_series: NamedMetricSeries[]
   }
   gpu_trend?: { ts: number; value: number }[]
   model_gpu_trend?: { ts: number; value: number }[]
   disk_trend: { ts: number; read_mb: number; write_mb: number }[]
   knowledge_events?: { ts: number; count: number }[]
+  model_runtime_breakdown: ModelRuntimeBreakdownItem[]
   model_events: {
     ts: number
     event_type: string
@@ -253,6 +440,7 @@ export interface SystemResources {
       cpu_percent: number
       mem_process_mb: number
       process_count: number
+      process_names?: string[]
       coverage_status?: string | null
       coverage_note?: string | null
     } | null
@@ -260,6 +448,7 @@ export interface SystemResources {
       cpu_percent: number
       mem_process_mb: number
       process_count: number
+      process_names?: string[]
       coverage_status?: string | null
       coverage_note?: string | null
     } | null

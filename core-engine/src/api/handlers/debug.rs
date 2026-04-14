@@ -3,13 +3,20 @@
 //! 提供：
 //! - GET /api/vector/status - 向量化状态
 //! - GET /api/stats - 系统统计信息
+//! - GET /api/debug/log-files - 关键日志列表
+//! - GET /api/debug/log-files/:key - 关键日志内容预览
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::UNIX_EPOCH,
+};
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::{Path as AxumPath, State}, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{error::ApiError, state::AppState};
+use crate::api::{error::ApiError, state::{AppState, DebugLogSpec}};
+
+const MAX_LOG_BYTES: usize = 128 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 向量化状态
@@ -27,6 +34,103 @@ pub struct VectorStatusResponse {
     pub items: Vec<VectorStatusItem>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct DebugLogFileItem {
+    pub key:         String,
+    pub label:       String,
+    pub exists:      bool,
+    pub size_bytes:  u64,
+    pub modified_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DebugLogFilesResponse {
+    pub items: Vec<DebugLogFileItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DebugLogContentResponse {
+    pub key:              String,
+    pub label:            String,
+    pub content:          String,
+    pub truncated:        bool,
+    pub total_size_bytes: u64,
+    pub returned_bytes:   usize,
+    pub modified_at:      Option<i64>,
+}
+
+fn modified_at_ms(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata.modified().ok()
+        .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
+fn log_file_item(spec: &DebugLogSpec) -> Result<DebugLogFileItem, ApiError> {
+    let path = spec.path();
+    match std::fs::metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(ApiError::Internal(format!("调试日志目标不是普通文件: {}", path.display())));
+            }
+            Ok(DebugLogFileItem {
+                key: spec.key.clone(),
+                label: spec.label.clone(),
+                exists: true,
+                size_bytes: metadata.len(),
+                modified_at: modified_at_ms(&metadata),
+            })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DebugLogFileItem {
+            key: spec.key.clone(),
+            label: spec.label.clone(),
+            exists: false,
+            size_bytes: 0,
+            modified_at: None,
+        }),
+        Err(err) => Err(ApiError::Internal(format!("读取调试日志元信息失败: {}: {err}", path.display()))),
+    }
+}
+
+fn resolve_log_spec<'a>(state: &'a AppState, key: &str) -> Result<&'a DebugLogSpec, ApiError> {
+    state.debug_log_specs
+        .iter()
+        .find(|spec| spec.key == key)
+        .ok_or_else(|| ApiError::NotFound(format!("未找到关键日志: {key}")))
+}
+
+fn read_log_tail(spec: &DebugLogSpec, max_bytes: usize) -> Result<(String, bool, u64, usize), ApiError> {
+    let allowed_dir = spec.dir.canonicalize()
+        .map_err(|err| ApiError::Internal(format!("解析日志目录失败: {}: {err}", spec.dir.display())))?;
+    let path = spec.path();
+    let canonical_path = path.canonicalize()
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => ApiError::NotFound(format!("关键日志不存在: {}", spec.label)),
+            _ => ApiError::Internal(format!("解析调试日志路径失败: {}: {err}", path.display())),
+        })?;
+
+    if !canonical_path.starts_with(&allowed_dir) {
+        return Err(ApiError::Internal(format!(
+            "调试日志路径越界: {}",
+            canonical_path.display()
+        )));
+    }
+
+    let metadata = std::fs::metadata(&canonical_path)
+        .map_err(|err| ApiError::Internal(format!("读取调试日志元信息失败: {}: {err}", canonical_path.display())))?;
+    if !metadata.is_file() {
+        return Err(ApiError::Internal(format!("调试日志目标不是普通文件: {}", canonical_path.display())));
+    }
+
+    let bytes = std::fs::read(&canonical_path)
+        .map_err(|err| ApiError::Internal(format!("读取调试日志失败: {}: {err}", canonical_path.display())))?;
+    let total_size_bytes = bytes.len() as u64;
+    let start = bytes.len().saturating_sub(max_bytes);
+    let truncated = start > 0;
+    let tail = &bytes[start..];
+    let content = String::from_utf8_lossy(tail).to_string();
+    Ok((content, truncated, total_size_bytes, tail.len()))
+}
+
 /// GET /api/vector/status
 ///
 /// 返回最近 50 条采集记录的向量化状态。
@@ -37,7 +141,7 @@ pub async fn vector_status(
 
     // 获取最近 50 条采集记录
     let captures = storage
-        .list(50, 0)
+        .list_recent(50, 0)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let mut items = Vec::new();
@@ -56,6 +160,51 @@ pub async fn vector_status(
     }
 
     Ok(Json(VectorStatusResponse { items }))
+}
+
+/// GET /api/debug/log-files
+///
+/// 返回允许查看的关键日志白名单与元信息。
+pub async fn debug_log_files(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DebugLogFilesResponse>, ApiError> {
+    let mut items = Vec::with_capacity(state.debug_log_specs.len());
+    for spec in &state.debug_log_specs {
+        items.push(log_file_item(spec)?);
+    }
+    Ok(Json(DebugLogFilesResponse { items }))
+}
+
+/// GET /api/debug/log-files/:key
+///
+/// 返回指定关键日志的尾部内容预览。
+pub async fn debug_log_content(
+    State(state): State<Arc<AppState>>,
+    AxumPath(key): AxumPath<String>,
+) -> Result<Json<DebugLogContentResponse>, ApiError> {
+    let spec = resolve_log_spec(&state, &key)?;
+    let path = spec.path();
+    let metadata = std::fs::metadata(&path)
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => ApiError::NotFound(format!("关键日志不存在: {}", spec.label)),
+            _ => ApiError::Internal(format!("读取调试日志元信息失败: {}: {err}", path.display())),
+        })?;
+
+    if !metadata.is_file() {
+        return Err(ApiError::Internal(format!("调试日志目标不是普通文件: {}", path.display())));
+    }
+
+    let (content, truncated, total_size_bytes, returned_bytes) = read_log_tail(spec, MAX_LOG_BYTES)?;
+
+    Ok(Json(DebugLogContentResponse {
+        key: spec.key.clone(),
+        label: spec.label.clone(),
+        content,
+        truncated,
+        total_size_bytes,
+        returned_bytes,
+        modified_at: modified_at_ms(&metadata),
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,7 +239,7 @@ pub async fn system_stats(
 
     // 获取最后一条采集记录的时间戳
     let last_capture = storage
-        .list(1, 0)
+        .list_recent(1, 0)
         .ok()
         .and_then(|caps| caps.first().map(|c| c.ts));
 

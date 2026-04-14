@@ -11,6 +11,9 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
+import types
 
 import pytest
 
@@ -123,6 +126,40 @@ class TestPaddleBackend:
         """初始化时不应立即加载模型（_ocr 应为 None）"""
         backend = PaddleBackend()
         assert backend._ocr is None
+
+    def test_concurrent_init_only_loads_once(self, monkeypatch):
+        init_count = 0
+        init_count_lock = threading.Lock()
+        start_event = threading.Event()
+
+        class FakePaddleOCR:
+            def __init__(self, **kwargs):
+                nonlocal init_count
+                start_event.wait(timeout=1)
+                time.sleep(0.02)
+                with init_count_lock:
+                    init_count += 1
+
+            def ocr(self, image_path):
+                return []
+
+        monkeypatch.setitem(
+            sys.modules,
+            "paddleocr",
+            types.SimpleNamespace(PaddleOCR=FakePaddleOCR),
+        )
+
+        backend = PaddleBackend()
+        threads = [threading.Thread(target=backend._ensure_loaded) for _ in range(4)]
+
+        for thread in threads:
+            thread.start()
+        start_event.set()
+        for thread in threads:
+            thread.join()
+
+        assert init_count == 1
+        assert backend._ocr is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

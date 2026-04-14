@@ -5,6 +5,12 @@
 //!
 //! 其他平台：返回 None，由调用方降级到 OCR。
 
+const EXTRACTED_TEXT_MAX_CHARS: usize = 5_000;
+const GENERIC_FOCUS_MIN_CHARS: usize = 24;
+const GENERIC_WINDOW_MIN_CHARS: usize = 48;
+const GENERIC_STATIC_ITEM_LIMIT: usize = 80;
+const GENERIC_ALL_UI_ITEM_LIMIT: usize = 140;
+
 /// 从 Accessibility Tree 抓取到的前台应用信息
 #[derive(Debug, Clone, Default)]
 pub struct AXInfo {
@@ -24,33 +30,156 @@ pub struct AXInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextExtractor {
+    Generic,
     Chrome,
     Safari,
     WeChat,
-    VSCode,
-    Generic,
 }
 
 impl TextExtractor {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Generic => "generic",
             Self::Chrome => "chrome",
             Self::Safari => "safari",
             Self::WeChat => "wechat",
-            Self::VSCode => "vscode",
-            Self::Generic => "generic",
         }
     }
 }
 
-fn extractor_for_app_name(app_name: &str) -> TextExtractor {
-    match app_name {
-        "Google Chrome" | "Google Chrome Canary" => TextExtractor::Chrome,
-        "Safari" => TextExtractor::Safari,
-        "WeChat" | "微信" => TextExtractor::WeChat,
-        "Code" | "Visual Studio Code" => TextExtractor::VSCode,
-        _ => TextExtractor::Generic,
+#[derive(Debug, Clone)]
+struct ExtractedText {
+    source: TextExtractor,
+    text:   String,
+}
+
+fn fallback_extractor_for_context(
+    bundle_id: Option<&str>,
+    app_name: Option<&str>,
+) -> Option<TextExtractor> {
+    match bundle_id {
+        Some("com.google.Chrome") | Some("com.google.Chrome.canary") => {
+            return Some(TextExtractor::Chrome)
+        }
+        Some("com.apple.Safari") => return Some(TextExtractor::Safari),
+        Some("com.tencent.xinWeChat") => return Some(TextExtractor::WeChat),
+        _ => {}
     }
+
+    match app_name {
+        Some("Google Chrome") | Some("Google Chrome Canary") => Some(TextExtractor::Chrome),
+        Some("Safari") => Some(TextExtractor::Safari),
+        Some("WeChat") | Some("微信") => Some(TextExtractor::WeChat),
+        _ => None,
+    }
+}
+
+fn parse_keyed_quoted_value(raw: &str, key: &str) -> Option<String> {
+    raw.lines().find_map(|line| {
+        let line = line.trim();
+        let prefix = format!("\"{key}\"=\"");
+        line.strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix('"'))
+            .map(ToString::to_string)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn normalize_whitespace(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_for_comparison(raw: &str) -> String {
+    normalize_whitespace(raw).to_lowercase()
+}
+
+fn is_code_symbol(ch: char) -> bool {
+    matches!(
+        ch,
+        '{'
+            | '}'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '<'
+            | '>'
+            | '.'
+            | ','
+            | ';'
+            | ':'
+            | '_'
+            | '-'
+            | '='
+            | '+'
+            | '*'
+            | '/'
+            | '\\'
+            | '|'
+            | '&'
+            | '!'
+            | '?'
+            | '#'
+            | '@'
+            | '$'
+            | '%'
+            | '^'
+            | '~'
+            | '`'
+            | '"'
+            | '\''
+    )
+}
+
+fn sanitize_extracted_text(raw: &str, win_title: Option<&str>) -> Option<String> {
+    let normalized = normalize_whitespace(raw);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let char_count = normalized.chars().count();
+    if char_count < 12 {
+        return None;
+    }
+
+    let non_whitespace_count = normalized.chars().filter(|ch| !ch.is_whitespace()).count();
+    if non_whitespace_count == 0 {
+        return None;
+    }
+
+    let meaningful_count = normalized
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && (ch.is_alphanumeric() || is_code_symbol(*ch)))
+        .count();
+    if (meaningful_count as f32 / non_whitespace_count as f32) < 0.55 {
+        return None;
+    }
+
+    let normalized_cmp = normalize_for_comparison(&normalized);
+    if let Some(title) = win_title {
+        let title_cmp = normalize_for_comparison(title);
+        if !title_cmp.is_empty() {
+            if normalized_cmp == title_cmp {
+                return None;
+            }
+
+            if let Some(remaining) = normalized_cmp.strip_prefix(&title_cmp) {
+                if remaining.trim().chars().count() < 8 {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    if !tokens.is_empty() {
+        let short_token_count = tokens.iter().filter(|token| token.chars().count() <= 4).count();
+        if tokens.len() <= 6 && short_token_count == tokens.len() && char_count < 24 {
+            return None;
+        }
+    }
+
+    Some(normalized)
 }
 
 /// 获取当前前台应用的 AX 信息（同步版本，已废弃）。
@@ -82,6 +211,7 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
             Ok(Ok(Some(info))) => {
                 debug!(
                     app = ?info.app_name,
+                    bundle_id = ?info.app_bundle_id,
                     win_title = ?info.win_title,
                     "AX 基础上下文获取成功"
                 );
@@ -101,47 +231,42 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
             }
         };
 
-        if let Some(app_name) = info.app_name.clone() {
-            let extractor = extractor_for_app_name(&app_name);
-            debug!(app = %app_name, extractor = extractor.as_str(), "AX 文本提取分支已选择");
+        let app_name = info.app_name.clone();
+        let bundle_id = info.app_bundle_id.clone();
+        let win_title = info.win_title.clone();
+        let fallback = fallback_extractor_for_context(bundle_id.as_deref(), app_name.as_deref());
+        debug!(
+            app = ?app_name,
+            bundle_id = ?bundle_id,
+            fallback = fallback.map(|extractor| extractor.as_str()),
+            "AX 文本提取策略已确定：generic-first"
+        );
 
-            let app_name_for_task = app_name.clone();
-            let text_task = tokio::task::spawn_blocking(move || {
-                macos_impl::extract_ax_text_for_app(&app_name_for_task)
-            });
+        let text_task = tokio::task::spawn_blocking(move || {
+            macos_impl::extract_ax_text_for_context(
+                app_name.as_deref(),
+                bundle_id.as_deref(),
+                win_title.as_deref(),
+            )
+        });
 
-            match tokio::time::timeout(Duration::from_millis(1200), text_task).await {
-                Ok(Ok(Some(text))) => {
-                    debug!(
-                        app = %app_name,
-                        extractor = extractor.as_str(),
-                        text_len = text.len(),
-                        "AX 文本提取成功"
-                    );
-                    info.extracted_text = Some(text);
-                }
-                Ok(Ok(None)) => {
-                    debug!(
-                        app = %app_name,
-                        extractor = extractor.as_str(),
-                        "AX 文本提取为空，等待 OCR 兜底"
-                    );
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        app = %app_name,
-                        extractor = extractor.as_str(),
-                        "AX 文本提取任务失败: {}",
-                        e
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        app = %app_name,
-                        extractor = extractor.as_str(),
-                        "AX 文本提取超时（1200ms）"
-                    );
-                }
+        match tokio::time::timeout(Duration::from_millis(1200), text_task).await {
+            Ok(Ok(Some(result))) => {
+                debug!(
+                    source = result.source.as_str(),
+                    text_len = result.text.len(),
+                    "AX 文本提取成功"
+                );
+                info.extracted_text = Some(result.text);
+            }
+            Ok(Ok(None)) => {
+                debug!("AX 文本提取为空或未通过质量门槛，等待 OCR 兜底");
+            }
+            Ok(Err(e)) => {
+                warn!("AX 文本提取任务失败: {}", e);
+            }
+            Err(_) => {
+                warn!("AX 文本提取超时（1200ms）");
             }
         }
 
@@ -159,8 +284,24 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
 
 #[cfg(all(target_os = "macos", not(test)))]
 mod macos_impl {
-    use super::{extractor_for_app_name, AXInfo, TextExtractor};
-    use std::process::Command;
+    use super::{
+        fallback_extractor_for_context,
+        parse_keyed_quoted_value,
+        sanitize_extracted_text,
+        AXInfo,
+        ExtractedText,
+        TextExtractor,
+        EXTRACTED_TEXT_MAX_CHARS,
+        GENERIC_ALL_UI_ITEM_LIMIT,
+        GENERIC_FOCUS_MIN_CHARS,
+        GENERIC_STATIC_ITEM_LIMIT,
+        GENERIC_WINDOW_MIN_CHARS,
+    };
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
     use tracing::{debug, warn};
 
     fn run_osascript(script: &str, stage: &str) -> Result<String, String> {
@@ -179,78 +320,197 @@ mod macos_impl {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    fn run_osascript_with_timeout(
+        script: &str,
+        stage: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let mut child = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("启动 osascript 失败: {e}"))?;
+
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    let output = child
+                        .wait_with_output()
+                        .map_err(|e| format!("等待 osascript 输出失败: {e}"))?;
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let status = output.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+                        return Err(format!("stage={stage} exit={status} stderr={stderr}"));
+                    }
+                    return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!("stage={stage} timeout={}ms", timeout.as_millis()));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(format!("stage={stage} try_wait_failed: {e}")),
+            }
+        }
+    }
+
+    fn run_lsappinfo(args: &[&str], stage: &str) -> Result<String, String> {
+        let output = Command::new("lsappinfo")
+            .args(args)
+            .output()
+            .map_err(|e| format!("启动 lsappinfo 失败: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let status = output.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+            return Err(format!("stage={stage} exit={status} stderr={stderr}"));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     pub fn get_frontmost_info_macos() -> Option<AXInfo> {
         let mut info = get_frontmost_basic_info_macos()?;
-        let app_name = info.app_name.clone()?;
-        info.extracted_text = extract_ax_text_for_app(&app_name);
+        let app_name = info.app_name.clone();
+        let app_bundle_id = info.app_bundle_id.clone();
+        let win_title = info.win_title.clone();
+        info.extracted_text = extract_ax_text_for_context(
+            app_name.as_deref(),
+            app_bundle_id.as_deref(),
+            win_title.as_deref(),
+        )
+        .map(|result| result.text);
         Some(info)
     }
 
     pub fn get_frontmost_basic_info_macos() -> Option<AXInfo> {
-        let basic_script = r#"
-            tell application "System Events"
-                set front_process to first application process whose frontmost is true
-                set app_name to name of front_process
-                set win_title to ""
-                try
-                    set win_title to name of front window of front_process
-                end try
-                return app_name & "|" & win_title
-            end tell
-        "#;
-
-        let raw = match run_osascript(basic_script, "basic_context") {
+        let front = match run_lsappinfo(&["front"], "front_context") {
             Ok(raw) => raw,
             Err(err) => {
-                warn!("AX 基础脚本失败: {}", err);
+                warn!("AX front app 查询失败: {}", err);
                 return None;
             }
         };
 
-        let parts: Vec<&str> = raw.splitn(2, '|').collect();
-        let app_name = parts.first().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let win_title = parts.get(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-
-        if app_name.is_none() {
-            warn!(raw = %raw, "AX 基础脚本未返回有效 app_name");
+        let asn = front.trim();
+        if asn.is_empty() {
+            warn!(raw = %front, "AX front app 查询未返回 ASN");
             return None;
         }
 
+        let info_raw =
+            match run_lsappinfo(&["info", "-only", "bundleID", "-only", "name", asn], "front_context_info") {
+                Ok(raw) => raw,
+                Err(err) => {
+                    warn!(asn = %asn, "AX front app 信息查询失败: {}", err);
+                    return None;
+                }
+            };
+
+        let app_name = parse_keyed_quoted_value(&info_raw, "LSDisplayName");
+        let app_bundle_id = parse_keyed_quoted_value(&info_raw, "CFBundleIdentifier");
+
+        if app_name.is_none() {
+            warn!(raw = %info_raw, "AX front app 信息未返回有效 app_name");
+            return None;
+        }
+
+        let basic_script = r#"
+            tell application "System Events"
+                set front_process to first application process whose frontmost is true
+                set win_title to ""
+                try
+                    set win_title to name of front window of front_process
+                end try
+                return win_title
+            end tell
+        "#;
+
+        let win_title = match run_osascript_with_timeout(
+            basic_script,
+            "front_window_title",
+            Duration::from_millis(1200),
+        ) {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Err(err) => {
+                debug!(asn = %asn, "AX 窗口标题脚本失败，继续使用 app 基础信息: {}", err);
+                None
+            }
+        };
+
         Some(AXInfo {
             app_name,
+            app_bundle_id,
             win_title,
             ..Default::default()
         })
     }
 
-    /// 按已知前台应用名提取 AX 文本内容。
-    ///
-    /// 针对常见应用（Chrome、Safari、VSCode 等）使用特定的提取方法。
-    pub fn extract_ax_text_for_app(app_name: &str) -> Option<String> {
-        let extractor = extractor_for_app_name(app_name);
-        debug!(app = %app_name, extractor = extractor.as_str(), "开始 AX 文本提取");
+    pub fn extract_ax_text_for_context(
+        app_name: Option<&str>,
+        bundle_id: Option<&str>,
+        win_title: Option<&str>,
+    ) -> Option<ExtractedText> {
+        debug!(
+            app = ?app_name,
+            bundle_id = ?bundle_id,
+            "开始 AX generic-first 文本提取"
+        );
 
-        match extractor {
+        if let Some(text) = extract_generic_text().and_then(|raw| sanitize_extracted_text(&raw, win_title)) {
+            return Some(ExtractedText {
+                source: TextExtractor::Generic,
+                text,
+            });
+        }
+
+        let fallback = fallback_extractor_for_context(bundle_id, app_name)?;
+        debug!(
+            app = ?app_name,
+            bundle_id = ?bundle_id,
+            fallback = fallback.as_str(),
+            "generic 未命中质量门槛，尝试 fallback"
+        );
+
+        let fallback_text = match fallback {
+            TextExtractor::Generic => None,
             TextExtractor::Chrome => extract_chrome_text(),
             TextExtractor::Safari => extract_safari_text(),
             TextExtractor::WeChat => extract_wechat_text(),
-            TextExtractor::VSCode => extract_vscode_text(),
-            TextExtractor::Generic => extract_generic_text(),
-        }
+        }?;
+
+        let text = sanitize_extracted_text(&fallback_text, win_title)?;
+        Some(ExtractedText {
+            source: fallback,
+            text,
+        })
     }
 
     /// 提取 Chrome 浏览器的页面文本
     fn extract_chrome_text() -> Option<String> {
-        let script = r#"
+        let script = format!(
+            r#"
             tell application "Google Chrome"
                 if (count of windows) > 0 then
                     set front_win to front window
                     if (count of tabs of front_win) > 0 then
                         set active_tab to active tab of front_win
                         try
-                            -- 执行 JavaScript 获取页面文本
                             set page_text to execute active_tab javascript "
-                                (function() {
+                                (function() {{
                                     var title = document.title;
                                     var body = document.body;
                                     if (!body) return title;
@@ -258,20 +518,20 @@ mod macos_impl {
                                     var clone = body.cloneNode(true);
                                     var scripts = clone.getElementsByTagName('script');
                                     var styles = clone.getElementsByTagName('style');
-                                    for (var i = scripts.length - 1; i >= 0; i--) {
+                                    for (var i = scripts.length - 1; i >= 0; i--) {{
                                         scripts[i].remove();
-                                    }
-                                    for (var i = styles.length - 1; i >= 0; i--) {
+                                    }}
+                                    for (var i = styles.length - 1; i >= 0; i--) {{
                                         styles[i].remove();
-                                    }
+                                    }}
 
                                     var text = clone.innerText || clone.textContent || '';
                                     text = text.replace(/\\s+/g, ' ').trim();
-                                    if (text.length > 5000) {
-                                        text = text.substring(0, 5000) + '...';
-                                    }
+                                    if (text.length > {max_chars}) {{
+                                        text = text.substring(0, {max_chars}) + '...';
+                                    }}
                                     return title + '\\n\\n' + text;
-                                })()
+                                }})()
                             "
                             return page_text
                         end try
@@ -279,9 +539,11 @@ mod macos_impl {
                 end if
             end tell
             return ""
-        "#;
+        "#,
+            max_chars = EXTRACTED_TEXT_MAX_CHARS,
+        );
 
-        match run_osascript(script, "chrome_text") {
+        match run_osascript(&script, "chrome_text") {
             Ok(text) if !text.is_empty() => Some(text),
             Ok(_) => None,
             Err(err) => {
@@ -293,7 +555,8 @@ mod macos_impl {
 
     /// 提取 Safari 浏览器的页面文本
     fn extract_safari_text() -> Option<String> {
-        let script = r#"
+        let script = format!(
+            r#"
             tell application "Safari"
                 if (count of windows) > 0 then
                     set front_win to front window
@@ -301,17 +564,17 @@ mod macos_impl {
                         set active_tab to current tab of front_win
                         try
                             set page_text to do JavaScript "
-                                (function() {
+                                (function() {{
                                     var title = document.title;
                                     var body = document.body;
                                     if (!body) return title;
                                     var text = body.innerText || body.textContent || '';
                                     text = text.replace(/\\s+/g, ' ').trim();
-                                    if (text.length > 5000) {
-                                        text = text.substring(0, 5000) + '...';
-                                    }
+                                    if (text.length > {max_chars}) {{
+                                        text = text.substring(0, {max_chars}) + '...';
+                                    }}
                                     return title + '\\n\\n' + text;
-                                })()
+                                }})()
                             " in active_tab
                             return page_text
                         end try
@@ -319,9 +582,11 @@ mod macos_impl {
                 end if
             end tell
             return ""
-        "#;
+        "#,
+            max_chars = EXTRACTED_TEXT_MAX_CHARS,
+        );
 
-        match run_osascript(script, "safari_text") {
+        match run_osascript(&script, "safari_text") {
             Ok(text) if !text.is_empty() => Some(text),
             Ok(_) => None,
             Err(err) => {
@@ -331,9 +596,10 @@ mod macos_impl {
         }
     }
 
-    /// 提取 WeChat 的聊天文本（优先遍历静态文本与文本区域）
+    /// 提取 WeChat 的聊天文本（作为 fallback，仅做聊天正文聚合）
     fn extract_wechat_text() -> Option<String> {
-        let script = r#"
+        let script = format!(
+            r#"
             tell application "System Events"
                 set front_process to first application process whose frontmost is true
                 if name of front_process is not "WeChat" and name of front_process is not "微信" then
@@ -343,92 +609,132 @@ mod macos_impl {
                 set text_content to ""
                 try
                     set front_win to front window of front_process
+                    set static_items to entire contents of front_win whose role is in {{"AXStaticText", "AXTextArea", "AXTextField"}}
+                    set item_count to count of static_items
+                    if item_count > {limit} then set item_count to {limit}
 
-                    try
-                        set static_items to entire contents of front_win whose role is in {"AXStaticText", "AXTextArea", "AXTextField"}
-                        repeat with ui_elem in static_items
-                            try
+                    repeat with idx from 1 to item_count
+                        try
+                            set ui_elem to item idx of static_items
+                            if value of ui_elem is not missing value then
                                 set val to value of ui_elem as string
                                 if val is not "" then
                                     set text_content to text_content & val & linefeed
                                 end if
+                            end if
+                        end try
+                        if (length of text_content) > {max_chars} then exit repeat
+                    end repeat
+                end try
+
+                if (length of text_content) > {max_chars} then
+                    return text 1 thru {max_chars} of text_content
+                end if
+                return text_content
+            end tell
+        "#,
+            limit = GENERIC_ALL_UI_ITEM_LIMIT,
+            max_chars = EXTRACTED_TEXT_MAX_CHARS,
+        );
+
+        match run_osascript(&script, "wechat_text") {
+            Ok(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+            Ok(_) => None,
+            Err(err) => {
+                debug!("WeChat AX 文本提取失败: {}", err);
+                None
+            }
+        }
+    }
+
+    /// 通用文本提取（generic-first，低成本优先 + 有预算宽扫）
+    fn extract_generic_text() -> Option<String> {
+        let script = format!(
+            r#"
+            tell application "System Events"
+                set front_process to first application process whose frontmost is true
+                set text_content to ""
+                set focus_text to ""
+                try
+                    set front_win to front window of front_process
+
+                    try
+                        set focused_elem to focused UI element of front_process
+                        try
+                            if value of focused_elem is not missing value then
+                                set focus_text to value of focused_elem as string
+                            end if
+                        end try
+                        if focus_text is "" then
+                            try
+                                set focus_text to description of focused_elem as string
                             end try
-                        end repeat
+                        end if
                     end try
 
-                    if text_content is "" then
+                    if (length of focus_text) ≥ {focus_min_chars} then
+                        set text_content to focus_text
+                    end if
+
+                    if (length of text_content) < {window_min_chars} then
                         try
-                            set all_ui to entire contents of front_win
-                            repeat with ui_elem in all_ui
+                            set static_items to entire contents of front_win whose role is in {{"AXStaticText", "AXTextArea", "AXTextField"}}
+                            set item_count to count of static_items
+                            if item_count > {static_limit} then set item_count to {static_limit}
+
+                            repeat with idx from 1 to item_count
                                 try
-                                    set role_name to role of ui_elem as string
-                                    if role_name is "AXStaticText" or role_name is "AXTextArea" or role_name is "AXTextField" then
-                                        if value of ui_elem is not missing value then
-                                            set val to value of ui_elem as string
-                                            if val is not "" then
-                                                set text_content to text_content & val & linefeed
-                                            end if
+                                    set ui_elem to item idx of static_items
+                                    if value of ui_elem is not missing value then
+                                        set val to value of ui_elem as string
+                                        if val is not "" then
+                                            set text_content to text_content & linefeed & val
                                         end if
                                     end if
                                 end try
+                                if (length of text_content) > {max_chars} then exit repeat
+                            end repeat
+                        end try
+                    end if
+
+                    if (length of text_content) < {window_min_chars} then
+                        try
+                            set all_ui to entire contents of front_win
+                            set item_count to count of all_ui
+                            if item_count > {all_limit} then set item_count to {all_limit}
+
+                            repeat with idx from 1 to item_count
+                                try
+                                    set ui_elem to item idx of all_ui
+                                    if value of ui_elem is not missing value then
+                                        set val to value of ui_elem as string
+                                        if val is not "" then
+                                            set text_content to text_content & linefeed & val
+                                        end if
+                                    end if
+                                end try
+                                if (length of text_content) > {max_chars} then exit repeat
                             end repeat
                         end try
                     end if
                 end try
 
+                if (length of text_content) > {max_chars} then
+                    return text 1 thru {max_chars} of text_content
+                end if
                 return text_content
             end tell
-        "#;
+        "#,
+            focus_min_chars = GENERIC_FOCUS_MIN_CHARS,
+            window_min_chars = GENERIC_WINDOW_MIN_CHARS,
+            static_limit = GENERIC_STATIC_ITEM_LIMIT,
+            all_limit = GENERIC_ALL_UI_ITEM_LIMIT,
+            max_chars = EXTRACTED_TEXT_MAX_CHARS,
+        );
 
-        match run_osascript(script, "wechat_text") {
-            Ok(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
-            Ok(_) => {
-                debug!("WeChat AX 文本提取为空，回退 generic 提取");
-                extract_generic_text()
-            }
-            Err(err) => {
-                debug!("WeChat AX 文本提取失败: {}，回退 generic 提取", err);
-                extract_generic_text()
-            }
-        }
-    }
-
-    /// 提取 VSCode 的文本（当前回退到 generic 提取）
-    fn extract_vscode_text() -> Option<String> {
-        debug!("VSCode 不支持专用 AppleScript，回退 generic 提取");
-        extract_generic_text()
-    }
-
-    /// 通用文本提取（使用 System Events）
-    fn extract_generic_text() -> Option<String> {
-        let script = r#"
-            tell application "System Events"
-                set front_process to first application process whose frontmost is true
-                set text_content to ""
-                try
-                    set front_win to front window of front_process
-                    set all_ui to entire contents of front_win
-                    repeat with ui_elem in all_ui
-                        try
-                            if value of ui_elem is not missing value then
-                                set val to value of ui_elem as string
-                                if val is not "" then
-                                    set text_content to text_content & val & " "
-                                end if
-                            end if
-                        end try
-                    end repeat
-                end try
-                return text_content
-            end tell
-        "#;
-
-        match run_osascript(script, "generic_text") {
-            Ok(text) if !text.is_empty() && text.len() > 10 => Some(text),
-            Ok(text) => {
-                debug!(text_len = text.len(), "generic AX 文本过短或为空");
-                None
-            }
+        match run_osascript(&script, "generic_text") {
+            Ok(text) if !text.is_empty() => Some(text),
+            Ok(_) => None,
             Err(err) => {
                 debug!("generic AX 文本提取失败: {}", err);
                 None
@@ -456,8 +762,8 @@ mod tests {
     #[test]
     fn test_ax_info_partial_construction() {
         let info = AXInfo {
-            app_name:    Some("Feishu".into()),
-            win_title:   Some("工作群".into()),
+            app_name:     Some("Feishu".into()),
+            win_title:    Some("工作群".into()),
             focused_role: Some("AXTextField".into()),
             ..Default::default()
         };
@@ -484,13 +790,61 @@ mod tests {
     }
 
     #[test]
-    fn test_extractor_for_app_name_routes_correctly() {
-        assert_eq!(extractor_for_app_name("Google Chrome"), TextExtractor::Chrome);
-        assert_eq!(extractor_for_app_name("Safari"), TextExtractor::Safari);
-        assert_eq!(extractor_for_app_name("WeChat"), TextExtractor::WeChat);
-        assert_eq!(extractor_for_app_name("微信"), TextExtractor::WeChat);
-        assert_eq!(extractor_for_app_name("Code"), TextExtractor::VSCode);
-        assert_eq!(extractor_for_app_name("Visual Studio Code"), TextExtractor::VSCode);
-        assert_eq!(extractor_for_app_name("WeCom"), TextExtractor::Generic);
+    fn test_parse_keyed_quoted_value() {
+        let raw = "\"CFBundleIdentifier\"=\"com.microsoft.VSCode\"\n\"LSDisplayName\"=\"Code\"";
+        assert_eq!(
+            parse_keyed_quoted_value(raw, "CFBundleIdentifier").as_deref(),
+            Some("com.microsoft.VSCode")
+        );
+        assert_eq!(
+            parse_keyed_quoted_value(raw, "LSDisplayName").as_deref(),
+            Some("Code")
+        );
+        assert!(parse_keyed_quoted_value(raw, "MissingKey").is_none());
+    }
+
+    #[test]
+    fn test_fallback_extractor_prefers_bundle_id() {
+        assert_eq!(
+            fallback_extractor_for_context(Some("com.google.Chrome"), Some("Whatever")),
+            Some(TextExtractor::Chrome)
+        );
+        assert_eq!(
+            fallback_extractor_for_context(Some("com.apple.Safari"), Some("Whatever")),
+            Some(TextExtractor::Safari)
+        );
+        assert_eq!(
+            fallback_extractor_for_context(Some("com.tencent.xinWeChat"), Some("Whatever")),
+            Some(TextExtractor::WeChat)
+        );
+    }
+
+    #[test]
+    fn test_vscode_no_longer_maps_to_special_extractor() {
+        assert_eq!(
+            fallback_extractor_for_context(Some("com.microsoft.VSCode"), Some("Code")),
+            None
+        );
+        assert_eq!(fallback_extractor_for_context(None, Some("Visual Studio Code")), None);
+    }
+
+    #[test]
+    fn test_sanitize_extracted_text_rejects_short_or_title_only_text() {
+        assert_eq!(sanitize_extracted_text("保存 取消", Some("设置")), None);
+        assert_eq!(sanitize_extracted_text("Investigate OCR memory f — gzdz", Some("Investigate OCR memory f — gzdz")), None);
+    }
+
+    #[test]
+    fn test_sanitize_extracted_text_accepts_meaningful_content() {
+        let text = "fn process_event(event: CaptureEvent) -> Result<Option<i64>, CaptureError> { let has_ax_text = true; }";
+        assert_eq!(
+            sanitize_extracted_text(text, Some("engine.rs")),
+            Some(normalize_whitespace(text))
+        );
+    }
+
+    #[test]
+    fn test_sanitize_extracted_text_rejects_low_information_token_list() {
+        assert_eq!(sanitize_extracted_text("文件 编辑 选择 视图 运行", Some("Code")), None);
     }
 }

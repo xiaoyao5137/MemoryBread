@@ -22,6 +22,13 @@ pub enum ApiError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("upstream error ({status}): {message}")]
+    Upstream {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl IntoResponse for ApiError {
@@ -34,6 +41,7 @@ impl IntoResponse for ApiError {
                 (StatusCode::INTERNAL_SERVER_ERROR,"STORAGE_ERROR",   "数据库操作失败")
             },
             ApiError::Internal(msg)  => (StatusCode::INTERNAL_SERVER_ERROR,"INTERNAL_ERROR",  msg.as_str()),
+            ApiError::Upstream { status, code, message } => (*status, *code, message.as_str()),
         };
         (
             status,

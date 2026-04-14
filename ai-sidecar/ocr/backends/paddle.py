@@ -12,6 +12,7 @@ PaddleOCR 后端
 from __future__ import annotations
 
 import logging
+import threading
 
 from .base import OcrBackend, OcrBox, OcrOutput
 
@@ -30,6 +31,7 @@ class PaddleBackend(OcrBackend):
         self._lang    = lang
         self._use_gpu = use_gpu
         self._ocr: object | None = None  # 懒加载，避免启动延迟
+        self._ocr_lock = threading.Lock()
 
     # ── 公共接口 ──────────────────────────────────────────────────────────────
 
@@ -91,18 +93,22 @@ class PaddleBackend(OcrBackend):
         """首次调用时初始化 PaddleOCR 模型（线程不安全，Sidecar 应单线程初始化）"""
         if self._ocr is not None:
             return
-        try:
-            from paddleocr import PaddleOCR
-            # 新版 PaddleOCR (>=2.8) 使用 use_textline_orientation 替代 use_angle_cls
-            self._ocr = PaddleOCR(
-                use_textline_orientation=True,
-                lang=self._lang,
-            )
-            logger.info(
-                "PaddleOCR 模型加载完成（lang=%s）",
-                self._lang,
-            )
-        except ImportError as e:
-            raise RuntimeError(
-                "paddleocr 未安装，请运行: pip install paddlepaddle paddleocr"
-            ) from e
+
+        with self._ocr_lock:
+            if self._ocr is not None:
+                return
+            try:
+                from paddleocr import PaddleOCR
+                # 新版 PaddleOCR (>=2.8) 使用 use_textline_orientation 替代 use_angle_cls
+                self._ocr = PaddleOCR(
+                    use_textline_orientation=True,
+                    lang=self._lang,
+                )
+                logger.info(
+                    "PaddleOCR 模型加载完成（lang=%s）",
+                    self._lang,
+                )
+            except ImportError as e:
+                raise RuntimeError(
+                    "paddleocr 未安装，请运行: pip install paddlepaddle paddleocr"
+                ) from e

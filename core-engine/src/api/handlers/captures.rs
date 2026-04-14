@@ -29,6 +29,8 @@ pub struct CapturesQuery {
     pub q:     Option<String>,
     /// 最大返回数量（默认 50，最大 500）
     pub limit: Option<usize>,
+    /// 分页偏移
+    pub offset: Option<usize>,
 }
 
 /// 查询响应体
@@ -43,27 +45,51 @@ pub async fn list_captures(
     Query(params): Query<CapturesQuery>,
 ) -> Result<Json<CapturesResponse>, ApiError> {
     let limit = params.limit.unwrap_or(50).min(500);
+    let offset = params.offset.unwrap_or(0);
 
     let storage = state.storage.clone();
 
     if let Some(q) = params.q.filter(|s| !s.is_empty()) {
-        // FTS5 全文搜索
+        let total = tokio::task::spawn_blocking({
+            let storage = storage.clone();
+            let q = q.clone();
+            move || storage.count_search_captures(&q)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?? as usize;
+
         let rows = tokio::task::spawn_blocking(move || {
-            storage.search_captures(&q, limit)
+            storage.search_captures_paginated(&q, limit, offset)
         })
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))??;
 
-        let total = rows.len();
         return Ok(Json(CapturesResponse { total, captures: rows }));
     }
 
-    // 时间 / 应用过滤
     let mut filter = CaptureFilter::new();
     filter.app_name = params.app;
     filter.from_ts  = params.from;
     filter.to_ts    = params.to;
     filter.limit    = limit;
+    filter.offset   = offset;
+
+    let total = tokio::task::spawn_blocking({
+        let storage = storage.clone();
+        let filter = CaptureFilter {
+            from_ts: filter.from_ts,
+            to_ts: filter.to_ts,
+            app_name: filter.app_name.clone(),
+            query: filter.query.clone(),
+            capture_id: filter.capture_id,
+            exclude_sensitive: filter.exclude_sensitive,
+            limit: filter.limit,
+            offset: filter.offset,
+        };
+        move || storage.count_captures(&filter)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?? as usize;
 
     let rows = tokio::task::spawn_blocking(move || {
         storage.list_captures(&filter)
@@ -71,6 +97,5 @@ pub async fn list_captures(
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))??;
 
-    let total = rows.len();
     Ok(Json(CapturesResponse { total, captures: rows }))
 }

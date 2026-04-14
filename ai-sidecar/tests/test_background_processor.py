@@ -1,3 +1,5 @@
+import asyncio
+import json
 import sqlite3
 
 from background_processor import BackgroundProcessor, _is_self_generated_capture
@@ -181,7 +183,6 @@ def test_process_knowledge_vectorization_passes_semantic_metadata(tmp_path, monk
         "category": "聊天",
     }
 
-    import asyncio
     ok = asyncio.run(processor._process_knowledge_vectorization(group, 77, knowledge))
 
     assert ok is True
@@ -196,3 +197,64 @@ def test_process_knowledge_vectorization_passes_semantic_metadata(tmp_path, monk
     assert metadata["content_origin"] == "live_interaction"
     assert metadata["activity_type"] == "ask_ai"
     assert metadata["evidence_strength"] == "medium"
+
+
+def test_trigger_unified_bake_pipeline_skips_when_no_new_knowledge(tmp_path) -> None:
+    db_path = str(tmp_path / "captures.db")
+    _init_db(db_path)
+    processor = BackgroundProcessor(db_path=db_path)
+
+    result = asyncio.run(processor._trigger_unified_bake_pipeline(0))
+
+    assert result == {
+        "triggered": False,
+        "reason": "no_new_knowledge",
+    }
+
+
+def test_trigger_unified_bake_pipeline_posts_to_core(tmp_path, monkeypatch) -> None:
+    db_path = str(tmp_path / "captures.db")
+    _init_db(db_path)
+    processor = BackgroundProcessor(db_path=db_path)
+
+    captured = {}
+
+    class _StubResponse:
+        def read(self):
+            return b'{"id":"42","status":"completed","auto_created_count":3,"candidate_count":1,"discarded_count":0}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def _fake_urlopen(request, timeout=0):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["headers"] = {k.lower(): v for k, v in request.header_items()}
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return _StubResponse()
+
+    monkeypatch.setenv("CORE_ENGINE_URL", "http://127.0.0.1:7070")
+    monkeypatch.setattr("background_processor.urllib_request.urlopen", _fake_urlopen)
+
+    result = asyncio.run(processor._trigger_unified_bake_pipeline(2))
+
+    assert captured["url"] == "http://127.0.0.1:7070/api/bake/run"
+    assert captured["method"] == "POST"
+    assert captured["headers"]["content-type"] == "application/json"
+    assert captured["body"] == {
+        "trigger_reason": "knowledge_background",
+        "limit": 2,
+    }
+    assert captured["timeout"] == 15
+    assert result == {
+        "triggered": True,
+        "status": "completed",
+        "run_id": "42",
+        "auto_created_count": 3,
+        "candidate_count": 1,
+        "discarded_count": 0,
+    }

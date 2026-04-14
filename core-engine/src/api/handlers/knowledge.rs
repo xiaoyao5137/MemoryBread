@@ -65,6 +65,81 @@ pub struct KnowledgeListResponse {
     pub total: i64,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ExtractKnowledgeRequest {
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub force_finalize_tail: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ExtractKnowledgeResponse {
+    pub status: String,
+    pub message: String,
+    pub fetched_count: usize,
+    pub processed_count: usize,
+    pub remaining_estimate: usize,
+    pub force_finalize_tail: bool,
+    pub reason: Option<String>,
+}
+
+/// POST /api/knowledge/extract - 触发一次真实 knowledge 提炼
+pub async fn extract_knowledge(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ExtractKnowledgeRequest>,
+) -> Result<Json<ExtractKnowledgeResponse>, ApiError> {
+    let client = reqwest::Client::new();
+    let upstream_url = format!("{}/knowledge/extract", state.sidecar_url);
+
+    let response = client
+        .post(&upstream_url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(180))
+        .send()
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("timed out") || msg.contains("timeout") {
+                ApiError::Internal("知识提炼执行超时，请稍后刷新知识列表确认结果".to_string())
+            } else {
+                ApiError::Internal(format!("知识提炼服务不可用，请确认 AI Sidecar 已正常启动: {e}"))
+            }
+        })?;
+
+    if response.status().is_success() {
+        let payload = response
+            .json::<ExtractKnowledgeResponse>()
+            .await
+            .map_err(|e| ApiError::Internal(format!("解析知识提炼响应失败: {e}")))?;
+        Ok(Json(payload))
+    } else {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        tracing::warn!("knowledge extract upstream error status={} body={}", status, body_text);
+
+        let (mapped_status, code) = match status.as_u16() {
+            400 | 422 => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+            502 => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            503 => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
+            504 => (StatusCode::GATEWAY_TIMEOUT, "GATEWAY_TIMEOUT"),
+            code if code >= 500 => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            _ => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+        };
+
+        let message = if body_text.trim().is_empty() {
+            format!("知识提炼服务返回错误 ({status})")
+        } else {
+            format!("知识提炼服务返回错误 ({status})：{body_text}")
+        };
+
+        Err(ApiError::Upstream {
+            status: mapped_status,
+            code,
+            message,
+        })
+    }
+}
+
 /// GET /api/knowledge - 获取知识条目列表
 pub async fn list_knowledge(
     State(state): State<Arc<AppState>>,

@@ -10,7 +10,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
-import { useFetchPreferences, useUpdatePreference } from '../hooks/useApi'
+import { useFetchPreferences, useRunScreenshotCleanup, useUpdatePreference } from '../hooks/useApi'
 import type { PreferenceRecord } from '../types'
 import './Settings.v2.css'
 
@@ -20,6 +20,7 @@ interface SettingsProps {
 
 const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const CAPTURE_INTERVAL_KEY = 'privacy.capture_interval_sec'
+  const SCREENSHOT_KEEP_DAYS_KEY = 'privacy.screenshot_keep_days'
   const USER_IDENTITY_KEY = 'user.identity_keywords'
   const DEFAULT_API_BASE = 'http://localhost:7070'
 
@@ -37,17 +38,21 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const [saveMsg, setSaveMsg] = useState<string | null>(null)
   const [identityInput, setIdentityInput] = useState('')
   const [identitySaved, setIdentitySaved] = useState(false)
+  const [cleanupRunning, setCleanupRunning] = useState(false)
 
   const fetchPrefs = useFetchPreferences()
   const updatePref = useUpdatePreference()
+  const runScreenshotCleanup = useRunScreenshotCleanup()
 
   const sortedPreferences = useMemo(() => {
     return [...preferences].sort((a, b) => {
       if (a.key === CAPTURE_INTERVAL_KEY) return -1
       if (b.key === CAPTURE_INTERVAL_KEY) return 1
+      if (a.key === SCREENSHOT_KEEP_DAYS_KEY) return -1
+      if (b.key === SCREENSHOT_KEEP_DAYS_KEY) return 1
       return a.key.localeCompare(b.key)
     })
-  }, [preferences])
+  }, [preferences, CAPTURE_INTERVAL_KEY, SCREENSHOT_KEEP_DAYS_KEY])
 
   useEffect(() => {
     setLoading(true)
@@ -96,7 +101,10 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
           prev.map((p) => (p.key === key ? { ...p, value: updated.value } : p))
         )
         if (key === CAPTURE_INTERVAL_KEY) {
-          setSaveMsg('后台采集间隔已保存，需重启 Core Engine 后生效')
+          setSaveMsg('OCR / 截图频率已保存，需重启 Core Engine 后生效')
+          setTimeout(() => setSaveMsg(null), 3000)
+        } else if (key === SCREENSHOT_KEEP_DAYS_KEY) {
+          setSaveMsg('图片过期时间已保存，将在下一次后台清理时生效')
           setTimeout(() => setSaveMsg(null), 3000)
         }
       } catch (e) {
@@ -105,6 +113,23 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
     },
     [CAPTURE_INTERVAL_KEY, updatePref]
   )
+
+  const handleRunScreenshotCleanup = useCallback(async () => {
+    setCleanupRunning(true)
+    setError(null)
+    try {
+      const result = await runScreenshotCleanup()
+      const freedMb = Math.round(result.freed_bytes / 1024 / 1024)
+      setSaveMsg(`截图清理完成：删除 ${result.deleted_count} 个文件，释放约 ${freedMb} MB（保留 ${result.keep_days} 天）`)
+      setTimeout(() => setSaveMsg(null), 5000)
+      const prefs = await fetchPrefs()
+      setPreferences(prefs)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setCleanupRunning(false)
+    }
+  }, [fetchPrefs, runScreenshotCleanup])
 
   const handleClose = () => setWindowMode('buddy')
 
@@ -325,6 +350,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
           <div className="settings-v2__pref-list">
             {sortedPreferences.map((pref) => {
               const isCaptureInterval = pref.key === CAPTURE_INTERVAL_KEY
+              const isScreenshotKeepDays = pref.key === SCREENSHOT_KEEP_DAYS_KEY
               return (
                 <div
                   key={pref.key}
@@ -332,14 +358,35 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
                   data-testid={`pref-row-${pref.key}`}
                 >
                   <label htmlFor={`pref-${pref.key}`} className="settings-v2__pref-label">
-                    {isCaptureInterval ? '后台采集间隔（秒）' : pref.key}
+                    {isCaptureInterval
+                      ? 'OCR / 截图频率（秒）'
+                      : isScreenshotKeepDays
+                        ? '图片过期时间（天）'
+                        : pref.key}
                   </label>
                   {isCaptureInterval && (
                     <p className="settings-v2__pref-help">
-                      控制 Core Engine 的后台定时采集节奏，不是调试面板的页面刷新频率。修改后需重启 Core Engine 生效。
+                      控制后台 OCR / 截图采集频率，不是调试面板的页面刷新频率。默认值保持当前配置，修改后需重启 Core Engine 生效。
                     </p>
                   )}
-                  {!isCaptureInterval && (
+                  {isScreenshotKeepDays && (
+                    <p className="settings-v2__pref-help">
+                      控制图片缓存的过期时间。超过该天数的本地截图文件会自动删除，并清空对应 capture 记录中的截图路径。
+                    </p>
+                  )}
+                  {isScreenshotKeepDays && (
+                    <div className="settings-v2__input-group" style={{ marginBottom: 8 }}>
+                      <button
+                        type="button"
+                        className="settings-v2__btn settings-v2__btn--secondary"
+                        onClick={handleRunScreenshotCleanup}
+                        disabled={cleanupRunning}
+                      >
+                        {cleanupRunning ? '清理中...' : '立即清理一次'}
+                      </button>
+                    </div>
+                  )}
+                  {!isCaptureInterval && !isScreenshotKeepDays && (
                     <div className="settings-v2__pref-key">{pref.key}</div>
                   )}
                   <input

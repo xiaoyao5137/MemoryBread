@@ -7,16 +7,25 @@
 """
 
 import asyncio
+import fcntl
 import json
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
+from urllib import error as urllib_error, request as urllib_request
 
+from idle_compute.model_manager import _log_model_event
 from knowledge.fragment_grouper import FragmentGrouper
 
 logger = logging.getLogger(__name__)
+
+_RAG_LOCK_FILE = "/tmp/memory-bread-rag.lock"
+_PROCESS_LOCK_FILE = "/tmp/memory-bread-knowledge-extract.lock"
+_DEFAULT_CORE_ENGINE_URL = "http://127.0.0.1:7070"
+_BAKE_RUN_ENDPOINT = "/api/bake/run"
 
 _SELF_GENERATED_APP_KEYWORDS = (
     "memory-bread",
@@ -53,6 +62,7 @@ class BackgroundProcessor:
         self.interval = interval
         self.batch_size = batch_size
         self.running = False
+        self._run_lock = asyncio.Lock()
 
         # 懒加载 workers
         self._embed_worker = None
@@ -63,7 +73,17 @@ class BackgroundProcessor:
         if self._embed_worker is None:
             from embedding.worker import EmbedWorker
             from embedding.model import EmbeddingModel
-            self._embed_worker = EmbedWorker(model=EmbeddingModel.create_default())
+            start_ms = int(time.time() * 1000)
+            _log_model_event("load_start", "embedding", "Sidecar Embedding · BGE-M3-INT8", memory_mb=650)
+            model = EmbeddingModel.create_default()
+            self._embed_worker = EmbedWorker(model=model)
+            _log_model_event(
+                "load_done",
+                "embedding",
+                "Sidecar Embedding · BGE-M3-INT8",
+                duration_ms=int(time.time() * 1000) - start_ms,
+                memory_mb=650,
+            )
             logger.info("EmbedWorker 已初始化（后台任务）")
         return self._embed_worker
 
@@ -90,7 +110,16 @@ class BackgroundProcessor:
             from knowledge.extractor_v2 import KnowledgeExtractorV2
             from embedding.model import EmbeddingModel
 
+            start_ms = int(time.time() * 1000)
+            _log_model_event("load_start", "embedding", "Knowledge Extractor · BGE-M3-INT8", memory_mb=650)
             embedding_model = EmbeddingModel.create_default()
+            _log_model_event(
+                "load_done",
+                "embedding",
+                "Knowledge Extractor · BGE-M3-INT8",
+                duration_ms=int(time.time() * 1000) - start_ms,
+                memory_mb=650,
+            )
             self._knowledge_extractor = KnowledgeExtractorV2(
                 embedding_model=embedding_model,
                 user_identity=current_identity,
@@ -142,6 +171,213 @@ class BackgroundProcessor:
             self._fragment_grouper = FragmentGrouper(embedding_model=embed_model)
             logger.info("FragmentGrouper 已初始化")
         return self._fragment_grouper
+
+    def _acquire_rag_priority_lock(self):
+        fd = open(_RAG_LOCK_FILE, "w")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def _acquire_process_file_lock(self):
+        fd = open(_PROCESS_LOCK_FILE, "w")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    @staticmethod
+    def _release_rag_priority_lock(fd) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            fd.close()
+
+    def _build_batch_summary(self, fetched_count: int, processed: int) -> dict:
+        return {
+            "fetched_count": fetched_count,
+            "processed_count": processed,
+            "remaining_estimate": max(fetched_count - processed, 0),
+        }
+
+    def _build_skipped_summary(self, fetched_count: int, reason: str) -> dict:
+        return {
+            "fetched_count": fetched_count,
+            "processed_count": 0,
+            "remaining_estimate": fetched_count,
+            "reason": reason,
+        }
+
+    def _build_idle_summary(self) -> dict:
+        return {
+            "fetched_count": 0,
+            "processed_count": 0,
+            "remaining_estimate": 0,
+            "reason": "no_unprocessed_captures",
+        }
+
+    @staticmethod
+    def _get_core_engine_url() -> str:
+        return os.getenv("CORE_ENGINE_URL") or os.getenv("MEMORY_BREAD_CORE_URL") or _DEFAULT_CORE_ENGINE_URL
+
+    async def _trigger_unified_bake_pipeline(self, processed_count: int) -> dict:
+        if processed_count <= 0:
+            return {
+                "triggered": False,
+                "reason": "no_new_knowledge",
+            }
+
+        url = f"{self._get_core_engine_url().rstrip('/')}{_BAKE_RUN_ENDPOINT}"
+        payload = json.dumps({
+            "trigger_reason": "knowledge_background",
+            "limit": max(processed_count, 1),
+        }).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+        }
+        request = urllib_request.Request(url, data=payload, headers=headers, method="POST")
+
+        def _send() -> dict:
+            try:
+                with urllib_request.urlopen(request, timeout=15) as response:
+                    body = response.read().decode("utf-8") if response else ""
+                    data = json.loads(body) if body else {}
+                    return {
+                        "triggered": True,
+                        "status": data.get("status"),
+                        "run_id": data.get("id"),
+                        "auto_created_count": data.get("auto_created_count"),
+                        "candidate_count": data.get("candidate_count"),
+                        "discarded_count": data.get("discarded_count"),
+                    }
+            except urllib_error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+                logger.warning("统一 bake pipeline 触发失败: status=%s body=%s", exc.code, detail)
+            except Exception as exc:
+                logger.warning("统一 bake pipeline 触发异常: %s", exc)
+            return {
+                "triggered": False,
+                "reason": "request_failed",
+            }
+
+        result = await asyncio.to_thread(_send)
+        if result.get("triggered"):
+            logger.info(
+                "统一 bake pipeline 已触发: run_id=%s status=%s auto=%s candidate=%s discarded=%s",
+                result.get("run_id"),
+                result.get("status"),
+                result.get("auto_created_count"),
+                result.get("candidate_count"),
+                result.get("discarded_count"),
+            )
+        return result
+
+    def _process_batch_sync(self, limit_override: Optional[int] = None, force_finalize_tail: bool = False) -> dict:
+        """同步执行一轮批处理，便于后台循环与手动触发复用。"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            limit = limit_override or self.batch_size
+            captures = self._get_unprocessed_captures(conn, limit)
+        finally:
+            conn.close()
+
+        if not captures:
+            return self._build_idle_summary()
+
+        now_ms = int(time.time() * 1000)
+        first_capture = captures[0]
+        last_capture = captures[-1]
+
+        logger.info(
+            "📦 发现 %s 条待处理 captures，开始语义分组 (first_id=%s, last_id=%s, force_finalize_tail=%s)",
+            len(captures),
+            first_capture['id'],
+            last_capture['id'],
+            force_finalize_tail,
+        )
+
+        if len(captures) < FragmentGrouper.MIN_GROUP_WAIT:
+            should_finalize, reason = self._should_finalize_last_group(captures, now_ms, len(captures))
+            if force_finalize_tail and captures:
+                should_finalize = True
+                reason = 'force_finalize_tail'
+            idle_minutes = self._group_idle_minutes(captures, now_ms)
+            logger.info(
+                "片段候选不足最小数量: count=%s idle=%.1fmin finalize=%s reason=%s",
+                len(captures), idle_minutes, should_finalize, reason,
+            )
+            if not should_finalize:
+                return self._build_skipped_summary(len(captures), reason)
+            groups = [captures]
+        else:
+            grouper = self._get_fragment_grouper()
+            groups = grouper.group_captures(captures)
+
+        groups_to_process = groups[:-1] if len(groups) > 1 else []
+        last_group = groups[-1] if groups else []
+        finalize_last_group = False
+        finalize_reason = 'no_groups'
+        last_group_idle = self._group_idle_minutes(last_group, now_ms) if last_group else 0.0
+
+        if last_group:
+            finalize_last_group, finalize_reason = self._should_finalize_last_group(
+                last_group, now_ms, len(captures)
+            )
+            if force_finalize_tail:
+                finalize_last_group = True
+                finalize_reason = 'force_finalize_tail'
+            if finalize_last_group and (not groups_to_process or groups_to_process[-1] is not last_group):
+                groups_to_process.append(last_group)
+
+        logger.info(
+            "分组结果: captures=%s groups=%s process_now=%s last_group_size=%s last_group_idle=%.1fmin finalize_last=%s reason=%s",
+            len(captures),
+            len(groups),
+            len(groups_to_process),
+            len(last_group),
+            last_group_idle,
+            finalize_last_group,
+            finalize_reason,
+        )
+
+        if not groups_to_process:
+            logger.debug("所有 captures 可能仍属于进行中的任务，等待下一轮")
+            return self._build_skipped_summary(len(captures), finalize_reason)
+
+        return {
+            "captures": captures,
+            "groups_to_process": groups_to_process,
+            "fetched_count": len(captures),
+            "finalize_reason": finalize_reason,
+        }
+
+    async def _run_batch(self, limit_override: Optional[int] = None, force_finalize_tail: bool = False) -> dict:
+        batch = await asyncio.to_thread(self._process_batch_sync, limit_override, force_finalize_tail)
+        groups_to_process = batch.get('groups_to_process')
+        if not groups_to_process:
+            return batch
+
+        process_lock_fd = await asyncio.to_thread(self._acquire_process_file_lock)
+        rag_lock_fd = None
+        try:
+            rag_lock_fd = await asyncio.to_thread(self._acquire_rag_priority_lock)
+            processed = 0
+            for group in groups_to_process:
+                await self._process_vectorization_batch(group)
+                if await self._process_capture_group(group):
+                    processed += 1
+                await asyncio.sleep(0.5)
+        finally:
+            if rag_lock_fd is not None:
+                await asyncio.to_thread(self._release_rag_priority_lock, rag_lock_fd)
+            await asyncio.to_thread(self._release_rag_priority_lock, process_lock_fd)
+
+        fetched_count = int(batch.get('fetched_count', 0))
+        logger.info("批处理完成: processed=%s fetched=%s", processed, fetched_count)
+        bake_result = await self._trigger_unified_bake_pipeline(processed)
+        summary = self._build_batch_summary(fetched_count, processed)
+        summary['bake_trigger'] = bake_result
+        return summary
+
+    async def run_once(self, limit_override: Optional[int] = None, force_finalize_tail: bool = False) -> dict:
+        async with self._run_lock:
+            return await self._run_batch(limit_override, force_finalize_tail)
 
     def _save_knowledge(self, conn: sqlite3.Connection, knowledge: dict) -> int:
         """保存 knowledge 条目，返回新插入的 id"""
@@ -280,7 +516,13 @@ class BackgroundProcessor:
 
             # 跨批次去重：若新 knowledge 与已有条目高度相似，则合并而非插入
             overview = knowledge.get('overview') or knowledge.get('summary', '')
-            similar_id = extractor._find_similar_knowledge(overview, conn) if overview else None
+            similar_id = extractor._find_similar_knowledge(
+                overview,
+                conn,
+                entities=json.loads(knowledge.get('entities') or '[]') if knowledge.get('entities') else None,
+                start_time=knowledge.get('start_time'),
+                end_time=knowledge.get('end_time'),
+            ) if overview else None
 
             if similar_id:
                 # 合并：occurrence_count+1，追加 details（去重保留新信息）
@@ -551,82 +793,8 @@ class BackgroundProcessor:
     async def _process_batch(self):
         """处理一批未处理的记录（基于语义分组）"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            captures = self._get_unprocessed_captures(conn, self.batch_size)
-            conn.close()
-
-            if not captures:
-                return 0
-
-            now_ms = int(time.time() * 1000)
-            first_capture = captures[0]
-            last_capture = captures[-1]
-
-            logger.info(
-                "📦 发现 %s 条待处理 captures，开始语义分组 (first_id=%s, last_id=%s)",
-                len(captures),
-                first_capture['id'],
-                last_capture['id'],
-            )
-
-            # 数据太少时，仅在尾巴已明显静默时才落知识，避免短尾巴永久卡住
-            if len(captures) < FragmentGrouper.MIN_GROUP_WAIT:
-                should_finalize, reason = self._should_finalize_last_group(captures, now_ms, len(captures))
-                idle_minutes = self._group_idle_minutes(captures, now_ms)
-                logger.info(
-                    "片段候选不足最小数量: count=%s idle=%.1fmin finalize=%s reason=%s",
-                    len(captures), idle_minutes, should_finalize, reason,
-                )
-                if not should_finalize:
-                    return 0
-                groups = [captures]
-            else:
-                # 语义分组
-                grouper = self._get_fragment_grouper()
-                groups = grouper.group_captures(captures)
-
-            groups_to_process = groups[:-1] if len(groups) > 1 else []
-            last_group = groups[-1] if groups else []
-            finalize_last_group = False
-            finalize_reason = 'no_groups'
-            last_group_idle = self._group_idle_minutes(last_group, now_ms) if last_group else 0.0
-
-            if last_group:
-                finalize_last_group, finalize_reason = self._should_finalize_last_group(
-                    last_group, now_ms, len(captures)
-                )
-                if finalize_last_group:
-                    groups_to_process.append(last_group)
-
-            logger.info(
-                "分组结果: captures=%s groups=%s process_now=%s last_group_size=%s last_group_idle=%.1fmin finalize_last=%s reason=%s",
-                len(captures),
-                len(groups),
-                len(groups_to_process),
-                len(last_group),
-                last_group_idle,
-                finalize_last_group,
-                finalize_reason,
-            )
-
-            if not groups_to_process:
-                logger.debug("所有 captures 可能仍属于进行中的任务，等待下一轮")
-                return 0
-
-            processed = 0
-            for group in groups_to_process:
-                # 1. 向量化（每条 capture 独立向量化，用于 RAG 检索）
-                await self._process_vectorization_batch(group)
-
-                # 2. 合并提炼为一个 knowledge 片段
-                if await self._process_capture_group(group):
-                    processed += 1
-
-                await asyncio.sleep(0.5)
-
-            logger.info("批处理完成: processed=%s fetched=%s", processed, len(captures))
-            return processed
-
+            result = await self.run_once()
+            return int(result.get('processed_count', 0))
         except Exception as e:
             logger.error(f"批处理异常: {e}")
             return 0

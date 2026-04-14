@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import type { MonitorOverview, SystemResources } from '../types'
 import { useAppStore } from '../store/useAppStore'
 
@@ -99,16 +99,16 @@ function fmtAxisTs(ms: number): string {
 }
 
 type OverviewRange = '1d' | '7d' | '30d'
-type SystemRange = '1h' | '6h' | '24h'
+type SystemRange = '1h' | '6h' | '24h' | '1d'
 
 function getOverviewBucketLabel(range: OverviewRange): string {
-  if (range === '1d') return '约 1 小时'
+  if (range === '1d') return '约 1 分钟'
   if (range === '7d') return '约 6 小时'
   return '约 1 天'
 }
 
 function getKnowledgeBucketLabel(range: OverviewRange): string {
-  if (range === '1d') return '约 5 分钟'
+  if (range === '1d') return '约 1 分钟'
   if (range === '7d') return '约 1 小时'
   return '约 1 天'
 }
@@ -124,7 +124,8 @@ function getKnowledgeTrendLabel(range: OverviewRange): string {
 function getSystemBucketLabel(range: SystemRange): string {
   if (range === '1h') return '约 1 分钟'
   if (range === '6h') return '约 3 分钟'
-  return '约 12 分钟'
+  if (range === '24h' || range === '1d') return '约 1 分钟'
+  return '约 1 分钟'
 }
 
 function fmtOverviewAxisTs(ms: number, range: OverviewRange): string {
@@ -146,7 +147,7 @@ function fmtOverviewAxisTs(ms: number, range: OverviewRange): string {
 function fmtSystemAxisTs(ms: number, range: SystemRange): string {
   const date = new Date(Number(ms))
   if (Number.isNaN(date.getTime())) return '—'
-  if (range === '24h') {
+  if (range === '24h' || range === '1d') {
     return date.toLocaleString('zh-CN', {
       month: '2-digit',
       day: '2-digit',
@@ -169,6 +170,21 @@ function fmtMs(ms: number | null): string {
 }
 
 // ── 迷你折线图（纯 SVG）────────────────────────────────────────────────────
+function sampleLineData<T extends { ts: number }>(data: T[], maxPoints = 120): T[] {
+  if (data.length <= maxPoints) return data
+  const lastIndex = data.length - 1
+  const sampled: T[] = []
+  for (let i = 0; i < maxPoints; i += 1) {
+    const index = Math.round((i / Math.max(maxPoints - 1, 1)) * lastIndex)
+    const point = data[index]
+    if (!point || sampled[sampled.length - 1]?.ts === point.ts) continue
+    sampled.push(point)
+  }
+  const tail = data[lastIndex]
+  if (sampled[sampled.length - 1]?.ts !== tail.ts) sampled.push(tail)
+  return sampled
+}
+
 type LinePoint = { ts: number; value: number }
 type MultiLineSeries = {
   label: string
@@ -195,8 +211,10 @@ const SparkLine: React.FC<{
   detailFormatter,
 }) => {
   const normalizedSeries = (series && series.length > 0)
-    ? series.filter(item => item.data.length > 0)
-    : (data && data.length > 0 ? [{ label: '当前序列', color, data, valueFormatter }] : [])
+    ? series
+        .map(item => ({ ...item, data: sampleLineData(item.data) }))
+        .filter(item => item.data.length > 0)
+    : (data && data.length > 0 ? [{ label: '当前序列', color, data: sampleLineData(data), valueFormatter }] : [])
   const [hoverIndex, setHoverIndex] = useState<number | null>(null)
 
   if (!normalizedSeries.length) return null
@@ -371,6 +389,49 @@ const StatCard: React.FC<{
     {sub && <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 3 }}>{sub}</div>}
   </div>
 )
+
+const RuntimeBreakdownCard: React.FC<{
+  items: SystemResources['model_runtime_breakdown']
+}> = ({ items }) => {
+  const visible = items.slice(0, 6)
+  return (
+    <div style={cardStyle}>
+      <div style={sectionTitle}>模型运行时拆分</div>
+      {visible.length === 0 ? (
+        <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无拆分数据</div>
+      ) : (
+        <div style={{ display: 'grid', gap: 8 }}>
+          {visible.map((item, index) => {
+            const color = getStableSeriesColor(item.key, index)
+            return (
+              <div key={item.key} style={{
+                border: `1px solid ${color}20`,
+                background: `${color}10`,
+                borderRadius: 10,
+                padding: '10px 12px',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: '#1D1D1F' }}>{item.label}</div>
+                    <div style={{ fontSize: 11, color: '#6E6E73', marginTop: 3 }}>
+                      {formatCoverageText(item.coverage_note, item.coverage_status)}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                    <div style={{ fontSize: 15, fontWeight: 700, color }}>{item.mem_process_mb.toLocaleString()} MB</div>
+                    <div style={{ fontSize: 11, color: '#6E6E73', marginTop: 3 }}>
+                      CPU {item.cpu_percent.toFixed(1)}% · {item.process_count} 个进程
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
 
 // ── 总览内容 ─────────────────────────────────────────────────────────────────
 const OverviewContent: React.FC<{ data: MonitorOverview; range: OverviewRange }> = ({ data, range }) => {
@@ -640,24 +701,157 @@ const formatCoverageText = (note?: string | null, status?: string | null) => {
   return '状态未知'
 }
 
+const formatProcessNames = (names?: string[] | null) => {
+  if (!names || names.length === 0) return null
+  return names.join(' · ')
+}
+
+const MODEL_TYPE_META: Record<string, { label: string; color: string; bg: string; border: string }> = {
+  llm: { label: 'LLM', color: '#007AFF', bg: 'rgba(0,122,255,0.12)', border: 'rgba(0,122,255,0.18)' },
+  embedding: { label: 'Embedding', color: '#AF52DE', bg: 'rgba(175,82,222,0.12)', border: 'rgba(175,82,222,0.18)' },
+  ocr: { label: 'OCR', color: '#34C759', bg: 'rgba(52,199,89,0.12)', border: 'rgba(52,199,89,0.18)' },
+  asr: { label: 'ASR', color: '#FF9500', bg: 'rgba(255,149,0,0.12)', border: 'rgba(255,149,0,0.18)' },
+  vlm: { label: 'VLM', color: '#FF2D55', bg: 'rgba(255,45,85,0.12)', border: 'rgba(255,45,85,0.18)' },
+}
+
+const getModelTypeMeta = (type?: string | null) => MODEL_TYPE_META[type || ''] || {
+  label: type || '模型',
+  color: '#FF2D55',
+  bg: 'rgba(255,45,85,0.12)',
+  border: 'rgba(255,45,85,0.18)',
+}
+
+const normalizeModelName = (rawName?: string | null) => {
+  if (!rawName) return ''
+  return rawName
+    .replace(/^RAG Embedding · /, '')
+    .replace(/^RAG LLM · /, '')
+    .replace(/^Sidecar Embedding · /, '')
+    .replace(/^Knowledge Extractor · /, '')
+    .trim()
+}
+
+const getLatestModelStates = (events: SystemResources['model_events']) => {
+  const latest = new Map<string, SystemResources['model_events'][number]>()
+  for (const event of events) {
+    const rawName = event.model_name || ''
+    const normalizedName = normalizeModelName(rawName)
+    const names = [rawName, normalizedName].filter(Boolean)
+    names.forEach((name) => {
+      if (!latest.has(name)) latest.set(name, event)
+    })
+  }
+  return latest
+}
+
+const getCurrentModelNames = (events: SystemResources['model_events']) => {
+  const latest = new Map<string, SystemResources['model_events'][number]>()
+  for (const event of events) {
+    const normalizedName = normalizeModelName(event.model_name)
+    if (!normalizedName) continue
+    if (!latest.has(normalizedName)) latest.set(normalizedName, event)
+  }
+  return Array.from(latest.entries())
+    .sort((a, b) => b[1].ts - a[1].ts)
+    .map(([name]) => name)
+}
+
+const renderProcessTags = (
+  names?: string[] | null,
+  events: SystemResources['model_events'] = [],
+  selectedName?: string | null,
+  onSelect?: (name: string | null) => void,
+) => {
+  if (!names || names.length === 0) return null
+  const latestStates = getLatestModelStates(events)
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+      {names.map((name) => {
+        const latest = latestStates.get(name)
+        const meta = getModelTypeMeta(latest?.model_type)
+        const active = selectedName === name
+        const stateLabel = latest ? (EVENT_LABEL[latest.event_type] || latest.event_type) : null
+        return (
+          <button
+            key={name}
+            onClick={() => onSelect?.(active ? null : name)}
+            style={{
+              fontSize: 10,
+              lineHeight: 1,
+              padding: '5px 8px',
+              borderRadius: 999,
+              background: active ? meta.color : meta.bg,
+              color: active ? 'white' : meta.color,
+              border: `1px solid ${meta.border}`,
+              whiteSpace: 'nowrap',
+              cursor: 'pointer',
+            }}
+            title={stateLabel ? `${meta.label} · ${stateLabel}` : meta.label}
+          >
+            {stateLabel ? `${name} · ${stateLabel}` : name}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+const MODEL_SERIES_COLORS = ['#FF3B30', '#FF2D55', '#FF9500', '#AF52DE', '#34C759', '#32ADE6']
+
+const getStableSeriesColor = (key: string, fallbackIndex: number) => {
+  let hash = 0
+  for (let i = 0; i < key.length; i += 1) hash = ((hash << 5) - hash) + key.charCodeAt(i)
+  const index = Math.abs(hash || fallbackIndex) % MODEL_SERIES_COLORS.length
+  return MODEL_SERIES_COLORS[index]
+}
+
+const toTrendLine = (
+  series: SystemResources['trends']['model_cpu_series'][number],
+  index: number,
+  formatter: (value: number) => string,
+) => ({
+  label: series.label,
+  color: getStableSeriesColor(series.key, index),
+  data: series.points,
+  formatter,
+  detailSuffix: formatCoverageText(series.coverage_note, series.coverage_status),
+})
+
 const SystemContent: React.FC<{ data: SystemResources | null; range: SystemRange }> = ({ data, range }) => {
   if (!data) return <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '24px 0' }}>暂无数据</div>
   const { latest, disk_trend, model_events, trends } = data
+  const runtimeBreakdown = data.model_runtime_breakdown ?? []
   const knowledgeEvents = data.knowledge_events ?? []
   const gpuTrend = data.gpu_trend ?? []
   const modelGpuTrend = data.model_gpu_trend ?? []
+  const currentModelNames = getCurrentModelNames(model_events)
   const system = latest.system
   const suite = latest.suite
   const model = latest.model
   const systemMemSub = system ? `${Math.round(system.mem_percent)}% · ${system.mem_used_mb.toLocaleString()} / ${system.mem_total_mb.toLocaleString()} MB` : ''
+  const modelCpuLines = [
+    { label: '系统', color: '#FF9500', data: trends.system_cpu, formatter: (value: number) => `${value.toFixed(1)}%` },
+    { label: '整套软件', color: '#AF52DE', data: trends.suite_cpu, formatter: (value: number) => `${value.toFixed(1)}%` },
+    ...((trends.model_cpu_series ?? []).map((series, index) => toTrendLine(series, index, (value) => `${value.toFixed(1)}%`))),
+  ]
+  const modelMemLines = [
+    { label: '系统', color: '#007AFF', data: trends.system_mem, formatter: (value: number) => `${value.toFixed(1)}%` },
+    { label: '整套软件', color: '#BF5AF2', data: trends.suite_mem, formatter: (value: number) => `${value.toFixed(0)} MB` },
+    ...((trends.model_mem_series ?? []).map((series, index) => toTrendLine(series, index, (value) => `${value.toFixed(0)} MB`))),
+    ...((trends.model_estimated_mem_series ?? []).map((series, index) => toTrendLine(series, index + 20, (value) => `${value.toFixed(0)} MB`))),
+  ]
   const eventPageSize = 10
   const [eventPage, setEventPage] = useState(1)
-  const totalEventPages = Math.max(1, Math.ceil(model_events.length / eventPageSize))
-  const pagedModelEvents = model_events.slice((eventPage - 1) * eventPageSize, eventPage * eventPageSize)
+  const [selectedModelName, setSelectedModelName] = useState<string | null>(null)
+  const filteredModelEvents = selectedModelName
+    ? model_events.filter((event) => event.model_name === selectedModelName)
+    : model_events
+  const totalEventPages = Math.max(1, Math.ceil(filteredModelEvents.length / eventPageSize))
+  const pagedModelEvents = filteredModelEvents.slice((eventPage - 1) * eventPageSize, eventPage * eventPageSize)
 
   useEffect(() => {
     setEventPage(1)
-  }, [range, model_events.length])
+  }, [range, model_events.length, selectedModelName])
 
   const renderTrendCard = (
     title: string,
@@ -685,7 +879,13 @@ const SystemContent: React.FC<{ data: SystemResources | null; range: SystemRange
 
   const renderDualTrendCard = (
     title: string,
-    lines: Array<{ label: string; color: string; data: { ts: number; value: number }[]; formatter: (value: number) => string }>,
+    lines: Array<{
+      label: string
+      color: string
+      data: { ts: number; value: number }[]
+      formatter: (value: number) => string
+      detailSuffix?: string | null
+    }>,
     emptyText = '暂无数据',
   ) => {
     const available = lines.filter(line => line.data.length > 0)
@@ -718,6 +918,15 @@ const SystemContent: React.FC<{ data: SystemResources | null; range: SystemRange
           }))}
           height={54}
           axisFormatter={(ts) => fmtSystemAxisTs(ts, range)}
+          detailFormatter={(point) => {
+            const labels = available.map((line) => {
+              const current = line.data.find((item) => item.ts === point.ts)
+              if (!current) return null
+              const suffix = line.detailSuffix ? `（${line.detailSuffix}）` : ''
+              return `${line.label}${suffix} ${line.formatter(current.value)}`
+            }).filter(Boolean)
+            return `${fmtTs(point.ts)} · ${labels.join(' · ')}`
+          }}
         />
         {available.every((line) => line.data.length === 1) && (
           <div style={{ color: '#AEAEB2', fontSize: 11, marginTop: 6 }}>当前范围仅 1 个采样点。</div>
@@ -755,24 +964,46 @@ const SystemContent: React.FC<{ data: SystemResources | null; range: SystemRange
         {model && (
           <>
             <StatCard label="模型 CPU" value={`${model.cpu_percent.toFixed(1)}%`}
-              sub={`${model.process_count} 个进程`} color="#FF3B30" />
+              sub={formatProcessNames(model.process_names) || `${model.process_count} 个进程`} color="#FF3B30" />
             <StatCard label="模型内存" value={`${model.mem_process_mb} MB`}
-              sub={formatCoverageText(model.coverage_note, model.coverage_status)} color="#FF2D55" />
+              sub={formatProcessNames(model.process_names) || formatCoverageText(model.coverage_note, model.coverage_status)} color="#FF2D55" />
           </>
         )}
         <StatCard label="数据库大小" value={fmtBytes(data.db_size_bytes)} color="#32ADE6" />
       </div>
 
-      {renderDualTrendCard('CPU 趋势（系统 vs 整套软件 vs 模型）', [
-        { label: '系统', color: '#FF9500', data: trends.system_cpu, formatter: (value) => `${value.toFixed(1)}%` },
-        { label: '整套软件', color: '#AF52DE', data: trends.suite_cpu, formatter: (value) => `${value.toFixed(1)}%` },
-        { label: '模型', color: '#FF3B30', data: trends.model_cpu, formatter: (value) => `${value.toFixed(1)}%` },
-      ], '暂无 CPU 趋势数据')}
-      {renderDualTrendCard('内存趋势（系统 vs 整套软件 vs 模型）', [
-        { label: '系统', color: '#007AFF', data: trends.system_mem, formatter: (value) => `${value.toFixed(1)}%` },
-        { label: '整套软件', color: '#BF5AF2', data: trends.suite_mem, formatter: (value) => `${value.toFixed(0)} MB` },
-        { label: '模型', color: '#FF2D55', data: trends.model_mem, formatter: (value) => `${value.toFixed(0)} MB` },
-      ], '暂无内存趋势数据')}
+      {model && (
+        <div style={{
+          background: 'rgba(255,45,85,0.05)',
+          border: '1px solid rgba(255,45,85,0.10)',
+          borderRadius: 10,
+          padding: '8px 10px',
+          marginBottom: 10,
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <div style={{ fontSize: 11, color: '#6E6E73', marginBottom: 2 }}>当前模型</div>
+            {selectedModelName && (
+              <button
+                onClick={() => setSelectedModelName(null)}
+                style={{
+                  fontSize: 11,
+                  padding: '2px 8px',
+                  borderRadius: 999,
+                  border: '1px solid rgba(0,0,0,0.08)',
+                  background: 'white',
+                  color: '#6E6E73',
+                  cursor: 'pointer',
+                }}
+              >清除高亮</button>
+            )}
+          </div>
+          {renderProcessTags(currentModelNames, model_events, selectedModelName, setSelectedModelName) || <div style={{ fontSize: 11, color: '#AEAEB2' }}>暂无模型名称</div>}
+        </div>
+      )}
+
+      {renderDualTrendCard('CPU 趋势（系统 vs 整套软件 vs 模型分线）', modelCpuLines, '暂无 CPU 趋势数据')}
+      {renderDualTrendCard('内存趋势（系统 vs 整套软件 vs 模型分线）', modelMemLines, '暂无内存趋势数据')}
+      <RuntimeBreakdownCard items={runtimeBreakdown} />
 
       <div style={cardStyle}>
         <div style={sectionTitle}>{getTrendTitle('GPU 趋势（系统 vs 模型）', getSystemBucketLabel(range))}</div>
@@ -861,43 +1092,54 @@ const SystemContent: React.FC<{ data: SystemResources | null; range: SystemRange
       <div style={{ ...cardStyle, marginBottom: 0 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
           <span style={sectionTitle as any}>模型加载/卸载事件</span>
-          {model_events.length > eventPageSize && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <button
-                onClick={() => setEventPage((page) => Math.max(1, page - 1))}
-                disabled={eventPage === 1}
-                style={{ fontSize: 11, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.1)', background: eventPage === 1 ? '#F2F2F7' : 'white', color: '#6E6E73', cursor: eventPage === 1 ? 'default' : 'pointer' }}
-              >上一页</button>
-              <span style={{ fontSize: 11, color: '#6E6E73' }}>{eventPage} / {totalEventPages}</span>
-              <button
-                onClick={() => setEventPage((page) => Math.min(totalEventPages, page + 1))}
-                disabled={eventPage === totalEventPages}
-                style={{ fontSize: 11, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.1)', background: eventPage === totalEventPages ? '#F2F2F7' : 'white', color: '#6E6E73', cursor: eventPage === totalEventPages ? 'default' : 'pointer' }}
-              >下一页</button>
-            </div>
-          )}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            {selectedModelName && <span style={{ fontSize: 11, color: '#FF2D55' }}>已筛选：{selectedModelName}</span>}
+            {filteredModelEvents.length > eventPageSize && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <button
+                  onClick={() => setEventPage((page) => Math.max(1, page - 1))}
+                  disabled={eventPage === 1}
+                  style={{ fontSize: 11, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.1)', background: eventPage === 1 ? '#F2F2F7' : 'white', color: '#6E6E73', cursor: eventPage === 1 ? 'default' : 'pointer' }}
+                >上一页</button>
+                <span style={{ fontSize: 11, color: '#6E6E73' }}>{eventPage} / {totalEventPages}</span>
+                <button
+                  onClick={() => setEventPage((page) => Math.min(totalEventPages, page + 1))}
+                  disabled={eventPage === totalEventPages}
+                  style={{ fontSize: 11, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.1)', background: eventPage === totalEventPages ? '#F2F2F7' : 'white', color: '#6E6E73', cursor: eventPage === totalEventPages ? 'default' : 'pointer' }}
+                >下一页</button>
+              </div>
+            )}
+          </div>
         </div>
-        {model_events.length === 0
+        {filteredModelEvents.length === 0
           ? <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无事件</div>
-          : pagedModelEvents.map((e, i) => (
-            <div key={`${e.ts}-${e.model_name}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0',
-              borderBottom: i < pagedModelEvents.length - 1 ? '1px solid rgba(0,0,0,0.05)' : 'none' }}>
-              <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, flexShrink: 0,
-                background: `${EVENT_COLOR[e.event_type] || '#6E6E73'}18`,
-                color: EVENT_COLOR[e.event_type] || '#6E6E73' }}>
-                {EVENT_LABEL[e.event_type] || e.event_type}
-              </span>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <span style={{ fontSize: 12, color: '#333' }}>{e.model_name}</span>
-                <span style={{ fontSize: 11, color: '#AEAEB2', marginLeft: 6 }}>{e.model_type}</span>
+          : pagedModelEvents.map((e, i) => {
+            const active = selectedModelName === e.model_name
+            const meta = getModelTypeMeta(e.model_type)
+            return (
+              <div key={`${e.ts}-${e.model_name}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0',
+                borderBottom: i < pagedModelEvents.length - 1 ? '1px solid rgba(0,0,0,0.05)' : 'none',
+                background: active ? meta.bg : 'transparent',
+                borderRadius: 8,
+                paddingLeft: 6,
+                paddingRight: 6 }}>
+                <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 4, flexShrink: 0,
+                  background: `${EVENT_COLOR[e.event_type] || '#6E6E73'}18`,
+                  color: EVENT_COLOR[e.event_type] || '#6E6E73' }}>
+                  {EVENT_LABEL[e.event_type] || e.event_type}
+                </span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ fontSize: 12, color: '#333' }}>{e.model_name}</span>
+                  <span style={{ fontSize: 11, color: meta.color, marginLeft: 6 }}>{meta.label}</span>
+                </div>
+                <div style={{ flexShrink: 0, fontSize: 11, color: '#6E6E73', textAlign: 'right' }}>
+                  {e.duration_ms && <span>{fmtMs(e.duration_ms)} · </span>}
+                  {e.memory_mb && <span>{e.memory_mb} MB · </span>}
+                  <span>{fmtTs(e.ts)}</span>
+                </div>
               </div>
-              <div style={{ flexShrink: 0, fontSize: 11, color: '#6E6E73', textAlign: 'right' }}>
-                {e.duration_ms && <span>{fmtMs(e.duration_ms)} · </span>}
-                {e.memory_mb && <span>{e.memory_mb} MB · </span>}
-                <span>{fmtTs(e.ts)}</span>
-              </div>
-            </div>
-          ))}
+            )
+          })}
       </div>
     </>
   )
@@ -924,16 +1166,19 @@ const MonitorPanel: React.FC = () => {
   const base = apiBaseUrl || API
 
   const [tab, setTab] = useState<'overview' | 'system'>('overview')
+  const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
+  const systemAbortRef = useRef<AbortController | null>(null)
   const [data, setData] = useState<MonitorOverview | null>(null)
   const [sysData, setSysData] = useState<SystemResources | null>(null)
   const [range, setRange] = useState<OverviewRange>('7d')
   const [sysRange, setSysRange] = useState<SystemRange>('6h')
-  const [loading, setLoading] = useState(false)
+  const [loadingOverview, setLoadingOverview] = useState(false)
+  const [loadingSystem, setLoadingSystem] = useState(false)
   const [overviewError, setOverviewError] = useState<string | null>(null)
   const [systemError, setSystemError] = useState<string | null>(null)
 
   const load = async () => {
-    setLoading(true)
+    setLoadingOverview(true)
     setOverviewError(null)
     try {
       const res = await fetch(`${base}/api/monitor/overview?range=${range}`)
@@ -948,34 +1193,64 @@ const MonitorPanel: React.FC = () => {
       setOverviewError(message)
       console.error(e)
     } finally {
-      setLoading(false)
+      setLoadingOverview(false)
     }
   }
 
   const loadSys = async () => {
-    setLoading(true)
+    systemAbortRef.current?.abort()
+    const controller = new AbortController()
+    systemAbortRef.current = controller
+    setLoadingSystem(true)
     setSystemError(null)
     try {
-      const res = await fetch(`${base}/api/monitor/system?range=${sysRange}`)
+      const res = await fetch(`${base}/api/monitor/system?range=${sysRange}`, {
+        signal: controller.signal,
+      })
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`)
       }
       const json = await res.json()
       setSysData(json)
     } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        return
+      }
       const message = e instanceof Error ? e.message : String(e)
       setSysData(null)
       setSystemError(message)
       console.error(e)
     } finally {
-      setLoading(false)
+      if (systemAbortRef.current === controller) {
+        systemAbortRef.current = null
+      }
+      setLoadingSystem(false)
     }
   }
 
   useEffect(() => { if (tab === 'overview') load() }, [base, range, tab])
-  useEffect(() => { if (tab === 'system') loadSys() }, [base, sysRange, tab])
+  useEffect(() => { if (tab === 'system' && isVisible) loadSys() }, [base, sysRange, tab, isVisible])
 
-  if (loading && !data && !sysData && !overviewError && !systemError) return (
+  useEffect(() => {
+    const handleVisibilityChange = () => setIsVisible(document.visibilityState === 'visible')
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }, [])
+
+  useEffect(() => {
+    if (tab !== 'system' || !isVisible) return
+    const timer = window.setInterval(() => {
+      loadSys()
+    }, 30000)
+    return () => window.clearInterval(timer)
+  }, [tab, base, sysRange, isVisible])
+
+  useEffect(() => () => {
+    systemAbortRef.current?.abort()
+  }, [])
+
+  if ((loadingOverview && !data && tab === 'overview' && !overviewError)
+    || (loadingSystem && !sysData && tab === 'system' && !systemError)) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
       height: '100%', color: '#AEAEB2', fontSize: 13 }}>加载中...</div>
   )
@@ -1003,12 +1278,17 @@ const MonitorPanel: React.FC = () => {
               color: range === r ? 'white' : '#6E6E73',
             }}>{r === '1d' ? '今天' : r === '7d' ? '7天' : '30天'}</button>
           ))}
-          {tab === 'system' && (['1h', '6h', '24h'] as const).map(r => (
-            <button key={r} onClick={() => setSysRange(r)} style={{
+          {tab === 'system' && ([
+            { value: '1h', label: '1h' },
+            { value: '6h', label: '6h' },
+            { value: '24h', label: '24h' },
+            { value: '1d', label: '今天' },
+          ] as const).map(({ value, label }) => (
+            <button key={value} onClick={() => setSysRange(value)} style={{
               fontSize: 11, padding: '3px 8px', borderRadius: 6, border: 'none', cursor: 'pointer',
-              background: sysRange === r ? '#007AFF' : 'white',
-              color: sysRange === r ? 'white' : '#6E6E73',
-            }}>{r}</button>
+              background: sysRange === value ? '#007AFF' : 'white',
+              color: sysRange === value ? 'white' : '#6E6E73',
+            }}>{label}</button>
           ))}
           <button onClick={tab === 'overview' ? load : loadSys} style={{
             fontSize: 11, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.1)',
@@ -1021,7 +1301,7 @@ const MonitorPanel: React.FC = () => {
       {tab === 'system' && systemError && <ErrorNotice message={`${systemError}，请检查 API 地址或确认 Core Engine 已启动`} />}
 
       {tab === 'overview' && data && <OverviewContent data={data} range={range} />}
-      {tab === 'overview' && !data && !overviewError && !loading && (
+      {tab === 'overview' && !data && !overviewError && !loadingOverview && (
         <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '24px 0' }}>暂无监控数据</div>
       )}
       {tab === 'system' && <SystemContent data={sysData} range={sysRange} />}

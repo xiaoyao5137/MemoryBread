@@ -7,9 +7,13 @@
  * 3. 优化图标视觉效果
  */
 
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  useFetchDebugLogContent,
+  useFetchDebugLogFiles,
+} from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
-import type { CaptureRecord } from '../types'
+import type { CaptureRecord, DebugLogContent, DebugLogFile } from '../types'
 
 interface DebugPanelProps {
   className?: string
@@ -30,18 +34,26 @@ interface SystemStats {
 
 const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
   const { apiBaseUrl, setWindowMode } = useAppStore()
+  const fetchDebugLogFiles = useFetchDebugLogFiles()
+  const fetchDebugLogContent = useFetchDebugLogContent()
 
   const [captures, setCaptures] = useState<CaptureRecord[]>([])
   const [vectorStatus, setVectorStatus] = useState<VectorStatus[]>([])
   const [stats, setStats] = useState<SystemStats | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [autoRefresh, setAutoRefresh] = useState(true)
-  const [refreshInterval, setRefreshInterval] = useState(2000)
+  const [autoRefresh, setAutoRefresh] = useState(false)
+  const [refreshInterval, setRefreshInterval] = useState(5000)
   const [selectedCapture, setSelectedCapture] = useState<CaptureRecord | null>(null)
   const [highlightCaptureId, setHighlightCaptureId] = useState<number | null>(null)
   const [clearingQueue, setClearingQueue] = useState(false)
   const [clearQueueResult, setClearQueueResult] = useState<string | null>(null)
+  const [logFiles, setLogFiles] = useState<DebugLogFile[]>([])
+  const [selectedLogKey, setSelectedLogKey] = useState('')
+  const selectedLogKeyRef = useRef('')
+  const [selectedLogContent, setSelectedLogContent] = useState<DebugLogContent | null>(null)
+  const [logLoading, setLogLoading] = useState(false)
+  const [logError, setLogError] = useState<string | null>(null)
 
   // 获取最新采集记录
   const fetchCaptures = useCallback(async () => {
@@ -80,12 +92,80 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
     }
   }, [apiBaseUrl])
 
+  const loadLogContent = useCallback(async (key: string, files: DebugLogFile[] = logFiles) => {
+    setSelectedLogKey(key)
+    selectedLogKeyRef.current = key
+
+    if (!key) {
+      setSelectedLogContent(null)
+      setLogError(null)
+      return
+    }
+
+    const selected = files.find((item) => item.key === key)
+    if (selected && !selected.exists) {
+      setSelectedLogContent(null)
+      setLogError(null)
+      return
+    }
+
+    setLogLoading(true)
+    try {
+      const data = await fetchDebugLogContent(key)
+      setSelectedLogContent(data)
+      setLogError(null)
+    } catch (e) {
+      setSelectedLogContent(null)
+      setLogError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLogLoading(false)
+    }
+  }, [fetchDebugLogContent, logFiles])
+
+  const refreshLogs = useCallback(async () => {
+    setLogLoading(true)
+    try {
+      const items = await fetchDebugLogFiles()
+      setLogFiles(items)
+
+      const currentKey = selectedLogKeyRef.current
+      const nextKey = items.some((item) => item.key === currentKey)
+        ? currentKey
+        : (items[0]?.key ?? '')
+
+      setSelectedLogKey(nextKey)
+      selectedLogKeyRef.current = nextKey
+
+      if (!nextKey) {
+        setSelectedLogContent(null)
+        setLogError(null)
+        return
+      }
+
+      const selected = items.find((item) => item.key === nextKey)
+      if (!selected?.exists) {
+        setSelectedLogContent(null)
+        setLogError(null)
+        return
+      }
+
+      const data = await fetchDebugLogContent(nextKey)
+      setSelectedLogContent(data)
+      setLogError(null)
+    } catch (e) {
+      setSelectedLogContent(null)
+      setLogError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLogLoading(false)
+    }
+  }, [fetchDebugLogContent, fetchDebugLogFiles])
+
   // 刷新所有数据
   const refreshAll = useCallback(async () => {
     setLoading(true)
-    await Promise.all([fetchCaptures(), fetchVectorStatus(), fetchStats()])
+    await Promise.all([fetchCaptures(), fetchVectorStatus(), fetchStats(), refreshLogs()])
     setLoading(false)
-  }, [fetchCaptures, fetchVectorStatus, fetchStats])
+  }, [fetchCaptures, fetchVectorStatus, fetchStats, refreshLogs])
 
   // 初始加载
   useEffect(() => {
@@ -142,7 +222,7 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
     }
   }
 
-  const formatTimestamp = (ts: number | undefined) => {
+  const formatTimestamp = (ts: number | undefined | null) => {
     if (!ts) return '无'
     const date = new Date(ts)
     return date.toLocaleString('zh-CN', {
@@ -156,9 +236,17 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
     })
   }
 
+  const formatBytes = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`
+  }
+
   const getVectorStatusForCapture = (captureId: number) => {
     return vectorStatus.find((v) => v.capture_id === captureId)
   }
+
+  const selectedLogMeta = logFiles.find((item) => item.key === selectedLogKey) ?? null
 
   return (
     <div className={`min-h-screen bg-gray-50 p-6 ${className}`} data-testid="debug-panel">
@@ -352,6 +440,88 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
           )}
         </div>
         <p className="text-xs text-gray-400 mt-2">将所有待提炼 captures 标记为跳过，释放积压队列。</p>
+      </section>
+
+      {/* 关键排查日志 */}
+      <section className="bg-white rounded-lg shadow-sm p-6 mb-6">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <div>
+            <h2 className="text-xl font-semibold text-gray-800">关键排查日志</h2>
+            <p className="text-xs text-gray-500 mt-1">仅支持查看服务端白名单日志，默认展示最新一段内容。</p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <select
+              value={selectedLogKey}
+              onChange={(e) => void loadLogContent(e.target.value)}
+              disabled={logFiles.length === 0 || logLoading}
+              className="text-sm border rounded px-3 py-2 min-w-[220px]"
+            >
+              {logFiles.length === 0 ? (
+                <option value="">暂无关键日志</option>
+              ) : (
+                logFiles.map((item) => (
+                  <option key={item.key} value={item.key}>
+                    {item.label}{item.exists ? '' : '（文件不存在）'}
+                  </option>
+                ))
+              )}
+            </select>
+
+            <button
+              onClick={() => void refreshLogs()}
+              disabled={logLoading}
+              className="px-4 py-2 bg-slate-700 text-white rounded hover:bg-slate-800 disabled:bg-gray-300 text-sm"
+            >
+              {logLoading ? '刷新中...' : '刷新日志'}
+            </button>
+          </div>
+        </div>
+
+        {selectedLogMeta && (
+          <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-500 mb-3">
+            <span>文件: {selectedLogMeta.label}</span>
+            <span>存在: {selectedLogMeta.exists ? '是' : '否'}</span>
+            <span>大小: {formatBytes(selectedLogMeta.size_bytes)}</span>
+            <span>更新时间: {formatTimestamp(selectedLogMeta.modified_at)}</span>
+            {selectedLogContent && (
+              <span>本次返回: {formatBytes(selectedLogContent.returned_bytes)}</span>
+            )}
+          </div>
+        )}
+
+        {logError && (
+          <div className="mb-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            读取日志失败：{logError}
+          </div>
+        )}
+
+        {!selectedLogMeta && (
+          <div className="text-sm text-gray-500 py-8 text-center">暂无可查看的关键日志。</div>
+        )}
+
+        {selectedLogMeta && !selectedLogMeta.exists && !logError && (
+          <div className="text-sm text-gray-500 py-8 text-center">
+            当前日志文件尚未生成：{selectedLogMeta.label}
+          </div>
+        )}
+
+        {selectedLogContent && !logError && (
+          <div>
+            {selectedLogContent.truncated && (
+              <div className="mb-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                当前仅显示最新 {formatBytes(selectedLogContent.returned_bytes)}，完整文件大小 {formatBytes(selectedLogContent.total_size_bytes)}。
+              </div>
+            )}
+            <pre className="bg-slate-950 text-slate-100 rounded p-4 text-xs overflow-auto max-h-[480px] whitespace-pre-wrap break-words">
+              {selectedLogContent.content || '日志为空'}
+            </pre>
+          </div>
+        )}
+
+        {selectedLogMeta?.exists && !selectedLogContent && !logLoading && !logError && (
+          <div className="text-sm text-gray-500 py-8 text-center">日志暂无内容。</div>
+        )}
       </section>
 
       {/* 实时采集记录 */}

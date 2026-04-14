@@ -1,0 +1,24 @@
+<svg width="1200" height="720" viewBox="0 0 1200 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="720" rx="32" fill="#EFF6FF"/>
+  <rect x="40" y="40" width="1120" height="640" rx="28" fill="#FFFFFF" stroke="#BFDBFE" stroke-width="2"/>
+  <rect x="80" y="84" width="1040" height="90" rx="24" fill="#EFF6FF"/>
+  <rect x="120" y="118" width="340" height="20" rx="10" fill="#3B82F6" fill-opacity="0.92"/>
+  <rect x="120" y="150" width="560" height="14" rx="7" fill="#93C5FD"/>
+  <rect x="80" y="210" width="660" height="390" rx="24" fill="#F8FBFF" stroke="#DBEAFE" stroke-width="2"/>
+  <rect x="780" y="210" width="340" height="390" rx="24" fill="#FFFFFF" stroke="#DBEAFE" stroke-width="2"/>
+  <rect x="116" y="248" width="270" height="88" rx="20" fill="#FFFFFF" stroke="#DBEAFE"/>
+  <rect x="116" y="356" width="588" height="206" rx="20" fill="#FFFFFF" stroke="#DBEAFE"/>
+  <rect x="150" y="278" width="110" height="14" rx="7" fill="#60A5FA"/>
+  <rect x="150" y="304" width="188" height="10" rx="5" fill="#BFDBFE"/>
+  <rect x="150" y="394" width="180" height="16" rx="8" fill="#60A5FA"/>
+  <rect x="150" y="430" width="506" height="12" rx="6" fill="#BFDBFE"/>
+  <rect x="150" y="462" width="474" height="12" rx="6" fill="#BFDBFE"/>
+  <rect x="150" y="494" width="390" height="12" rx="6" fill="#BFDBFE"/>
+  <rect x="150" y="526" width="428" height="12" rx="6" fill="#BFDBFE"/>
+  <rect x="816" y="252" width="90" height="14" rx="7" fill="#60A5FA"/>
+  <rect x="816" y="284" width="228" height="12" rx="6" fill="#BFDBFE"/>
+  <rect x="816" y="332" width="256" height="96" rx="18" fill="#EFF6FF"/>
+  <rect x="816" y="456" width="256" height="96" rx="18" fill="#EFF6FF"/>
+  <text x="80" y="630" fill="#1D4ED8" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial" font-size="46" font-weight="700">问答面板 / 吃面包</text>
+  <text x="80" y="672" fill="#2563EB" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial" font-size="24">结合历史上下文、知识与模板，回答不再从零开始</text>
+</svg>

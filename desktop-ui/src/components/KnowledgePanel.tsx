@@ -7,6 +7,8 @@
 
 import React, { useCallback, useState, useEffect } from 'react'
 
+import { useAppStore } from '../store/useAppStore'
+
 interface KnowledgeEntry {
   id: number
   capture_id: number
@@ -30,11 +32,14 @@ interface KnowledgePanelProps {
 }
 
 const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
   const [entries, setEntries] = useState<KnowledgeEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<string>('all')
   const [searchQuery, setSearchQuery] = useState('')
+  const [extracting, setExtracting] = useState(false)
+  const [extractMessage, setExtractMessage] = useState<string | null>(null)
 
   // 加载知识条目
   const loadEntries = useCallback(async () => {
@@ -50,7 +55,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
         params.append('category', filter)
       }
 
-      const response = await fetch(`http://localhost:7070/api/knowledge?${params}`)
+      const response = await fetch(`${apiBaseUrl}/api/knowledge?${params}`)
       if (!response.ok) {
         throw new Error('加载知识库失败')
       }
@@ -62,7 +67,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
     } finally {
       setLoading(false)
     }
-  }, [filter])
+  }, [apiBaseUrl, filter])
 
   // 初始加载
   useEffect(() => {
@@ -72,7 +77,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
   // 验证条目
   const handleVerify = async (id: number) => {
     try {
-      const response = await fetch(`http://localhost:7070/api/knowledge/${id}/verify`, {
+      const response = await fetch(`${apiBaseUrl}/api/knowledge/${id}/verify`, {
         method: 'POST'
       })
 
@@ -94,7 +99,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
     }
 
     try {
-      const response = await fetch(`http://localhost:7070/api/knowledge/${id}`, {
+      const response = await fetch(`${apiBaseUrl}/api/knowledge/${id}`, {
         method: 'DELETE'
       })
 
@@ -124,28 +129,35 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
       return
     }
 
-    setLoading(true)
+    setError('当前版本暂不支持服务端搜索，请先使用分类筛选或直接刷新列表')
+  }
+
+  const handleExtract = async () => {
+    setExtracting(true)
     setError(null)
+    setExtractMessage(null)
 
     try {
-      const response = await fetch(
-        `http://localhost:7070/api/knowledge/search?q=${encodeURIComponent(searchQuery)}&limit=50`
-      )
+      const response = await fetch(`${apiBaseUrl}/api/knowledge/extract`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force_finalize_tail: true }),
+      })
 
+      const data = await response.json().catch(() => ({}))
       if (!response.ok) {
-        throw new Error('搜索失败')
+        throw new Error(data.message || data.error || '触发提炼失败')
       }
 
-      const data = await response.json()
-      setEntries(data.results || [])
+      setExtractMessage(data.message || '已触发知识提炼')
+      await loadEntries()
     } catch (err) {
-      setError(err instanceof Error ? err.message : '搜索失败')
+      setError(err instanceof Error ? err.message : '触发提炼失败')
     } finally {
-      setLoading(false)
+      setExtracting(false)
     }
   }
 
-  // 重要性星级
   const renderStars = (importance: number) => {
     return '⭐'.repeat(importance)
   }
@@ -172,14 +184,26 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
       {/* 标题栏 */}
       <div className="knowledge-panel__header" data-testid="knowledge-panel-header">
         <h2 className="knowledge-panel__title">知识库</h2>
-        <button
-          className="knowledge-panel__refresh"
-          onClick={loadEntries}
-          aria-label="刷新"
-          type="button"
-        >
-          🔄
-        </button>
+        <div className="knowledge-panel__header-actions">
+          <button
+            className="knowledge-panel__extract"
+            onClick={handleExtract}
+            aria-label="提炼知识"
+            type="button"
+            disabled={extracting || loading}
+          >
+            {extracting ? '提炼中...' : '提炼知识'}
+          </button>
+          <button
+            className="knowledge-panel__refresh"
+            onClick={loadEntries}
+            aria-label="刷新"
+            type="button"
+            disabled={loading}
+          >
+            🔄
+          </button>
+        </div>
       </div>
 
       {/* 筛选和搜索 */}
@@ -232,6 +256,13 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
         </div>
       </div>
 
+      {/* 提炼结果 */}
+      {extractMessage && !error && (
+        <div className="knowledge-panel__notice" role="status">
+          {extractMessage}
+        </div>
+      )}
+
       {/* 错误提示 */}
       {error && (
         <div className="knowledge-panel__error" role="alert">
@@ -266,8 +297,8 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
                   {renderStars(entry.importance)}
                 </span>
                 {entry.occurrence_count && entry.occurrence_count > 1 && (
-                  <span className="knowledge-item__count" title="出现次数">
-                    ×{entry.occurrence_count}
+                  <span className="knowledge-item__count" title="重复观察次数">
+                    重复观察 ×{entry.occurrence_count}
                   </span>
                 )}
               </div>

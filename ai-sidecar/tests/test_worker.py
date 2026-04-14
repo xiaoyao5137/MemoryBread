@@ -12,6 +12,8 @@ OcrWorker IPC 集成测试
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 import uuid
 
 import pytest
@@ -166,3 +168,35 @@ class TestOcrWorkerConcurrency:
         assert all(r.status == ResponseStatus.OK for r in responses)
         # 每次调用 make_ocr_request 生成新 UUID，所以 n_tasks 个响应有 n_tasks 个不同 ID
         assert len({r.id for r in responses}) == n_tasks
+
+    async def test_concurrent_requests_share_single_lazy_init(self, jpeg_image_path, make_ocr_request):
+        class ThreadSafeLazyBackend:
+            def __init__(self) -> None:
+                self._loaded = False
+                self._load_lock = threading.Lock()
+                self.load_count = 0
+
+            def is_available(self) -> bool:
+                return True
+
+            def run(self, image_path: str) -> OcrOutput:
+                if not self._loaded:
+                    with self._load_lock:
+                        if not self._loaded:
+                            time.sleep(0.02)
+                            self.load_count += 1
+                            self._loaded = True
+                return OcrOutput(boxes=[OcrBox(text="延迟初始化", confidence=0.91)])
+
+        backend = ThreadSafeLazyBackend()
+        worker = OcrWorker(engine=OcrEngine(primary=backend, fallback=MockOcrBackend(available=False)))
+
+        tasks = [
+            worker.handle(make_ocr_request(screenshot_path=jpeg_image_path))
+            for _ in range(5)
+        ]
+        responses = await asyncio.gather(*tasks)
+
+        assert all(r.status == ResponseStatus.OK for r in responses)
+        assert all(r.result.text == "延迟初始化" for r in responses)
+        assert backend.load_count == 1

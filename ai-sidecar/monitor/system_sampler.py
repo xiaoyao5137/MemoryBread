@@ -24,7 +24,11 @@ DB_PATH = str(Path.home() / ".memory-bread" / "memory-bread.db")
 _PROCESS = psutil.Process(os.getpid())
 _GPU_NAME_CACHE: str | None | bool = False
 _GPU_IOREG_CLASS_CACHE: str | None | bool = False
+_GPU_PERCENT_CACHE: tuple[float, float] | None = None
+_GPU_SAMPLE_CACHE_TTL_SECONDS = 5.0
 _PREV_PROCESS_CPU_TIMES: dict[int, tuple[float, float, float]] = {}
+_PROCESS_SCAN_CACHE: tuple[float, tuple[set[int], dict[str, set[int]], list[str]]] | None = None
+_PROCESS_SCAN_CACHE_TTL_SECONDS = 20.0
 LOG_DIR = Path.home() / ".memory-bread" / "logs"
 SIDECAR_PID_FILE = LOG_DIR / "sidecar.pid"
 MODEL_API_PID_FILE = LOG_DIR / "model_api.pid"
@@ -34,7 +38,18 @@ MODEL_RUNTIME_PORTS = {11434}
 _SCOPE_SYSTEM = "system_global"
 _SCOPE_SUITE = "app_suite_total"
 _SCOPE_MODEL = "model_process_total"
+_SCOPE_MODEL_SERIES = "model_runtime_series"
 _SOURCE = "ai_sidecar"
+
+_MODEL_SERIES_SIDECAR = "sidecar_local_runtime"
+_MODEL_SERIES_MODEL_API = "model_api_runtime"
+_MODEL_SERIES_OLLAMA = "ollama_runtime"
+
+_MODEL_SERIES_LABELS = {
+    _MODEL_SERIES_SIDECAR: "AI Sidecar 本地模型",
+    _MODEL_SERIES_MODEL_API: "Model API Server",
+    _MODEL_SERIES_OLLAMA: "Ollama / 11434",
+}
 
 
 @dataclass
@@ -161,6 +176,8 @@ def _extract_ioreg_number(output: str, field: str) -> float | None:
 
 
 def _sample_gpu_percent() -> float | None:
+    global _GPU_PERCENT_CACHE
+
     raw = os.getenv("WORKBUDDY_GPU_PERCENT")
     if raw:
         try:
@@ -168,6 +185,10 @@ def _sample_gpu_percent() -> float | None:
             return max(0.0, min(100.0, value))
         except Exception:
             pass
+
+    now_monotonic = time.monotonic()
+    if _GPU_PERCENT_CACHE and now_monotonic - _GPU_PERCENT_CACHE[0] < _GPU_SAMPLE_CACHE_TTL_SECONDS:
+        return _GPU_PERCENT_CACHE[1]
 
     class_name = _detect_ioreg_gpu_class()
     if not class_name:
@@ -180,7 +201,9 @@ def _sample_gpu_percent() -> float | None:
     for field in ("Device Utilization %", "Renderer Utilization %", "Tiler Utilization %"):
         value = _extract_ioreg_number(output, field)
         if value is not None:
-            return max(0.0, min(100.0, value))
+            normalized = max(0.0, min(100.0, value))
+            _GPU_PERCENT_CACHE = (now_monotonic, normalized)
+            return normalized
 
     return None
 
@@ -238,34 +261,44 @@ def _candidate_processes() -> list[psutil.Process]:
     return result
 
 
-def _collect_pids_from_pid_files() -> tuple[set[int], set[int]]:
+def _read_pid_scope(path: Path, expected: str) -> set[int]:
+    pid = _read_pid_file(path)
+    if pid is None:
+        return set()
+    proc = _safe_process(pid)
+    if not proc or not _matches_expected(proc, expected):
+        return set()
+    return _descendant_pids(proc)
+
+
+def _collect_pids_from_pid_files() -> tuple[set[int], dict[str, set[int]]]:
     suite_pids: set[int] = set()
-    model_pids: set[int] = set()
-    pid_specs = [
-        (SIDECAR_PID_FILE, "main.py", False),
-        (MODEL_API_PID_FILE, "model_api_server.py", True),
-        (CORE_PID_FILE, "memory-bread", False),
-        (UI_PID_FILE, "tauri:dev", False),
-    ]
+    model_series: dict[str, set[int]] = {
+        _MODEL_SERIES_SIDECAR: _read_pid_scope(SIDECAR_PID_FILE, "main.py"),
+        _MODEL_SERIES_MODEL_API: _read_pid_scope(MODEL_API_PID_FILE, "model_api_server.py"),
+    }
 
-    for pid_file, expected, is_model in pid_specs:
-        pid = _read_pid_file(pid_file)
-        if pid is None:
-            continue
-        proc = _safe_process(pid)
-        if not proc or not _matches_expected(proc, expected):
-            continue
-        pids = _descendant_pids(proc)
-        suite_pids.update(pids)
-        if is_model:
-            model_pids.update(pids)
+    suite_pids.update(model_series[_MODEL_SERIES_SIDECAR])
+    suite_pids.update(model_series[_MODEL_SERIES_MODEL_API])
+    suite_pids.update(_read_pid_scope(CORE_PID_FILE, "memory-bread"))
+    suite_pids.update(_read_pid_scope(UI_PID_FILE, "tauri:dev"))
 
-    return suite_pids, model_pids
+    return suite_pids, model_series
 
 
-def _collect_pids_from_process_scan() -> tuple[set[int], set[int], list[str]]:
+def _collect_pids_from_process_scan() -> tuple[set[int], dict[str, set[int]], list[str]]:
+    global _PROCESS_SCAN_CACHE
+
+    now_monotonic = time.monotonic()
+    if _PROCESS_SCAN_CACHE and now_monotonic - _PROCESS_SCAN_CACHE[0] < _PROCESS_SCAN_CACHE_TTL_SECONDS:
+        return _PROCESS_SCAN_CACHE[1]
+
     suite_pids: set[int] = set()
-    model_pids: set[int] = set()
+    model_series: dict[str, set[int]] = {
+        _MODEL_SERIES_SIDECAR: set(),
+        _MODEL_SERIES_MODEL_API: set(),
+        _MODEL_SERIES_OLLAMA: set(),
+    }
     notes: list[str] = []
 
     for proc in _candidate_processes():
@@ -274,11 +307,13 @@ def _collect_pids_from_process_scan() -> tuple[set[int], set[int], list[str]]:
         name = _process_name(proc)
 
         if any(token in lower_cmd for token in ("/ai-sidecar/main.py", " python main.py")):
-            suite_pids.update(_descendant_pids(proc))
+            pids = _descendant_pids(proc)
+            suite_pids.update(pids)
+            model_series[_MODEL_SERIES_SIDECAR].update(pids)
         elif "model_api_server.py" in lower_cmd:
             pids = _descendant_pids(proc)
             suite_pids.update(pids)
-            model_pids.update(pids)
+            model_series[_MODEL_SERIES_MODEL_API].update(pids)
         elif "target/release/memory-bread" in lower_cmd or name == "memory-bread":
             suite_pids.update(_descendant_pids(proc))
         elif "tauri:dev" in lower_cmd or "vite" in lower_cmd or "memory-bread-desktop" in lower_cmd:
@@ -286,22 +321,12 @@ def _collect_pids_from_process_scan() -> tuple[set[int], set[int], list[str]]:
         elif "ollama" in lower_cmd or name == "ollama":
             pids = _descendant_pids(proc)
             suite_pids.update(pids)
-            model_pids.update(pids)
+            model_series[_MODEL_SERIES_OLLAMA].update(pids)
             notes.append("已纳入 Ollama 相关进程")
 
-        try:
-            connections = proc.net_connections(kind="inet")
-        except (psutil.Error, AttributeError):
-            connections = []
-        for conn in connections:
-            if conn.laddr and conn.laddr.port in MODEL_RUNTIME_PORTS:
-                pids = _descendant_pids(proc)
-                suite_pids.update(pids)
-                model_pids.update(pids)
-                notes.append(f"已纳入监听 {conn.laddr.port} 端口的模型运行时")
-                break
-
-    return suite_pids, model_pids, notes
+    result = (suite_pids, model_series, list(dict.fromkeys(notes)))
+    _PROCESS_SCAN_CACHE = (now_monotonic, result)
+    return result
 
 
 def _sample_process_metrics(
@@ -365,13 +390,53 @@ def _aggregate_processes(pids: set[int], target_name: str, scope: str, coverage_
     return metrics
 
 
-def _collect_scope_metrics() -> tuple[ScopeMetrics, ScopeMetrics]:
+def _build_model_series_note(series_key: str) -> str | None:
+    if series_key == _MODEL_SERIES_SIDECAR:
+        return "sidecar 主进程内承载的本地模型运行时（含 OCR / embedding 等）"
+    if series_key == _MODEL_SERIES_MODEL_API:
+        return "独立 model_api_server 进程"
+    if series_key == _MODEL_SERIES_OLLAMA:
+        return "Ollama / 11434 模型运行时"
+    return None
+
+
+def _build_model_series_metrics(model_series: dict[str, set[int]]) -> list[ScopeMetrics]:
+    series_metrics: list[ScopeMetrics] = []
+    for series_key, pids in model_series.items():
+        if not pids:
+            continue
+        metrics, _ = _sample_process_metrics(
+            pids,
+            _MODEL_SERIES_LABELS.get(series_key, series_key),
+            _SCOPE_MODEL_SERIES,
+            "exact",
+            _build_model_series_note(series_key),
+        )
+        metrics.target_name = series_key
+        series_metrics.append(metrics)
+    return series_metrics
+
+
+def _collect_scope_metrics() -> tuple[ScopeMetrics, ScopeMetrics, list[ScopeMetrics]]:
     global _PREV_PROCESS_CPU_TIMES
 
-    suite_pids, model_pids = _collect_pids_from_pid_files()
-    scan_suite_pids, scan_model_pids, notes = _collect_pids_from_process_scan()
+    suite_pids, file_model_series = _collect_pids_from_pid_files()
+    scan_suite_pids, scan_model_series, notes = _collect_pids_from_process_scan()
     suite_pids.update(scan_suite_pids)
-    model_pids.update(scan_model_pids)
+
+    merged_model_series: dict[str, set[int]] = {
+        _MODEL_SERIES_SIDECAR: set(),
+        _MODEL_SERIES_MODEL_API: set(),
+        _MODEL_SERIES_OLLAMA: set(),
+    }
+    for series_key, pids in file_model_series.items():
+        merged_model_series.setdefault(series_key, set()).update(pids)
+    for series_key, pids in scan_model_series.items():
+        merged_model_series.setdefault(series_key, set()).update(pids)
+
+    model_pids: set[int] = set()
+    for pids in merged_model_series.values():
+        model_pids.update(pids)
 
     suite_note = None
     if not suite_pids:
@@ -386,17 +451,20 @@ def _collect_scope_metrics() -> tuple[ScopeMetrics, ScopeMetrics]:
     else:
         model_status = "partial" if notes else "exact"
         unique_notes = list(dict.fromkeys(notes))
+        if merged_model_series.get(_MODEL_SERIES_SIDECAR):
+            unique_notes.insert(0, "含 sidecar 主进程内本地模型运行时")
         if any("11434" in note for note in unique_notes):
-            model_note = "含 Ollama / 11434 运行时"
+            model_note = "含 sidecar 本地模型 + Ollama / 11434 运行时"
         elif any("Ollama" in note for note in unique_notes):
-            model_note = "含 Ollama 运行时"
+            model_note = "含 sidecar 本地模型 + Ollama 运行时"
         elif unique_notes:
-            model_note = "已合并模型运行时"
+            model_note = "含 sidecar 本地模型运行时"
         else:
             model_note = None
 
     suite_metrics, suite_times = _sample_process_metrics(suite_pids, "memory_bread_suite", _SCOPE_SUITE, suite_status, suite_note)
     model_metrics, model_times = _sample_process_metrics(model_pids, "model_runtime", _SCOPE_MODEL, model_status, model_note)
+    model_series_metrics = _build_model_series_metrics(merged_model_series)
 
     live_times = {**suite_times, **model_times}
     _PREV_PROCESS_CPU_TIMES = {
@@ -406,7 +474,7 @@ def _collect_scope_metrics() -> tuple[ScopeMetrics, ScopeMetrics]:
     }
     _PREV_PROCESS_CPU_TIMES.update(live_times)
 
-    return suite_metrics, model_metrics
+    return suite_metrics, model_metrics, model_series_metrics
 
 
 def _sample_system_snapshot(prev_disk_counters) -> tuple[SystemSnapshot, object]:
@@ -475,7 +543,7 @@ def _sample_once(
 ):
     try:
         snapshot, curr_disk = _sample_system_snapshot(prev_disk_counters)
-        suite_metrics, model_metrics = _collect_scope_metrics()
+        suite_metrics, model_metrics, model_series_metrics = _collect_scope_metrics()
         ts = int(time.time() * 1000)
         conn = sqlite3.connect(db_path)
         _ensure_columns(conn)
@@ -489,7 +557,7 @@ def _sample_once(
             coverage_status="exact",
             coverage_note=None,
         )
-        for metric in (system_metrics, suite_metrics, model_metrics):
+        for metric in (system_metrics, suite_metrics, model_metrics, *model_series_metrics):
             _insert_scope_metric(conn, ts, context, snapshot, metric)
 
         conn.commit()

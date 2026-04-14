@@ -6,6 +6,12 @@
 //! 测试环境：`capture_and_save` 返回 None，不调用系统 API。
 
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+use image::{imageops::FilterType, DynamicImage};
 
 use super::CaptureError;
 
@@ -20,6 +26,8 @@ pub struct ScreenshotResult {
     pub relative_path: String,
     /// 截图文件的完整磁盘路径
     pub full_path: PathBuf,
+    /// 感知哈希（dHash）用于近似去重
+    pub dhash: u64,
     /// 图像宽度（像素）
     pub width: u32,
     /// 图像高度（像素）
@@ -45,9 +53,7 @@ pub fn capture_and_save(
     }
     #[cfg(test)]
     {
-        // 测试环境：不调用系统截图 API，直接返回 None
-        let _ = (captures_dir, quality);
-        Ok(None)
+        capture_test(captures_dir, quality)
     }
 }
 
@@ -56,6 +62,66 @@ pub fn capture_and_save(
 /// 格式：`screenshots/{timestamp_ms}.jpg`
 pub fn make_relative_path(ts_ms: i64) -> String {
     format!("screenshots/{}.jpg", ts_ms)
+}
+
+/// 计算图像的 64-bit dHash（difference hash）。
+pub fn compute_dhash64(image: &DynamicImage) -> u64 {
+    let resized = image
+        .resize_exact(9, 8, FilterType::Triangle)
+        .grayscale()
+        .to_luma8();
+
+    let mut hash = 0u64;
+    for y in 0..8 {
+        for x in 0..8 {
+            let left = resized.get_pixel(x, y)[0];
+            let right = resized.get_pixel(x + 1, y)[0];
+            hash <<= 1;
+            if left > right {
+                hash |= 1;
+            }
+        }
+    }
+
+    hash
+}
+
+/// 计算两个 dHash 的汉明距离。
+pub fn hamming_distance(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct TestScreenshotFixture {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+#[cfg(test)]
+fn test_screenshot_queue() -> &'static Mutex<VecDeque<TestScreenshotFixture>> {
+    static TEST_SCREENSHOT_QUEUE: OnceLock<Mutex<VecDeque<TestScreenshotFixture>>> = OnceLock::new();
+    TEST_SCREENSHOT_QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_screenshots() {
+    if let Ok(mut guard) = test_screenshot_queue().lock() {
+        guard.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn push_test_screenshot(width: u32, height: u32, pixels: Vec<u8>) {
+    let fixture = TestScreenshotFixture { width, height, pixels };
+    test_screenshot_queue().lock().unwrap().push_back(fixture);
+}
+
+#[cfg(test)]
+pub(crate) fn push_test_screenshot_from_image(image: &DynamicImage) {
+    let rgb = image.to_rgb8();
+    push_test_screenshot(rgb.width(), rgb.height(), rgb.into_raw());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,7 +134,6 @@ fn capture_real(
     quality:      u8,
 ) -> Result<Option<ScreenshotResult>, CaptureError> {
     use image::codecs::jpeg::JpegEncoder;
-    use image::DynamicImage;
     use std::fs;
     use std::io::BufWriter;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,7 +168,9 @@ fn capture_real(
     }
 
     // RGBA → RGB（JPEG 不支持透明通道）
-    let rgb_image = DynamicImage::ImageRgba8(rgba_image).into_rgb8();
+    let dynamic = DynamicImage::ImageRgba8(rgba_image);
+    let dhash = compute_dhash64(&dynamic);
+    let rgb_image = dynamic.into_rgb8();
 
     // 编码为 JPEG（指定质量）
     let file   = fs::File::create(&full_path)?;
@@ -112,12 +179,68 @@ fn capture_real(
     encoder
         .encode_image(&DynamicImage::ImageRgb8(rgb_image))
         .map_err(|e| CaptureError::ImageError(e.to_string()))?;
+    drop(encoder);
 
     let file_size = fs::metadata(&full_path)?.len();
 
     Ok(Some(ScreenshotResult {
         relative_path,
         full_path,
+        dhash,
+        width,
+        height,
+        file_size,
+    }))
+}
+
+#[cfg(test)]
+fn capture_test(
+    captures_dir: &Path,
+    quality:      u8,
+) -> Result<Option<ScreenshotResult>, CaptureError> {
+    use image::{codecs::jpeg::JpegEncoder, RgbImage};
+    use std::fs;
+    use std::io::BufWriter;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let fixture = match test_screenshot_queue().lock().unwrap().pop_front() {
+        Some(fixture) => fixture,
+        None => return Ok(None),
+    };
+
+    let TestScreenshotFixture { width, height, pixels } = fixture;
+    let rgb_image = RgbImage::from_raw(width, height, pixels)
+        .ok_or_else(|| CaptureError::ImageError("invalid test screenshot pixels".to_string()))?;
+
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let relative_path = make_relative_path(ts_ms);
+    let full_path = captures_dir.join(&relative_path);
+
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let dynamic = DynamicImage::ImageRgb8(rgb_image);
+    let dhash = compute_dhash64(&dynamic);
+
+    let file = fs::File::create(&full_path)?;
+    let writer = BufWriter::new(file);
+    let mut encoder = JpegEncoder::new_with_quality(writer, quality);
+    encoder
+        .encode_image(&dynamic)
+        .map_err(|e| CaptureError::ImageError(e.to_string()))?;
+    drop(encoder);
+
+    let file_size = fs::metadata(&full_path)?.len();
+
+    Ok(Some(ScreenshotResult {
+        relative_path,
+        full_path,
+        dhash,
         width,
         height,
         file_size,
@@ -131,13 +254,15 @@ fn capture_real(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{DynamicImage, GrayImage, Luma, RgbImage};
     use tempfile::tempdir;
 
     #[test]
     fn test_capture_returns_none_in_test_env() {
+        clear_test_screenshots();
         let dir = tempdir().unwrap();
         let result = capture_and_save(dir.path(), 80).unwrap();
-        assert!(result.is_none(), "测试环境不应产生真实截图");
+        assert!(result.is_none(), "测试环境未注入截图时不应产生截图");
     }
 
     #[test]
@@ -154,6 +279,49 @@ mod tests {
         let p1 = make_relative_path(1_000_000_000);
         let p2 = make_relative_path(1_000_000_001);
         assert_ne!(p1, p2);
+    }
+
+    fn gradient_image(offset: u8) -> DynamicImage {
+        let mut image = GrayImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let value = x as u8 ^ offset ^ ((y as u8) >> 2);
+                image.put_pixel(x, y, Luma([value]));
+            }
+        }
+        DynamicImage::ImageLuma8(image)
+    }
+
+    #[test]
+    fn test_compute_dhash64_same_image_same_hash() {
+        let image = gradient_image(0);
+        let hash1 = compute_dhash64(&image);
+        let hash2 = compute_dhash64(&image);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_hamming_distance_counts_bit_differences() {
+        let hash = 0b1011u64;
+        assert_eq!(hamming_distance(hash, hash), 0);
+        assert_eq!(hamming_distance(hash, hash ^ 0b1), 1);
+        assert_eq!(hamming_distance(hash, hash ^ 0b11), 2);
+    }
+
+    #[test]
+    fn test_capture_test_returns_fixture_with_dhash() {
+        clear_test_screenshots();
+        let dir = tempdir().unwrap();
+        let image = DynamicImage::ImageRgb8(RgbImage::from_fn(16, 16, |x, y| {
+            image::Rgb([(x * 3) as u8, (y * 5) as u8, (x + y) as u8])
+        }));
+        let expected_hash = compute_dhash64(&image);
+        push_test_screenshot_from_image(&image);
+
+        let result = capture_and_save(dir.path(), 80).unwrap().unwrap();
+        assert_eq!(result.dhash, expected_hash);
+        assert!(result.full_path.exists());
+        assert!(result.file_size > 0);
     }
 
     /// 验证 image crate 的 JPEG 编码流程（不依赖系统截图 API）

@@ -1,0 +1,20 @@
+<svg width="1200" height="720" viewBox="0 0 1200 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="720" rx="32" fill="#F0FDF4"/>
+  <rect x="40" y="40" width="1120" height="640" rx="28" fill="#FFFFFF" stroke="#BBF7D0" stroke-width="2"/>
+  <rect x="80" y="84" width="1040" height="100" rx="24" fill="#F0FDF4"/>
+  <rect x="120" y="120" width="330" height="20" rx="10" fill="#22C55E" fill-opacity="0.92"/>
+  <rect x="120" y="152" width="540" height="14" rx="7" fill="#86EFAC"/>
+  <rect x="80" y="222" width="300" height="330" rx="24" fill="#FFFFFF" stroke="#DCFCE7" stroke-width="2"/>
+  <rect x="410" y="222" width="710" height="330" rx="24" fill="#FFFFFF" stroke="#DCFCE7" stroke-width="2"/>
+  <rect x="114" y="260" width="120" height="16" rx="8" fill="#4ADE80"/>
+  <rect x="114" y="298" width="228" height="92" rx="18" fill="#F0FDF4"/>
+  <rect x="114" y="410" width="228" height="92" rx="18" fill="#F0FDF4"/>
+  <rect x="448" y="260" width="140" height="16" rx="8" fill="#4ADE80"/>
+  <rect x="448" y="300" width="622" height="18" rx="9" fill="#DCFCE7"/>
+  <rect x="448" y="336" width="578" height="18" rx="9" fill="#DCFCE7"/>
+  <rect x="448" y="388" width="290" height="104" rx="20" fill="#F0FDF4"/>
+  <rect x="780" y="388" width="290" height="104" rx="20" fill="#F0FDF4"/>
+  <rect x="80" y="584" width="1040" height="44" rx="22" fill="#22C55E" fill-opacity="0.1"/>
+  <text x="80" y="630" fill="#15803D" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial" font-size="46" font-weight="700">烤面包 / 内容加工区</text>
+  <text x="80" y="672" fill="#16A34A" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial" font-size="24">把捕获、知识与经验继续提炼成模板、SOP 和问答增强资产</text>
+</svg>

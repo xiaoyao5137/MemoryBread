@@ -7,6 +7,7 @@
 //! - 引擎本身不包含事件监听逻辑（由 `listener` 模块或外部注入）
 //! - 这使得引擎在测试中可以完全脱离系统 API 运行
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,7 +24,7 @@ use crate::storage::{
 use super::{
     ax::{get_frontmost_info_async, AXInfo},
     filter::PrivacyFilter,
-    screenshot::capture_and_save,
+    screenshot::{capture_and_save, hamming_distance},
     CaptureError,
 };
 
@@ -144,12 +145,48 @@ impl CachedContext {
     }
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct PeriodicSceneKey {
+    app_identity: String,
+    win_title: String,
+}
+
+impl PeriodicSceneKey {
+    fn from_ax_info(info: &AXInfo) -> Option<Self> {
+        let app_identity = info
+            .app_bundle_id
+            .as_deref()
+            .or(info.app_name.as_deref())?
+            .trim();
+        if app_identity.is_empty() {
+            return None;
+        }
+
+        let win_title = info.win_title.as_deref().unwrap_or("").trim();
+        Some(Self {
+            app_identity: app_identity.to_string(),
+            win_title: win_title.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecentFrameFingerprint {
+    ts_ms: i64,
+    dhash: u64,
+}
+
+const PERIODIC_DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
+const PERIODIC_DHASH_SKIP_DISTANCE: u32 = 1;
+const PERIODIC_MAX_RECENT_PER_SCENE: usize = 8;
+
 pub struct CaptureEngine {
     storage: StorageManager,
     config:  CaptureConfig,
     filter:  PrivacyFilter,
     ipc_client: Option<IpcClient>,
     last_context: Mutex<Option<CachedContext>>,
+    recent_periodic_frames: Mutex<HashMap<PeriodicSceneKey, VecDeque<RecentFrameFingerprint>>>,
 }
 
 impl CaptureEngine {
@@ -168,6 +205,7 @@ impl CaptureEngine {
             filter: PrivacyFilter::new(),
             ipc_client: Some(ipc_client),
             last_context: Mutex::new(None),
+            recent_periodic_frames: Mutex::new(HashMap::new()),
         }
     }
 
@@ -190,6 +228,7 @@ impl CaptureEngine {
             filter,
             ipc_client: Some(ipc_client),
             last_context: Mutex::new(None),
+            recent_periodic_frames: Mutex::new(HashMap::new()),
         }
     }
 
@@ -217,6 +256,9 @@ impl CaptureEngine {
         let merged = self.merge_ax_and_event(&event, ax_info);
         let cache_hit = ax_missing
             && (merged.app_name.is_some() || merged.win_title.is_some() || merged.app_bundle_id.is_some());
+        let is_periodic_event = matches!(event, CaptureEvent::Periodic);
+        let has_ax_text = has_meaningful_ax_text(&merged);
+        let has_input_text = has_meaningful_input_text(&event);
 
         debug!(
             event = ?event.to_event_type(),
@@ -254,22 +296,65 @@ impl CaptureEngine {
             return Ok(Some(id));
         }
 
-        // 4. 截图（非敏感才截）
-        let screenshot_path = if self.config.enable_screenshot {
+        // 4. 截图 / periodic 去重策略
+        let mut screenshot_path = None;
+        let mut periodic_screenshot_dhash = None;
+        if is_periodic_event {
+            if has_ax_text {
+                debug!(event = ?event.to_event_type(), "跳过截图：periodic_ax_present_lightweight_mode");
+            } else if !self.config.enable_screenshot {
+                debug!(event = ?event.to_event_type(), "跳过入库：periodic_ax_missing_without_screenshot");
+                return Ok(None);
+            } else if let Some(result) = capture_and_save(&self.config.captures_dir, self.config.screenshot_quality)? {
+                let duplicate = self.should_skip_periodic_capture(&merged, ts, result.dhash);
+                if duplicate {
+                    delete_screenshot_file(&result.full_path);
+                    debug!(
+                        event = ?event.to_event_type(),
+                        path = %result.relative_path,
+                        "跳过入库：periodic_visual_duplicate"
+                    );
+                    return Ok(None);
+                }
+
+                debug!(path = %result.relative_path, dhash = result.dhash, "periodic 截图已保存，等待 OCR 兜底");
+                periodic_screenshot_dhash = Some(result.dhash);
+                screenshot_path = Some(result.relative_path);
+            } else {
+                debug!(event = ?event.to_event_type(), "跳过入库：periodic_ax_missing_without_screenshot_result");
+                return Ok(None);
+            }
+        } else if self.config.enable_screenshot {
             match capture_and_save(&self.config.captures_dir, self.config.screenshot_quality)? {
                 Some(result) => {
                     debug!(path = %result.relative_path, "截图已保存");
-                    Some(result.relative_path)
+                    screenshot_path = Some(result.relative_path);
                 }
-                None => None,
+                None => {}
             }
-        } else {
-            None
-        };
+        }
+
+        if !has_ax_text && screenshot_path.is_none() && !has_input_text {
+            debug!(
+                event = ?event.to_event_type(),
+                app = ?merged.app_name,
+                win_title = ?merged.win_title,
+                "跳过入库：empty_capture_payload"
+            );
+            return Ok(None);
+        }
 
         // 5. 写入数据库
         let id = self.save_capture(ts, &merged, &event, screenshot_path.clone(), false)?;
         self.update_cached_context(&merged);
+        if is_periodic_event {
+            if let (Some(scene_key), Some(dhash)) = (
+                PeriodicSceneKey::from_ax_info(&merged),
+                periodic_screenshot_dhash,
+            ) {
+                self.record_periodic_frame(scene_key, ts, dhash);
+            }
+        }
         debug!(
             id,
             event = ?event.to_event_type(),
@@ -280,8 +365,8 @@ impl CaptureEngine {
             "采集完成"
         );
 
-        // 6. 异步调用 OCR（如果 AX 文本为空且有截图）
-        if merged.extracted_text.is_none() {
+        // 6. 异步调用 OCR（只要 AX 正文缺失且有截图就允许）
+        if !has_ax_text {
             if screenshot_path.is_none() {
                 debug!(id, "跳过 OCR：no_screenshot");
             } else if let Some(ref ipc_client) = self.ipc_client {
@@ -323,11 +408,7 @@ impl CaptureEngine {
                                     return;
                                 }
 
-                                debug!(id, "OCR 文本已回写");
-
-                                // OCR 成功后，立即触发向量化
-                                Self::trigger_embedding(ipc_client, storage, id, ocr_result.text)
-                                    .await;
+                                debug!(id, "OCR 文本已回写，等待后台批处理统一向量化");
                             }
                             Ok(Ok(Err(e))) => {
                                 warn!(id, "OCR 调用失败: {}", e);
@@ -345,16 +426,7 @@ impl CaptureEngine {
                 debug!(id, app = ?merged.app_name, "跳过 OCR：sidecar_unavailable");
             }
         } else {
-            debug!(id, ax_text_len = merged.extracted_text.as_ref().map(|t| t.len()), "跳过 OCR：ax_present");
-            // 7. 如果 AX 已经有文本，直接触发向量化
-            if let Some(ref ipc_client) = self.ipc_client {
-                let ipc_client = ipc_client.clone();
-                let storage = self.storage.clone();
-                let text = merged.extracted_text.unwrap();
-                tokio::spawn(async move {
-                    Self::trigger_embedding(ipc_client, storage, id, text).await;
-                });
-            }
+            debug!(id, ax_text_len = merged.extracted_text.as_ref().map(|t| t.len()), "跳过 OCR：ax_present，等待后台批处理统一向量化");
         }
 
         Ok(Some(id))
@@ -434,6 +506,33 @@ impl CaptureEngine {
         }
     }
 
+    fn should_skip_periodic_capture(&self, info: &AXInfo, ts: i64, dhash: u64) -> bool {
+        let Some(scene_key) = PeriodicSceneKey::from_ax_info(info) else {
+            return false;
+        };
+
+        let Ok(mut guard) = self.recent_periodic_frames.lock() else {
+            return false;
+        };
+
+        let entry = guard.entry(scene_key).or_default();
+        prune_recent_frames(entry, ts);
+        entry.iter().any(|frame| hamming_distance(frame.dhash, dhash) <= PERIODIC_DHASH_SKIP_DISTANCE)
+    }
+
+    fn record_periodic_frame(&self, scene_key: PeriodicSceneKey, ts: i64, dhash: u64) {
+        let Ok(mut guard) = self.recent_periodic_frames.lock() else {
+            return;
+        };
+
+        let entry = guard.entry(scene_key).or_default();
+        prune_recent_frames(entry, ts);
+        entry.push_back(RecentFrameFingerprint { ts_ms: ts, dhash });
+        while entry.len() > PERIODIC_MAX_RECENT_PER_SCENE {
+            entry.pop_front();
+        }
+    }
+
     /// 构造并写入 captures 记录。
     fn save_capture(
         &self,
@@ -471,6 +570,35 @@ fn current_ts_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("time went backwards")
         .as_millis() as i64
+}
+
+fn has_meaningful_ax_text(info: &AXInfo) -> bool {
+    info.extracted_text
+        .as_deref()
+        .map(|text| !text.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn has_meaningful_input_text(event: &CaptureEvent) -> bool {
+    event.input_text()
+        .map(|text| !text.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn prune_recent_frames(frames: &mut VecDeque<RecentFrameFingerprint>, now_ts: i64) {
+    while let Some(front) = frames.front() {
+        if now_ts - front.ts_ms > PERIODIC_DEDUP_WINDOW_MS {
+            frames.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn delete_screenshot_file(path: &std::path::Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        warn!(path = ?path, "删除去重截图失败: {}", err);
+    }
 }
 
 impl CaptureEngine {
@@ -553,35 +681,68 @@ impl CaptureEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::screenshot::{clear_test_screenshots, push_test_screenshot_from_image};
     use crate::storage::repo::capture::CaptureFilter;
     use crate::storage::StorageManager;
+    use image::{DynamicImage, GrayImage, Luma};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn make_test_captures_dir() -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("memory-bread-test-captures-{}-{}", current_ts_ms(), suffix));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     /// 创建测试用引擎（关闭截图和 AX，全部走 mock）
     fn make_engine() -> CaptureEngine {
         let storage = StorageManager::open_in_memory().unwrap();
         let config = CaptureConfig {
-            enable_screenshot: false,
+            captures_dir:       make_test_captures_dir(),
+            enable_screenshot:  false,
             enable_ax:         false,
             ..Default::default()
         };
         CaptureEngine::new(storage, config)
     }
 
+    fn make_engine_with_screenshot() -> CaptureEngine {
+        let storage = StorageManager::open_in_memory().unwrap();
+        let config = CaptureConfig {
+            captures_dir:       make_test_captures_dir(),
+            enable_screenshot:  true,
+            enable_ax:         false,
+            ..Default::default()
+        };
+        CaptureEngine::new(storage, config)
+    }
+
+    fn gradient_image(offset: u8) -> DynamicImage {
+        let mut image = GrayImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let value = x as u8 ^ offset ^ ((y as u8) >> 2);
+                image.put_pixel(x, y, Luma([value]));
+            }
+        }
+        DynamicImage::ImageLuma8(image)
+    }
+
     // ── 单事件处理 ────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_mouse_click_stored() {
+    async fn test_mouse_click_without_payload_skips_insert() {
         let engine = make_engine();
-        let id = engine
+        let result = engine
             .process_event(CaptureEvent::MouseClick { x: 100.0, y: 200.0 })
             .await
-            .unwrap()
             .unwrap();
 
-        let rec = engine.storage.get_capture(id).unwrap().unwrap();
-        assert_eq!(rec.event_type, "mouse_click");
-        assert!(!rec.is_sensitive);
-        assert!(rec.screenshot_path.is_none()); // 截图已禁用
+        assert!(result.is_none());
+        let list = engine.storage.list_captures(&CaptureFilter::new()).unwrap();
+        assert!(list.is_empty());
     }
 
     #[tokio::test]
@@ -601,16 +762,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_app_switch_stores_app_info() {
+    async fn test_key_pause_with_blank_input_skips_insert() {
         let engine = make_engine();
-        let id = engine
+        let result = engine
+            .process_event(CaptureEvent::KeyPause {
+                input_buffer: "   ".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        let list = engine.storage.list_captures(&CaptureFilter::new()).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_app_switch_without_payload_skips_insert() {
+        let engine = make_engine();
+        let result = engine
             .process_event(CaptureEvent::AppSwitch {
                 app_name:  "Feishu".into(),
                 bundle_id: Some("com.feishu.feishu".into()),
                 win_title: "工作群".into(),
             })
             .await
-            .unwrap()
+            .unwrap();
+
+        assert!(result.is_none());
+        let list = engine.storage.list_captures(&CaptureFilter::new()).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_app_switch_with_ax_text_stores_app_info() {
+        let engine = make_engine();
+        let ts = current_ts_ms();
+        let ax = AXInfo {
+            app_name: Some("Feishu".into()),
+            app_bundle_id: Some("com.feishu.feishu".into()),
+            win_title: Some("工作群".into()),
+            extracted_text: Some("项目同步中".into()),
+            ..Default::default()
+        };
+
+        let id = engine
+            .save_capture(ts, &ax, &CaptureEvent::AppSwitch {
+                app_name:  "Feishu".into(),
+                bundle_id: Some("com.feishu.feishu".into()),
+                win_title: "工作群".into(),
+            }, None, false)
             .unwrap();
 
         let rec = engine.storage.get_capture(id).unwrap().unwrap();
@@ -618,11 +818,82 @@ mod tests {
         assert_eq!(rec.app_name.as_deref(), Some("Feishu"));
         assert_eq!(rec.app_bundle_id.as_deref(), Some("com.feishu.feishu"));
         assert_eq!(rec.win_title.as_deref(), Some("工作群"));
+        assert_eq!(rec.ax_text.as_deref(), Some("项目同步中"));
+    }
+
+    #[tokio::test]
+    async fn test_scroll_without_payload_skips_insert() {
+        let engine = make_engine();
+        let result = engine.process_event(CaptureEvent::Scroll).await.unwrap();
+
+        assert!(result.is_none());
+        let list = engine.storage.list_captures(&CaptureFilter::new()).unwrap();
+        assert!(list.is_empty());
     }
 
     #[tokio::test]
     async fn test_periodic_event() {
         let engine = make_engine();
+        let result = engine
+            .process_event(CaptureEvent::Periodic)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        let list = engine.storage.list_captures(&CaptureFilter::new()).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_periodic_with_ax_text_stays_lightweight() {
+        let engine = make_engine_with_screenshot();
+        let ts = current_ts_ms();
+        let ax = AXInfo {
+            app_name: Some("Chrome".into()),
+            app_bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("Doc".into()),
+            extracted_text: Some("这是一段 AX 正文".into()),
+            ..Default::default()
+        };
+
+        let id = engine
+            .save_capture(ts, &ax, &CaptureEvent::Periodic, None, false)
+            .unwrap();
+        let rec = engine.storage.get_capture(id).unwrap().unwrap();
+        assert_eq!(rec.event_type, "auto");
+        assert!(rec.screenshot_path.is_none());
+        assert_eq!(rec.ax_text.as_deref(), Some("这是一段 AX 正文"));
+    }
+
+    #[tokio::test]
+    async fn test_periodic_ax_missing_without_screenshot_skips_insert() {
+        let engine = make_engine();
+        engine.update_cached_context(&AXInfo {
+            app_name: Some("Chrome".into()),
+            app_bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("Doc".into()),
+            ..Default::default()
+        });
+
+        let result = engine.process_event(CaptureEvent::Periodic).await.unwrap();
+        assert!(result.is_none());
+
+        let list = engine.storage.list_captures(&CaptureFilter::new()).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_periodic_ax_missing_with_new_frame_inserts_capture_and_keeps_screenshot() {
+        clear_test_screenshots();
+        let engine = make_engine_with_screenshot();
+        engine.update_cached_context(&AXInfo {
+            app_name: Some("Chrome".into()),
+            app_bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("Doc".into()),
+            ..Default::default()
+        });
+        push_test_screenshot_from_image(&gradient_image(0));
+
         let id = engine
             .process_event(CaptureEvent::Periodic)
             .await
@@ -631,19 +902,107 @@ mod tests {
 
         let rec = engine.storage.get_capture(id).unwrap().unwrap();
         assert_eq!(rec.event_type, "auto");
+        assert!(rec.screenshot_path.is_some());
+        assert!(rec.ax_text.is_none());
     }
 
     #[tokio::test]
-    async fn test_manual_event() {
-        let engine = make_engine();
-        let id = engine
-            .process_event(CaptureEvent::Manual)
+    async fn test_periodic_ax_missing_duplicate_frame_skips_insert_and_deletes_file() {
+        clear_test_screenshots();
+        let engine = make_engine_with_screenshot();
+        engine.update_cached_context(&AXInfo {
+            app_name: Some("Chrome".into()),
+            app_bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("Doc".into()),
+            ..Default::default()
+        });
+        let screenshot_dir = engine.config.captures_dir.join("screenshots");
+        let baseline_files = std::fs::read_dir(&screenshot_dir)
+            .ok()
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or(0);
+        push_test_screenshot_from_image(&gradient_image(0));
+        let first_id = engine
+            .process_event(CaptureEvent::Periodic)
             .await
             .unwrap()
             .unwrap();
+        let first = engine.storage.get_capture(first_id).unwrap().unwrap();
+        let first_path = engine
+            .config
+            .captures_dir
+            .join(first.screenshot_path.as_deref().unwrap());
+        assert!(first_path.exists());
 
-        let rec = engine.storage.get_capture(id).unwrap().unwrap();
-        assert_eq!(rec.event_type, "manual");
+        push_test_screenshot_from_image(&gradient_image(0));
+        let result = engine.process_event(CaptureEvent::Periodic).await.unwrap();
+        assert!(result.is_none());
+
+        let list = engine.storage.list_captures(&CaptureFilter::new()).unwrap();
+        assert_eq!(list.len(), 1);
+
+        let screenshot_files = std::fs::read_dir(&screenshot_dir)
+            .ok()
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or(0);
+        assert_eq!(screenshot_files, baseline_files + 1, "重复截图文件应被清理");
+    }
+
+    #[test]
+    fn test_periodic_dedup_distance_threshold() {
+        let engine = make_engine_with_screenshot();
+        let info = AXInfo {
+            app_name: Some("Chrome".into()),
+            app_bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("Doc".into()),
+            ..Default::default()
+        };
+        let scene_key = PeriodicSceneKey::from_ax_info(&info).unwrap();
+        let now = current_ts_ms();
+
+        engine.record_periodic_frame(scene_key.clone(), now, 0);
+        assert!(engine.should_skip_periodic_capture(&info, now, 1));
+        assert!(!engine.should_skip_periodic_capture(&info, now, 3));
+
+        engine.record_periodic_frame(scene_key, now - PERIODIC_DEDUP_WINDOW_MS - 1, 0);
+        assert!(!engine.should_skip_periodic_capture(&info, now, 3));
+    }
+
+    #[test]
+    fn test_periodic_dedup_expired_frame_no_longer_skips() {
+        let engine = make_engine_with_screenshot();
+        let info = AXInfo {
+            app_name: Some("Chrome".into()),
+            app_bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("Doc".into()),
+            ..Default::default()
+        };
+        let scene_key = PeriodicSceneKey::from_ax_info(&info).unwrap();
+        let now = current_ts_ms();
+
+        engine.record_periodic_frame(scene_key, now - PERIODIC_DEDUP_WINDOW_MS - 10, 0);
+        assert!(!engine.should_skip_periodic_capture(&info, now, 0));
+    }
+
+    #[test]
+    fn test_periodic_dedup_different_scene_key_does_not_collide() {
+        let engine = make_engine_with_screenshot();
+        let chrome = AXInfo {
+            app_name: Some("Chrome".into()),
+            app_bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("Doc".into()),
+            ..Default::default()
+        };
+        let safari = AXInfo {
+            app_name: Some("Safari".into()),
+            app_bundle_id: Some("com.apple.Safari".into()),
+            win_title: Some("Doc".into()),
+            ..Default::default()
+        };
+        let now = current_ts_ms();
+
+        engine.record_periodic_frame(PeriodicSceneKey::from_ax_info(&chrome).unwrap(), now, 0);
+        assert!(!engine.should_skip_periodic_capture(&safari, now, 0));
     }
 
     // ── 隐私过滤 ──────────────────────────────────────────────────────────
@@ -745,16 +1104,19 @@ mod tests {
         let engine = CaptureEngine::new(storage, config);
         let (tx, rx) = mpsc::channel::<CaptureEvent>(16);
 
-        // 发送 3 个事件后关闭 channel
+        // 发送 4 个事件后关闭 channel，仅保留带输入文本的 key pause
         tx.send(CaptureEvent::Manual).await.unwrap();
         tx.send(CaptureEvent::Periodic).await.unwrap();
         tx.send(CaptureEvent::Scroll).await.unwrap();
+        tx.send(CaptureEvent::KeyPause { input_buffer: "hello".into() }).await.unwrap();
         drop(tx); // channel 关闭后 run() 返回
 
         engine.run(rx).await.unwrap();
 
         let list = storage_clone.list_captures(&CaptureFilter::new()).unwrap();
-        assert_eq!(list.len(), 3, "应有 3 条采集记录");
+        assert_eq!(list.len(), 1, "空壳事件应被统一跳过，仅保留带输入文本的 key_pause");
+        assert_eq!(list[0].event_type, "key_pause");
+        assert_eq!(list[0].input_text.as_deref(), Some("hello"));
     }
 
     // ── CaptureEvent 方法 ─────────────────────────────────────────────────
@@ -782,12 +1144,19 @@ mod tests {
     fn test_event_input_text() {
         let e1 = CaptureEvent::KeyPause { input_buffer: "hello".into() };
         assert_eq!(e1.input_text(), Some("hello"));
+        assert!(has_meaningful_input_text(&e1));
 
         let e2 = CaptureEvent::Manual;
         assert!(e2.input_text().is_none());
+        assert!(!has_meaningful_input_text(&e2));
 
         let e3 = CaptureEvent::MouseClick { x: 1.0, y: 2.0 };
         assert!(e3.input_text().is_none());
+        assert!(!has_meaningful_input_text(&e3));
+
+        let e4 = CaptureEvent::KeyPause { input_buffer: "   ".into() };
+        assert_eq!(e4.input_text(), Some("   "));
+        assert!(!has_meaningful_input_text(&e4));
     }
 
     #[test]

@@ -2,13 +2,14 @@ import React, { useEffect } from 'react'
 import { useAppStore }        from './store/useAppStore'
 import FloatingBuddy          from './components/FloatingBuddy'
 import RagPanel               from './components/RagPanel.v2'
-import KnowledgePanel         from './components/KnowledgePanel'
+import RepositoryPanel        from './components/RepositoryPanel'
 import ModelManager           from './components/ModelManager'
 import ActionConfirm          from './components/ActionConfirm'
 import Settings               from './components/Settings'
 import DebugPanel             from './components/DebugPanel'
 import ScheduledTasksPanel    from './components/ScheduledTasksPanel'
 import MonitorPanel           from './components/MonitorPanel'
+import BakePanel              from './components/BakePanel'
 import OnboardingWizard       from './components/OnboardingWizard'
 
 const App: React.FC = () => {
@@ -48,12 +49,13 @@ const App: React.FC = () => {
 
       <main className="app-content">
         {windowMode === 'rag'       && <RagPanel />}
-        {windowMode === 'knowledge' && <KnowledgePanel />}
+        {windowMode === 'knowledge' && <RepositoryPanel />}
         {windowMode === 'models'    && <ModelManager />}
         {windowMode === 'settings'  && <Settings />}
         {windowMode === 'debug'     && <DebugPanel />}
         {windowMode === 'tasks'     && <ScheduledTasksPanel />}
         {windowMode === 'monitor'   && <MonitorPanel />}
+        {windowMode === 'bake'      && <BakePanel />}
       </main>
 
       <ActionConfirm />

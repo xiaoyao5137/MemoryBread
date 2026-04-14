@@ -94,6 +94,8 @@ class MockFts5Retriever:
         is_self_generated: bool | None = None,
         evidence_strengths: list[str] | None = None,
         query_mode: str = "lookup",
+        created_start_ts: int | None = None,
+        created_end_ts: int | None = None,
     ) -> list[RetrievedChunk]:
         self.call_count += 1
         self.last_kwargs = {
@@ -112,6 +114,8 @@ class MockFts5Retriever:
             "is_self_generated": is_self_generated,
             "evidence_strengths": evidence_strengths,
             "query_mode": query_mode,
+            "created_start_ts": created_start_ts,
+            "created_end_ts": created_end_ts,
         }
         return self._chunks[:top_k]
 

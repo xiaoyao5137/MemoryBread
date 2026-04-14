@@ -35,8 +35,22 @@ const MENU_ITEMS: MenuItem[] = [
     )
   },
   {
+    mode: 'bake',
+    label: '烤面包',
+    testId: 'bake-btn',
+    icon: (
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M6 10V8a6 6 0 0 1 12 0v2" />
+        <path d="M4 10h16v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5v-5Z" />
+        <path d="M9 14h.01" />
+        <path d="M12 14h.01" />
+        <path d="M15 14h.01" />
+      </svg>
+    )
+  },
+  {
     mode: 'knowledge',
-    label: '面包仓',
+    label: '醒发箱',
     testId: 'knowledge-btn',
     icon: (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

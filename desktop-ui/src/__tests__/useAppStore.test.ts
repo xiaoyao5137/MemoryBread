@@ -6,14 +6,13 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { useAppStore } from '../store/useAppStore'
 import type { ActionCommand } from '../types'
 
-// 每个测试前重置 store
 beforeEach(() => {
   useAppStore.getState().reset()
 })
 
 describe('windowMode', () => {
-  it('初始状态为 buddy', () => {
-    expect(useAppStore.getState().windowMode).toBe('buddy')
+  it('初始状态为 rag', () => {
+    expect(useAppStore.getState().windowMode).toBe('rag')
   })
 
   it('setWindowMode 切换到 rag', () => {
@@ -26,10 +25,10 @@ describe('windowMode', () => {
     expect(useAppStore.getState().windowMode).toBe('settings')
   })
 
-  it('reset 恢复到 buddy', () => {
-    useAppStore.getState().setWindowMode('rag')
+  it('reset 恢复到 rag', () => {
+    useAppStore.getState().setWindowMode('settings')
     useAppStore.getState().reset()
-    expect(useAppStore.getState().windowMode).toBe('buddy')
+    expect(useAppStore.getState().windowMode).toBe('rag')
   })
 })
 
@@ -80,14 +79,17 @@ describe('RAG 状态', () => {
     const state = useAppStore.getState()
     expect(state.ragQuery).toBe('')
     expect(state.ragAnswer).toBe('')
+    expect(state.ragContexts).toEqual([])
+    expect(state.ragError).toBeNull()
+    expect(state.windowMode).toBe('rag')
   })
 })
 
 describe('Action Confirm 状态', () => {
   const mockAction: ActionCommand = {
-    type:        'click',
-    x:           100,
-    y:           200,
+    type: 'click',
+    x: 100,
+    y: 200,
     description: '点击确认按钮',
   }
 

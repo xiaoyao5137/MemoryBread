@@ -4,6 +4,7 @@
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from werkzeug.exceptions import BadGateway, ServiceUnavailable
 from model_manager import ModelManager, ModelType, AVAILABLE_MODELS as MANAGER_MODELS
 from model_registry import AVAILABLE_MODELS, get_recommendations, get_model, list_models as registry_list
 import psutil
@@ -13,9 +14,18 @@ import json
 import sqlite3
 import time
 import fcntl
+import asyncio
+import sys
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+IPC_PYTHON_DIR = PROJECT_ROOT.parent / "shared" / "ipc-protocol" / "python"
+if str(IPC_PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(IPC_PYTHON_DIR))
+
+from background_processor import BackgroundProcessor
 from monitor.llm_tracker import estimate_tokens, log_llm_usage
+from idle_compute.model_manager import _log_model_event
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +40,49 @@ _rag_lock_fd = open(_RAG_LOCK_FILE, "w")
 model_manager = ModelManager()
 _rag_pipeline = None
 _rag_pipeline_lock = __import__('threading').Lock()
+_bake_extractor = None
+_bake_extractor_lock = __import__('threading').Lock()
 DB_PATH = str(Path.home() / ".memory-bread" / "memory-bread.db")
+
+
+def _read_user_identity() -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM user_preferences WHERE key = 'user.identity_keywords' LIMIT 1"
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return (row[0] or "").strip() if row else ""
+    except Exception as exc:
+        logger.warning("读取用户身份偏好失败: %s", exc)
+        return ""
+
+
+def get_bake_extractor():
+    global _bake_extractor
+    identity = _read_user_identity()
+    active_llm_id = model_manager.config.get('active_llm', 'qwen3.5-4b')
+    active_llm = MANAGER_MODELS.get(active_llm_id)
+    ollama_model = active_llm.model_id if active_llm else 'qwen3.5:4b'
+    cached_identity = getattr(get_bake_extractor, '_cached_identity', None)
+    cached_model = getattr(get_bake_extractor, '_cached_model', None)
+
+    if _bake_extractor is None or cached_identity != identity or cached_model != ollama_model:
+        with _bake_extractor_lock:
+            cached_identity = getattr(get_bake_extractor, '_cached_identity', None)
+            cached_model = getattr(get_bake_extractor, '_cached_model', None)
+            if _bake_extractor is None or cached_identity != identity or cached_model != ollama_model:
+                from knowledge.extractor_v2 import KnowledgeExtractorV2
+                logger.info("初始化 Bake Extractor，model=%s identity=%r", ollama_model, identity)
+                _bake_extractor = KnowledgeExtractorV2(
+                    model=ollama_model,
+                    user_identity=identity,
+                )
+                get_bake_extractor._cached_identity = identity
+                get_bake_extractor._cached_model = ollama_model
+    return _bake_extractor
 
 
 def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[dict], latency_ms: int) -> int | None:
@@ -68,35 +120,52 @@ def get_rag_pipeline():
         with _rag_pipeline_lock:
             if _rag_pipeline is None:
                 logger.info("初始化 RAG pipeline...")
-                from embedding.model import EmbeddingModel
-                from rag.retriever import VectorRetriever, KnowledgeFts5Retriever, Fts5Retriever
-                from rag.llm.ollama import OllamaBackend
-                from rag.pipeline import RagPipeline
-
-                db_path = str(Path.home() / ".memory-bread" / "memory-bread.db")
-                qdrant_path = str(Path.home() / ".qdrant")
-                active_llm_id = model_manager.config.get('active_llm', 'qwen3.5-4b')
-                active_llm = MANAGER_MODELS.get(active_llm_id)
-                ollama_model = active_llm.model_id if active_llm else 'qwen3.5:4b'
-
-                _rag_pipeline = RagPipeline(
-                    embedding_model=EmbeddingModel.create_default(),
-                    vector_retriever=VectorRetriever(
-                        collection="memory_bread_captures",
-                        qdrant_path=qdrant_path,
-                    ),
-                    fts5_retriever=Fts5Retriever(db_path=db_path),
-                    knowledge_retriever=KnowledgeFts5Retriever(db_path=db_path),
-                    llm=OllamaBackend(model=ollama_model, timeout=180, num_predict=1536),
-                    top_k=5,
-                    db_path=db_path,
-                )
-                # 强制预热 embedding，避免首次查询时再加载 BGE 导致超时
                 try:
-                    _rag_pipeline._embed.encode(["预热"])
-                except Exception as e:
-                    logger.warning(f"Embedding 预热失败: {e}")
-                logger.info(f"RAG pipeline 初始化完成，模型: {ollama_model}")
+                    from embedding.model import EmbeddingModel
+                    from rag.retriever import VectorRetriever, KnowledgeFts5Retriever, Fts5Retriever
+                    from rag.llm.ollama import OllamaBackend
+                    from rag.pipeline import RagPipeline
+
+                    db_path = str(Path.home() / ".memory-bread" / "memory-bread.db")
+                    qdrant_path = str(Path.home() / ".qdrant")
+                    active_llm_id = model_manager.config.get('active_llm', 'qwen3.5-4b')
+                    active_llm = MANAGER_MODELS.get(active_llm_id)
+                    ollama_model = active_llm.model_id if active_llm else 'qwen3.5:4b'
+
+                    _log_model_event("load_start", "embedding", "RAG Embedding · BGE-M3-INT8", memory_mb=650)
+                    embed_start_ms = int(time.time() * 1000)
+                    embedding_model = EmbeddingModel.create_default()
+                    _log_model_event(
+                        "load_done",
+                        "embedding",
+                        "RAG Embedding · BGE-M3-INT8",
+                        duration_ms=int(time.time() * 1000) - embed_start_ms,
+                        memory_mb=650,
+                    )
+                    _log_model_event("load_start", "llm", f"RAG LLM · {ollama_model}", memory_mb=2500)
+                    _rag_pipeline = RagPipeline(
+                        embedding_model=embedding_model,
+                        vector_retriever=VectorRetriever(
+                            collection="memory_bread_captures",
+                            qdrant_path=qdrant_path,
+                        ),
+                        fts5_retriever=Fts5Retriever(db_path=db_path),
+                        knowledge_retriever=KnowledgeFts5Retriever(db_path=db_path),
+                        llm=OllamaBackend(model=ollama_model, timeout=180, num_predict=1536),
+                        top_k=5,
+                        db_path=db_path,
+                    )
+                    _log_model_event("load_done", "llm", f"RAG LLM · {ollama_model}", memory_mb=2500)
+                    # 强制预热 embedding，避免首次查询时再加载 BGE 导致超时
+                    try:
+                        _rag_pipeline._embed.encode(["预热"])
+                    except Exception as e:
+                        logger.warning(f"Embedding 预热失败: {e}")
+                    logger.info(f"RAG pipeline 初始化完成，模型: {ollama_model}")
+                except Exception as exc:
+                    logger.error("RAG pipeline 初始化失败: %s", exc, exc_info=True)
+                    _rag_pipeline = None
+                    raise ServiceUnavailable(f"RAG pipeline 初始化失败: {exc}") from exc
     return _rag_pipeline
 
 
@@ -109,6 +178,23 @@ def _model_to_dict(meta, status_info: dict) -> dict:
     d['recommended']       = status_info.get('recommended', False)
     d['recommend_reason']  = status_info.get('recommend_reason', '')
     return d
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """7071 统一健康检查：模型管理 API 与 RAG /query 共用此服务。"""
+    try:
+        pipeline_ready = _rag_pipeline is not None
+        return jsonify({
+            'status': 'ok',
+            'service': 'model_api_rag',
+            'pipeline_ready': pipeline_ready,
+            'active_llm': model_manager.config.get('active_llm'),
+            'active_embedding': model_manager.config.get('active_embedding'),
+        })
+    except Exception as e:
+        logger.error(f"健康检查失败: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @app.route('/api/models', methods=['GET'])
@@ -369,6 +455,7 @@ def rag_query():
         })
     except Exception as e:
         latency_ms = int(time.time() * 1000) - start_ms
+        error_text = str(e)
         if query:
             log_llm_usage(
                 caller='rag',
@@ -377,9 +464,123 @@ def rag_query():
                 completion_tokens=0,
                 latency_ms=latency_ms,
                 status='failed',
-                error_msg=str(e),
+                error_msg=error_text,
             )
         logger.error(f"RAG 查询失败: {e}", exc_info=True)
+
+        lowered = error_text.lower()
+        if 'ollama' in lowered or 'bad gateway' in lowered:
+            return jsonify({'error': error_text}), 502
+        if 'service unavailable' in lowered or '初始化失败' in error_text or 'busy' in lowered:
+            return jsonify({'error': error_text}), 503
+        return jsonify({'error': error_text}), 500
+
+
+@app.route('/knowledge/extract', methods=['POST'])
+def extract_knowledge():
+    """触发一次真实 knowledge 提炼。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        limit = data.get('limit')
+        force_finalize_tail = bool(data.get('force_finalize_tail', False))
+
+        if limit is not None:
+            try:
+                limit = int(limit)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'limit 必须是正整数'}), 400
+            if limit <= 0:
+                return jsonify({'error': 'limit 必须是正整数'}), 400
+
+        processor = BackgroundProcessor(db_path=DB_PATH, interval=90, batch_size=8)
+        result = asyncio.run(
+            processor.run_once(
+                limit_override=limit,
+                force_finalize_tail=force_finalize_tail,
+            )
+        )
+
+        processed_count = int(result.get('processed_count', 0))
+        fetched_count = int(result.get('fetched_count', 0))
+        remaining_estimate = int(result.get('remaining_estimate', 0))
+        reason = result.get('reason')
+
+        if processed_count > 0:
+            message = f'知识提炼完成，本轮处理 {processed_count} 个片段'
+        elif fetched_count == 0:
+            message = '当前没有待提炼的采集记录'
+        elif reason == 'force_finalize_tail':
+            message = '已强制收尾最后一组，但本轮未生成新知识'
+        else:
+            message = '已触发知识提炼，本轮暂无可完成的片段'
+
+        return jsonify({
+            'status': 'ok',
+            'message': message,
+            'fetched_count': fetched_count,
+            'processed_count': processed_count,
+            'remaining_estimate': remaining_estimate,
+            'force_finalize_tail': force_finalize_tail,
+            'reason': reason,
+        })
+    except Exception as e:
+        logger.error(f"知识提炼触发失败: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/bake/extract', methods=['POST'])
+def extract_bake():
+    """对单条 bake candidate 做分类特异提炼，不直接写业务表。"""
+    start_ms = int(time.time() * 1000)
+    lock_wait_start_ms = start_ms
+    try:
+        data = request.get_json(silent=True) or {}
+        candidate = data.get('candidate')
+        trigger_reason = data.get('trigger_reason') or 'manual_debug'
+        if not isinstance(candidate, dict):
+            return jsonify({'error': '缺少 candidate 对象'}), 400
+        if not candidate.get('source_knowledge_id'):
+            return jsonify({'error': 'candidate.source_knowledge_id 缺失'}), 400
+
+        source_knowledge_id = candidate.get('source_knowledge_id')
+        logger.info(
+            "bake extract request start source_knowledge_id=%s trigger_reason=%s",
+            source_knowledge_id,
+            trigger_reason,
+        )
+        extractor = get_bake_extractor()
+        fcntl.flock(_rag_lock_fd, fcntl.LOCK_EX)
+        lock_wait_ms = int(time.time() * 1000) - lock_wait_start_ms
+        logger.info(
+            "bake extract lock acquired source_knowledge_id=%s lock_wait_ms=%s",
+            source_knowledge_id,
+            lock_wait_ms,
+        )
+        try:
+            result = extractor.extract_bake_bundle(candidate)
+        finally:
+            fcntl.flock(_rag_lock_fd, fcntl.LOCK_UN)
+            logger.info("bake extract lock released source_knowledge_id=%s", source_knowledge_id)
+
+        result['trigger_reason'] = trigger_reason
+        result['latency_ms'] = int(time.time() * 1000) - start_ms
+        result['lock_wait_ms'] = lock_wait_ms
+        logger.info(
+            "bake extract request done source_knowledge_id=%s latency_ms=%s total_elapsed_ms=%s stage_elapsed_ms=%s degraded=%s",
+            source_knowledge_id,
+            result['latency_ms'],
+            result.get('total_elapsed_ms'),
+            result.get('stage_elapsed_ms'),
+            result.get('degraded'),
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error("bake 提炼失败: %s", e, exc_info=True)
+        lowered = str(e).lower()
+        if 'ollama' in lowered or 'bad gateway' in lowered:
+            return jsonify({'error': str(e)}), 502
+        if 'service unavailable' in lowered or 'busy' in lowered:
+            return jsonify({'error': str(e)}), 503
         return jsonify({'error': str(e)}), 500
 
 

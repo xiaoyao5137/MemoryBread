@@ -2,10 +2,11 @@
 #
 # 记忆面包 启动脚本
 #
-# 按顺序启动三个服务：
-# 1. AI Sidecar (Python)
-# 2. Core Engine (Rust)
-# 3. Desktop UI (Tauri)
+# 按顺序启动三个组件：
+# 1. AI Sidecar (Python，含 7072 内部检索服务)
+# 2. Model API / RAG API (Python，7071，提供 /api/models + /query)
+# 3. Core Engine (Rust)
+# 4. Desktop UI (Tauri)
 #
 
 set -e  # 遇到错误立即退出
@@ -28,6 +29,31 @@ NC='\033[0m' # No Color
 # 项目根目录
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+check_path_leaks() {
+    local leaked_paths=()
+    local candidates=(
+        "$PROJECT_ROOT/ai-sidecar/~/.workbuddy"
+        "$PROJECT_ROOT/ai-sidecar/~/.qdrant"
+        "$PROJECT_ROOT/~/.workbuddy"
+        "$PROJECT_ROOT/~/.qdrant"
+    )
+
+    for path in "${candidates[@]}"; do
+        if [ -e "$path" ]; then
+            leaked_paths+=("$path")
+        fi
+    done
+
+    if [ ${#leaked_paths[@]} -gt 0 ]; then
+        log_error "检测到仓库内存在未展开的 home 路径残留："
+        for path in "${leaked_paths[@]}"; do
+            log_error "  - $path"
+        done
+        log_error "请先清理这些目录，再重新启动，避免模型和向量数据继续写入仓库目录。"
+        exit 1
+    fi
+}
+
 # 日志目录
 LOG_DIR="$HOME/.memory-bread/logs"
 mkdir -p "$LOG_DIR"
@@ -37,6 +63,7 @@ SIDECAR_PID_FILE="$LOG_DIR/sidecar.pid"
 MODEL_API_PID_FILE="$LOG_DIR/model_api.pid"
 CORE_PID_FILE="$LOG_DIR/core.pid"
 UI_PID_FILE="$LOG_DIR/ui.pid"
+UI_APP_PID_FILE="$LOG_DIR/ui_app.pid"
 
 # 日志文件
 SIDECAR_LOG="$LOG_DIR/sidecar.log"
@@ -92,6 +119,55 @@ cleanup_port() {
     fi
 }
 
+cleanup_desktop_app() {
+    local pids=$(pgrep -f "/target/debug/memory-bread-desktop|target/debug/memory-bread-desktop" || true)
+    if [ -n "$pids" ]; then
+        log_info "清理残留 Desktop UI 窗口进程: $pids"
+        echo "$pids" | xargs kill 2>/dev/null || true
+        sleep 1
+        pids=$(pgrep -f "/target/debug/memory-bread-desktop|target/debug/memory-bread-desktop" || true)
+        if [ -n "$pids" ]; then
+            echo "$pids" | xargs kill -9 2>/dev/null || true
+        fi
+    fi
+    rm -f "$UI_APP_PID_FILE"
+}
+
+find_desktop_app_pids() {
+    pgrep -f "/target/debug/memory-bread-desktop|target/debug/memory-bread-desktop" || true
+}
+
+warn_if_multiple_desktop_apps() {
+    local pids=$(find_desktop_app_pids)
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+
+    local count=$(echo "$pids" | wc -l | tr -d '[:space:]')
+    if [ "$count" -gt 1 ]; then
+        log_warn "检测到 ${count} 个 Desktop UI 历史残留窗口进程，restart 将先自动清理: $(echo "$pids" | tr '\n' ' ' | xargs)"
+    fi
+}
+
+record_desktop_app_pid() {
+    local retries=${1:-20}
+    local delay=${2:-1}
+
+    for ((i=1; i<=retries; i++)); do
+        local pids=$(find_desktop_app_pids)
+        if [ -n "$pids" ]; then
+            local pid=$(echo "$pids" | tail -n 1 | tr -d '[:space:]')
+            if [ -n "$pid" ]; then
+                echo "$pid" > "$UI_APP_PID_FILE"
+                return 0
+            fi
+        fi
+        sleep "$delay"
+    done
+
+    return 1
+}
+
 wait_for_http() {
     local url=$1
     local label=$2
@@ -119,9 +195,9 @@ show_status() {
     fi
 
     if is_running "$MODEL_API_PID_FILE"; then
-        log_success "Model API: 运行中 (PID: $(cat "$MODEL_API_PID_FILE"), Port: ${MODEL_API_PORT})"
+        log_success "Model API / RAG API: 运行中 (PID: $(cat "$MODEL_API_PID_FILE"), Port: ${MODEL_API_PORT})"
     else
-        log_error "Model API: 未运行"
+        log_error "Model API / RAG API: 未运行"
     fi
 
     if is_running "$CORE_PID_FILE"; then
@@ -131,9 +207,22 @@ show_status() {
     fi
 
     if is_running "$UI_PID_FILE"; then
-        log_success "Desktop UI: 运行中 (PID: $(cat "$UI_PID_FILE"), Port: ${UI_PORT})"
+        local ui_msg="Desktop UI: 运行中 (启动器 PID: $(cat "$UI_PID_FILE"), Port: ${UI_PORT}"
+        if is_running "$UI_APP_PID_FILE"; then
+            ui_msg+="，窗口 PID: $(cat "$UI_APP_PID_FILE")"
+        fi
+        ui_msg+=")"
+        log_success "$ui_msg"
     else
         log_error "Desktop UI: 未运行"
+    fi
+
+    local desktop_pids=$(find_desktop_app_pids)
+    if [ -n "$desktop_pids" ]; then
+        local desktop_count=$(echo "$desktop_pids" | wc -l | tr -d '[:space:]')
+        log_info "Desktop UI 窗口进程数: ${desktop_count} (PID: $(echo "$desktop_pids" | tr '\n' ' ' | xargs))"
+    else
+        log_info "Desktop UI 窗口进程数: 0"
     fi
     echo ""
 }
@@ -145,7 +234,7 @@ stop_all() {
     # 停止 Desktop UI（包括子进程）
     if is_running "$UI_PID_FILE"; then
         local pid=$(cat "$UI_PID_FILE")
-        log_info "停止 Desktop UI (PID: $pid)"
+        log_info "停止 Desktop UI (启动器 PID: $pid)"
         # 先尝试优雅关闭
         pkill -P "$pid" 2>/dev/null || true
         kill "$pid" 2>/dev/null || true
@@ -157,7 +246,19 @@ stop_all() {
         rm -f "$UI_PID_FILE"
     fi
 
+    if is_running "$UI_APP_PID_FILE"; then
+        local app_pid=$(cat "$UI_APP_PID_FILE")
+        log_info "停止 Desktop UI 窗口进程 (PID: $app_pid)"
+        kill "$app_pid" 2>/dev/null || true
+        sleep 1
+        if ps -p "$app_pid" > /dev/null 2>&1; then
+            kill -9 "$app_pid" 2>/dev/null || true
+        fi
+        rm -f "$UI_APP_PID_FILE"
+    fi
+
     cleanup_port "$UI_PORT" "Desktop UI / Vite"
+    cleanup_desktop_app
 
     # 停止 Core Engine
     if is_running "$CORE_PID_FILE"; then
@@ -197,7 +298,7 @@ stop_all() {
         rm -f "$MODEL_API_PID_FILE"
     fi
 
-    cleanup_port "$MODEL_API_PORT" "Model API"
+    cleanup_port "$MODEL_API_PORT" "Model API / RAG API"
 
     log_success "所有服务已停止"
 }
@@ -270,23 +371,27 @@ start_sidecar() {
         source .venv/bin/activate
     fi
 
-    cleanup_port "$MODEL_API_PORT" "Model API"
+    cleanup_port "$MODEL_API_PORT" "Model API / RAG API"
 
     # 启动 Sidecar（后台运行）
     nohup python main.py > "$SIDECAR_LOG" 2>&1 &
     echo $! > "$SIDECAR_PID_FILE"
 
-    # 启动 Model API Server（后台运行）
+    # 启动 Model API / RAG API Server（后台运行）
     nohup python model_api_server.py > "$MODEL_API_LOG" 2>&1 &
     echo $! > "$MODEL_API_PID_FILE"
 
     log_success "AI Sidecar 已启动 (PID: $(cat "$SIDECAR_PID_FILE"))"
-    log_success "Model API Server 已启动 (PID: $(cat "$MODEL_API_PID_FILE"))"
-    log_info "日志文件: $SIDECAR_LOG"
+    log_success "Model API / RAG API 已启动 (PID: $(cat "$MODEL_API_PID_FILE"))"
+    log_info "Sidecar 日志文件: $SIDECAR_LOG"
+    log_info "Model API / RAG API 日志文件: $MODEL_API_LOG"
 
-    # 等待 Sidecar 启动
+    # 等待 Sidecar 与 7071 API 启动
     log_info "等待 AI Sidecar 初始化..."
     sleep 3
+    wait_for_http "http://localhost:${MODEL_API_PORT}/health" "Model API / RAG API" 40 2 || {
+        log_warn "Model API / RAG API 未就绪，可查看日志: $MODEL_API_LOG"
+    }
 }
 
 # 启动 Core Engine
@@ -300,11 +405,9 @@ start_core() {
 
     cd "$PROJECT_ROOT/core-engine"
 
-    # 构建（如果需要）
-    if [ ! -f "target/release/memory-bread" ]; then
-        log_info "首次运行，正在构建 Core Engine..."
-        cargo build --release
-    fi
+    # 构建最新 Core Engine
+    log_info "构建最新 Core Engine..."
+    cargo build --release
 
     cleanup_port "$CORE_PORT" "Core Engine"
 
@@ -343,16 +446,23 @@ start_ui() {
     export PATH="$HOME/.cargo/bin:$PATH"
 
     cleanup_port "$UI_PORT" "Desktop UI / Vite"
+    cleanup_desktop_app
 
     # 启动 Tauri 开发服务器（后台运行）
     log_info "启动 Tauri 开发服务器..."
     nohup npm run tauri:dev > "$UI_LOG" 2>&1 &
     echo $! > "$UI_PID_FILE"
 
-    log_success "Desktop UI 已启动 (PID: $(cat "$UI_PID_FILE"))"
+    log_success "Desktop UI 已启动 (启动器 PID: $(cat "$UI_PID_FILE"))"
     log_info "日志文件: $UI_LOG"
     log_info "等待 Desktop UI 初始化..."
     sleep 5
+
+    if record_desktop_app_pid 20 1; then
+        log_success "Desktop UI 窗口进程已记录 (PID: $(cat "$UI_APP_PID_FILE"))"
+    else
+        log_warn "未能记录 Desktop UI 窗口进程 PID，后续将依赖残留扫描兜底"
+    fi
 
     if curl -fsS "http://localhost:${UI_PORT}" > /dev/null 2>&1; then
         log_success "Desktop UI / Vite 健康检查通过"
@@ -372,6 +482,7 @@ main() {
     # 解析命令行参数
     case "${1:-start}" in
         start)
+            check_path_leaks
             check_dependencies
             start_sidecar
             start_core
@@ -383,14 +494,16 @@ main() {
             ;;
         restart)
             log_info "执行全组件 restart（AI Sidecar → Core Engine → Desktop UI）..."
+            warn_if_multiple_desktop_apps
             stop_all
             sleep 2
+            check_path_leaks
             check_dependencies
             start_sidecar
             start_core
             start_ui
             show_status
-            log_info "联调测试前请优先使用 ./start.sh restart，避免旧进程状态污染测试结果"
+            log_info "联调测试前请优先使用 ./start.sh restart，7071 由 model_api_server.py 统一提供 /api/models + /query，避免旧进程状态污染测试结果"
             ;;
         status)
             show_status

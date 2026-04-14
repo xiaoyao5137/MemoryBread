@@ -105,6 +105,10 @@ pub struct CaptureFilter {
     pub to_ts:    Option<i64>,
     /// 按应用名过滤
     pub app_name: Option<String>,
+    /// 关键词搜索
+    pub query: Option<String>,
+    /// 按单个 capture id 限定
+    pub capture_id: Option<i64>,
     /// 是否过滤掉隐私记录（默认 true）
     pub exclude_sensitive: bool,
     /// 最多返回条数
@@ -155,34 +159,42 @@ impl StorageManager {
     /// 按过滤条件列举采集记录，按 ts 倒序。
     pub fn list_captures(&self, filter: &CaptureFilter) -> Result<Vec<CaptureRecord>, StorageError> {
         self.with_conn(|conn| {
-            // 动态拼接 WHERE 子句
-            let mut conditions = vec!["1=1"];
             let mut sql = String::from(
-                "SELECT id, ts, app_name, app_bundle_id, win_title, event_type,
-                        ax_text, ax_focused_role, ax_focused_id,
-                        ocr_text, screenshot_path, input_text, audio_text,
-                        is_sensitive, pii_scrubbed
-                 FROM captures WHERE ",
+                "SELECT c.id, c.ts, c.app_name, c.app_bundle_id, c.win_title, c.event_type,
+                        c.ax_text, c.ax_focused_role, c.ax_focused_id,
+                        c.ocr_text, c.screenshot_path, c.input_text, c.audio_text,
+                        c.is_sensitive, c.pii_scrubbed
+                 FROM captures c",
             );
+            let query_pattern = filter.query.as_ref().map(|value| format!("%{}%", value));
+            sql.push_str(" WHERE ");
 
             let mut wheres: Vec<String> = Vec::new();
-            if filter.from_ts.is_some()         { wheres.push("ts >= ?".into()); }
-            if filter.to_ts.is_some()            { wheres.push("ts <= ?".into()); }
-            if filter.app_name.is_some()         { wheres.push("app_name = ?".into()); }
-            if filter.exclude_sensitive          { wheres.push("is_sensitive = 0".into()); }
+            if filter.query.is_some() {
+                wheres.push("(COALESCE(c.win_title, '') LIKE ? OR c.id IN (SELECT rowid FROM captures_fts WHERE captures_fts MATCH ?))".into());
+            }
+            if filter.from_ts.is_some() { wheres.push("c.ts >= ?".into()); }
+            if filter.to_ts.is_some() { wheres.push("c.ts <= ?".into()); }
+            if filter.app_name.is_some() { wheres.push("c.app_name = ?".into()); }
+            if filter.capture_id.is_some() { wheres.push("c.id = ?".into()); }
+            if filter.exclude_sensitive { wheres.push("c.is_sensitive = 0".into()); }
 
             let where_clause = if wheres.is_empty() { "1=1".to_string() } else { wheres.join(" AND ") };
             sql.push_str(&where_clause);
-            sql.push_str(" ORDER BY ts DESC LIMIT ? OFFSET ?");
+            sql.push_str(" ORDER BY c.ts DESC LIMIT ? OFFSET ?");
 
             let mut stmt = conn.prepare(&sql)?;
-
-            // 按顺序绑定参数（与 WHERE 拼接顺序一致）
-            let mut idx = 1usize;
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-            if let Some(v) = filter.from_ts  { bind_values.push(Box::new(v)); }
-            if let Some(v) = filter.to_ts    { bind_values.push(Box::new(v)); }
+            if let Some(ref pattern) = query_pattern {
+                bind_values.push(Box::new(pattern.clone()));
+            }
+            if let Some(ref query) = filter.query {
+                bind_values.push(Box::new(query.clone()));
+            }
+            if let Some(v) = filter.from_ts { bind_values.push(Box::new(v)); }
+            if let Some(v) = filter.to_ts { bind_values.push(Box::new(v)); }
             if let Some(ref v) = filter.app_name { bind_values.push(Box::new(v.clone())); }
+            if let Some(v) = filter.capture_id { bind_values.push(Box::new(v)); }
             bind_values.push(Box::new(filter.limit as i64));
             bind_values.push(Box::new(filter.offset as i64));
 
@@ -195,8 +207,126 @@ impl StorageManager {
         })
     }
 
+    pub fn count_captures(&self, filter: &CaptureFilter) -> Result<i64, StorageError> {
+        self.with_conn(|conn| {
+            let mut sql = String::from("SELECT COUNT(*) FROM captures c");
+            let query_pattern = filter.query.as_ref().map(|value| format!("%{}%", value));
+            sql.push_str(" WHERE ");
+
+            let mut wheres: Vec<String> = Vec::new();
+            if filter.query.is_some() {
+                wheres.push("(COALESCE(c.win_title, '') LIKE ? OR c.id IN (SELECT rowid FROM captures_fts WHERE captures_fts MATCH ?))".into());
+            }
+            if filter.from_ts.is_some() { wheres.push("c.ts >= ?".into()); }
+            if filter.to_ts.is_some() { wheres.push("c.ts <= ?".into()); }
+            if filter.app_name.is_some() { wheres.push("c.app_name = ?".into()); }
+            if filter.capture_id.is_some() { wheres.push("c.id = ?".into()); }
+            if filter.exclude_sensitive { wheres.push("c.is_sensitive = 0".into()); }
+
+            let where_clause = if wheres.is_empty() { "1=1".to_string() } else { wheres.join(" AND ") };
+            sql.push_str(&where_clause);
+
+            let mut stmt = conn.prepare(&sql)?;
+            let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            if let Some(ref pattern) = query_pattern {
+                bind_values.push(Box::new(pattern.clone()));
+            }
+            if let Some(ref query) = filter.query {
+                bind_values.push(Box::new(query.clone()));
+            }
+            if let Some(v) = filter.from_ts { bind_values.push(Box::new(v)); }
+            if let Some(v) = filter.to_ts { bind_values.push(Box::new(v)); }
+            if let Some(ref v) = filter.app_name { bind_values.push(Box::new(v.clone())); }
+            if let Some(v) = filter.capture_id { bind_values.push(Box::new(v)); }
+            let params: Vec<&dyn rusqlite::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
+
+            stmt.query_row(params.as_slice(), |row| row.get(0)).map_err(StorageError::Sqlite)
+        })
+    }
+
+    pub fn search_captures_paginated(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<CaptureRecord>, StorageError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT c.id, c.ts, c.app_name, c.app_bundle_id, c.win_title, c.event_type,
+                        c.ax_text, c.ax_focused_role, c.ax_focused_id,
+                        c.ocr_text, c.screenshot_path, c.input_text, c.audio_text,
+                        c.is_sensitive, c.pii_scrubbed
+                 FROM captures c
+                 JOIN captures_fts f ON f.rowid = c.id
+                 WHERE captures_fts MATCH ?1
+                   AND c.is_sensitive = 0
+                 ORDER BY rank
+                 LIMIT ?2 OFFSET ?3",
+            )?;
+            let rows = stmt.query_map(params![query, limit as i64, offset as i64], |row| {
+                Ok(row_to_capture(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+        })
+    }
+
+    pub fn count_search_captures(&self, query: &str) -> Result<i64, StorageError> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*)
+                 FROM captures c
+                 JOIN captures_fts f ON f.rowid = c.id
+                 WHERE captures_fts MATCH ?1
+                   AND c.is_sensitive = 0",
+                params![query],
+                |row| row.get(0),
+            ).map_err(StorageError::Sqlite)
+        })
+    }
+
     /// 简单列举最近的 N 条采集记录（用于调试面板）。
-    pub fn list(&self, limit: usize, offset: usize) -> Result<Vec<CaptureRecord>, StorageError> {
+    pub fn list_capture_knowledge_links(
+        &self,
+        capture_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (i64, String)>, StorageError> {
+        if capture_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        self.with_conn(|conn| {
+            let placeholders = std::iter::repeat("?")
+                .take(capture_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT capture_id, id, summary
+                 FROM knowledge_entries
+                 WHERE capture_id IN ({})
+                   AND category = 'bake_knowledge'
+                 ORDER BY updated_at DESC, id DESC",
+                placeholders
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = capture_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+
+            let mut result = std::collections::HashMap::new();
+            for row in rows {
+                let (capture_id, knowledge_id, summary) = row?;
+                result.entry(capture_id).or_insert((knowledge_id, summary));
+            }
+            Ok(result)
+        })
+    }
+
+    /// 简单列举最近的 N 条采集记录（用于调试面板）。
+    pub fn list_recent(&self, limit: usize, offset: usize) -> Result<Vec<CaptureRecord>, StorageError> {
         let filter = CaptureFilter {
             exclude_sensitive: false,
             limit,

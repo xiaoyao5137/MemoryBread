@@ -103,8 +103,8 @@ class IdleDetector:
 
     def _check_resource_state(self) -> bool:
         """检查系统资源状态（CPU + 内存 + 充电）"""
-        # 1. 检查 CPU 使用率
-        cpu_usage = psutil.cpu_percent(interval=1)
+        # 1. 检查 CPU 使用率（非阻塞采样，避免每次检测都卡 1 秒）
+        cpu_usage = psutil.cpu_percent(interval=None)
         if cpu_usage > self.cpu_threshold:
             logger.debug("CPU 使用率过高: %.1f%% > %.1f%%",
                         cpu_usage, self.cpu_threshold)

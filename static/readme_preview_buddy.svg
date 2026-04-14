@@ -1,0 +1,28 @@
+<svg width="1200" height="720" viewBox="0 0 1200 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="720" rx="32" fill="#FFF7ED"/>
+  <rect x="40" y="40" width="1120" height="640" rx="28" fill="#FFFFFF" stroke="#FED7AA" stroke-width="2"/>
+  <rect x="80" y="84" width="230" height="552" rx="24" fill="#FFF1E6"/>
+  <circle cx="132" cy="136" r="24" fill="#FB923C"/>
+  <rect x="170" y="118" width="92" height="14" rx="7" fill="#FDBA74"/>
+  <rect x="170" y="142" width="60" height="10" rx="5" fill="#FED7AA"/>
+  <rect x="108" y="208" width="174" height="58" rx="18" fill="#FFFFFF" stroke="#FED7AA"/>
+  <rect x="108" y="286" width="174" height="58" rx="18" fill="#FFFFFF" stroke="#FED7AA"/>
+  <rect x="108" y="364" width="174" height="58" rx="18" fill="#FFFFFF" stroke="#FED7AA"/>
+  <rect x="108" y="442" width="174" height="58" rx="18" fill="#FFFFFF" stroke="#FED7AA"/>
+  <rect x="360" y="100" width="750" height="112" rx="24" fill="#FFF7ED"/>
+  <rect x="400" y="136" width="320" height="20" rx="10" fill="#FB923C" fill-opacity="0.92"/>
+  <rect x="400" y="170" width="520" height="14" rx="7" fill="#FDBA74"/>
+  <rect x="360" y="244" width="350" height="352" rx="24" fill="#FFFFFF" stroke="#FED7AA" stroke-width="2"/>
+  <rect x="760" y="244" width="350" height="352" rx="24" fill="#FFFFFF" stroke="#FED7AA" stroke-width="2"/>
+  <rect x="392" y="286" width="150" height="16" rx="8" fill="#FDBA74"/>
+  <rect x="392" y="324" width="264" height="12" rx="6" fill="#FED7AA"/>
+  <rect x="392" y="356" width="228" height="12" rx="6" fill="#FED7AA"/>
+  <rect x="392" y="410" width="286" height="118" rx="18" fill="#FFF7ED"/>
+  <rect x="792" y="286" width="120" height="16" rx="8" fill="#FDBA74"/>
+  <rect x="792" y="324" width="252" height="12" rx="6" fill="#FED7AA"/>
+  <rect x="792" y="356" width="228" height="12" rx="6" fill="#FED7AA"/>
+  <rect x="792" y="410" width="286" height="70" rx="18" fill="#FFF7ED"/>
+  <rect x="792" y="498" width="286" height="30" rx="15" fill="#FB923C" fill-opacity="0.85"/>
+  <text x="80" y="630" fill="#9A3412" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial" font-size="46" font-weight="700">悬浮搭子 / 首页入口</text>
+  <text x="80" y="672" fill="#C2410C" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial" font-size="24">轻量陪伴 · 自然进入工作流 · 随时唤起</text>
+</svg>

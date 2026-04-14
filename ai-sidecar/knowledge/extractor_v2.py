@@ -2,9 +2,11 @@
 知识提炼模块 V2 - 强制使用 LLM，支持去重和出现次数统计
 """
 
+import ast
 import json
 import logging
 import re
+import time
 import urllib.request
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -30,20 +32,54 @@ def _rag_is_active() -> bool:
         return True   # 拿不到锁 → RAG 正在占用 Ollama
 
 
-def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
-    """尽量从 LLM 输出中提取第一个合法 JSON 对象。"""
-    if not raw:
+def _try_parse_json_like_object(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
         return None
 
-    text = raw.strip()
+    candidate = text.strip()
+    if not candidate:
+        return None
+
+    normalized = (
+        candidate
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("‘", "'")
+        .replace("’", "'")
+    )
+
+    variants = [candidate]
+    if normalized != candidate:
+        variants.append(normalized)
+
+    for variant in variants:
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                value = parser(variant)
+            except (json.JSONDecodeError, SyntaxError, ValueError):
+                continue
+            if isinstance(value, dict):
+                return value
+
+    return None
+
+
+def _extract_json_object(raw: Any) -> Optional[Dict[str, Any]]:
+    """尽量从 LLM 输出中提取第一个合法 JSON 对象。"""
+    if raw is None:
+        return None
+
+    text = str(raw).strip()
+    if not text:
+        return None
+
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    parsed = _try_parse_json_like_object(text)
+    if parsed is not None:
+        return parsed
 
     start = text.find('{')
     if start == -1:
@@ -71,13 +107,281 @@ def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
             depth -= 1
             if depth == 0:
                 candidate = text[start:idx + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
+                return _try_parse_json_like_object(candidate)
 
     return None
 
+
+def _stringify_response_fragment(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("content", "response", "text", "message", "thinking"):
+            fragment = _stringify_response_fragment(value.get(key))
+            if fragment.strip():
+                return fragment
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except TypeError:
+            return str(value)
+    if isinstance(value, list):
+        parts = [_stringify_response_fragment(item) for item in value]
+        return "\n".join(part for part in parts if part.strip())
+    return str(value)
+
+
+def _extract_attr(value: Any, name: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _extract_ollama_response_text(response: Dict[str, Any]) -> str:
+    candidates = [
+        _extract_attr(response, "message"),
+        _extract_attr(response, "response"),
+        _extract_attr(response, "content"),
+        _extract_attr(response, "output"),
+    ]
+    for item in candidates:
+        content = _extract_attr(item, "content")
+        text = _stringify_response_fragment(content).strip()
+        if text:
+            return text
+
+        direct_text = _extract_attr(item, "text")
+        text = _stringify_response_fragment(direct_text).strip()
+        if text:
+            return text
+
+        text = _stringify_response_fragment(item).strip()
+        if text:
+            return text
+    return ""
+
+
+def _preview_text(value: Any, limit: int = 500) -> str:
+    text = _stringify_response_fragment(value).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " ...(已截断)"
+
+
+MERGE_SYSTEM_PROMPT ="""你是一个工作片段提炼助手。以下是用户在一段连续时间内的屏幕采集记录（按时间顺序），它们属于同一个工作片段。
+
+**你的任务**：将这些连续采集提炼为一个完整的工作片段知识条目。
+
+**提炼规则**：
+1. 识别这段时间内用户在做的一件完整的事
+2. 生成概述（50-150字）：描述做了什么、关键进展、结果，使用过去时态
+3. 生成明细（200-500字）：
+   - 保留有追溯价值的具体信息（代码逻辑、会议决策、学到的知识点）
+   - 过滤掉 UI 操作、重复内容、无意义的切换记录
+   - 不要堆砌原始文本，要提炼和归纳
+4. 识别关键实体（人名、项目名、技术词汇）
+5. 判断分类和重要性
+
+**输出格式（JSON）**：
+{
+  "overview": "概述，50-150字，不含换行符",
+  "details": "明细，200-500字，使用空格代替换行符",
+  "entities": ["实体1", "实体2"],
+  "category": "会议|文档|代码|聊天|学习|其他",
+  "importance": 1-5,
+  "history_view": true,
+  "content_origin": "live_interaction|historical_content|document_reference|other",
+  "activity_type": "meeting|coding|reading|chat|ask_ai|reviewing_history|other",
+  "event_time_start": 1710000000000,
+  "event_time_end": 1710003600000,
+  "evidence_strength": "low|medium|high"
+}
+
+**注意补充判断**：
+- 如果用户今天在 IM/聊天/AI 工具里回看昨天、前天、更早的消息或历史对话，`history_view=true`
+- `observed_at` 不需要输出，由系统记录当前片段结束时间
+- `event_time_start/event_time_end` 只在内容明确提到事情发生时间时填写；不明确时返回 null
+- 询问 Gemini/Claude/ChatGPT 等 AI 助手，通常可标为 `activity_type=ask_ai`
+- 查看历史消息/历史会话，通常可标为 `activity_type=reviewing_history` 且 `content_origin=historical_content`
+- 直接实时聊天或会议记录，通常 `content_origin=live_interaction`
+- 证据弱、推断成分高时降低 `evidence_strength`
+
+**重要性评分**：
+- 5分：关键决策、重要会议纪要、核心代码逻辑
+- 4分：项目进展、技术文档、重要沟通
+- 3分：日常工作记录、一般文档
+- 2分：简单操作记录
+- 1分：无关紧要的内容
+
+**注意**：输出必须是有效的 JSON，字符串中的引号要转义，不要包含未转义的换行符。
+"""
+
+BAKE_SHARED_PROMPT = """你在执行 bake pipeline 的类别特异提炼。输入是一条来自情节记忆/episodic memory 的候选工作片段。
+
+目标不是泛泛总结，而是判断这条候选是否足以沉淀为某一类稳定资产。所有判断都必须保守：证据不足就 reject，不要为了凑产出而改写成看似合理的结果。
+
+你会收到候选的 summary / overview / details / entities，以及关联 capture 的上下文文本。可以综合这些信息，但必须只基于输入证据，不要臆测。
+
+输出要求：
+- 必须返回且只返回 1 个 JSON 对象
+- 顶层字段固定且仅允许：accepted, reason, payload
+- `accepted` 为 true 时，`payload` 必须符合该类别 schema
+- `accepted` 为 false 时，`payload` 必须为 null，并用 `reason` 简要说明为什么不适合该类别
+- 不要输出 markdown，不要输出解释性前后缀，不要输出代码块，不要输出思考过程
+- 所有字符串保持单行，避免换行和超长段落
+- schema 外字段一律不要输出
+- 输出前自检：结果必须能被 JSON 解析，且顶层只有 accepted/reason/payload 三个字段"""
+
+BAKE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "accepted": {"type": "boolean"},
+        "reason": {"type": ["string", "null"]},
+        "payload": {"type": ["object", "null"]},
+    },
+    "required": ["accepted", "reason", "payload"],
+    "additionalProperties": False,
+}
+
+
+BAKE_TEMPLATE_MARKERS = (
+    "模板",
+    "骨架",
+    "槽位",
+    "填写",
+    "结构",
+    "段落",
+    "框架",
+    "提纲",
+    "复用",
+)
+
+BAKE_KNOWLEDGE_MARKERS = (
+    "经验",
+    "结论",
+    "决策",
+    "约束",
+    "事实",
+    "观察",
+    "原则",
+    "根因",
+    "教训",
+    "发现",
+    "踩坑",
+    "原因",
+)
+
+BAKE_SOP_MARKERS = (
+    "sop",
+    "步骤",
+    "step",
+    "触发条件",
+    "前置条件",
+    "检查点",
+    "预期结果",
+    "排查",
+    "流程",
+    "操作",
+    "执行",
+    "验证",
+)
+
+
+BAKE_KNOWLEDGE_PROMPT = """类别：knowledge
+
+只提炼“可复用的事实 / 经验 / 决策 / 结论 / 约束 / 观察”。
+如果输入只是过程片段、模板语气、零散操作，没有形成稳定知识，就 reject。
+
+accepted=true 时，payload schema：
+{
+  "summary": "知识标题/摘要，简洁明确",
+  "overview": "对该知识的概述，可为空",
+  "entities": ["实体1", "实体2"],
+  "importance": 1-5,
+  "occurrence_count": 1,
+  "observed_at": 1710000000000,
+  "event_time_start": null,
+  "event_time_end": null,
+  "history_view": false,
+  "content_origin": "live_interaction|historical_content|document_reference|other|null",
+  "activity_type": "meeting|coding|reading|chat|ask_ai|reviewing_history|other|null",
+  "evidence_strength": "low|medium|high|null",
+  "evidence_summary": "一句话说明依据",
+  "match_score": 0.0,
+  "match_level": "high|medium|low",
+  "review_status": "auto_created|candidate"
+}
+
+约束：
+- `summary` 必须体现沉淀后的知识点，不要直接照抄流水账
+- 如果输入重点是模板骨架、槽位设计、段落结构、可替换表达，即使可以总结出一些写作建议，也必须 reject，这类内容应交给 template 类别处理
+- `match_score` 使用 0-1 小数
+- 证据强、知识明确时才用 `auto_created`，否则用 `candidate`
+- 若只是模糊猜测或噪声，直接 reject"""
+
+BAKE_TEMPLATE_PROMPT = """类别：template
+
+只提炼“可复用表达结构 / 模板骨架 / 段落框架 / 可替换槽位”。
+普通总结、知识点、步骤说明都不能算模板。必须真的存在重复复用价值的结构化表达形态，否则 reject。
+
+accepted=true 时，payload schema：
+{
+  "name": "模板名称",
+  "category": "weekly_report|meeting_note|analysis|plan|generic",
+  "status": "active",
+  "tags": ["标签1", "标签2"],
+  "applicable_tasks": ["适用场景1"],
+  "linked_knowledge_ids": [],
+  "structure_sections": [
+    {"title": "段落标题", "keywords": ["关键词"], "notes": "如何填写，可为空"}
+  ],
+  "style_phrases": ["常用表达"],
+  "replacement_rules": [
+    {"from": "原表达", "to": "建议表达"}
+  ],
+  "prompt_hint": "如何使用该模板，可为空",
+  "diagram_code": null,
+  "image_assets": [],
+  "evidence_summary": "一句话说明模板证据",
+  "match_score": 0.0,
+  "match_level": "high|medium|low",
+  "review_status": "auto_created|candidate"
+}
+
+约束：
+- 必须至少给出 2 个 `structure_sections`
+- 必须体现“槽位/骨架/结构”而不是单次内容
+- 如果只是某次会议/某段总结，不是模板，直接 reject
+- 模板证据较弱时使用 `candidate`"""
+
+BAKE_SOP_PROMPT = """类别：sop
+
+只提炼“可执行步骤、触发条件、排查/处理流程、前置条件、检查点”。
+如果输入没有清晰步骤化结构，或者只是描述结果/知识点，不是 SOP，直接 reject。
+
+accepted=true 时，payload schema：
+{
+  "summary": "SOP 标题/摘要",
+  "overview": "该 SOP 解决什么问题，可为空",
+  "source_title": "来源标题，可为空",
+  "trigger_keywords": ["触发词1", "触发词2"],
+  "extracted_problem": "触发场景/问题",
+  "steps": ["步骤1", "步骤2", "步骤3"],
+  "linked_knowledge_ids": [],
+  "confidence": "high|medium|low",
+  "evidence_summary": "一句话说明步骤依据",
+  "match_score": 0.0,
+  "match_level": "high|medium|low",
+  "review_status": "auto_created|candidate"
+}
+
+约束：
+- `steps` 至少 3 条，且必须是可执行动作
+- 没有明确步骤化流程就 reject
+- 如果只是经验总结或模板骨架，不要误判成 SOP"""
 
 MERGE_SYSTEM_PROMPT ="""你是一个工作片段提炼助手。以下是用户在一段连续时间内的屏幕采集记录（按时间顺序），它们属于同一个工作片段。
 
@@ -298,6 +602,8 @@ class KnowledgeExtractorV2:
         db_conn,
         threshold: float = 0.72,
         entities: Optional[List[str]] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
     ) -> Optional[int]:
         """
         查找相似的知识条目
@@ -324,7 +630,7 @@ class KnowledgeExtractorV2:
 
             # 2. 获取所有现有知识条目（仅取最近 500 条，提高相关性）
             cursor = db_conn.execute(
-                "SELECT id, overview, entities FROM knowledge_entries WHERE overview IS NOT NULL ORDER BY created_at DESC LIMIT 500"
+                "SELECT id, overview, entities, start_time, end_time FROM knowledge_entries WHERE overview IS NOT NULL ORDER BY created_at DESC LIMIT 500"
             )
             existing_entries = cursor.fetchall()
 
@@ -335,6 +641,8 @@ class KnowledgeExtractorV2:
             existing_ids = [row[0] for row in existing_entries]
             existing_overviews = [row[1] or '' for row in existing_entries]
             existing_entities_raw = [row[2] for row in existing_entries]
+            existing_start_times = [row[3] for row in existing_entries]
+            existing_end_times = [row[4] for row in existing_entries]
 
             batch_embeddings = self.embedding_model.encode(existing_overviews)
             existing_vectors = np.array([np.array(e.vector) for e in batch_embeddings])
@@ -361,7 +669,24 @@ class KnowledgeExtractorV2:
                 except Exception:
                     pass
 
-            # 6. 取相似度最高的条目
+            # 6. 连续片段保护：时间重叠或紧邻的同一事件，不计为新的重复观察
+            continuity_gap_ms = 15 * 60 * 1000
+            if start_time is not None and end_time is not None:
+                for i, (existing_start, existing_end) in enumerate(zip(existing_start_times, existing_end_times)):
+                    if existing_start is None or existing_end is None:
+                        continue
+                    overlaps = start_time <= existing_end and end_time >= existing_start
+                    near_continuation = 0 <= start_time - existing_end <= continuity_gap_ms
+                    if overlaps or near_continuation:
+                        similarities[i] = min(similarities[i], threshold - 0.01)
+                        logger.info(
+                            "跳过连续片段重复计数候选 (ID=%s, overlap=%s, gap_ms=%s)",
+                            existing_ids[i],
+                            overlaps,
+                            max(0, start_time - existing_end),
+                        )
+
+            # 7. 取相似度最高的条目
             best_idx = int(np.argmax(similarities))
             best_sim = float(similarities[best_idx])
             if best_sim >= threshold:
@@ -374,6 +699,367 @@ class KnowledgeExtractorV2:
         except Exception as e:
             logger.error(f"查找相似知识失败: {e}")
             return None
+
+    def _truncate_text(self, value: Any, limit: int) -> str:
+        text = str(value or '').strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + " ...(已截断)"
+
+    def _build_bake_candidate_text(self, candidate: Dict[str, Any]) -> str:
+        entities = candidate.get('entities') or []
+        entities_text = "、".join(str(item) for item in entities if item)
+        capture_parts = [
+            self._truncate_text(candidate.get('capture_ax_text'), 600),
+            self._truncate_text(candidate.get('capture_ocr_text'), 600),
+            self._truncate_text(candidate.get('capture_input_text'), 300),
+            self._truncate_text(candidate.get('capture_audio_text'), 300),
+        ]
+        capture_text = "\n\n".join(part for part in capture_parts if part)
+        if len(capture_text) > 1800:
+            capture_text = capture_text[:1800].rstrip() + "\n...(已截断)"
+
+        return (
+            f"source_knowledge_id: {candidate.get('source_knowledge_id')}\n"
+            f"source_capture_id: {candidate.get('source_capture_id')}\n"
+            f"summary: {self._truncate_text(candidate.get('summary'), 180)}\n"
+            f"overview: {self._truncate_text(candidate.get('overview'), 280)}\n"
+            f"details: {self._truncate_text(candidate.get('details'), 700)}\n"
+            f"importance: {candidate.get('importance')}\n"
+            f"occurrence_count: {candidate.get('occurrence_count')}\n"
+            f"observed_at: {candidate.get('observed_at')}\n"
+            f"event_time_start: {candidate.get('event_time_start')}\n"
+            f"event_time_end: {candidate.get('event_time_end')}\n"
+            f"history_view: {bool(candidate.get('history_view', False))}\n"
+            f"content_origin: {candidate.get('content_origin') or ''}\n"
+            f"activity_type: {candidate.get('activity_type') or ''}\n"
+            f"evidence_strength: {candidate.get('evidence_strength') or ''}\n"
+            f"capture_ts: {candidate.get('capture_ts')}\n"
+            f"capture_app_name: {self._truncate_text(candidate.get('capture_app_name'), 80)}\n"
+            f"capture_win_title: {self._truncate_text(candidate.get('capture_win_title'), 120)}\n"
+            f"entities: {self._truncate_text(entities_text, 160)}\n\n"
+            f"capture_context:\n{capture_text}"
+        )
+
+    def _count_marker_hits(self, text: str, markers: tuple[str, ...]) -> int:
+        normalized = str(text or '').lower()
+        return sum(1 for marker in markers if marker and marker.lower() in normalized)
+
+    def _should_reject_template_like_knowledge(self, candidate: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+        candidate_text = "\n".join(
+            str(candidate.get(field) or '')
+            for field in (
+                'summary',
+                'overview',
+                'details',
+                'capture_ax_text',
+                'capture_ocr_text',
+                'capture_input_text',
+                'capture_audio_text',
+            )
+        )
+        entities = candidate.get('entities') or []
+        if entities:
+            candidate_text += "\n" + " ".join(str(item) for item in entities if item)
+
+        payload_text = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload or '')
+        candidate_template_hits = self._count_marker_hits(candidate_text, BAKE_TEMPLATE_MARKERS)
+        payload_template_hits = self._count_marker_hits(payload_text, BAKE_TEMPLATE_MARKERS)
+        knowledge_hits = self._count_marker_hits(candidate_text + "\n" + payload_text, BAKE_KNOWLEDGE_MARKERS)
+        return candidate_template_hits >= 2 and payload_template_hits >= 1 and knowledge_hits == 0
+
+    def _should_reject_sop_like_knowledge(self, candidate: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+        candidate_text = "\n".join(
+            str(candidate.get(field) or '')
+            for field in (
+                'summary',
+                'overview',
+                'details',
+                'capture_ax_text',
+                'capture_ocr_text',
+                'capture_input_text',
+                'capture_audio_text',
+            )
+        )
+        entities = candidate.get('entities') or []
+        if entities:
+            candidate_text += "\n" + " ".join(str(item) for item in entities if item)
+
+        payload_text = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload or '')
+        candidate_sop_hits = self._count_marker_hits(candidate_text, BAKE_SOP_MARKERS)
+        payload_sop_hits = self._count_marker_hits(payload_text, BAKE_SOP_MARKERS)
+        knowledge_hits = self._count_marker_hits(candidate_text + "\n" + payload_text, BAKE_KNOWLEDGE_MARKERS)
+        return candidate_sop_hits >= 2 and payload_sop_hits >= 1 and knowledge_hits == 0
+
+    def _call_bake_llm(self, caller_id: str, system_prompt: str, user_prompt: str) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        from monitor.llm_tracker import LLMCallTracker, estimate_tokens
+
+        started_at = time.time()
+        logger.info("bake llm start caller=%s", caller_id)
+        with LLMCallTracker(
+            caller="bake",
+            model_name=self.model,
+            caller_id=caller_id,
+        ) as tracker:
+            response = self.client.chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                think=False,
+                format=BAKE_RESPONSE_SCHEMA,
+                options={"temperature": 0.0, "num_predict": 1024},
+            )
+            raw_content = _extract_ollama_response_text(response)
+            tracker.set_response(response)
+            if tracker._prompt_tokens == 0:
+                tracker.set_tokens(
+                    prompt=estimate_tokens(system_prompt + user_prompt),
+                    completion=estimate_tokens(raw_content),
+                )
+
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        logger.info(
+            "bake llm done caller=%s elapsed_ms=%s raw_len=%s",
+            caller_id,
+            elapsed_ms,
+            len(raw_content),
+        )
+
+        parsed = _extract_json_object(raw_content)
+        if parsed is None:
+            logger.warning(
+                "bake llm raw response caller=%s raw=%s response=%s",
+                caller_id,
+                _preview_text(raw_content, 800),
+                _preview_text(response, 800),
+            )
+        usage = response.get('usage') or {}
+        usage_summary = {
+            'prompt_tokens': usage.get('prompt_tokens') or response.get('prompt_eval_count') or estimate_tokens(system_prompt + user_prompt),
+            'completion_tokens': usage.get('completion_tokens') or response.get('eval_count') or estimate_tokens(raw_content),
+        }
+        return parsed, {
+            'usage': usage_summary,
+            'model': response.get('model') or self.model,
+            'raw_content': raw_content,
+            'raw_preview': _preview_text(raw_content),
+            'response_preview': _preview_text(response),
+            'empty_content': not bool(raw_content.strip()),
+            'elapsed_ms': elapsed_ms,
+        }
+
+    def _extract_bake_artifact(self, candidate: Dict[str, Any], artifact_type: str, artifact_prompt: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        candidate_text = self._build_bake_candidate_text(candidate)
+        system_prompt = BAKE_SHARED_PROMPT + "\n\n" + artifact_prompt
+        user_prompt = f"候选输入如下：\n\n{candidate_text}"
+        caller_id = f"{artifact_type}:{candidate.get('source_knowledge_id')}"
+        started_at = time.time()
+        logger.info("bake artifact start type=%s caller=%s", artifact_type, caller_id)
+
+        try:
+            parsed, meta = self._call_bake_llm(caller_id, system_prompt, user_prompt)
+        except Exception as e:
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            logger.error("bake %s 提炼失败 caller=%s elapsed_ms=%s error=%s", artifact_type, caller_id, elapsed_ms, e)
+            return {
+                'accepted': False,
+                'reason': f'llm_error: {e}',
+                'payload': None,
+            }, {
+                'usage': None,
+                'model': self.model,
+                'degraded': True,
+                'elapsed_ms': elapsed_ms,
+            }
+
+        elapsed_ms = int((time.time() - started_at) * 1000)
+
+        if not parsed:
+            reason = 'empty_content' if meta.get('empty_content') else 'invalid_json'
+            logger.warning(
+                "bake %s 提炼响应不可解析 caller=%s reason=%s elapsed_ms=%s raw=%s response=%s",
+                artifact_type,
+                caller_id,
+                reason,
+                elapsed_ms,
+                meta.get('raw_preview', ''),
+                meta.get('response_preview', ''),
+            )
+            return {
+                'accepted': False,
+                'reason': reason,
+                'payload': None,
+            }, {
+                'usage': meta['usage'],
+                'model': meta['model'],
+                'degraded': True,
+                'elapsed_ms': elapsed_ms,
+            }
+
+        accepted = bool(parsed.get('accepted', False))
+        reason = parsed.get('reason')
+        payload = parsed.get('payload')
+        if accepted and payload is None:
+            logger.warning(
+                "bake %s accepted without payload caller=%s elapsed_ms=%s",
+                artifact_type,
+                caller_id,
+                elapsed_ms,
+            )
+            return {
+                'accepted': False,
+                'reason': 'accepted_without_payload',
+                'payload': None,
+            }, {
+                'usage': meta['usage'],
+                'model': meta['model'],
+                'degraded': True,
+                'elapsed_ms': elapsed_ms,
+            }
+
+        if accepted and not isinstance(payload, dict):
+            logger.warning(
+                "bake %s malformed payload caller=%s elapsed_ms=%s payload_type=%s",
+                artifact_type,
+                caller_id,
+                elapsed_ms,
+                type(payload).__name__,
+            )
+            return {
+                'accepted': False,
+                'reason': 'malformed_payload',
+                'payload': None,
+            }, {
+                'usage': meta['usage'],
+                'model': meta['model'],
+                'degraded': True,
+                'elapsed_ms': elapsed_ms,
+            }
+
+        if accepted and artifact_type == 'knowledge':
+            if self._should_reject_template_like_knowledge(candidate, payload):
+                logger.info(
+                    "bake knowledge rejected as template-like caller=%s elapsed_ms=%s",
+                    caller_id,
+                    elapsed_ms,
+                )
+                return {
+                    'accepted': False,
+                    'reason': 'template_like_content',
+                    'payload': None,
+                }, {
+                    'usage': meta['usage'],
+                    'model': meta['model'],
+                    'degraded': False,
+                    'elapsed_ms': elapsed_ms,
+                }
+
+            if self._should_reject_sop_like_knowledge(candidate, payload):
+                logger.info(
+                    "bake knowledge rejected as sop-like caller=%s elapsed_ms=%s",
+                    caller_id,
+                    elapsed_ms,
+                )
+                return {
+                    'accepted': False,
+                    'reason': 'sop_like_content',
+                    'payload': None,
+                }, {
+                    'usage': meta['usage'],
+                    'model': meta['model'],
+                    'degraded': False,
+                    'elapsed_ms': elapsed_ms,
+                }
+
+        logger.info(
+            "bake artifact done type=%s caller=%s accepted=%s elapsed_ms=%s reason=%s",
+            artifact_type,
+            caller_id,
+            accepted,
+            elapsed_ms,
+            reason,
+        )
+
+        if not accepted:
+            return {
+                'accepted': False,
+                'reason': reason or 'rejected',
+                'payload': None,
+            }, {
+                'usage': meta['usage'],
+                'model': meta['model'],
+                'degraded': False,
+                'elapsed_ms': elapsed_ms,
+            }
+
+        return {
+            'accepted': True,
+            'reason': reason,
+            'payload': payload,
+        }, {
+            'usage': meta['usage'],
+            'model': meta['model'],
+            'degraded': False,
+            'elapsed_ms': elapsed_ms,
+        }
+
+    def extract_bake_knowledge(self, candidate: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        return self._extract_bake_artifact(candidate, 'knowledge', BAKE_KNOWLEDGE_PROMPT)
+
+    def extract_bake_template(self, candidate: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        return self._extract_bake_artifact(candidate, 'template', BAKE_TEMPLATE_PROMPT)
+
+    def extract_bake_sop(self, candidate: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        return self._extract_bake_artifact(candidate, 'sop', BAKE_SOP_PROMPT)
+
+    def extract_bake_bundle(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        bundle_started_at = time.time()
+        source_knowledge_id = candidate.get('source_knowledge_id')
+        logger.info("bake bundle start source_knowledge_id=%s", source_knowledge_id)
+
+        knowledge, knowledge_meta = self.extract_bake_knowledge(candidate)
+        template, template_meta = self.extract_bake_template(candidate)
+        sop, sop_meta = self.extract_bake_sop(candidate)
+
+        usage_items = [meta.get('usage') for meta in (knowledge_meta, template_meta, sop_meta) if meta.get('usage')]
+        usage = None
+        if usage_items:
+            usage = {
+                'prompt_tokens': sum(int(item.get('prompt_tokens') or 0) for item in usage_items),
+                'completion_tokens': sum(int(item.get('completion_tokens') or 0) for item in usage_items),
+            }
+
+        models = [meta.get('model') for meta in (knowledge_meta, template_meta, sop_meta) if meta.get('model')]
+        degraded = any(bool(meta.get('degraded')) for meta in (knowledge_meta, template_meta, sop_meta))
+        total_elapsed_ms = int((time.time() - bundle_started_at) * 1000)
+        per_stage_ms = {
+            'knowledge': int(knowledge_meta.get('elapsed_ms') or 0),
+            'template': int(template_meta.get('elapsed_ms') or 0),
+            'sop': int(sop_meta.get('elapsed_ms') or 0),
+        }
+        logger.info(
+            "bake bundle done source_knowledge_id=%s total_elapsed_ms=%s stage_elapsed_ms=%s degraded=%s accepted={knowledge:%s,template:%s,sop:%s}",
+            source_knowledge_id,
+            total_elapsed_ms,
+            per_stage_ms,
+            degraded,
+            knowledge.get('accepted'),
+            template.get('accepted'),
+            sop.get('accepted'),
+        )
+
+        return {
+            'knowledge': knowledge,
+            'template': template,
+            'sop': sop,
+            'usage': usage,
+            'model': models[0] if models else self.model,
+            'degraded': degraded,
+            'stage_elapsed_ms': per_stage_ms,
+            'total_elapsed_ms': total_elapsed_ms,
+        }
 
     def extract_sync(
         self,
@@ -415,15 +1101,15 @@ class KnowledgeExtractorV2:
                     format="json",
                     options={"temperature": 0.3, "num_predict": 1024},
                 )
+                content = _extract_ollama_response_text(response)
                 tracker.set_response(response)
                 if tracker._prompt_tokens == 0:
                     tracker.set_tokens(
                         prompt=estimate_tokens(SYSTEM_PROMPT + prompt),
-                        completion=estimate_tokens(response['message']['content']),
+                        completion=estimate_tokens(content),
                     )
 
             # 3. 解析结果
-            content = response['message']['content']
             result = _extract_json_object(content)
             if result is None:
                 raise json.JSONDecodeError("No valid JSON object found", content, 0)
@@ -439,7 +1125,13 @@ class KnowledgeExtractorV2:
             # 5. 去重检查和知识合并
             if db_conn:
                 entities = result.get('entities') or []
-                similar_id = self._find_similar_knowledge(overview, db_conn, entities=entities)
+                similar_id = self._find_similar_knowledge(
+                    overview,
+                    db_conn,
+                    entities=entities,
+                    start_time=capture_data.get('ts'),
+                    end_time=capture_data.get('ts'),
+                )
                 if similar_id:
                     # 合并知识：更新明细内容，追加新的细节
                     cursor = db_conn.execute(
@@ -579,15 +1271,15 @@ class KnowledgeExtractorV2:
                     format="json",
                     options={"temperature": 0.3, "num_predict": 1024},
                 )
+                content = _extract_ollama_response_text(response)
                 tracker.set_response(response)
                 if tracker._prompt_tokens == 0:
                     tracker.set_tokens(
                         prompt=estimate_tokens(_sys_prompt + user_prompt),
-                        completion=estimate_tokens(response['message']['content']),
+                        completion=estimate_tokens(content),
                     )
 
             # 3. 解析结果
-            content = response['message']['content']
             result = _extract_json_object(content)
             if result is None:
                 logger.warning("合并提炼返回非预期 JSON，使用兜底 knowledge: content=%s", content[:500])
