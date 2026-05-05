@@ -5,9 +5,9 @@
 //!
 //! 测试环境：`capture_and_save` 返回 None，不调用系统 API。
 
-use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
@@ -45,7 +45,7 @@ pub struct ScreenshotResult {
 /// 返回 `Ok(None)` 表示无可用显示器（无头服务器 / 测试环境）。
 pub fn capture_and_save(
     captures_dir: &Path,
-    quality:      u8,
+    quality: u8,
 ) -> Result<Option<ScreenshotResult>, CaptureError> {
     #[cfg(not(test))]
     {
@@ -101,7 +101,8 @@ struct TestScreenshotFixture {
 
 #[cfg(test)]
 fn test_screenshot_queue() -> &'static Mutex<VecDeque<TestScreenshotFixture>> {
-    static TEST_SCREENSHOT_QUEUE: OnceLock<Mutex<VecDeque<TestScreenshotFixture>>> = OnceLock::new();
+    static TEST_SCREENSHOT_QUEUE: OnceLock<Mutex<VecDeque<TestScreenshotFixture>>> =
+        OnceLock::new();
     TEST_SCREENSHOT_QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
@@ -114,7 +115,11 @@ pub(crate) fn clear_test_screenshots() {
 
 #[cfg(test)]
 pub(crate) fn push_test_screenshot(width: u32, height: u32, pixels: Vec<u8>) {
-    let fixture = TestScreenshotFixture { width, height, pixels };
+    let fixture = TestScreenshotFixture {
+        width,
+        height,
+        pixels,
+    };
     test_screenshot_queue().lock().unwrap().push_back(fixture);
 }
 
@@ -131,33 +136,62 @@ pub(crate) fn push_test_screenshot_from_image(image: &DynamicImage) {
 #[cfg(not(test))]
 fn capture_real(
     captures_dir: &Path,
-    quality:      u8,
+    quality: u8,
 ) -> Result<Option<ScreenshotResult>, CaptureError> {
     use image::codecs::jpeg::JpegEncoder;
+    use image::imageops;
     use std::fs;
     use std::io::BufWriter;
     use std::time::{SystemTime, UNIX_EPOCH};
     use xcap::Monitor;
 
-    let monitors = Monitor::all()
-        .map_err(|e| CaptureError::ScreenshotFailed(e.to_string()))?;
+    let monitors = Monitor::all().map_err(|e| CaptureError::ScreenshotFailed(e.to_string()))?;
 
     if monitors.is_empty() {
         return Ok(None);
     }
 
-    // 采集主显示器（第一个）
-    let rgba_image = monitors[0]
-        .capture_image()
-        .map_err(|e| CaptureError::ScreenshotFailed(e.to_string()))?;
-
-    let width  = rgba_image.width();
-    let height = rgba_image.height();
-
     let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
+
+    // 采集所有显示器并水平拼接
+    let mut combined_image: Option<DynamicImage> = None;
+
+    for (i, monitor) in monitors.iter().enumerate() {
+        let rgba_image = match monitor.capture_image() {
+            Ok(img) => img,
+            Err(e) => {
+                tracing::warn!("显示器 {} 截图失败: {}", i, e);
+                continue;
+            }
+        };
+
+        let dynamic = DynamicImage::ImageRgba8(rgba_image);
+
+        combined_image = Some(match combined_image {
+            None => dynamic,
+            Some(existing) => {
+                // 水平拼接：将新图像放在右侧
+                let total_width = existing.width() + dynamic.width();
+                let total_height = existing.height().max(dynamic.height());
+
+                let mut combined = DynamicImage::new_rgba8(total_width, total_height);
+                imageops::overlay(&mut combined, &existing, 0, 0);
+                imageops::overlay(&mut combined, &dynamic, existing.width() as i64, 0);
+                combined
+            }
+        });
+    }
+
+    let combined_image = match combined_image {
+        Some(img) => img,
+        None => return Ok(None),
+    };
+
+    let width = combined_image.width();
+    let height = combined_image.height();
 
     let relative_path = make_relative_path(ts_ms);
     let full_path = captures_dir.join(&relative_path);
@@ -167,13 +201,11 @@ fn capture_real(
         fs::create_dir_all(parent)?;
     }
 
-    // RGBA → RGB（JPEG 不支持透明通道）
-    let dynamic = DynamicImage::ImageRgba8(rgba_image);
-    let dhash = compute_dhash64(&dynamic);
-    let rgb_image = dynamic.into_rgb8();
+    let dhash = compute_dhash64(&combined_image);
+    let rgb_image = combined_image.into_rgb8();
 
     // 编码为 JPEG（指定质量）
-    let file   = fs::File::create(&full_path)?;
+    let file = fs::File::create(&full_path)?;
     let writer = BufWriter::new(file);
     let mut encoder = JpegEncoder::new_with_quality(writer, quality);
     encoder
@@ -196,7 +228,7 @@ fn capture_real(
 #[cfg(test)]
 fn capture_test(
     captures_dir: &Path,
-    quality:      u8,
+    quality: u8,
 ) -> Result<Option<ScreenshotResult>, CaptureError> {
     use image::{codecs::jpeg::JpegEncoder, RgbImage};
     use std::fs;
@@ -208,7 +240,11 @@ fn capture_test(
         None => return Ok(None),
     };
 
-    let TestScreenshotFixture { width, height, pixels } = fixture;
+    let TestScreenshotFixture {
+        width,
+        height,
+        pixels,
+    } = fixture;
     let rgb_image = RgbImage::from_raw(width, height, pixels)
         .ok_or_else(|| CaptureError::ImageError("invalid test screenshot pixels".to_string()))?;
 
@@ -332,7 +368,7 @@ mod tests {
         use std::io::Cursor;
 
         // 创建 8×8 纯色 RGB 图像
-        let width  = 8u32;
+        let width = 8u32;
         let height = 8u32;
         let pixels: Vec<u8> = (0..width * height * 3)
             .map(|i| match i % 3 {
@@ -343,7 +379,7 @@ mod tests {
             .collect();
 
         let rgb_image = RgbImage::from_raw(width, height, pixels).unwrap();
-        let dynamic   = DynamicImage::ImageRgb8(rgb_image);
+        let dynamic = DynamicImage::ImageRgb8(rgb_image);
 
         let mut buf = Cursor::new(Vec::<u8>::new());
         let mut encoder = JpegEncoder::new_with_quality(&mut buf, 80);
@@ -363,12 +399,12 @@ mod tests {
         use image::{DynamicImage, RgbImage};
         use std::io::Cursor;
 
-        let width  = 4u32;
+        let width = 4u32;
         let height = 4u32;
         let pixels: Vec<u8> = vec![128u8; (width * height * 3) as usize];
 
-        let rgb   = RgbImage::from_raw(width, height, pixels).unwrap();
-        let dyn_  = DynamicImage::ImageRgb8(rgb);
+        let rgb = RgbImage::from_raw(width, height, pixels).unwrap();
+        let dyn_ = DynamicImage::ImageRgb8(rgb);
 
         let mut encoded = Cursor::new(Vec::<u8>::new());
         JpegEncoder::new_with_quality(&mut encoded, 90)
