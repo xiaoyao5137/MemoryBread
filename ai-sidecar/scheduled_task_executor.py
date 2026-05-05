@@ -349,7 +349,10 @@ class TaskExecutor:
             for k in knowledge_list:
                 ts = self._format_time(k.get('start_time'))
                 duration = f"（{k['duration_minutes']}分钟）" if k.get('duration_minutes') else ""
-                block = f"[{ts}{duration}][{k['category']}] {k['overview']}"
+                work_item = k.get('work_item') or k['category']
+                block = f"[{ts}{duration}][{work_item}] {k['overview']}"
+                if k.get('work_progress'):
+                    block += f"（{k['work_progress']}）"
                 if k.get('details'):
                     block += f"\n详情：{k['details']}"
                 blocks.append(block)
@@ -362,7 +365,11 @@ class TaskExecutor:
             for k in knowledge_list:
                 ts = self._format_time(k.get('start_time'))
                 duration = f"（{k['duration_minutes']}分钟）" if k.get('duration_minutes') else ""
-                blocks.append(f"[{ts}{duration}][{k['category']}] {k['overview']}")
+                work_item = k.get('work_item') or k['category']
+                line = f"[{ts}{duration}][{work_item}] {k['overview']}"
+                if k.get('work_progress'):
+                    line += f"（{k['work_progress']}）"
+                blocks.append(line)
             context = "\n".join(blocks)
             estimated_tokens = len(knowledge_list) * 80
             logger.info(f"上下文策略：仅概述，{len(knowledge_list)} 条，预估 {estimated_tokens} tokens")
@@ -377,7 +384,11 @@ class TaskExecutor:
             blocks = []
             for k in truncated:
                 ts = self._format_time(k.get('start_time'))
-                blocks.append(f"[{ts}][{k['category']}] {k['overview']}")
+                work_item = k.get('work_item') or k['category']
+                line = f"[{ts}][{work_item}] {k['overview']}"
+                if k.get('work_progress'):
+                    line += f"（{k['work_progress']}）"
+                blocks.append(line)
             context = "\n".join(blocks)
             estimated_tokens = len(truncated) * 80
             logger.info(f"上下文策略：截断，{len(truncated)}/{len(knowledge_list)} 条，预估 {estimated_tokens} tokens")
@@ -590,14 +601,17 @@ class TaskExecutor:
 
         system_prompt = (
             "你是用户的个人工作助手。以下是用户近期的工作记录摘要（按时间顺序）。"
+            "每条记录的格式为：[时间][工作项] 概述（进度）\n\n"
             "请严格按照用户的指令，基于这些工作记录生成相应的报告或总结。"
             "输出使用 Markdown 格式，语言简洁专业。\n\n"
             "【重要】生成报告时必须遵守以下规则：\n"
-            "1. 以「产出」为中心，而非「活动」。每一条内容必须体现可见的价值或结果。\n"
-            "2. 以下类型的活动禁止直接写入报告：纯阅读/查看文档、安装配置环境、无结论的调研、中间态的失败尝试。"
+            "1. 每条产出必须明确说明是哪个项目/工作项的成果，格式：【工作项】完成了…\n"
+            "2. 项目进展章节必须按工作项分组，每个工作项说明当前状态（待启动/进行中/已完成/阻塞）和具体进度\n"
+            "3. 以「产出」为中心，而非「活动」。每一条内容必须体现可见的价值或结果。\n"
+            "4. 以下类型的活动禁止直接写入报告：纯阅读/查看文档、安装配置环境、无结论的调研、中间态的失败尝试。"
             "若这些活动产生了明确结论或结果，则以结论为主语来描述。\n"
-            "3. 凡有可量化数据（测试通过率、性能指标、完成模块数等），必须写出具体数字。\n"
-            "4. 每条工作项须能回答「这件事带来了什么价值？」，否则删除该条。"
+            "5. 凡有可量化数据（测试通过率、性能指标、完成模块数等），必须写出具体数字。\n"
+            "6. 每条工作项须能回答「这件事带来了什么价值？」，否则删除该条。"
             f"{weekly_rules}"
         )
         user_prompt = f"## 工作记录\n\n{context}\n\n---\n\n## 用户指令\n\n{user_instruction}"

@@ -171,22 +171,119 @@ def _preview_text(value: Any, limit: int = 500) -> str:
     return text[:limit].rstrip() + " ...(已截断)"
 
 
+UI_NOISE_LINE_PATTERNS = (
+    re.compile(r'^(file|edit|selection|view|go|run|terminal|window|help)(\s+\w+){0,10}$', re.IGNORECASE),
+    re.compile(r'^(welcome|explorer|extensions?)$', re.IGNORECASE),
+    re.compile(r'^[\d\s]{4,}$'),
+    re.compile(r'^[=+\-_*~•·。，、…<>|/\\]{3,}$'),
+)
+
+UI_NOISE_KEYWORDS = {
+    'file', 'edit', 'selection', 'view', 'go', 'run', 'terminal', 'window', 'help',
+    'welcome', 'explorer', 'bash tool output', 'taskoutput tool output',
+}
+
+WORK_ACTION_KEYWORDS = (
+    '修复', '排查', '实现', '更新', '重启', '验证', '提炼', '分析', '编写',
+    '调试', '优化', '新增', '删除', '合并', 'review', '检查', '对齐',
+)
+
+
+def _normalize_inline_text(text: str) -> str:
+    return re.sub(r'\s+', ' ', str(text or '').replace('\r', ' ').replace('\n', ' ')).strip()
+
+
+def _sanitize_capture_text(raw_text: str) -> str:
+    lines = str(raw_text or '').replace('\r', '\n').split('\n')
+    cleaned: List[str] = []
+    prev = ''
+    for line in lines:
+        normalized = _normalize_inline_text(line)
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if any(pattern.match(normalized) for pattern in UI_NOISE_LINE_PATTERNS):
+            continue
+        if lowered in UI_NOISE_KEYWORDS:
+            continue
+        if normalized == prev:
+            continue
+        cleaned.append(normalized)
+        prev = normalized
+
+    if cleaned:
+        return '\n'.join(cleaned)
+    return _normalize_inline_text(raw_text)
+
+
+def _overview_quality_reason(overview: str, source_text: str) -> Optional[str]:
+    compact = _normalize_inline_text(overview)
+    if not compact or len(compact) < 16:
+        return 'overview_too_short'
+
+    if '\n' in str(overview or ''):
+        return 'overview_contains_newline'
+
+    lowered = compact.lower()
+    ui_hits = sum(1 for keyword in UI_NOISE_KEYWORDS if keyword in lowered)
+    has_action = any(keyword in compact for keyword in WORK_ACTION_KEYWORDS)
+    if ui_hits >= 2 and not has_action:
+        return 'ui_noise_dominant'
+
+    words = re.findall(r'[a-zA-Z]+|\d+', lowered)
+    if words:
+        noisy_terms = sum(
+            1
+            for word in words
+            if word.isdigit() or word in UI_NOISE_KEYWORDS
+        )
+        if len(words) >= 10 and (noisy_terms / len(words)) >= 0.32 and not has_action:
+            return 'ui_noise_ratio_high'
+
+    source_compact = _normalize_inline_text(source_text)
+    if source_compact and compact in source_compact and not has_action:
+        return 'overview_is_raw_copy'
+
+    return None
+
+
+def _overview_to_summary(overview: str, max_len: int = 42) -> str:
+    compact = _normalize_inline_text(overview)
+    if not compact:
+        return "工作片段"
+    sentence = re.split(r'[。！？!?]', compact, maxsplit=1)[0].strip() or compact
+    if len(sentence) <= max_len:
+        return sentence
+    return sentence[:max_len].rstrip() + "…"
+
+
 MERGE_SYSTEM_PROMPT ="""你是一个工作片段提炼助手。以下是用户在一段连续时间内的屏幕采集记录（按时间顺序），它们属于同一个工作片段。
 
 **你的任务**：将这些连续采集提炼为一个完整的工作片段知识条目。
 
 **提炼规则**：
 1. 识别这段时间内用户在做的一件完整的事
-2. 生成概述（50-150字）：描述做了什么、关键进展、结果，使用过去时态
-3. 生成明细（200-500字）：
+2. **从工作内容中提炼工作项**：综合分析所有帧的内容，识别用户在做哪个项目/功能的工作
+   - 从代码注释、函数名、文件路径、Git commit、文档标题、聊天主题等内容中提炼
+   - 格式："项目名-功能模块"（如"MemoryBread-知识提炼优化"）或"项目名"（如"个人博客"）
+   - 如果内容明确提到具体任务（如"修复 bug #123"），可以更具体（如"MemoryBread-修复排查步骤 bug"）
+   - 如果无法从内容中识别，填写 null
+3. **识别工作进度和状态**：从内容中推断当前工作的进展
+   - work_status: "pending"（待启动）| "in_progress"（进行中）| "completed"（已完成）| "blocked"（阻塞）
+   - work_progress: 具体进度描述（如"已完成核心逻辑"、"待其他团队协作"、"等待需求确认"）
+4. 生成概述（50-150字）：描述做了什么、关键进展、结果，使用过去时态
+5. 生成明细（200-500字）：
    - 保留有追溯价值的具体信息（代码逻辑、会议决策、学到的知识点）
    - 过滤掉 UI 操作、重复内容、无意义的切换记录
    - 不要堆砌原始文本，要提炼和归纳
-4. 识别关键实体（人名、项目名、技术词汇）
-5. 判断分类和重要性
+6. 识别关键实体（人名、项目名、技术词汇）
+7. 判断分类和重要性
 
 **输出格式（JSON）**：
 {
+  "work_item": "项目名或项目名-功能模块，如 'MemoryBread-知识提炼优化'，无法识别时填 null",
+  "work_status": "pending|in_progress|completed|blocked",
+  "work_progress": "具体进度描述，如 '已完成核心逻辑，待集成测试'",
   "overview": "概述，50-150字，不含换行符",
   "details": "明细，200-500字，使用空格代替换行符",
   "entities": ["实体1", "实体2"],
@@ -201,6 +298,17 @@ MERGE_SYSTEM_PROMPT ="""你是一个工作片段提炼助手。以下是用户�
 }
 
 **注意补充判断**：
+- **工作项识别示例**：
+  * 代码文件 "extractor_v2.py" + 注释 "优化知识提炼逻辑" → work_item: "MemoryBread-知识提炼优化"
+  * Git commit "fix: 修复排查步骤 bug" → work_item: "MemoryBread-修复排查步骤 bug"
+  * 聊天记录讨论 "个人博客的评论功能需求" → work_item: "个人博客-评论功能"
+  * 文档标题 "用户认证系统重构方案" → work_item: "用户认证系统-重构"
+  * 如果只看到 "修复 bug"、"写代码" 等模糊描述，无法识别具体项目，填 null
+- **工作进度识别示例**：
+  * 看到 "TODO"、"开始实现" → work_status: "in_progress", work_progress: "刚开始开发"
+  * 看到 "测试通过"、"已上线" → work_status: "completed", work_progress: "已完成并上线"
+  * 看到 "等待"、"阻塞"、"依赖" → work_status: "blocked", work_progress: "等待其他团队协作"
+  * 看到 "80% 完成"、"还剩最后一步" → work_status: "in_progress", work_progress: "已完成 80%"
 - 如果用户今天在 IM/聊天/AI 工具里回看昨天、前天、更早的消息或历史对话，`history_view=true`
 - `observed_at` 不需要输出，由系统记录当前片段结束时间
 - `event_time_start/event_time_end` 只在内容明确提到事情发生时间时填写；不明确时返回 null
@@ -288,6 +396,29 @@ BAKE_SOP_MARKERS = (
     "执行",
     "验证",
 )
+
+BAKE_SCORE_METADATA_KEYS = {
+    "match_score",
+    "match_level",
+    "review_status",
+    "score",
+    "confidence",
+    "status",
+    "auto_created",
+    "candidate",
+    "confirmed",
+    "ignored",
+}
+
+BAKE_SCORE_METADATA_KEYWORDS = (
+    "match_score",
+    "match level",
+    "match_level",
+    "review_status",
+    "confidence",
+)
+
+BAKE_MISMATCH_MAX_SCORE = 0.49
 
 
 BAKE_KNOWLEDGE_PROMPT = """类别：knowledge
@@ -389,16 +520,27 @@ MERGE_SYSTEM_PROMPT ="""你是一个工作片段提炼助手。以下是用户�
 
 **提炼规则**：
 1. 识别这段时间内用户在做的一件完整的事
-2. 生成概述（50-150字）：描述做了什么、关键进展、结果，使用过去时态
-3. 生成明细（200-500字）：
+2. **从工作内容中提炼工作项**：综合分析所有帧的内容，识别用户在做哪个项目/功能的工作
+   - 从代码注释、函数名、文件路径、Git commit、文档标题、聊天主题等内容中提炼
+   - 格式："项目名-功能模块"（如"MemoryBread-知识提炼优化"）或"项目名"（如"个人博客"）
+   - 如果内容明确提到具体任务（如"修复 bug #123"），可以更具体（如"MemoryBread-修复排查步骤 bug"）
+   - 如果无法从内容中识别，填写 null
+3. **识别工作进度和状态**：从内容中推断当前工作的进展
+   - work_status: "pending"（待启动）| "in_progress"（进行中）| "completed"（已完成）| "blocked"（阻塞）
+   - work_progress: 具体进度描述（如"已完成核心逻辑"、"待其他团队协作"、"等待需求确认"）
+4. 生成概述（50-150字）：描述做了什么、关键进展、结果，使用过去时态
+5. 生成明细（200-500字）：
    - 保留有追溯价值的具体信息（代码逻辑、会议决策、学到的知识点）
    - 过滤掉 UI 操作、重复内容、无意义的切换记录
    - 不要堆砌原始文本，要提炼和归纳
-4. 识别关键实体（人名、项目名、技术词汇）
-5. 判断分类和重要性
+6. 识别关键实体（人名、项目名、技术词汇）
+7. 判断分类和重要性
 
 **输出格式（JSON）**：
 {
+  "work_item": "项目名或项目名-功能模块，如 'MemoryBread-知识提炼优化'，无法识别时填 null",
+  "work_status": "pending|in_progress|completed|blocked",
+  "work_progress": "具体进度描述，如 '已完成核心逻辑，待集成测试'",
   "overview": "概述，50-150字，不含换行符",
   "details": "明细，200-500字，使用空格代替换行符",
   "entities": ["实体1", "实体2"],
@@ -413,6 +555,17 @@ MERGE_SYSTEM_PROMPT ="""你是一个工作片段提炼助手。以下是用户�
 }
 
 **注意补充判断**：
+- **工作项识别示例**：
+  * 代码文件 "extractor_v2.py" + 注释 "优化知识提炼逻辑" → work_item: "MemoryBread-知识提炼优化"
+  * Git commit "fix: 修复排查步骤 bug" → work_item: "MemoryBread-修复排查步骤 bug"
+  * 聊天记录讨论 "个人博客的评论功能需求" → work_item: "个人博客-评论功能"
+  * 文档标题 "用户认证系统重构方案" → work_item: "用户认证系统-重构"
+  * 如果只看到 "修复 bug"、"写代码" 等模糊描述，无法识别具体项目，填 null
+- **工作进度识别示例**：
+  * 看到 "TODO"、"开始实现" → work_status: "in_progress", work_progress: "刚开始开发"
+  * 看到 "测试通过"、"已上线" → work_status: "completed", work_progress: "已完成并上线"
+  * 看到 "等待"、"阻塞"、"依赖" → work_status: "blocked", work_progress: "等待其他团队协作"
+  * 看到 "80% 完成"、"还剩最后一步" → work_status: "in_progress", work_progress: "已完成 80%"
 - 如果用户今天在 IM/聊天/AI 工具里回看昨天、前天、更早的消息或历史对话，`history_view=true`
 - `observed_at` 不需要输出，由系统记录当前片段结束时间
 - `event_time_start/event_time_end` 只在内容明确提到事情发生时间时填写；不明确时返回 null
@@ -580,7 +733,8 @@ class KnowledgeExtractorV2:
         app_name = capture_data.get('app_name', '未知应用')
         window_title = capture_data.get('window_title', '未知窗口')
         timestamp = capture_data.get('timestamp', datetime.now().isoformat())
-        ocr_text = capture_data.get('ocr_text') or capture_data.get('ax_text') or ''
+        raw_text = capture_data.get('ocr_text') or capture_data.get('ax_text') or ''
+        ocr_text = _sanitize_capture_text(raw_text)
 
         # 限制文本长度，避免超过上下文
         if len(ocr_text) > 2000:
@@ -592,7 +746,7 @@ class KnowledgeExtractorV2:
 **OCR 文本**：
 {ocr_text}
 
-请提炼上述内容。"""
+请提炼上述内容。要求：必须总结工作动作与结果，禁止照抄菜单词/窗口壳层词或原始 OCR 长串。"""
 
         return prompt
 
@@ -706,9 +860,81 @@ class KnowledgeExtractorV2:
             return text
         return text[:limit].rstrip() + " ...(已截断)"
 
+    def _sanitize_bake_details_value(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            cleaned: Dict[str, Any] = {}
+            for raw_key, raw_value in value.items():
+                key = str(raw_key or '').strip()
+                normalized_key = key.lower().replace('-', '_').replace(' ', '_')
+                if normalized_key in BAKE_SCORE_METADATA_KEYS:
+                    continue
+                if any(keyword in normalized_key for keyword in BAKE_SCORE_METADATA_KEYWORDS):
+                    continue
+                nested = self._sanitize_bake_details_value(raw_value)
+                if nested in (None, '', [], {}):
+                    continue
+                cleaned[key] = nested
+            return cleaned
+
+        if isinstance(value, list):
+            cleaned_items = [self._sanitize_bake_details_value(item) for item in value]
+            return [item for item in cleaned_items if item not in (None, '', [], {})]
+
+        return value
+
+    def _sanitize_bake_details_text(self, value: Any) -> str:
+        if value is None:
+            return ''
+
+        if isinstance(value, (dict, list)):
+            cleaned = self._sanitize_bake_details_value(value)
+            if cleaned in (None, '', [], {}):
+                return ''
+            return json.dumps(cleaned, ensure_ascii=False)
+
+        raw_text = str(value or '').strip()
+        if not raw_text:
+            return ''
+
+        parsed = _try_parse_json_like_object(raw_text)
+        if isinstance(parsed, dict):
+            cleaned = self._sanitize_bake_details_value(parsed)
+            if cleaned in (None, '', [], {}):
+                return ''
+            return json.dumps(cleaned, ensure_ascii=False)
+
+        lines = []
+        for line in raw_text.splitlines():
+            normalized_line = line.lower()
+            if any(keyword in normalized_line for keyword in BAKE_SCORE_METADATA_KEYWORDS):
+                continue
+            lines.append(line)
+        return '\n'.join(lines).strip()
+
+    def _build_bake_semantic_text(self, candidate: Dict[str, Any], payload: Dict[str, Any]) -> tuple[str, str]:
+        candidate_text = "\n".join(
+            str(candidate.get(field) or '')
+            for field in (
+                'summary',
+                'overview',
+                'details',
+                'capture_ax_text',
+                'capture_ocr_text',
+                'capture_input_text',
+                'capture_audio_text',
+            )
+        )
+        entities = candidate.get('entities') or []
+        if entities:
+            candidate_text += "\n" + " ".join(str(item) for item in entities if item)
+
+        payload_text = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload or '')
+        return candidate_text, payload_text
+
     def _build_bake_candidate_text(self, candidate: Dict[str, Any]) -> str:
         entities = candidate.get('entities') or []
         entities_text = "、".join(str(item) for item in entities if item)
+        sanitized_details = self._sanitize_bake_details_text(candidate.get('details'))
         capture_parts = [
             self._truncate_text(candidate.get('capture_ax_text'), 600),
             self._truncate_text(candidate.get('capture_ocr_text'), 600),
@@ -722,9 +948,12 @@ class KnowledgeExtractorV2:
         return (
             f"source_knowledge_id: {candidate.get('source_knowledge_id')}\n"
             f"source_capture_id: {candidate.get('source_capture_id')}\n"
+            f"work_item: {candidate.get('work_item') or ''}\n"
+            f"work_status: {candidate.get('work_status') or ''}\n"
+            f"work_progress: {candidate.get('work_progress') or ''}\n"
             f"summary: {self._truncate_text(candidate.get('summary'), 180)}\n"
             f"overview: {self._truncate_text(candidate.get('overview'), 280)}\n"
-            f"details: {self._truncate_text(candidate.get('details'), 700)}\n"
+            f"details: {self._truncate_text(sanitized_details, 700)}\n"
             f"importance: {candidate.get('importance')}\n"
             f"occurrence_count: {candidate.get('occurrence_count')}\n"
             f"observed_at: {candidate.get('observed_at')}\n"
@@ -746,50 +975,63 @@ class KnowledgeExtractorV2:
         return sum(1 for marker in markers if marker and marker.lower() in normalized)
 
     def _should_reject_template_like_knowledge(self, candidate: Dict[str, Any], payload: Dict[str, Any]) -> bool:
-        candidate_text = "\n".join(
-            str(candidate.get(field) or '')
-            for field in (
-                'summary',
-                'overview',
-                'details',
-                'capture_ax_text',
-                'capture_ocr_text',
-                'capture_input_text',
-                'capture_audio_text',
-            )
-        )
-        entities = candidate.get('entities') or []
-        if entities:
-            candidate_text += "\n" + " ".join(str(item) for item in entities if item)
-
-        payload_text = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload or '')
+        candidate_text, payload_text = self._build_bake_semantic_text(candidate, payload)
         candidate_template_hits = self._count_marker_hits(candidate_text, BAKE_TEMPLATE_MARKERS)
         payload_template_hits = self._count_marker_hits(payload_text, BAKE_TEMPLATE_MARKERS)
         knowledge_hits = self._count_marker_hits(candidate_text + "\n" + payload_text, BAKE_KNOWLEDGE_MARKERS)
         return candidate_template_hits >= 2 and payload_template_hits >= 1 and knowledge_hits == 0
 
     def _should_reject_sop_like_knowledge(self, candidate: Dict[str, Any], payload: Dict[str, Any]) -> bool:
-        candidate_text = "\n".join(
-            str(candidate.get(field) or '')
-            for field in (
-                'summary',
-                'overview',
-                'details',
-                'capture_ax_text',
-                'capture_ocr_text',
-                'capture_input_text',
-                'capture_audio_text',
-            )
-        )
-        entities = candidate.get('entities') or []
-        if entities:
-            candidate_text += "\n" + " ".join(str(item) for item in entities if item)
-
-        payload_text = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload or '')
+        candidate_text, payload_text = self._build_bake_semantic_text(candidate, payload)
         candidate_sop_hits = self._count_marker_hits(candidate_text, BAKE_SOP_MARKERS)
         payload_sop_hits = self._count_marker_hits(payload_text, BAKE_SOP_MARKERS)
         knowledge_hits = self._count_marker_hits(candidate_text + "\n" + payload_text, BAKE_KNOWLEDGE_MARKERS)
         return candidate_sop_hits >= 2 and payload_sop_hits >= 1 and knowledge_hits == 0
+
+    def _resolve_bake_artifact_mismatch_reason(self, artifact_type: str, candidate: Dict[str, Any], payload: Dict[str, Any]) -> Optional[str]:
+        candidate_text, payload_text = self._build_bake_semantic_text(candidate, payload)
+
+        template_hits = self._count_marker_hits(candidate_text + "\n" + payload_text, BAKE_TEMPLATE_MARKERS)
+        sop_hits = self._count_marker_hits(candidate_text + "\n" + payload_text, BAKE_SOP_MARKERS)
+        knowledge_hits = self._count_marker_hits(candidate_text + "\n" + payload_text, BAKE_KNOWLEDGE_MARKERS)
+        candidate_template_hits = self._count_marker_hits(candidate_text, BAKE_TEMPLATE_MARKERS)
+        candidate_sop_hits = self._count_marker_hits(candidate_text, BAKE_SOP_MARKERS)
+
+        if artifact_type == 'knowledge':
+            if self._should_reject_template_like_knowledge(candidate, payload):
+                return 'template_like_content'
+            if self._should_reject_sop_like_knowledge(candidate, payload):
+                return 'sop_like_content'
+            return None
+
+        if artifact_type == 'template':
+            if sop_hits >= 3 and template_hits <= 1:
+                return 'sop_like_content'
+            if knowledge_hits >= 3 and template_hits <= 1:
+                return 'knowledge_like_content'
+            return None
+
+        if artifact_type == 'sop':
+            if template_hits >= 3 and candidate_template_hits >= 2 and candidate_sop_hits <= 1:
+                return 'template_like_content'
+            if knowledge_hits >= 3 and sop_hits <= 1:
+                return 'knowledge_like_content'
+            return None
+
+        return None
+
+    def _downgrade_mismatch_payload(self, payload: Dict[str, Any], reason: str) -> Dict[str, Any]:
+        adjusted = dict(payload)
+        score = adjusted.get('match_score')
+        if isinstance(score, (int, float)):
+            adjusted['match_score'] = min(float(score), BAKE_MISMATCH_MAX_SCORE)
+        else:
+            adjusted['match_score'] = BAKE_MISMATCH_MAX_SCORE
+        adjusted['match_level'] = 'low'
+        adjusted['review_status'] = 'candidate'
+        evidence = str(adjusted.get('evidence_summary') or '').strip()
+        adjusted['evidence_summary'] = f"{evidence} | mismatch_guard={reason}" if evidence else f"mismatch_guard={reason}"
+        return adjusted
 
     def _call_bake_llm(self, caller_id: str, system_prompt: str, user_prompt: str) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         from monitor.llm_tracker import LLMCallTracker, estimate_tokens
@@ -938,16 +1180,18 @@ class KnowledgeExtractorV2:
                 'elapsed_ms': elapsed_ms,
             }
 
-        if accepted and artifact_type == 'knowledge':
-            if self._should_reject_template_like_knowledge(candidate, payload):
+        if accepted:
+            mismatch_reason = self._resolve_bake_artifact_mismatch_reason(artifact_type, candidate, payload)
+            if mismatch_reason and artifact_type == 'knowledge':
                 logger.info(
-                    "bake knowledge rejected as template-like caller=%s elapsed_ms=%s",
+                    "bake knowledge rejected as mismatch caller=%s elapsed_ms=%s reason=%s",
                     caller_id,
                     elapsed_ms,
+                    mismatch_reason,
                 )
                 return {
                     'accepted': False,
-                    'reason': 'template_like_content',
+                    'reason': mismatch_reason,
                     'payload': None,
                 }, {
                     'usage': meta['usage'],
@@ -956,22 +1200,18 @@ class KnowledgeExtractorV2:
                     'elapsed_ms': elapsed_ms,
                 }
 
-            if self._should_reject_sop_like_knowledge(candidate, payload):
+            if mismatch_reason:
+                payload = self._downgrade_mismatch_payload(payload, mismatch_reason)
+                reason = reason or mismatch_reason
                 logger.info(
-                    "bake knowledge rejected as sop-like caller=%s elapsed_ms=%s",
+                    "bake %s mismatch downgraded caller=%s elapsed_ms=%s reason=%s score=%s level=%s",
+                    artifact_type,
                     caller_id,
                     elapsed_ms,
+                    mismatch_reason,
+                    payload.get('match_score'),
+                    payload.get('match_level'),
                 )
-                return {
-                    'accepted': False,
-                    'reason': 'sop_like_content',
-                    'payload': None,
-                }, {
-                    'usage': meta['usage'],
-                    'model': meta['model'],
-                    'degraded': False,
-                    'elapsed_ms': elapsed_ms,
-                }
 
         logger.info(
             "bake artifact done type=%s caller=%s accepted=%s elapsed_ms=%s reason=%s",
@@ -1014,13 +1254,75 @@ class KnowledgeExtractorV2:
     def extract_bake_sop(self, candidate: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
         return self._extract_bake_artifact(candidate, 'sop', BAKE_SOP_PROMPT)
 
-    def extract_bake_bundle(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    def extract_bake_bundle(self, candidate: Dict[str, Any], preempt_check=None) -> Dict[str, Any]:
+        """提炼 bake bundle（知识/模板/SOP），支持抢占中断。
+
+        Args:
+            candidate: 候选知识条目
+            preempt_check: 抢占检查函数，返回 True 表示需要中断
+
+        Returns:
+            提炼结果字典，如果被抢占则 degraded=True
+        """
         bundle_started_at = time.time()
         source_knowledge_id = candidate.get('source_knowledge_id')
         logger.info("bake bundle start source_knowledge_id=%s", source_knowledge_id)
 
+        # 检查抢占信号
+        if preempt_check and preempt_check():
+            logger.info("bake bundle 收到抢占信号，中断提炼 source_knowledge_id=%s", source_knowledge_id)
+            return {
+                'knowledge': {'accepted': False, 'reason': 'preempted', 'payload': None},
+                'template': {'accepted': False, 'reason': 'preempted', 'payload': None},
+                'sop': {'accepted': False, 'reason': 'preempted', 'payload': None},
+                'usage': None,
+                'model': self.model,
+                'degraded': True,
+                'stage_elapsed_ms': {},
+                'total_elapsed_ms': int((time.time() - bundle_started_at) * 1000),
+            }
+
         knowledge, knowledge_meta = self.extract_bake_knowledge(candidate)
+
+        # 每个阶段后检查抢占
+        if preempt_check and preempt_check():
+            logger.info("bake bundle 在 knowledge 后收到抢占信号 source_knowledge_id=%s", source_knowledge_id)
+            return {
+                'knowledge': knowledge,
+                'template': {'accepted': False, 'reason': 'preempted', 'payload': None},
+                'sop': {'accepted': False, 'reason': 'preempted', 'payload': None},
+                'usage': knowledge_meta.get('usage'),
+                'model': knowledge_meta.get('model') or self.model,
+                'degraded': True,
+                'stage_elapsed_ms': {'knowledge': int(knowledge_meta.get('elapsed_ms') or 0)},
+                'total_elapsed_ms': int((time.time() - bundle_started_at) * 1000),
+            }
+
         template, template_meta = self.extract_bake_template(candidate)
+
+        if preempt_check and preempt_check():
+            logger.info("bake bundle 在 template 后收到抢占信号 source_knowledge_id=%s", source_knowledge_id)
+            usage_items = [meta.get('usage') for meta in (knowledge_meta, template_meta) if meta.get('usage')]
+            usage = None
+            if usage_items:
+                usage = {
+                    'prompt_tokens': sum(int(item.get('prompt_tokens') or 0) for item in usage_items),
+                    'completion_tokens': sum(int(item.get('completion_tokens') or 0) for item in usage_items),
+                }
+            return {
+                'knowledge': knowledge,
+                'template': template,
+                'sop': {'accepted': False, 'reason': 'preempted', 'payload': None},
+                'usage': usage,
+                'model': template_meta.get('model') or self.model,
+                'degraded': True,
+                'stage_elapsed_ms': {
+                    'knowledge': int(knowledge_meta.get('elapsed_ms') or 0),
+                    'template': int(template_meta.get('elapsed_ms') or 0),
+                },
+                'total_elapsed_ms': int((time.time() - bundle_started_at) * 1000),
+            }
+
         sop, sop_meta = self.extract_bake_sop(candidate)
 
         usage_items = [meta.get('usage') for meta in (knowledge_meta, template_meta, sop_meta) if meta.get('usage')]
@@ -1115,9 +1417,15 @@ class KnowledgeExtractorV2:
                 raise json.JSONDecodeError("No valid JSON object found", content, 0)
 
             # 4. 跳过无价值内容
-            overview = result.get('overview', '')
+            overview = _normalize_inline_text(result.get('overview', ''))
             if overview == 'SKIP' or not overview:
                 logger.info(f"采集记录 {capture_data.get('id')} 无价值，跳过")
+                return None
+
+            source_text = _sanitize_capture_text(capture_data.get('ocr_text') or capture_data.get('ax_text') or '')
+            quality_reason = _overview_quality_reason(overview, source_text)
+            if quality_reason:
+                logger.info("采集记录 %s 提炼质量不足，跳过: %s", capture_data.get('id'), quality_reason)
                 return None
 
             details = result.get('details', '')
@@ -1159,8 +1467,10 @@ class KnowledgeExtractorV2:
                     return None
 
             # 6. 返回结构化知识
+            summary = _overview_to_summary(overview)
             knowledge = {
                 'capture_id': capture_data['id'],
+                'summary': summary,
                 'overview': overview,
                 'details': details,
                 'entities': json.dumps(result.get('entities', []), ensure_ascii=False),
@@ -1198,17 +1508,24 @@ class KnowledgeExtractorV2:
     def extract_merged(
         self,
         captures: List[Dict[str, Any]],
+        preempt_check=None,
     ) -> Optional[Dict[str, Any]]:
         """
         将多条 captures 合并提炼为一个工作片段知识条目。
 
         Args:
             captures: 按时间升序排列的 capture 列表
+            preempt_check: 抢占检查函数，返回 True 表示需要中断
 
         Returns:
             提炼后的知识条目，包含 capture_ids/start_time/end_time/duration_minutes
         """
         if not captures:
+            return None
+
+        # 检查抢占信号
+        if preempt_check and preempt_check():
+            logger.info("extract_merged 收到抢占信号，中断提炼")
             return None
 
         # 单条直接走原有逻辑
@@ -1229,13 +1546,14 @@ class KnowledgeExtractorV2:
             merged_blocks = []
             for c in captures:
                 text = c.get('ocr_text') or c.get('ax_text') or ''
-                if not text.strip():
+                sanitized_text = _sanitize_capture_text(text)
+                if not sanitized_text.strip():
                     continue
                 ts_str = datetime.fromtimestamp(c['ts'] / 1000).strftime('%H:%M:%S')
                 app = c.get('app_name', '')
                 title = c.get('window_title', '')
                 # 每块限制 800 字，避免单条噪声过多
-                block = f"[{ts_str}] {app} - {title}\n{text[:800]}"
+                block = f"[{ts_str}] {app} - {title}\n{sanitized_text[:800]}"
                 merged_blocks.append(block)
 
             if not merged_blocks:
@@ -1246,13 +1564,21 @@ class KnowledgeExtractorV2:
             if len(merged_text) > 6000:
                 merged_text = merged_text[:6000] + "\n...(已截断)"
 
-            user_prompt = f"以下是一段连续工作片段的采集记录，请提炼：\n\n{merged_text}"
+            user_prompt = (
+                "以下是一段连续工作片段的采集记录，请提炼。"
+                "输出必须是对工作内容的归纳，不允许照抄 UI 菜单词、窗口壳层词或原始 OCR 长串。\n\n"
+                f"{merged_text}"
+            )
 
             # 2. 调用 LLM（带埋点）
             logger.info(f"合并提炼 {len(captures)} 条 captures")
             # RAG 优先：若 RAG 查询正在占用 Ollama，跳过本轮提炼
             if _rag_is_active():
                 logger.info("RAG 查询正在进行，本轮合并提炼跳过")
+                return None
+            # 检查抢占信号
+            if preempt_check and preempt_check():
+                logger.info("extract_merged 在 LLM 调用前收到抢占信号")
                 return None
             from monitor.llm_tracker import LLMCallTracker, estimate_tokens
             capture_ids_str = ",".join(str(c['id']) for c in captures[:5])
@@ -1291,10 +1617,15 @@ class KnowledgeExtractorV2:
                 )
                 return _build_fallback_knowledge(captures, reason='invalid_json')
 
-            overview = result.get('overview', '')
+            overview = _normalize_inline_text(result.get('overview', ''))
             if not overview or overview == 'SKIP':
                 logger.warning("合并提炼未返回有效 overview，使用兜底 knowledge: result=%s", result)
                 return _build_fallback_knowledge(captures, reason='empty_overview')
+
+            quality_reason = _overview_quality_reason(overview, merged_text)
+            if quality_reason:
+                logger.warning("合并提炼 overview 质量不足，使用兜底 knowledge: reason=%s overview=%s", quality_reason, overview)
+                return _build_fallback_knowledge(captures, reason=quality_reason)
 
             # 4. 计算片段元数据
             start_time = captures[0]['ts']
@@ -1314,8 +1645,11 @@ class KnowledgeExtractorV2:
                 None
             )
 
+            summary = _overview_to_summary(overview)
+
             knowledge = {
                 'capture_ids': json.dumps([c['id'] for c in captures]),
+                'summary': summary,
                 'overview': overview,
                 'details': result.get('details', ''),
                 'entities': json.dumps(result.get('entities', []), ensure_ascii=False),
@@ -1331,6 +1665,14 @@ class KnowledgeExtractorV2:
                 'event_time_start': result.get('event_time_start'),
                 'event_time_end': result.get('event_time_end'),
                 'history_view': bool(result.get('history_view', False)),
+                'content_origin': result.get('content_origin'),
+                'activity_type': result.get('activity_type'),
+                'is_self_generated': False,
+                'evidence_strength': result.get('evidence_strength'),
+                'work_item': result.get('work_item'),
+                'work_status': result.get('work_status'),
+                'work_progress': result.get('work_progress'),
+            }
                 'content_origin': result.get('content_origin'),
                 'activity_type': result.get('activity_type'),
                 'is_self_generated': False,
