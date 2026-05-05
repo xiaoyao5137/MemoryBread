@@ -1673,11 +1673,6 @@ class KnowledgeExtractorV2:
                 'work_status': result.get('work_status'),
                 'work_progress': result.get('work_progress'),
             }
-                'content_origin': result.get('content_origin'),
-                'activity_type': result.get('activity_type'),
-                'is_self_generated': False,
-                'evidence_strength': result.get('evidence_strength'),
-            }
 
             logger.info(
                 f"合并提炼完成: {len(captures)} captures → 1 knowledge, "
