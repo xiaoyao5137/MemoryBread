@@ -6,15 +6,18 @@
 //! - GET /api/debug/log-files - 关键日志列表
 //! - GET /api/debug/log-files/:key - 关键日志内容预览
 
-use std::{
-    sync::Arc,
-    time::UNIX_EPOCH,
-};
+use std::{sync::Arc, time::UNIX_EPOCH};
 
-use axum::{extract::{Path as AxumPath, State}, Json};
+use axum::{
+    extract::{Path as AxumPath, State},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{error::ApiError, state::{AppState, DebugLogSpec}};
+use crate::api::{
+    error::ApiError,
+    state::{AppState, DebugLogSpec},
+};
 
 const MAX_LOG_BYTES: usize = 128 * 1024;
 
@@ -26,7 +29,7 @@ const MAX_LOG_BYTES: usize = 128 * 1024;
 pub struct VectorStatusItem {
     pub capture_id: i64,
     pub vectorized: bool,
-    pub point_id:   Option<String>,
+    pub point_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,10 +39,10 @@ pub struct VectorStatusResponse {
 
 #[derive(Debug, Serialize)]
 pub struct DebugLogFileItem {
-    pub key:         String,
-    pub label:       String,
-    pub exists:      bool,
-    pub size_bytes:  u64,
+    pub key: String,
+    pub label: String,
+    pub exists: bool,
+    pub size_bytes: u64,
     pub modified_at: Option<i64>,
 }
 
@@ -50,17 +53,19 @@ pub struct DebugLogFilesResponse {
 
 #[derive(Debug, Serialize)]
 pub struct DebugLogContentResponse {
-    pub key:              String,
-    pub label:            String,
-    pub content:          String,
-    pub truncated:        bool,
+    pub key: String,
+    pub label: String,
+    pub content: String,
+    pub truncated: bool,
     pub total_size_bytes: u64,
-    pub returned_bytes:   usize,
-    pub modified_at:      Option<i64>,
+    pub returned_bytes: usize,
+    pub modified_at: Option<i64>,
 }
 
 fn modified_at_ms(metadata: &std::fs::Metadata) -> Option<i64> {
-    metadata.modified().ok()
+    metadata
+        .modified()
+        .ok()
         .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
 }
@@ -70,7 +75,10 @@ fn log_file_item(spec: &DebugLogSpec) -> Result<DebugLogFileItem, ApiError> {
     match std::fs::metadata(&path) {
         Ok(metadata) => {
             if !metadata.is_file() {
-                return Err(ApiError::Internal(format!("调试日志目标不是普通文件: {}", path.display())));
+                return Err(ApiError::Internal(format!(
+                    "调试日志目标不是普通文件: {}",
+                    path.display()
+                )));
             }
             Ok(DebugLogFileItem {
                 key: spec.key.clone(),
@@ -87,26 +95,35 @@ fn log_file_item(spec: &DebugLogSpec) -> Result<DebugLogFileItem, ApiError> {
             size_bytes: 0,
             modified_at: None,
         }),
-        Err(err) => Err(ApiError::Internal(format!("读取调试日志元信息失败: {}: {err}", path.display()))),
+        Err(err) => Err(ApiError::Internal(format!(
+            "读取调试日志元信息失败: {}: {err}",
+            path.display()
+        ))),
     }
 }
 
 fn resolve_log_spec<'a>(state: &'a AppState, key: &str) -> Result<&'a DebugLogSpec, ApiError> {
-    state.debug_log_specs
+    state
+        .debug_log_specs
         .iter()
         .find(|spec| spec.key == key)
         .ok_or_else(|| ApiError::NotFound(format!("未找到关键日志: {key}")))
 }
 
-fn read_log_tail(spec: &DebugLogSpec, max_bytes: usize) -> Result<(String, bool, u64, usize), ApiError> {
-    let allowed_dir = spec.dir.canonicalize()
-        .map_err(|err| ApiError::Internal(format!("解析日志目录失败: {}: {err}", spec.dir.display())))?;
+fn read_log_tail(
+    spec: &DebugLogSpec,
+    max_bytes: usize,
+) -> Result<(String, bool, u64, usize), ApiError> {
+    let allowed_dir = spec.dir.canonicalize().map_err(|err| {
+        ApiError::Internal(format!("解析日志目录失败: {}: {err}", spec.dir.display()))
+    })?;
     let path = spec.path();
-    let canonical_path = path.canonicalize()
-        .map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => ApiError::NotFound(format!("关键日志不存在: {}", spec.label)),
-            _ => ApiError::Internal(format!("解析调试日志路径失败: {}: {err}", path.display())),
-        })?;
+    let canonical_path = path.canonicalize().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            ApiError::NotFound(format!("关键日志不存在: {}", spec.label))
+        }
+        _ => ApiError::Internal(format!("解析调试日志路径失败: {}: {err}", path.display())),
+    })?;
 
     if !canonical_path.starts_with(&allowed_dir) {
         return Err(ApiError::Internal(format!(
@@ -115,14 +132,25 @@ fn read_log_tail(spec: &DebugLogSpec, max_bytes: usize) -> Result<(String, bool,
         )));
     }
 
-    let metadata = std::fs::metadata(&canonical_path)
-        .map_err(|err| ApiError::Internal(format!("读取调试日志元信息失败: {}: {err}", canonical_path.display())))?;
+    let metadata = std::fs::metadata(&canonical_path).map_err(|err| {
+        ApiError::Internal(format!(
+            "读取调试日志元信息失败: {}: {err}",
+            canonical_path.display()
+        ))
+    })?;
     if !metadata.is_file() {
-        return Err(ApiError::Internal(format!("调试日志目标不是普通文件: {}", canonical_path.display())));
+        return Err(ApiError::Internal(format!(
+            "调试日志目标不是普通文件: {}",
+            canonical_path.display()
+        )));
     }
 
-    let bytes = std::fs::read(&canonical_path)
-        .map_err(|err| ApiError::Internal(format!("读取调试日志失败: {}: {err}", canonical_path.display())))?;
+    let bytes = std::fs::read(&canonical_path).map_err(|err| {
+        ApiError::Internal(format!(
+            "读取调试日志失败: {}: {err}",
+            canonical_path.display()
+        ))
+    })?;
     let total_size_bytes = bytes.len() as u64;
     let start = bytes.len().saturating_sub(max_bytes);
     let truncated = start > 0;
@@ -148,14 +176,12 @@ pub async fn vector_status(
 
     for cap in captures {
         // 查询该 capture_id 是否已向量化
-        let vector_record = storage
-            .get_by_capture_id(cap.id)
-            .ok();
+        let vector_record = storage.get_by_capture_id(cap.id).ok();
 
         items.push(VectorStatusItem {
             capture_id: cap.id,
             vectorized: vector_record.is_some(),
-            point_id:   vector_record.and_then(|v| Some(v.qdrant_point_id)),
+            point_id: vector_record.and_then(|v| Some(v.qdrant_point_id)),
         });
     }
 
@@ -184,17 +210,22 @@ pub async fn debug_log_content(
 ) -> Result<Json<DebugLogContentResponse>, ApiError> {
     let spec = resolve_log_spec(&state, &key)?;
     let path = spec.path();
-    let metadata = std::fs::metadata(&path)
-        .map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => ApiError::NotFound(format!("关键日志不存在: {}", spec.label)),
-            _ => ApiError::Internal(format!("读取调试日志元信息失败: {}: {err}", path.display())),
-        })?;
+    let metadata = std::fs::metadata(&path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            ApiError::NotFound(format!("关键日志不存在: {}", spec.label))
+        }
+        _ => ApiError::Internal(format!("读取调试日志元信息失败: {}: {err}", path.display())),
+    })?;
 
     if !metadata.is_file() {
-        return Err(ApiError::Internal(format!("调试日志目标不是普通文件: {}", path.display())));
+        return Err(ApiError::Internal(format!(
+            "调试日志目标不是普通文件: {}",
+            path.display()
+        )));
     }
 
-    let (content, truncated, total_size_bytes, returned_bytes) = read_log_tail(spec, MAX_LOG_BYTES)?;
+    let (content, truncated, total_size_bytes, returned_bytes) =
+        read_log_tail(spec, MAX_LOG_BYTES)?;
 
     Ok(Json(DebugLogContentResponse {
         key: spec.key.clone(),
@@ -213,10 +244,10 @@ pub async fn debug_log_content(
 
 #[derive(Debug, Serialize)]
 pub struct SystemStatsResponse {
-    pub total_captures:   i64,
+    pub total_captures: i64,
     pub total_vectorized: i64,
-    pub db_size_mb:       f64,
-    pub last_capture_ts:  Option<i64>,
+    pub db_size_mb: f64,
+    pub last_capture_ts: Option<i64>,
 }
 
 /// GET /api/stats

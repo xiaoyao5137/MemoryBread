@@ -12,7 +12,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
-import { useRagQuery } from '../hooks/useApi'
+import { useRagQuery, useModelStatus } from '../hooks/useApi'
 import { BUILTIN_TEMPLATES, CATEGORY_COLORS, groupTemplatesByCategory } from '../data/taskTemplates'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
@@ -40,6 +40,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   const [contextsExpanded, setContextsExpanded] = useState(false)
   const textareaRef = React.useRef<HTMLTextAreaElement>(null)
   const doQuery = useRagQuery()
+  const { status: modelStatus, ready: modelsReady, loading: modelStatusLoading } = useModelStatus()
 
   // 内容变化时自动调整高度
   const adjustHeight = useCallback((el: HTMLTextAreaElement) => {
@@ -96,10 +97,33 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
       {/* 标题栏 */}
       <div className="rag-panel__header" data-testid="rag-panel-header">
         <div className="rag-panel__title-group">
-          <h2 className="rag-panel__title">吃面包</h2>
+          <h2 className="rag-panel__title">咨询</h2>
         </div>
         <p className="rag-panel__subtitle">看见就会记住，记住就会理解<br />理解就能生产，生产就有希望</p>
       </div>
+
+      {/* 模型未就绪提示 */}
+      {!modelStatusLoading && !modelsReady && (
+        <div style={{
+          margin: '12px 16px',
+          padding: '12px',
+          background: '#FFF3CD',
+          border: '1px solid #FFE69C',
+          borderRadius: 8,
+          fontSize: 13,
+          color: '#856404',
+        }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>⚠️ 模型未就绪</div>
+          <div style={{ marginBottom: 8 }}>
+            {!modelStatus.ollama && '• Ollama 推理引擎未运行'}
+            {!modelStatus.llm && '• LLM 推理模型未加载'}
+            {!modelStatus.embedding && '• 向量模型未加载'}
+          </div>
+          <div style={{ fontSize: 12 }}>
+            请前往「模型」界面检查模型状态
+          </div>
+        </div>
+      )}
 
       {/* 输入区域 */}
       <form
@@ -111,18 +135,18 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           ref={textareaRef}
           className="rag-panel__input"
           data-testid="rag-panel-input"
-          placeholder="问我任何工作相关的问题..."
+          placeholder={modelsReady ? "问我任何工作相关的问题..." : "模型未就绪，请先配置模型"}
           value={inputValue}
           onChange={handleInputChange}
           rows={3}
           style={{ resize: 'none', overflow: 'hidden' }}
-          disabled={ragLoading}
+          disabled={ragLoading || !modelsReady}
         />
         <button
           type="submit"
           className="rag-panel__submit"
           data-testid="rag-panel-submit"
-          disabled={ragLoading || !inputValue.trim()}
+          disabled={ragLoading || !inputValue.trim() || !modelsReady}
         >
           {ragLoading ? (
             <>

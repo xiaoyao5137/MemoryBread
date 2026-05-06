@@ -36,10 +36,7 @@ impl Default for ListenerConfig {
 /// 启动事件监听器
 ///
 /// 定期向 `tx` 发送 `CaptureEvent::Periodic` 事件
-pub async fn start_listener(
-    config: ListenerConfig,
-    tx: mpsc::Sender<CaptureEvent>,
-) {
+pub async fn start_listener(config: ListenerConfig, tx: mpsc::Sender<CaptureEvent>) {
     info!(
         "启动事件监听器，采集间隔: {} 秒，空闲阈值: {} 秒",
         config.interval_secs, config.idle_threshold_secs
@@ -68,12 +65,7 @@ pub async fn start_listener(
         debug!("触发定时采集事件");
 
         // 发送采集事件（带超时保护）
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            tx.send(CaptureEvent::Periodic),
-        )
-        .await
-        {
+        match tokio::time::timeout(Duration::from_secs(5), tx.send(CaptureEvent::Periodic)).await {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => {
                 info!("采集引擎已关闭，停止监听器");

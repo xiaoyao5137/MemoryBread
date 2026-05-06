@@ -42,11 +42,11 @@ struct IpcRequest {
 enum Task {
     Ocr {
         capture_id: i64,
-        screenshot_path: String
+        screenshot_path: String,
     },
     Embed {
         capture_id: i64,
-        texts: Vec<String>
+        texts: Vec<String>,
     },
 }
 
@@ -93,9 +93,7 @@ impl IpcClient {
         let socket_path = self.socket_path.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            tokio::task::spawn_blocking(move || {
-                UnixStream::connect(&socket_path).is_ok()
-            }),
+            tokio::task::spawn_blocking(move || UnixStream::connect(&socket_path).is_ok()),
         )
         .await;
 
@@ -143,10 +141,7 @@ impl IpcClient {
         let request = IpcRequest {
             id: uuid::Uuid::new_v4().to_string(),
             ts,
-            task: Task::Embed {
-                capture_id,
-                texts,
-            },
+            task: Task::Embed { capture_id, texts },
         };
 
         let response = self.send_request(&request)?;

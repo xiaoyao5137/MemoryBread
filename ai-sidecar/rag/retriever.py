@@ -459,7 +459,8 @@ class Fts5Retriever:
         sql += " ORDER BY rank LIMIT ?"
         params.append(top_k)
         cursor.execute(sql, params)
-        return [self._row_to_chunk(row, abs(row["score"])) for row in cursor.fetchall()]
+        rows = cursor.fetchall()
+        return [self._row_to_chunk(row, abs(row["score"])) for row in rows]
 
     def _search_by_app_fields(
         self,
@@ -685,7 +686,7 @@ class KnowledgeFts5Retriever:
                 k.importance,
                 fts.rank as score
             FROM knowledge_fts fts
-            JOIN episodic_memories k ON fts.rowid = k.id
+            JOIN timelines k ON fts.rowid = k.id
             WHERE knowledge_fts MATCH ?
         """
         params: list[object] = [fts_query]
@@ -730,10 +731,10 @@ class KnowledgeFts5Retriever:
                 sql += f" AND k.evidence_strength IN {clause}"
                 params.extend(clause_params)
         if created_start_ts is not None:
-            sql += " AND CAST(strftime('%s', k.created_at) AS INTEGER) * 1000 >= ?"
+            sql += " AND k.created_at_ms >= ?"
             params.append(created_start_ts)
         if created_end_ts is not None:
-            sql += " AND CAST(strftime('%s', k.created_at) AS INTEGER) * 1000 <= ?"
+            sql += " AND k.created_at_ms <= ?"
             params.append(created_end_ts)
         sql, params = _apply_noise_filters(sql, params)
         if entity_terms:
@@ -747,7 +748,8 @@ class KnowledgeFts5Retriever:
         sql += " ORDER BY rank LIMIT ?"
         params.append(top_k)
         cursor.execute(sql, params)
-        return [self._row_to_chunk(row, abs(row["score"])) for row in cursor.fetchall()]
+        rows = cursor.fetchall()
+        return [self._row_to_chunk(row, abs(row["score"])) for row in rows]
 
     def _search_by_app_fields(
         self,
@@ -803,7 +805,7 @@ class KnowledgeFts5Retriever:
                 k.is_self_generated,
                 k.evidence_strength,
                 k.importance
-            FROM episodic_memories k
+            FROM timelines k
             WHERE 1=1
         """
         params: list[object] = []
@@ -848,10 +850,10 @@ class KnowledgeFts5Retriever:
                 sql += f" AND k.evidence_strength IN {clause}"
                 params.extend(clause_params)
         if created_start_ts is not None:
-            sql += " AND CAST(strftime('%s', k.created_at) AS INTEGER) * 1000 >= ?"
+            sql += " AND k.created_at_ms >= ?"
             params.append(created_start_ts)
         if created_end_ts is not None:
-            sql += " AND CAST(strftime('%s', k.created_at) AS INTEGER) * 1000 <= ?"
+            sql += " AND k.created_at_ms <= ?"
             params.append(created_end_ts)
 
         sql, params = _apply_noise_filters(sql, params)
@@ -862,7 +864,11 @@ class KnowledgeFts5Retriever:
             )
             sql += f" AND {clause}"
             params.extend(clause_params)
-        sql += " ORDER BY COALESCE(k.observed_at, k.end_time, k.start_time, 0) DESC LIMIT ?"
+        # 当使用 created_at 过滤时，按 created_at 排序；否则按 observed_at 排序
+        if created_start_ts is not None or created_end_ts is not None:
+            sql += " ORDER BY k.created_at_ms DESC LIMIT ?"
+        else:
+            sql += " ORDER BY COALESCE(k.observed_at, k.end_time, k.start_time, 0) DESC LIMIT ?"
         params.append(top_k)
         cursor.execute(sql, params)
 

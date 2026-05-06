@@ -21,9 +21,9 @@ impl StorageManager {
     /// 会话结束后，将 LLM 响应和延迟回写。
     pub fn update_rag_response(
         &self,
-        id:          i64,
+        id: i64,
         llm_response: &str,
-        latency_ms:  i64,
+        latency_ms: i64,
     ) -> Result<(), StorageError> {
         self.with_conn(|conn| {
             conn.execute(
@@ -35,11 +35,7 @@ impl StorageManager {
     }
 
     /// 记录用户对 RAG 结果的反馈/修改。
-    pub fn record_rag_feedback(
-        &self,
-        id:       i64,
-        feedback: &str,
-    ) -> Result<(), StorageError> {
+    pub fn record_rag_feedback(&self, id: i64, feedback: &str) -> Result<(), StorageError> {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE rag_sessions SET user_feedback = ?1 WHERE id = ?2",
@@ -50,10 +46,7 @@ impl StorageManager {
     }
 }
 
-fn insert_rag_session_inner(
-    conn: &Connection,
-    s:    &NewRagSession,
-) -> Result<i64, StorageError> {
+fn insert_rag_session_inner(conn: &Connection, s: &NewRagSession) -> Result<i64, StorageError> {
     conn.execute(
         "INSERT INTO rag_sessions
             (ts, scene_type, user_query, retrieved_ids, prompt_used, llm_response, latency_ms)
@@ -96,7 +89,7 @@ impl StorageManager {
     /// 列举最近的 RAG 会话，按 ts 倒序。
     pub fn list_rag_sessions(
         &self,
-        limit:  usize,
+        limit: usize,
         offset: usize,
     ) -> Result<Vec<RagSessionRecord>, StorageError> {
         self.with_conn(|conn| {
@@ -108,7 +101,8 @@ impl StorageManager {
             let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
                 Ok(row_to_rag_session(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
@@ -116,7 +110,7 @@ impl StorageManager {
     pub fn list_rag_sessions_by_scene(
         &self,
         scene_type: &str,
-        limit:      usize,
+        limit: usize,
     ) -> Result<Vec<RagSessionRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -127,7 +121,8 @@ impl StorageManager {
             let rows = stmt.query_map(params![scene_type, limit as i64], |row| {
                 Ok(row_to_rag_session(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
@@ -145,7 +140,8 @@ impl StorageManager {
             let rows = stmt.query_map(params![limit as i64], |row| {
                 Ok(row_to_rag_session(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 }
@@ -156,15 +152,15 @@ impl StorageManager {
 
 fn row_to_rag_session(row: &rusqlite::Row<'_>) -> Result<RagSessionRecord, StorageError> {
     Ok(RagSessionRecord {
-        id:            row.get(0)?,
-        ts:            row.get(1)?,
-        scene_type:    row.get(2)?,
-        user_query:    row.get(3)?,
+        id: row.get(0)?,
+        ts: row.get(1)?,
+        scene_type: row.get(2)?,
+        user_query: row.get(3)?,
         retrieved_ids: row.get(4)?,
-        prompt_used:   row.get(5)?,
-        llm_response:  row.get(6)?,
+        prompt_used: row.get(5)?,
+        llm_response: row.get(6)?,
         user_feedback: row.get(7)?,
-        latency_ms:    row.get(8)?,
+        latency_ms: row.get(8)?,
     })
 }
 
@@ -182,13 +178,13 @@ mod tests {
 
     fn sample_session() -> NewRagSession {
         NewRagSession {
-            ts:            1_700_000_000_000,
-            scene_type:    Some("weekly_report".into()),
-            user_query:    "帮我写本周工作总结".into(),
+            ts: 1_700_000_000_000,
+            scene_type: Some("weekly_report".into()),
+            user_query: "帮我写本周工作总结".into(),
             retrieved_ids: Some("[1,2,3]".into()),
-            prompt_used:   Some("你是一名助手...".into()),
-            llm_response:  None,
-            latency_ms:    None,
+            prompt_used: Some("你是一名助手...".into()),
+            llm_response: None,
+            latency_ms: None,
         }
     }
 
@@ -207,7 +203,8 @@ mod tests {
     fn test_update_response() {
         let mgr = make_mgr();
         let id = mgr.insert_rag_session(&sample_session()).unwrap();
-        mgr.update_rag_response(id, "本周主要完成了...", 320).unwrap();
+        mgr.update_rag_response(id, "本周主要完成了...", 320)
+            .unwrap();
 
         let rec = mgr.get_rag_session(id).unwrap().unwrap();
         assert_eq!(rec.llm_response.as_deref(), Some("本周主要完成了..."));

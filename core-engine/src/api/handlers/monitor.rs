@@ -16,10 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{error::ApiError, state::AppState};
 
-const SELF_GENERATED_APP_KEYWORDS: [&str; 2] = [
-    "memory-bread",
-    "记忆面包",
-];
+const SELF_GENERATED_APP_KEYWORDS: [&str; 2] = ["memory-bread", "记忆面包"];
 const SELF_GENERATED_WINDOW_KEYWORDS: [&str; 5] = [
     "memory-bread",
     "记忆面包",
@@ -50,13 +47,15 @@ pub struct MonitorQuery {
     pub range: String,
 }
 
-fn default_range() -> String { "7d".to_string() }
+fn default_range() -> String {
+    "7d".to_string()
+}
 
 fn range_to_ms(range: &str) -> i64 {
     let days: i64 = match range {
-        "1d"  => 1,
+        "1d" => 1,
         "30d" => 30,
-        _     => 7,
+        _ => 7,
     };
     days * 24 * 3600 * 1000
 }
@@ -115,79 +114,79 @@ fn bucket_label(range: &str, bucket_start_ms: i64) -> String {
 
 #[derive(Debug, Serialize)]
 pub struct MonitorOverview {
-    pub db_size_bytes:   i64,
+    pub db_size_bytes: i64,
     pub capture_total_count: i64,
-    pub token_usage:     TokenUsage,
-    pub capture_flow:    CaptureFlow,
-    pub knowledge_flow:  KnowledgeFlow,
-    pub rag_sessions:    RagSessionStats,
+    pub token_usage: TokenUsage,
+    pub capture_flow: CaptureFlow,
+    pub knowledge_flow: KnowledgeFlow,
+    pub rag_sessions: RagSessionStats,
     pub task_executions: TaskExecutionStats,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TokenUsage {
-    pub total_period:    i64,
-    pub total_today:     i64,
-    pub by_model:        Vec<ModelUsage>,
-    pub by_caller:       Vec<CallerUsage>,
-    pub trend:           Vec<DayTrend>,
+    pub total_period: i64,
+    pub total_today: i64,
+    pub by_model: Vec<ModelUsage>,
+    pub by_caller: Vec<CallerUsage>,
+    pub trend: Vec<DayTrend>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ModelUsage {
-    pub model:  String,
-    pub total:  i64,
-    pub calls:  i64,
+    pub model: String,
+    pub total: i64,
+    pub calls: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CallerUsage {
     pub caller: String,
-    pub total:  i64,
-    pub calls:  i64,
+    pub total: i64,
+    pub calls: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DayTrend {
-    pub ts:    i64,
-    pub date:   String,
+    pub ts: i64,
+    pub date: String,
     pub tokens: i64,
-    pub calls:  i64,
+    pub calls: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CaptureFlow {
-    pub today_count:                i64,
-    pub period_count:               i64,
-    pub eligible_count:             i64,
-    pub vectorized_count:           i64,
-    pub vectorization_rate:         f64,
-    pub knowledge_generated_count:  i64,
-    pub knowledge_generation_rate:  f64,
-    pub knowledge_linked_count:     i64,
-    pub knowledge_rate:             f64,
-    pub by_hour:                    Vec<HourCount>,
-    pub by_app:                     Vec<AppCount>,
-    pub recent:                     Vec<CaptureItem>,
+    pub today_count: i64,
+    pub period_count: i64,
+    pub eligible_count: i64,
+    pub vectorized_count: i64,
+    pub vectorization_rate: f64,
+    pub knowledge_generated_count: i64,
+    pub knowledge_generation_rate: f64,
+    pub knowledge_linked_count: i64,
+    pub knowledge_rate: f64,
+    pub by_hour: Vec<HourCount>,
+    pub by_app: Vec<AppCount>,
+    pub recent: Vec<CaptureItem>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CaptureItem {
-    pub id:        i64,
-    pub ts:        i64,
-    pub app_name:  String,
+    pub id: i64,
+    pub ts: i64,
+    pub app_name: String,
     pub win_title: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct HourCount {
-    pub hour:  i64,
+    pub hour: i64,
     pub count: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AppCount {
-    pub app:   String,
+    pub app: String,
     pub count: i64,
 }
 
@@ -219,37 +218,37 @@ pub struct KnowledgeItem {
 
 #[derive(Debug, Serialize)]
 pub struct RagSessionStats {
-    pub today_count:   i64,
-    pub period_count:  i64,
+    pub today_count: i64,
+    pub period_count: i64,
     pub avg_latency_ms: i64,
-    pub recent:        Vec<RagSessionItem>,
+    pub recent: Vec<RagSessionItem>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RagSessionItem {
-    pub id:            i64,
-    pub ts:            i64,
-    pub query:         String,
-    pub latency_ms:    Option<i64>,
+    pub id: i64,
+    pub ts: i64,
+    pub query: String,
+    pub latency_ms: Option<i64>,
     pub context_count: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TaskExecutionStats {
-    pub total:        i64,
-    pub success:      i64,
-    pub failed:       i64,
+    pub total: i64,
+    pub success: i64,
+    pub failed: i64,
     pub success_rate: f64,
-    pub recent:       Vec<TaskExecutionItem>,
+    pub recent: Vec<TaskExecutionItem>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TaskExecutionItem {
-    pub id:              i64,
-    pub task_name:       String,
-    pub status:          String,
-    pub started_at:      i64,
-    pub latency_ms:      Option<i64>,
+    pub id: i64,
+    pub task_name: String,
+    pub status: String,
+    pub started_at: i64,
+    pub latency_ms: Option<i64>,
     pub knowledge_count: Option<i64>,
 }
 
@@ -258,9 +257,9 @@ pub async fn monitor_overview(
     State(state): State<Arc<AppState>>,
     Query(params): Query<MonitorQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let now_ms   = Utc::now().timestamp_millis();
+    let now_ms = Utc::now().timestamp_millis();
     let range_ms = range_to_ms(&params.range);
-    let from_ms  = now_ms - range_ms;
+    let from_ms = now_ms - range_ms;
     let today_start = local_day_start_ms(now_ms);
     let token_bucket_ms = trend_bucket_ms(&params.range);
     let knowledge_bucket_ms = knowledge_bucket_ms(&params.range);
@@ -415,12 +414,12 @@ pub async fn monitor_overview(
         let win_not_like = build_not_like_clause("c.win_title", &SELF_GENERATED_WINDOW_KEYWORDS);
 
         let knowledge_today_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM knowledge_entries WHERE created_at >= datetime(?1/1000, 'unixepoch') AND summary NOT LIKE ?2",
+            "SELECT COUNT(*) FROM timelines WHERE created_at >= datetime(?1/1000, 'unixepoch') AND summary NOT LIKE ?2",
             rusqlite::params![today_start, fallback_noise_pattern.as_str()],
             |r| r.get(0),
         ).unwrap_or(0);
         let knowledge_period_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM knowledge_entries WHERE created_at >= datetime(?1/1000, 'unixepoch') AND summary NOT LIKE ?2",
+            "SELECT COUNT(*) FROM timelines WHERE created_at >= datetime(?1/1000, 'unixepoch') AND summary NOT LIKE ?2",
             rusqlite::params![from_ms, fallback_noise_pattern.as_str()],
             |r| r.get(0),
         ).unwrap_or(0);
@@ -441,7 +440,7 @@ pub async fn monitor_overview(
 
         let mut knowledge_by_time_stmt = conn.prepare(
             "SELECT (CAST(strftime('%s', created_at) AS INTEGER) * 1000 / ?1) * ?1 + ?1/2 as bucket, COUNT(*)
-             FROM knowledge_entries
+             FROM timelines
              WHERE created_at >= datetime(?2/1000, 'unixepoch')
                AND summary NOT LIKE ?3
              GROUP BY bucket ORDER BY bucket"
@@ -461,7 +460,7 @@ pub async fn monitor_overview(
                     COALESCE(importance, 0),
                     COALESCE(frag_app_name, ''),
                     COALESCE(frag_win_title, '')
-             FROM knowledge_entries
+             FROM timelines
              WHERE created_at >= datetime(?1/1000, 'unixepoch')
                AND summary NOT LIKE ?2
              ORDER BY created_at DESC LIMIT 10"
@@ -710,7 +709,9 @@ pub struct SystemQuery {
     pub range: String,
 }
 
-fn default_sys_range() -> String { "6h".to_string() }
+fn default_sys_range() -> String {
+    "6h".to_string()
+}
 
 fn has_column(columns: &HashSet<String>, name: &str) -> bool {
     columns.contains(name)
@@ -740,9 +741,15 @@ fn sidecar_model_type_label(model_type: &str, model_name: &str) -> String {
 }
 
 fn has_scope_columns(columns: &HashSet<String>) -> bool {
-    ["scope", "source", "target_pids_json", "coverage_status", "coverage_note"]
-        .iter()
-        .all(|column| has_column(columns, column))
+    [
+        "scope",
+        "source",
+        "target_pids_json",
+        "coverage_status",
+        "coverage_note",
+    ]
+    .iter()
+    .all(|column| has_column(columns, column))
 }
 
 fn downsample_metric_points(points: Vec<MetricPoint>, max_points: usize) -> Vec<MetricPoint> {
@@ -765,7 +772,10 @@ fn downsample_metric_points(points: Vec<MetricPoint>, max_points: usize) -> Vec<
     sampled
 }
 
-fn downsample_named_metric_series(series: Vec<NamedMetricSeries>, max_points: usize) -> Vec<NamedMetricSeries> {
+fn downsample_named_metric_series(
+    series: Vec<NamedMetricSeries>,
+    max_points: usize,
+) -> Vec<NamedMetricSeries> {
     series
         .into_iter()
         .map(|mut item| {
@@ -795,7 +805,10 @@ fn downsample_disk_points(points: Vec<DiskPoint>, max_points: usize) -> Vec<Disk
     sampled
 }
 
-fn downsample_knowledge_points(points: Vec<KnowledgeTimePoint>, max_points: usize) -> Vec<KnowledgeTimePoint> {
+fn downsample_knowledge_points(
+    points: Vec<KnowledgeTimePoint>,
+    max_points: usize,
+) -> Vec<KnowledgeTimePoint> {
     if points.len() <= max_points || max_points == 0 {
         return points;
     }
@@ -830,7 +843,10 @@ fn scoped_metric_trend(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms, scope], |r| {
-        Ok(MetricPoint { ts: r.get(0)?, value: r.get(1)? })
+        Ok(MetricPoint {
+            ts: r.get(0)?,
+            value: r.get(1)?,
+        })
     })?;
     let points = rows.filter_map(|r| r.ok()).collect();
     Ok(points)
@@ -849,7 +865,7 @@ fn scoped_metric_series(
          FROM system_metrics
          WHERE ts >= ?1 AND scope = ?2 AND target_name IS NOT NULL AND target_name != ''
          GROUP BY target_name
-         ORDER BY MAX(mem_process_mb) DESC, target_name ASC"
+         ORDER BY MAX(mem_process_mb) DESC, target_name ASC",
     )?;
     let targets = target_stmt
         .query_map(rusqlite::params![from_ms, scope], |r| {
@@ -874,9 +890,15 @@ fn scoped_metric_series(
     for (key, _label, coverage_status, coverage_note) in targets {
         let mut stmt = conn.prepare(&sql)?;
         let points = stmt
-            .query_map(rusqlite::params![bucket_ms, from_ms, scope, key.as_str()], |r| {
-                Ok(MetricPoint { ts: r.get(0)?, value: r.get(1)? })
-            })?
+            .query_map(
+                rusqlite::params![bucket_ms, from_ms, scope, key.as_str()],
+                |r| {
+                    Ok(MetricPoint {
+                        ts: r.get(0)?,
+                        value: r.get(1)?,
+                    })
+                },
+            )?
             .filter_map(|r| r.ok())
             .collect::<Vec<_>>();
         if points.is_empty() {
@@ -887,8 +909,16 @@ fn scoped_metric_series(
             label: runtime_label(&key),
             points,
             process_names: vec![runtime_label(&key)],
-            coverage_status: if coverage_status.is_empty() { None } else { Some(coverage_status) },
-            coverage_note: if coverage_note.is_empty() { None } else { Some(coverage_note) },
+            coverage_status: if coverage_status.is_empty() {
+                None
+            } else {
+                Some(coverage_status)
+            },
+            coverage_note: if coverage_note.is_empty() {
+                None
+            } else {
+                Some(coverage_note)
+            },
         });
     }
     Ok(series)
@@ -908,9 +938,10 @@ fn estimated_sidecar_model_mem_series(
            AND model_type IN ('ocr', 'embedding', 'llm')
            AND event_type IN ('load_start', 'load_done', 'unload')
          GROUP BY model_type, model_name, bucket
-         ORDER BY bucket"
+         ORDER BY bucket",
     )?;
-    let mut grouped: std::collections::BTreeMap<String, (String, Vec<MetricPoint>)> = std::collections::BTreeMap::new();
+    let mut grouped: std::collections::BTreeMap<String, (String, Vec<MetricPoint>)> =
+        std::collections::BTreeMap::new();
     let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -924,8 +955,21 @@ fn estimated_sidecar_model_mem_series(
         let label = sidecar_model_type_label(&row.0, &row.1);
         grouped
             .entry(key)
-            .and_modify(|(_, points)| points.push(MetricPoint { ts: row.2, value: row.3 as f64 }))
-            .or_insert_with(|| (label, vec![MetricPoint { ts: row.2, value: row.3 as f64 }]));
+            .and_modify(|(_, points)| {
+                points.push(MetricPoint {
+                    ts: row.2,
+                    value: row.3 as f64,
+                })
+            })
+            .or_insert_with(|| {
+                (
+                    label,
+                    vec![MetricPoint {
+                        ts: row.2,
+                        value: row.3 as f64,
+                    }],
+                )
+            });
     }
 
     Ok(grouped
@@ -936,7 +980,9 @@ fn estimated_sidecar_model_mem_series(
             points,
             process_names: Vec::new(),
             coverage_status: Some("estimated".to_string()),
-            coverage_note: Some("基于 sidecar 模型事件估算的逻辑内存时间线，非进程级精确 RSS".to_string()),
+            coverage_note: Some(
+                "基于 sidecar 模型事件估算的逻辑内存时间线，非进程级精确 RSS".to_string(),
+            ),
         })
         .collect())
 }
@@ -965,8 +1011,16 @@ fn latest_system_metrics(
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, f64>(3)?,
-                if has_gpu_percent { r.get::<_, Option<f64>>(4)? } else { None },
-                if has_gpu_name { r.get::<_, Option<String>>(5)? } else { None },
+                if has_gpu_percent {
+                    r.get::<_, Option<f64>>(4)?
+                } else {
+                    None
+                },
+                if has_gpu_name {
+                    r.get::<_, Option<String>>(5)?
+                } else {
+                    None
+                },
             ))
         })
     } else {
@@ -976,8 +1030,16 @@ fn latest_system_metrics(
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, f64>(3)?,
-                if has_gpu_percent { r.get::<_, Option<f64>>(4)? } else { None },
-                if has_gpu_name { r.get::<_, Option<String>>(5)? } else { None },
+                if has_gpu_percent {
+                    r.get::<_, Option<f64>>(4)?
+                } else {
+                    None
+                },
+                if has_gpu_name {
+                    r.get::<_, Option<String>>(5)?
+                } else {
+                    None
+                },
             ))
         })
     };
@@ -993,10 +1055,7 @@ fn latest_system_metrics(
     })
 }
 
-fn latest_scoped_metrics(
-    conn: &rusqlite::Connection,
-    scope: &str,
-) -> Option<ScopedLatestMetrics> {
+fn latest_scoped_metrics(conn: &rusqlite::Connection, scope: &str) -> Option<ScopedLatestMetrics> {
     conn.query_row(
         "SELECT cpu_process, mem_process_mb,
                 COALESCE(target_pids_json, '[]'),
@@ -1064,7 +1123,7 @@ fn latest_model_runtime_breakdown(
          FROM system_metrics, latest_ts
          WHERE scope = ?1 AND system_metrics.ts = latest_ts.ts
          GROUP BY target_name, target_pids_json
-         ORDER BY AVG(mem_process_mb) DESC, target_name ASC"
+         ORDER BY AVG(mem_process_mb) DESC, target_name ASC",
     )?;
     let runtime_rows = runtime_stmt.query_map(rusqlite::params![MODEL_SERIES_SCOPE], |r| {
         let key: String = r.get(0)?;
@@ -1096,7 +1155,7 @@ fn latest_model_runtime_breakdown(
          WHERE ts >= ?1
            AND model_type IN ('ocr', 'embedding', 'llm')
            AND event_type IN ('load_start', 'load_done', 'unload')
-         ORDER BY ts DESC"
+         ORDER BY ts DESC",
     )?;
     let cutoff = Utc::now().timestamp_millis() - 24 * 3600 * 1000;
     let mut seen = std::collections::HashSet::new();
@@ -1122,7 +1181,9 @@ fn latest_model_runtime_breakdown(
             mem_process_mb: row.3,
             process_count: 1,
             coverage_status: Some("estimated".to_string()),
-            coverage_note: Some("基于 sidecar 模型事件的逻辑拆分，内存为近似值，非进程级精确 RSS".to_string()),
+            coverage_note: Some(
+                "基于 sidecar 模型事件的逻辑拆分，内存为近似值，非进程级精确 RSS".to_string(),
+            ),
         });
     }
 
@@ -1137,10 +1198,10 @@ pub async fn monitor_system(
 ) -> Result<impl IntoResponse, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
     let range_ms: i64 = match params.range.as_str() {
-        "1h"  => 3600 * 1000,
-        "6h"  => 6 * 3600 * 1000,
+        "1h" => 3600 * 1000,
+        "6h" => 6 * 3600 * 1000,
         "24h" | "1d" => 24 * 3600 * 1000,
-        _     => 24 * 3600 * 1000,
+        _ => 24 * 3600 * 1000,
     };
     let from_ms = now_ms - range_ms;
     let fallback_noise_pattern = format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX);
@@ -1152,235 +1213,291 @@ pub async fn monitor_system(
         _ => 160,
     };
 
-    let result = state.storage.with_conn_async(move |conn| {
-        let db_size_bytes = conn.query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0)).unwrap_or(0)
-            * conn.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0)).unwrap_or(0);
-        let metric_columns: HashSet<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(system_metrics)")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        let has_gpu_percent = has_column(&metric_columns, "gpu_percent");
-        let has_gpu_name = has_column(&metric_columns, "gpu_name");
-        let scoped = has_scope_columns(&metric_columns);
+    let result = state
+        .storage
+        .with_conn_async(move |conn| {
+            let db_size_bytes = conn
+                .query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(0)
+                * conn
+                    .query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
+                    .unwrap_or(0);
+            let metric_columns: HashSet<String> = {
+                let mut stmt = conn.prepare("PRAGMA table_info(system_metrics)")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            let has_gpu_percent = has_column(&metric_columns, "gpu_percent");
+            let has_gpu_name = has_column(&metric_columns, "gpu_name");
+            let scoped = has_scope_columns(&metric_columns);
 
-        let system_cpu = if scoped {
-            scoped_metric_trend(conn, SYSTEM_SCOPE, "cpu_total", bucket_ms, from_ms)?
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(cpu_total)
-                 FROM system_metrics WHERE ts >= ?2
-                 GROUP BY bucket ORDER BY bucket"
-            )?;
-            let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms], |r| {
-                Ok(MetricPoint { ts: r.get(0)?, value: r.get(1)? })
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-
-        let system_mem = if scoped {
-            scoped_metric_trend(conn, SYSTEM_SCOPE, "mem_percent", bucket_ms, from_ms)?
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(mem_percent)
-                 FROM system_metrics WHERE ts >= ?2
-                 GROUP BY bucket ORDER BY bucket"
-            )?;
-            let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms], |r| {
-                Ok(MetricPoint { ts: r.get(0)?, value: r.get(1)? })
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-
-        let suite_cpu = if scoped {
-            scoped_metric_trend(conn, SUITE_SCOPE, "cpu_process", bucket_ms, from_ms)?
-        } else {
-            Vec::new()
-        };
-        let suite_mem = if scoped {
-            scoped_metric_trend(conn, SUITE_SCOPE, "mem_process_mb", bucket_ms, from_ms)?
-        } else {
-            Vec::new()
-        };
-        let model_cpu = if scoped {
-            scoped_metric_trend(conn, MODEL_SCOPE, "cpu_process", bucket_ms, from_ms)?
-        } else {
-            Vec::new()
-        };
-        let model_mem = if scoped {
-            scoped_metric_trend(conn, MODEL_SCOPE, "mem_process_mb", bucket_ms, from_ms)?
-        } else {
-            Vec::new()
-        };
-        let model_cpu_series = if scoped {
-            scoped_metric_series(conn, MODEL_SERIES_SCOPE, "cpu_process", bucket_ms, from_ms)?
-        } else {
-            Vec::new()
-        };
-        let model_mem_series = if scoped {
-            scoped_metric_series(conn, MODEL_SERIES_SCOPE, "mem_process_mb", bucket_ms, from_ms)?
-        } else {
-            Vec::new()
-        };
-        let model_estimated_mem_series = if scoped {
-            estimated_sidecar_model_mem_series(conn, bucket_ms, from_ms)?
-        } else {
-            Vec::new()
-        };
-
-        let gpu_trend: Vec<MetricPoint> = if has_gpu_percent {
-            if scoped {
+            let system_cpu = if scoped {
+                scoped_metric_trend(conn, SYSTEM_SCOPE, "cpu_total", bucket_ms, from_ms)?
+            } else {
                 let mut stmt = conn.prepare(
-                    "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(gpu_percent)
+                    "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(cpu_total)
+                 FROM system_metrics WHERE ts >= ?2
+                 GROUP BY bucket ORDER BY bucket",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms], |r| {
+                    Ok(MetricPoint {
+                        ts: r.get(0)?,
+                        value: r.get(1)?,
+                    })
+                })?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+
+            let system_mem = if scoped {
+                scoped_metric_trend(conn, SYSTEM_SCOPE, "mem_percent", bucket_ms, from_ms)?
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(mem_percent)
+                 FROM system_metrics WHERE ts >= ?2
+                 GROUP BY bucket ORDER BY bucket",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms], |r| {
+                    Ok(MetricPoint {
+                        ts: r.get(0)?,
+                        value: r.get(1)?,
+                    })
+                })?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+
+            let suite_cpu = if scoped {
+                scoped_metric_trend(conn, SUITE_SCOPE, "cpu_process", bucket_ms, from_ms)?
+            } else {
+                Vec::new()
+            };
+            let suite_mem = if scoped {
+                scoped_metric_trend(conn, SUITE_SCOPE, "mem_process_mb", bucket_ms, from_ms)?
+            } else {
+                Vec::new()
+            };
+            let model_cpu = if scoped {
+                scoped_metric_trend(conn, MODEL_SCOPE, "cpu_process", bucket_ms, from_ms)?
+            } else {
+                Vec::new()
+            };
+            let model_mem = if scoped {
+                scoped_metric_trend(conn, MODEL_SCOPE, "mem_process_mb", bucket_ms, from_ms)?
+            } else {
+                Vec::new()
+            };
+            let model_cpu_series = if scoped {
+                scoped_metric_series(conn, MODEL_SERIES_SCOPE, "cpu_process", bucket_ms, from_ms)?
+            } else {
+                Vec::new()
+            };
+            let model_mem_series = if scoped {
+                scoped_metric_series(
+                    conn,
+                    MODEL_SERIES_SCOPE,
+                    "mem_process_mb",
+                    bucket_ms,
+                    from_ms,
+                )?
+            } else {
+                Vec::new()
+            };
+            let model_estimated_mem_series = if scoped {
+                estimated_sidecar_model_mem_series(conn, bucket_ms, from_ms)?
+            } else {
+                Vec::new()
+            };
+
+            let gpu_trend: Vec<MetricPoint> = if has_gpu_percent {
+                if scoped {
+                    let mut stmt = conn.prepare(
+                        "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(gpu_percent)
                      FROM system_metrics
                      WHERE ts >= ?2 AND scope = ?3 AND gpu_percent IS NOT NULL
-                     GROUP BY bucket ORDER BY bucket"
+                     GROUP BY bucket ORDER BY bucket",
+                    )?;
+                    let rows =
+                        stmt.query_map(rusqlite::params![bucket_ms, from_ms, SYSTEM_SCOPE], |r| {
+                            Ok(MetricPoint {
+                                ts: r.get(0)?,
+                                value: r.get(1)?,
+                            })
+                        })?;
+                    rows.filter_map(|r| r.ok()).collect()
+                } else {
+                    let mut stmt = conn.prepare(
+                        "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(gpu_percent)
+                     FROM system_metrics
+                     WHERE ts >= ?2 AND gpu_percent IS NOT NULL
+                     GROUP BY bucket ORDER BY bucket",
+                    )?;
+                    let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms], |r| {
+                        Ok(MetricPoint {
+                            ts: r.get(0)?,
+                            value: r.get(1)?,
+                        })
+                    })?;
+                    rows.filter_map(|r| r.ok()).collect()
+                }
+            } else {
+                Vec::new()
+            };
+            let model_gpu_trend: Vec<MetricPoint> = if has_gpu_percent && scoped {
+                let mut stmt = conn.prepare(
+                    "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(gpu_percent)
+                 FROM system_metrics
+                 WHERE ts >= ?2 AND scope = ?3 AND gpu_percent IS NOT NULL
+                 GROUP BY bucket ORDER BY bucket",
                 )?;
-                let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms, SYSTEM_SCOPE], |r| {
-                    Ok(MetricPoint { ts: r.get(0)?, value: r.get(1)? })
-                })?;
+                let rows =
+                    stmt.query_map(rusqlite::params![bucket_ms, from_ms, MODEL_SCOPE], |r| {
+                        Ok(MetricPoint {
+                            ts: r.get(0)?,
+                            value: r.get(1)?,
+                        })
+                    })?;
+                rows.filter_map(|r| r.ok()).collect()
+            } else {
+                Vec::new()
+            };
+
+            let disk_trend: Vec<DiskPoint> = if scoped {
+                let mut stmt = conn.prepare(
+                    "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, SUM(disk_read_mb), SUM(disk_write_mb)
+                 FROM system_metrics
+                 WHERE ts >= ?2 AND scope = ?3
+                 GROUP BY bucket ORDER BY bucket",
+                )?;
+                let rows =
+                    stmt.query_map(rusqlite::params![bucket_ms, from_ms, SYSTEM_SCOPE], |r| {
+                        Ok(DiskPoint {
+                            ts: r.get(0)?,
+                            read_mb: r.get(1)?,
+                            write_mb: r.get(2)?,
+                        })
+                    })?;
                 rows.filter_map(|r| r.ok()).collect()
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(gpu_percent)
-                     FROM system_metrics
-                     WHERE ts >= ?2 AND gpu_percent IS NOT NULL
-                     GROUP BY bucket ORDER BY bucket"
-                )?;
-                let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms], |r| {
-                    Ok(MetricPoint { ts: r.get(0)?, value: r.get(1)? })
-                })?;
-                rows.filter_map(|r| r.ok()).collect()
-            }
-        } else {
-            Vec::new()
-        };
-        let model_gpu_trend: Vec<MetricPoint> = if has_gpu_percent && scoped {
-            let mut stmt = conn.prepare(
-                "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, AVG(gpu_percent)
-                 FROM system_metrics
-                 WHERE ts >= ?2 AND scope = ?3 AND gpu_percent IS NOT NULL
-                 GROUP BY bucket ORDER BY bucket"
-            )?;
-            let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms, MODEL_SCOPE], |r| {
-                Ok(MetricPoint { ts: r.get(0)?, value: r.get(1)? })
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        } else {
-            Vec::new()
-        };
-
-        let disk_trend: Vec<DiskPoint> = if scoped {
-            let mut stmt = conn.prepare(
-                "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, SUM(disk_read_mb), SUM(disk_write_mb)
-                 FROM system_metrics
-                 WHERE ts >= ?2 AND scope = ?3
-                 GROUP BY bucket ORDER BY bucket"
-            )?;
-            let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms, SYSTEM_SCOPE], |r| {
-                Ok(DiskPoint { ts: r.get(0)?, read_mb: r.get(1)?, write_mb: r.get(2)? })
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, SUM(disk_read_mb), SUM(disk_write_mb)
+                    "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, SUM(disk_read_mb), SUM(disk_write_mb)
                  FROM system_metrics
                  WHERE ts >= ?2
-                 GROUP BY bucket ORDER BY bucket"
-            )?;
-            let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms], |r| {
-                Ok(DiskPoint { ts: r.get(0)?, read_mb: r.get(1)?, write_mb: r.get(2)? })
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
+                 GROUP BY bucket ORDER BY bucket",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![bucket_ms, from_ms], |r| {
+                    Ok(DiskPoint {
+                        ts: r.get(0)?,
+                        read_mb: r.get(1)?,
+                        write_mb: r.get(2)?,
+                    })
+                })?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
 
-        let latest = ResourceLatestBundle {
-            system: latest_system_metrics(conn, has_gpu_percent, has_gpu_name, scoped),
-            suite: if scoped { latest_scoped_metrics(conn, SUITE_SCOPE) } else { None },
-            model: if scoped { latest_scoped_metrics(conn, MODEL_SCOPE) } else { None },
-        };
-        let model_runtime_breakdown = if scoped {
-            latest_model_runtime_breakdown(conn)?
-        } else {
-            Vec::new()
-        };
+            let latest = ResourceLatestBundle {
+                system: latest_system_metrics(conn, has_gpu_percent, has_gpu_name, scoped),
+                suite: if scoped {
+                    latest_scoped_metrics(conn, SUITE_SCOPE)
+                } else {
+                    None
+                },
+                model: if scoped {
+                    latest_scoped_metrics(conn, MODEL_SCOPE)
+                } else {
+                    None
+                },
+            };
+            let model_runtime_breakdown = if scoped {
+                latest_model_runtime_breakdown(conn)?
+            } else {
+                Vec::new()
+            };
 
-        let mut knowledge_events_stmt = conn.prepare(
-            "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, COUNT(*)
+            let mut knowledge_events_stmt = conn.prepare(
+                "SELECT (ts / ?1) * ?1 + ?1/2 as bucket, COUNT(*)
              FROM (
                 SELECT CAST(strftime('%s', created_at) AS INTEGER) * 1000 as ts
-                FROM knowledge_entries
+                FROM timelines
                 WHERE created_at >= datetime(?2/1000, 'unixepoch')
                   AND summary NOT LIKE ?3
              )
-             GROUP BY bucket ORDER BY bucket"
-        )?;
-        let knowledge_events: Vec<KnowledgeTimePoint> = knowledge_events_stmt
-            .query_map(rusqlite::params![bucket_ms, from_ms, fallback_noise_pattern.as_str()], |r| {
-                Ok(KnowledgeTimePoint { ts: r.get(0)?, count: r.get(1)? })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+             GROUP BY bucket ORDER BY bucket",
+            )?;
+            let knowledge_events: Vec<KnowledgeTimePoint> = knowledge_events_stmt
+                .query_map(
+                    rusqlite::params![bucket_ms, from_ms, fallback_noise_pattern.as_str()],
+                    |r| {
+                        Ok(KnowledgeTimePoint {
+                            ts: r.get(0)?,
+                            count: r.get(1)?,
+                        })
+                    },
+                )?
+                .filter_map(|r| r.ok())
+                .collect();
 
-        let mut ev_stmt = conn.prepare(
-            "SELECT ts, event_type, model_type, model_name,
+            let mut ev_stmt = conn.prepare(
+                "SELECT ts, event_type, model_type, model_name,
                     duration_ms, memory_mb, mem_before_mb, mem_after_mb, error_msg
              FROM model_events WHERE ts >= ?1
-             ORDER BY ts DESC LIMIT 50"
-        )?;
-        let model_events: Vec<ModelEventItem> = ev_stmt
-            .query_map(rusqlite::params![from_ms], |r| {
-                Ok(ModelEventItem {
-                    ts:            r.get(0)?,
-                    event_type:    r.get(1)?,
-                    model_type:    r.get(2)?,
-                    model_name:    r.get(3)?,
-                    duration_ms:   r.get(4)?,
-                    memory_mb:     r.get(5)?,
-                    mem_before_mb: r.get(6)?,
-                    mem_after_mb:  r.get(7)?,
-                    error_msg:     r.get(8)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+             ORDER BY ts DESC LIMIT 50",
+            )?;
+            let model_events: Vec<ModelEventItem> = ev_stmt
+                .query_map(rusqlite::params![from_ms], |r| {
+                    Ok(ModelEventItem {
+                        ts: r.get(0)?,
+                        event_type: r.get(1)?,
+                        model_type: r.get(2)?,
+                        model_name: r.get(3)?,
+                        duration_ms: r.get(4)?,
+                        memory_mb: r.get(5)?,
+                        mem_before_mb: r.get(6)?,
+                        mem_after_mb: r.get(7)?,
+                        error_msg: r.get(8)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
 
-        let system_cpu = downsample_metric_points(system_cpu, max_trend_points);
-        let system_mem = downsample_metric_points(system_mem, max_trend_points);
-        let suite_cpu = downsample_metric_points(suite_cpu, max_trend_points);
-        let suite_mem = downsample_metric_points(suite_mem, max_trend_points);
-        let model_cpu = downsample_metric_points(model_cpu, max_trend_points);
-        let model_mem = downsample_metric_points(model_mem, max_trend_points);
-        let model_cpu_series = downsample_named_metric_series(model_cpu_series, max_trend_points);
-        let model_mem_series = downsample_named_metric_series(model_mem_series, max_trend_points);
-        let model_estimated_mem_series = downsample_named_metric_series(model_estimated_mem_series, max_trend_points);
-        let gpu_trend = downsample_metric_points(gpu_trend, max_trend_points);
-        let model_gpu_trend = downsample_metric_points(model_gpu_trend, max_trend_points);
-        let disk_trend = downsample_disk_points(disk_trend, max_trend_points);
-        let knowledge_events = downsample_knowledge_points(knowledge_events, max_trend_points);
+            let system_cpu = downsample_metric_points(system_cpu, max_trend_points);
+            let system_mem = downsample_metric_points(system_mem, max_trend_points);
+            let suite_cpu = downsample_metric_points(suite_cpu, max_trend_points);
+            let suite_mem = downsample_metric_points(suite_mem, max_trend_points);
+            let model_cpu = downsample_metric_points(model_cpu, max_trend_points);
+            let model_mem = downsample_metric_points(model_mem, max_trend_points);
+            let model_cpu_series =
+                downsample_named_metric_series(model_cpu_series, max_trend_points);
+            let model_mem_series =
+                downsample_named_metric_series(model_mem_series, max_trend_points);
+            let model_estimated_mem_series =
+                downsample_named_metric_series(model_estimated_mem_series, max_trend_points);
+            let gpu_trend = downsample_metric_points(gpu_trend, max_trend_points);
+            let model_gpu_trend = downsample_metric_points(model_gpu_trend, max_trend_points);
+            let disk_trend = downsample_disk_points(disk_trend, max_trend_points);
+            let knowledge_events = downsample_knowledge_points(knowledge_events, max_trend_points);
 
-        Ok(SystemResourcesResponse {
-            db_size_bytes,
-            trends: ResourceTrends {
-                system_cpu,
-                system_mem,
-                suite_cpu,
-                suite_mem,
-                model_cpu,
-                model_mem,
-                model_cpu_series,
-                model_mem_series,
-                model_estimated_mem_series,
-            },
-            gpu_trend,
-            model_gpu_trend,
-            disk_trend,
-            knowledge_events,
-            model_events,
-            model_runtime_breakdown,
-            latest,
+            Ok(SystemResourcesResponse {
+                db_size_bytes,
+                trends: ResourceTrends {
+                    system_cpu,
+                    system_mem,
+                    suite_cpu,
+                    suite_mem,
+                    model_cpu,
+                    model_mem,
+                    model_cpu_series,
+                    model_mem_series,
+                    model_estimated_mem_series,
+                },
+                gpu_trend,
+                model_gpu_trend,
+                disk_trend,
+                knowledge_events,
+                model_events,
+                model_runtime_breakdown,
+                latest,
+            })
         })
-    }).await?;
+        .await?;
 
     Ok(Json(result))
 }

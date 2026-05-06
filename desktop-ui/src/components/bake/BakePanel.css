@@ -249,7 +249,7 @@
   min-width: min(100%, 280px);
   display: grid;
   align-items: end;
-  grid-template-columns: minmax(0, 1.65fr) repeat(2, minmax(112px, 0.72fr));
+  grid-template-columns: auto minmax(0, 1fr);
   gap: 8px;
 }
 
@@ -430,7 +430,7 @@
   display: grid;
   grid-template-columns: minmax(320px, 360px) minmax(0, 1fr);
   gap: 16px;
-  align-items: start;
+  align-items: stretch;
 }
 
 .bake-split-list-detail--memories-fixed,
@@ -691,6 +691,15 @@ button.bake-list-item.bake-list-item--active {
   color: #1F5FBF;
   font-size: 12px;
   font-weight: 600;
+}
+
+.bake-stat-chip--button {
+  border: none;
+  cursor: pointer;
+}
+
+.bake-stat-chip--button:hover {
+  background: rgba(0, 122, 255, 0.16);
 }
 
 .bake-aside-stack {

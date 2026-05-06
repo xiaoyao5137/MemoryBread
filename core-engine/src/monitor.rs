@@ -41,10 +41,12 @@ impl ResourceMonitor {
             sys.refresh_all();
 
             let total_mem_mb = sys.total_memory() / 1024 / 1024;
-            let used_mem_mb  = sys.used_memory()  / 1024 / 1024;
-            let mem_percent  = if total_mem_mb > 0 {
+            let used_mem_mb = sys.used_memory() / 1024 / 1024;
+            let mem_percent = if total_mem_mb > 0 {
                 used_mem_mb as f64 / total_mem_mb as f64 * 100.0
-            } else { 0.0 };
+            } else {
+                0.0
+            };
 
             let mut cpu_process: f64 = 0.0;
             let mut mem_process_mb: u64 = 0;
@@ -79,7 +81,10 @@ impl ResourceMonitor {
                 warn!("内存使用过高 ({} MB)，建议清理旧数据", mem_process_mb);
             }
 
-            info!("资源使用: CPU {:.1}%, 内存 {} MB, 系统 CPU {:.1}%, 系统内存 {:.1}%", cpu_process, mem_process_mb, cpu_total, mem_percent);
+            info!(
+                "资源使用: CPU {:.1}%, 内存 {} MB, 系统 CPU {:.1}%, 系统内存 {:.1}%",
+                cpu_process, mem_process_mb, cpu_total, mem_percent
+            );
         }
     }
 }

@@ -19,11 +19,7 @@ impl StorageManager {
     }
 
     /// 更新动作执行状态。
-    pub fn update_action_status(
-        &self,
-        id:     i64,
-        status: &ActionStatus,
-    ) -> Result<(), StorageError> {
+    pub fn update_action_status(&self, id: i64, status: &ActionStatus) -> Result<(), StorageError> {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE action_logs SET status = ?1 WHERE id = ?2",
@@ -34,11 +30,7 @@ impl StorageManager {
     }
 
     /// 记录用户对 AI 输出的修改内容，并将状态标记为 success。
-    pub fn record_user_correction(
-        &self,
-        id:         i64,
-        correction: &str,
-    ) -> Result<(), StorageError> {
+    pub fn record_user_correction(&self, id: i64, correction: &str) -> Result<(), StorageError> {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE action_logs SET user_correction = ?1, status = 'success' WHERE id = ?2",
@@ -60,10 +52,7 @@ impl StorageManager {
     }
 }
 
-fn insert_action_log_inner(
-    conn: &Connection,
-    log:  &NewActionLog,
-) -> Result<i64, StorageError> {
+fn insert_action_log_inner(conn: &Connection, log: &NewActionLog) -> Result<i64, StorageError> {
     conn.execute(
         "INSERT INTO action_logs
             (ts, trigger_source, app_name, action_type, action_payload, confirmed_by_user, status)
@@ -87,17 +76,20 @@ fn insert_action_log_inner(
 /// 动作日志查询过滤条件
 #[derive(Debug, Default)]
 pub struct ActionLogFilter {
-    pub from_ts:    Option<i64>,
-    pub to_ts:      Option<i64>,
-    pub app_name:   Option<String>,
-    pub status:     Option<String>,
-    pub limit:      usize,
-    pub offset:     usize,
+    pub from_ts: Option<i64>,
+    pub to_ts: Option<i64>,
+    pub app_name: Option<String>,
+    pub status: Option<String>,
+    pub limit: usize,
+    pub offset: usize,
 }
 
 impl ActionLogFilter {
     pub fn new() -> Self {
-        Self { limit: 100, ..Default::default() }
+        Self {
+            limit: 100,
+            ..Default::default()
+        }
     }
 }
 
@@ -126,12 +118,24 @@ impl StorageManager {
     ) -> Result<Vec<ActionLogRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut wheres: Vec<String> = Vec::new();
-            if filter.from_ts.is_some()  { wheres.push("ts >= ?".into()); }
-            if filter.to_ts.is_some()    { wheres.push("ts <= ?".into()); }
-            if filter.app_name.is_some() { wheres.push("app_name = ?".into()); }
-            if filter.status.is_some()   { wheres.push("status = ?".into()); }
+            if filter.from_ts.is_some() {
+                wheres.push("ts >= ?".into());
+            }
+            if filter.to_ts.is_some() {
+                wheres.push("ts <= ?".into());
+            }
+            if filter.app_name.is_some() {
+                wheres.push("app_name = ?".into());
+            }
+            if filter.status.is_some() {
+                wheres.push("status = ?".into());
+            }
 
-            let where_clause = if wheres.is_empty() { "1=1".into() } else { wheres.join(" AND ") };
+            let where_clause = if wheres.is_empty() {
+                "1=1".into()
+            } else {
+                wheres.join(" AND ")
+            };
             let sql = format!(
                 "SELECT id, ts, trigger_source, app_name, action_type, action_payload,
                         confirmed_by_user, status, user_correction, error_msg
@@ -141,10 +145,18 @@ impl StorageManager {
 
             let mut stmt = conn.prepare(&sql)?;
             let mut bind: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-            if let Some(v) = filter.from_ts      { bind.push(Box::new(v)); }
-            if let Some(v) = filter.to_ts        { bind.push(Box::new(v)); }
-            if let Some(ref v) = filter.app_name { bind.push(Box::new(v.clone())); }
-            if let Some(ref v) = filter.status   { bind.push(Box::new(v.clone())); }
+            if let Some(v) = filter.from_ts {
+                bind.push(Box::new(v));
+            }
+            if let Some(v) = filter.to_ts {
+                bind.push(Box::new(v));
+            }
+            if let Some(ref v) = filter.app_name {
+                bind.push(Box::new(v.clone()));
+            }
+            if let Some(ref v) = filter.status {
+                bind.push(Box::new(v.clone()));
+            }
             bind.push(Box::new(filter.limit as i64));
             bind.push(Box::new(filter.offset as i64));
 
@@ -152,7 +164,8 @@ impl StorageManager {
             let rows = stmt.query_map(params.as_slice(), |row| {
                 Ok(row_to_action_log(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
@@ -185,16 +198,16 @@ impl StorageManager {
 
 fn row_to_action_log(row: &rusqlite::Row<'_>) -> Result<ActionLogRecord, StorageError> {
     Ok(ActionLogRecord {
-        id:                row.get(0)?,
-        ts:                row.get(1)?,
-        trigger_source:    row.get(2)?,
-        app_name:          row.get(3)?,
-        action_type:       row.get(4)?,
-        action_payload:    row.get(5)?,
+        id: row.get(0)?,
+        ts: row.get(1)?,
+        trigger_source: row.get(2)?,
+        app_name: row.get(3)?,
+        action_type: row.get(4)?,
+        action_payload: row.get(5)?,
         confirmed_by_user: row.get::<_, i64>(6)? != 0,
-        status:            row.get(7)?,
-        user_correction:   row.get(8)?,
-        error_msg:         row.get(9)?,
+        status: row.get(7)?,
+        user_correction: row.get(8)?,
+        error_msg: row.get(9)?,
     })
 }
 
@@ -212,11 +225,11 @@ mod tests {
 
     fn sample_log() -> NewActionLog {
         NewActionLog {
-            ts:                1_700_000_000_000,
-            trigger_source:    "auto".into(),
-            app_name:          Some("Feishu".into()),
-            action_type:       "type_text".into(),
-            action_payload:    r#"{"text":"你好","target_ax_id":"input-1"}"#.into(),
+            ts: 1_700_000_000_000,
+            trigger_source: "auto".into(),
+            app_name: Some("Feishu".into()),
+            action_type: "type_text".into(),
+            action_payload: r#"{"text":"你好","target_ax_id":"input-1"}"#.into(),
             confirmed_by_user: false,
         }
     }
@@ -237,7 +250,8 @@ mod tests {
     fn test_update_status() {
         let mgr = make_mgr();
         let id = mgr.insert_action_log(&sample_log()).unwrap();
-        mgr.update_action_status(id, &ActionStatus::Success).unwrap();
+        mgr.update_action_status(id, &ActionStatus::Success)
+            .unwrap();
 
         let rec = mgr.get_action_log(id).unwrap().unwrap();
         assert_eq!(rec.status, "success");
@@ -259,14 +273,15 @@ mod tests {
         let mgr = make_mgr();
         mgr.insert_action_log(&sample_log()).unwrap();
         let id2 = mgr.insert_action_log(&sample_log()).unwrap();
-        mgr.update_action_status(id2, &ActionStatus::Success).unwrap();
+        mgr.update_action_status(id2, &ActionStatus::Success)
+            .unwrap();
 
         let all = mgr.list_action_logs(&ActionLogFilter::new()).unwrap();
         assert_eq!(all.len(), 2);
 
         let filter = ActionLogFilter {
             status: Some("success".into()),
-            limit:  10,
+            limit: 10,
             ..Default::default()
         };
         let success_list = mgr.list_action_logs(&filter).unwrap();

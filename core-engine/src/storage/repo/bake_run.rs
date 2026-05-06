@@ -17,7 +17,7 @@ impl StorageManager {
             let mut stmt = conn.prepare(
                 "SELECT id, trigger_reason, status, started_at, completed_at,
                         processed_episode_count, auto_created_count, candidate_count, discarded_count,
-                        knowledge_created_count, template_created_count, sop_created_count,
+                        knowledge_created_count, design_created_count, sop_created_count,
                         error_message, latency_ms
                  FROM bake_runs
                  ORDER BY started_at DESC, id DESC
@@ -43,7 +43,7 @@ impl StorageManager {
         candidate_count: i64,
         discarded_count: i64,
         knowledge_created_count: i64,
-        template_created_count: i64,
+        design_created_count: i64,
         sop_created_count: i64,
         error_message: Option<&str>,
         latency_ms: Option<i64>,
@@ -58,7 +58,7 @@ impl StorageManager {
                      candidate_count = ?5,
                      discarded_count = ?6,
                      knowledge_created_count = ?7,
-                     template_created_count = ?8,
+                     design_created_count = ?8,
                      sop_created_count = ?9,
                      error_message = ?10,
                      latency_ms = ?11
@@ -71,7 +71,7 @@ impl StorageManager {
                     candidate_count,
                     discarded_count,
                     knowledge_created_count,
-                    template_created_count,
+                    design_created_count,
                     sop_created_count,
                     error_message,
                     latency_ms,
@@ -82,7 +82,10 @@ impl StorageManager {
         })
     }
 
-    pub fn get_bake_watermark(&self, pipeline_name: &str) -> Result<Option<BakeWatermarkRecord>, StorageError> {
+    pub fn get_bake_watermark(
+        &self,
+        pipeline_name: &str,
+    ) -> Result<Option<BakeWatermarkRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT pipeline_name, last_processed_ts, updated_at
@@ -98,7 +101,11 @@ impl StorageManager {
         })
     }
 
-    pub fn upsert_bake_watermark(&self, pipeline_name: &str, last_processed_ts: i64) -> Result<(), StorageError> {
+    pub fn upsert_bake_watermark(
+        &self,
+        pipeline_name: &str,
+        last_processed_ts: i64,
+    ) -> Result<(), StorageError> {
         let updated_at = current_ts_ms();
         self.with_conn(|conn| {
             conn.execute(
@@ -125,7 +132,7 @@ fn insert_bake_run_inner(conn: &Connection, run: &NewBakeRun) -> Result<i64, Sto
             candidate_count,
             discarded_count,
             knowledge_created_count,
-            template_created_count,
+            design_created_count,
             sop_created_count
          ) VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, 0)",
         params![run.trigger_reason, run.status, run.started_at],
@@ -145,7 +152,7 @@ fn row_to_bake_run(row: &rusqlite::Row<'_>) -> Result<BakeRunRecord, StorageErro
         candidate_count: row.get(7)?,
         discarded_count: row.get(8)?,
         knowledge_created_count: row.get(9)?,
-        template_created_count: row.get(10)?,
+        design_created_count: row.get(10)?,
         sop_created_count: row.get(11)?,
         error_message: row.get(12)?,
         latency_ms: row.get(13)?,
@@ -171,26 +178,17 @@ mod tests {
     #[test]
     fn test_insert_and_complete_bake_run() {
         let mgr = make_mgr();
-        let id = mgr.insert_bake_run(&NewBakeRun {
-            trigger_reason: "manual_debug".to_string(),
-            status: "running".to_string(),
-            started_at: 123,
-        }).unwrap();
+        let id = mgr
+            .insert_bake_run(&NewBakeRun {
+                trigger_reason: "manual_debug".to_string(),
+                status: "running".to_string(),
+                started_at: 123,
+            })
+            .unwrap();
 
-        assert!(mgr.complete_bake_run(
-            id,
-            "completed",
-            456,
-            3,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            None,
-            Some(333),
-        ).unwrap());
+        assert!(mgr
+            .complete_bake_run(id, "completed", 456, 3, 1, 1, 1, 1, 0, 0, None, Some(333),)
+            .unwrap());
 
         let latest = mgr.get_latest_bake_run().unwrap().unwrap();
         assert_eq!(latest.id, id);

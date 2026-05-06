@@ -5,13 +5,13 @@ import {
   useFetchBakeCaptures,
 } from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
-import type { BakeCaptureItem, EpisodicMemoryItem, RepositoryTab } from '../types'
+import type { BakeCaptureItem, TimelineItem, RepositoryTab } from '../types'
 import BakeCaptureTab, { parseDateInputToMs } from './bake/BakeCaptureTab'
 import BakeHeader from './bake/BakeHeader'
 import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './bake/BakeShared'
 import './bake/BakePanel.css'
 
-const formatMemoryTime = (item: Pick<EpisodicMemoryItem, 'createdAt' | 'createdAtMs'>) => {
+const formatMemoryTime = (item: Pick<TimelineItem, 'createdAt' | 'createdAtMs'>) => {
   if (item.createdAtMs > 0) {
     return new Date(item.createdAtMs).toLocaleString('zh-CN', {
       year: 'numeric',
@@ -47,19 +47,24 @@ const RepositoryPanel: React.FC = () => {
     setRepositoryTab,
     setSelectedMemoryId,
     setSelectedKnowledgeId,
+    setSelectedTemplateId,
+    setSelectedSopId,
     setSelectedCaptureId,
     setBakeMemoryOffset,
     setBakeCaptureOffset,
     setRepositoryMemoryLimit,
     setRepositoryCaptureLimit,
     setRepositoryCaptureSourceCaptureId,
+    captureBackTarget,
+    setCaptureBackTarget,
+    clearCaptureBackTarget,
   } = useAppStore()
 
   const fetchMemories = useFetchBakeMemories()
   const fetchCaptures = useFetchBakeCaptures()
   const fetchCaptureDetail = useFetchBakeCaptureDetail()
 
-  const [memories, setMemories] = useState<EpisodicMemoryItem[]>([])
+  const [memories, setMemories] = useState<TimelineItem[]>([])
   const [memoryTotal, setMemoryTotal] = useState(0)
   const [captureItems, setCaptureItems] = useState<BakeCaptureItem[]>([])
   const [captureTotal, setCaptureTotal] = useState(0)
@@ -85,7 +90,7 @@ const RepositoryPanel: React.FC = () => {
       setMemories(data.items)
       setMemoryTotal(data.total)
     }).catch((error) => {
-      setStatusMessage(error instanceof Error ? error.message : '情节记忆加载失败')
+      setStatusMessage(error instanceof Error ? error.message : '时间线加载失败')
     })
   }, [
     bakeMemoryOffset,
@@ -110,7 +115,7 @@ const RepositoryPanel: React.FC = () => {
       setCaptureItems(data.items)
       setCaptureTotal(data.total)
     }).catch((error) => {
-      setStatusMessage(error instanceof Error ? error.message : '记忆片段加载失败')
+      setStatusMessage(error instanceof Error ? error.message : '采集记录加载失败')
     })
   }, [
     bakeCaptureOffset,
@@ -129,7 +134,7 @@ const RepositoryPanel: React.FC = () => {
       return
     }
     void fetchCaptureDetail(selectedCaptureId).then(setCaptureDetail).catch((error) => {
-      setStatusMessage(error instanceof Error ? error.message : '记忆片段详情加载失败')
+      setStatusMessage(error instanceof Error ? error.message : '采集记录详情加载失败')
     })
   }, [fetchCaptureDetail, repositoryTab, selectedCaptureId])
 
@@ -232,7 +237,7 @@ const RepositoryPanel: React.FC = () => {
 
   const handleViewLinkedKnowledge = (knowledgeId?: string | null) => {
     if (!knowledgeId) {
-      setStatusMessage('当前情节记忆尚未提炼出 bake 知识')
+      setStatusMessage('当前时间线尚未提炼出 bake 知识')
       return
     }
     setWindowMode('bake')
@@ -241,14 +246,42 @@ const RepositoryPanel: React.FC = () => {
     setStatusMessage('已切换到已提炼知识页；来源 knowledge 不在这里展示')
   }
 
+  const handleCaptureGoBack = () => {
+    if (!captureBackTarget) {
+      setStatusMessage('当前没有可返回的上一步页面')
+      return
+    }
+
+    const target = captureBackTarget
+    clearCaptureBackTarget()
+
+    if (target.windowMode === 'bake') {
+      setWindowMode('bake')
+      if (target.bakeTab) setBakeTab(target.bakeTab)
+      if (target.selectedMemoryId !== undefined) setSelectedMemoryId(target.selectedMemoryId)
+      if (target.selectedTemplateId !== undefined) setSelectedTemplateId(target.selectedTemplateId)
+      if (target.selectedSopId !== undefined) setSelectedSopId(target.selectedSopId)
+      if (target.selectedKnowledgeId !== undefined) setSelectedKnowledgeId(target.selectedKnowledgeId)
+      setStatusMessage('已返回上一步页面')
+      return
+    }
+
+    setWindowMode('knowledge')
+    if (target.repositoryTab) setRepositoryTab(target.repositoryTab)
+    if (target.selectedMemoryId !== undefined) setSelectedMemoryId(target.selectedMemoryId)
+    if (target.selectedCaptureId !== undefined) setSelectedCaptureId(target.selectedCaptureId)
+    setRepositoryCaptureSourceCaptureId(target.repositoryCaptureSourceCaptureId ?? null)
+    setStatusMessage('已返回上一步页面')
+  }
+
   const tabs: Array<{ key: RepositoryTab; label: string }> = [
-    { key: 'memory', label: '情节记忆' },
-    { key: 'capture', label: '记忆片段' },
+    { key: 'memory', label: '时间线' },
+    { key: 'capture', label: '采集记录' },
   ]
 
   return (
     <div className="bake-panel">
-      <BakeHeader title="醒发箱" subtitle="集中浏览情节记忆与记忆片段，只做回溯原始上下文" />
+      <BakeHeader title="采集" subtitle="集中浏览时间线与采集记录，只做回溯原始上下文" />
       {statusMessage && <div className="bake-inline-message">{statusMessage}</div>}
       <section className="bake-tabs bake-tabs--scroll">
         {tabs.map(tab => (
@@ -263,7 +296,7 @@ const RepositoryPanel: React.FC = () => {
           <div className="bake-split-list-detail bake-split-list-detail--memories-fixed">
             <BakeCard className="bake-memory-list-card bake-memory-list-card--fixed">
               <BakeSectionHeader
-                title="情节记忆"
+                title="时间线"
                 subtitle="只做浏览与回溯，不在这里执行提炼动作"
               />
 
@@ -282,7 +315,7 @@ const RepositoryPanel: React.FC = () => {
                         className="bake-input"
                         value={draftMemoryQuery}
                         onChange={(event) => setDraftMemoryQuery(event.target.value)}
-                        placeholder="搜索情节记忆标题、摘要或详情"
+                        placeholder="搜索时间线标题、摘要或详情"
                       />
                     </label>
                     <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--search">
@@ -324,7 +357,7 @@ const RepositoryPanel: React.FC = () => {
               )}
 
               {memories.length === 0 ? (
-                <div className="bake-muted">当前筛选条件下没有可浏览的情节记忆。</div>
+                <div className="bake-muted">当前筛选条件下没有可浏览的时间线。</div>
               ) : (
                 <>
                   <div className="bake-list bake-memory-list bake-memory-list--paged">
@@ -410,7 +443,7 @@ const RepositoryPanel: React.FC = () => {
                         <div className="bake-title" style={{ fontSize: 20, lineHeight: 1.4 }}>{selectedMemory.title}</div>
                         <div className="bake-muted bake-line-clamp-1" style={{ marginTop: 6 }}>{selectedMemory.url || `片段 #${selectedMemory.sourceCaptureId || '—'}`}</div>
                       </div>
-                      <BakePill text="情节记忆浏览" />
+                      <BakePill text="时间线浏览" />
                     </div>
                     <div className="bake-memory-detail__stats">
                       <span className="bake-stat-chip">创建于 {formatMemoryTime(selectedMemory)}</span>
@@ -423,37 +456,42 @@ const RepositoryPanel: React.FC = () => {
 
                   <div className="bake-grid-2">
                     <div className="bake-memory-action-card">
-                      <div className="bake-kv__title">情节记忆摘要</div>
+                      <div className="bake-kv__title">时间线摘要</div>
                       <div className="bake-muted" style={{ lineHeight: 1.8 }}>{selectedMemory.summary || '暂无摘要'}</div>
                     </div>
                     <div className="bake-memory-action-card">
                       <div className="bake-kv__title">浏览提示</div>
-                      <div className="bake-muted" style={{ lineHeight: 1.8 }}>醒发箱只用于浏览情节记忆与回溯上下文；如需提炼为知识、模板或 SOP，请回到烤面包的情节记忆页。</div>
+                      <div className="bake-muted" style={{ lineHeight: 1.8 }}>采集只用于浏览时间线与回溯上下文；如需提炼为知识、模板或 SOP，请回到收藏的时间线页。</div>
                     </div>
                   </div>
 
                   <div className="bake-memory-action-card bake-memory-action-card--secondary">
                     <div>
                       <div className="bake-kv__title">回溯</div>
-                      <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>从醒发箱中的情节记忆跳到来源记忆片段，或回到烤面包查看已提炼出的知识、模板与 SOP。</div>
+                      <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>从采集中的时间线跳到来源采集记录，或回到收藏查看已提炼出的知识、模板与 SOP。</div>
                     </div>
                     <div className="bake-actions bake-actions--secondary bake-memory-detail__action-copy">
                       <BakeButton compact onClick={() => {
                         if (!selectedMemory.sourceCaptureId) {
-                          setStatusMessage('当前情节记忆暂无来源记忆片段')
+                          setStatusMessage('当前时间线暂无来源采集记录')
                           return
                         }
+                        setCaptureBackTarget({
+                          windowMode: 'knowledge',
+                          repositoryTab: 'memory',
+                          selectedMemoryId: selectedMemory.id,
+                        })
                         setRepositoryTab('capture')
                         setRepositoryCaptureSourceCaptureId(selectedMemory.sourceCaptureId)
                         setSelectedCaptureId(selectedMemory.sourceCaptureId)
-                        setStatusMessage('已切换到来源记忆片段')
-                      }}>来源记忆片段</BakeButton>
+                        setStatusMessage('已切换到来源采集记录')
+                      }}>来源采集记录</BakeButton>
                       <BakeButton compact onClick={() => handleViewLinkedKnowledge(selectedMemory.sourceKnowledgeId)}>关联知识</BakeButton>
                     </div>
                   </div>
                 </div>
               ) : (
-                <div className="bake-muted">暂无情节记忆详情</div>
+                <div className="bake-muted">暂无时间线详情</div>
               )}
             </BakeCard>
           </div>
@@ -483,6 +521,8 @@ const RepositoryPanel: React.FC = () => {
             onClearFilters={handleClearCaptureFilters}
             onClearScope={() => setRepositoryCaptureSourceCaptureId(null)}
             onViewLinkedKnowledge={handleViewLinkedKnowledge}
+            canGoBack={Boolean(captureBackTarget)}
+            onGoBack={handleCaptureGoBack}
           />
         )}
       </div>

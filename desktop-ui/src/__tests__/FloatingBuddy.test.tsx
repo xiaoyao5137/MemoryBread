@@ -21,7 +21,7 @@ describe('FloatingBuddy', () => {
     expect(useAppStore.getState().windowMode).toBe('settings')
   })
 
-  it('烤面包菜单排在第二位，醒发箱排在第三位', () => {
+  it('收藏菜单排在第二位，采集排在第三位', () => {
     render(<FloatingBuddy />)
     const buttons = screen.getAllByRole('button')
     expect(buttons[1]).toHaveAttribute('data-testid', 'bake-btn')
@@ -35,7 +35,7 @@ describe('BakeTabs', () => {
     render(<BakeTabs current="overview" onChange={onChange} />)
 
     const tabs = screen.getAllByRole('button').map(button => button.textContent)
-    expect(tabs).toEqual(['总览', '情节记忆', '知识（芝士）', '文档模板（面包片）', '操作手册（火腿）', '写作自然感提升'])
+    expect(tabs).toEqual(['总览', '时间线', '知识', '设计', '操作手册', '写作自然感提升'])
     expect(screen.queryByText('高价值文档')).not.toBeInTheDocument()
   })
 })

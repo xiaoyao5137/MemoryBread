@@ -29,7 +29,7 @@ const bucketMeta: Record<BakeBucket, { title: string; subtitle: string; empty: s
   },
   pending: {
     title: '待提炼',
-    subtitle: '这里展示待确认候选模板，可直接调整后入库',
+    subtitle: '这里展示待确认候选模板，可直接采纳或忽略',
     empty: '当前还没有待提炼模板候选。',
   },
 }
@@ -47,6 +47,7 @@ const BakeTemplatesTab: React.FC<{
   onCreateTemplate: () => void
   onUpdateTemplate: (templateId: string, updater: (template: ArticleTemplate) => ArticleTemplate) => void
   onToggleTemplateStatus: (templateId: string) => void
+  onAdoptTemplate: (templateId: string) => void
   onDeleteTemplate: (templateId: string) => void
   onViewSourceMemory: (memoryId?: string) => void
   onPageChange: (offset: number) => void
@@ -65,6 +66,7 @@ const BakeTemplatesTab: React.FC<{
   onCreateTemplate,
   onUpdateTemplate,
   onToggleTemplateStatus,
+  onAdoptTemplate,
   onDeleteTemplate,
   onViewSourceMemory,
   onPageChange,
@@ -133,23 +135,22 @@ const BakeTemplatesTab: React.FC<{
   }
 
   return (
-    <div className="bake-split-list-detail bake-split-list-detail--templates">
-      <BakeCard className="bake-knowledge-list-card">
+    <>
+      <BakeCard>
         <BakeSectionHeader
-          title="文档模板（面包片）"
-          subtitle={bucketMeta[bucket].subtitle}
-          right={(
-            <div className="bake-section-header__actions">
+          title="设计"
+          subtitle="管理可复用的文档模板"
+          right={<BakeButton primary onClick={onCreateTemplate}>新建模板</BakeButton>}
+        />
+        <div className="bake-list-toolbar">
+          <div className="bake-list-toolbar__filters">
+            <label className="bake-form-field bake-filter-field">
+              <span className="bake-filter-label">分组</span>
               <div className="bake-segmented-actions">
                 <BakeButton compact active={bucket === 'extracted'} onClick={() => onBucketChange('extracted')}>已提炼</BakeButton>
                 <BakeButton compact active={bucket === 'pending'} onClick={() => onBucketChange('pending')}>待提炼</BakeButton>
               </div>
-              <BakeButton primary onClick={onCreateTemplate}>新建模板</BakeButton>
-            </div>
-          )}
-        />
-        <div className="bake-list-toolbar">
-          <div className="bake-list-toolbar__filters">
+            </label>
             <label className="bake-form-field bake-filter-field bake-filter-field--search">
               <span className="bake-filter-label">关键词</span>
               <input
@@ -160,12 +161,13 @@ const BakeTemplatesTab: React.FC<{
               />
             </label>
           </div>
-          <div className="bake-list-toolbar__meta">
+          <div className="bake-list-toolbar__actions">
             {query && <BakeButton compact onClick={() => onQueryChange('')}>清除筛选</BakeButton>}
-            <BakePill text={bucketMeta[bucket].title} />
-            <BakePill text={`第 ${page}/${totalPages} 页`} />
           </div>
         </div>
+      </BakeCard>
+      <div className="bake-split-list-detail bake-split-list-detail--templates">
+        <BakeCard className="bake-knowledge-list-card">
         <div className="bake-list bake-knowledge-list">
           {templates.length === 0 ? (
             <div className="bake-muted">{query.trim() ? '当前筛选条件下没有模板。' : bucketMeta[bucket].empty}</div>
@@ -289,31 +291,31 @@ const BakeTemplatesTab: React.FC<{
             ) : (
               <>
                 <div className="bake-knowledge-detail__section">
-                  <div className="bake-kv__title">结构字段</div>
+                  <div className="bake-kv__title">结构骨架（决定输出结构）</div>
                   <div className="bake-list">
                     {selected.structureSections.length > 0 ? selected.structureSections.map(section => (
                       <div key={section.title} className="bake-list-item">
                         <div className="bake-list-item__title">{section.title}</div>
                         <div className="bake-muted">关键词：{section.keywords.join(' / ') || '未设置'}</div>
                       </div>
-                    )) : <div className="bake-muted">暂无结构字段</div>}
+                    )) : <div className="bake-muted">暂无结构骨架</div>}
                   </div>
                 </div>
 
                 <div className="bake-knowledge-detail__section">
-                  <div className="bake-kv__title">风格字段</div>
-                  <div className="bake-muted">常用口语：{selected.stylePhrases.join('、') || '—'}</div>
+                  <div className="bake-kv__title">表达风格（决定措辞）</div>
+                  <div className="bake-muted">常用短语：{selected.stylePhrases.join('、') || '—'}</div>
                   <div className="bake-muted" style={{ marginTop: 6 }}>
-                    AI 替代词：{selected.replacementRules.map(item => `${item.from} → ${item.to}`).join('；') || '—'}
+                    替换规则：{selected.replacementRules.map(item => `${item.from} → ${item.to}`).join('；') || '—'}
                   </div>
-                  <div className="bake-muted" style={{ marginTop: 6 }}>提示词：{selected.promptHint || '—'}</div>
+                  <div className="bake-muted" style={{ marginTop: 6 }}>写作提示：{selected.promptHint || '—'}</div>
                 </div>
               </>
             )}
 
             <div className="bake-knowledge-detail__section">
               <div className="bake-kv__title">关联资产</div>
-              <div className="bake-muted">来源情节记忆 {selected.sourceMemoryIds.length} 条 · 关联 Knowledge {selected.linkedKnowledgeIds.length} 条</div>
+              <div className="bake-muted">来源时间线 {selected.sourceMemoryIds.length} 条 · 关联 Knowledge {selected.linkedKnowledgeIds.length} 条</div>
             </div>
 
             <div className="bake-actions--primary">
@@ -325,9 +327,13 @@ const BakeTemplatesTab: React.FC<{
               ) : (
                 <>
                   <BakeButton primary onClick={() => setIsEditing(true)}>编辑模板</BakeButton>
-                  <BakeButton onClick={() => onToggleTemplateStatus(selected.id)}>{selected.status === 'enabled' ? '停用' : '启用'}</BakeButton>
-                  <BakeButton onClick={() => onDeleteTemplate(selected.id)}>{bucket === 'pending' ? '移出候选' : '删除模板'}</BakeButton>
-                  <BakeButton compact onClick={() => onViewSourceMemory(selected.sourceMemoryIds[0])}>查看来源情节记忆</BakeButton>
+                  {bucket === 'pending'
+                    ? <BakeButton onClick={() => onAdoptTemplate(selected.id)}>采纳模板</BakeButton>
+                    : <BakeButton onClick={() => onToggleTemplateStatus(selected.id)}>{selected.status === 'enabled' ? '停用' : '启用'}</BakeButton>}
+                  {bucket === 'pending'
+                    ? <BakeButton onClick={() => onDeleteTemplate(selected.id)}>忽略候选</BakeButton>
+                    : <BakeButton onClick={() => onDeleteTemplate(selected.id)}>删除模板</BakeButton>}
+                  <BakeButton compact onClick={() => onViewSourceMemory(selected.sourceMemoryIds[0])}>查看来源时间线</BakeButton>
                 </>
               )}
             </div>
@@ -336,7 +342,8 @@ const BakeTemplatesTab: React.FC<{
           <div className="bake-muted">暂无模板</div>
         )}
       </BakeCard>
-    </div>
+      </div>
+    </>
   )
 }
 

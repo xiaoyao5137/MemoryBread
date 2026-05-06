@@ -15,15 +15,15 @@ const GENERIC_ALL_UI_ITEM_LIMIT: usize = 140;
 #[derive(Debug, Clone, Default)]
 pub struct AXInfo {
     /// 前台应用名称，如 "Feishu"
-    pub app_name:       Option<String>,
+    pub app_name: Option<String>,
     /// macOS Bundle ID，如 "com.feishu.feishu"
-    pub app_bundle_id:  Option<String>,
+    pub app_bundle_id: Option<String>,
     /// 窗口标题
-    pub win_title:      Option<String>,
+    pub win_title: Option<String>,
     /// 当前焦点元素的 AX Role，如 "AXTextField"（用于密码框检测）
-    pub focused_role:   Option<String>,
+    pub focused_role: Option<String>,
     /// 当前焦点元素的标识符（用于执行器精确定位）
-    pub focused_id:     Option<String>,
+    pub focused_id: Option<String>,
     /// 从 AX Tree 提取的文本内容（最优路径，失败则降级 OCR）
     pub extracted_text: Option<String>,
 }
@@ -50,7 +50,7 @@ impl TextExtractor {
 #[derive(Debug, Clone)]
 struct ExtractedText {
     source: TextExtractor,
-    text:   String,
+    text: String,
 }
 
 fn fallback_extractor_for_context(
@@ -96,8 +96,7 @@ fn normalize_for_comparison(raw: &str) -> String {
 fn is_code_symbol(ch: char) -> bool {
     matches!(
         ch,
-        '{'
-            | '}'
+        '{' | '}'
             | '('
             | ')'
             | '['
@@ -173,7 +172,10 @@ fn sanitize_extracted_text(raw: &str, win_title: Option<&str>) -> Option<String>
 
     let tokens: Vec<&str> = normalized.split_whitespace().collect();
     if !tokens.is_empty() {
-        let short_token_count = tokens.iter().filter(|token| token.chars().count() <= 4).count();
+        let short_token_count = tokens
+            .iter()
+            .filter(|token| token.chars().count() <= 4)
+            .count();
         if tokens.len() <= 6 && short_token_count == tokens.len() && char_count < 24 {
             return None;
         }
@@ -285,17 +287,9 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
 #[cfg(all(target_os = "macos", not(test)))]
 mod macos_impl {
     use super::{
-        fallback_extractor_for_context,
-        parse_keyed_quoted_value,
-        sanitize_extracted_text,
-        AXInfo,
-        ExtractedText,
-        TextExtractor,
-        EXTRACTED_TEXT_MAX_CHARS,
-        GENERIC_ALL_UI_ITEM_LIMIT,
-        GENERIC_FOCUS_MIN_CHARS,
-        GENERIC_STATIC_ITEM_LIMIT,
-        GENERIC_WINDOW_MIN_CHARS,
+        fallback_extractor_for_context, parse_keyed_quoted_value, sanitize_extracted_text, AXInfo,
+        ExtractedText, TextExtractor, EXTRACTED_TEXT_MAX_CHARS, GENERIC_ALL_UI_ITEM_LIMIT,
+        GENERIC_FOCUS_MIN_CHARS, GENERIC_STATIC_ITEM_LIMIT, GENERIC_WINDOW_MIN_CHARS,
     };
     use std::{
         process::{Command, Stdio},
@@ -313,7 +307,10 @@ mod macos_impl {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let status = output.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+            let status = output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string());
             return Err(format!("stage={stage} exit={status} stderr={stderr}"));
         }
 
@@ -342,7 +339,10 @@ mod macos_impl {
                         .map_err(|e| format!("等待 osascript 输出失败: {e}"))?;
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                        let status = output.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+                        let status = output
+                            .status
+                            .code()
+                            .map_or_else(|| "signal".to_string(), |c| c.to_string());
                         return Err(format!("stage={stage} exit={status} stderr={stderr}"));
                     }
                     return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
@@ -368,7 +368,10 @@ mod macos_impl {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let status = output.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+            let status = output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string());
             return Err(format!("stage={stage} exit={status} stderr={stderr}"));
         }
 
@@ -404,14 +407,16 @@ mod macos_impl {
             return None;
         }
 
-        let info_raw =
-            match run_lsappinfo(&["info", "-only", "bundleID", "-only", "name", asn], "front_context_info") {
-                Ok(raw) => raw,
-                Err(err) => {
-                    warn!(asn = %asn, "AX front app 信息查询失败: {}", err);
-                    return None;
-                }
-            };
+        let info_raw = match run_lsappinfo(
+            &["info", "-only", "bundleID", "-only", "name", asn],
+            "front_context_info",
+        ) {
+            Ok(raw) => raw,
+            Err(err) => {
+                warn!(asn = %asn, "AX front app 信息查询失败: {}", err);
+                return None;
+            }
+        };
 
         let app_name = parse_keyed_quoted_value(&info_raw, "LSDisplayName");
         let app_bundle_id = parse_keyed_quoted_value(&info_raw, "CFBundleIdentifier");
@@ -470,7 +475,9 @@ mod macos_impl {
             "开始 AX generic-first 文本提取"
         );
 
-        if let Some(text) = extract_generic_text().and_then(|raw| sanitize_extracted_text(&raw, win_title)) {
+        if let Some(text) =
+            extract_generic_text().and_then(|raw| sanitize_extracted_text(&raw, win_title))
+        {
             return Some(ExtractedText {
                 source: TextExtractor::Generic,
                 text,
@@ -762,8 +769,8 @@ mod tests {
     #[test]
     fn test_ax_info_partial_construction() {
         let info = AXInfo {
-            app_name:     Some("Feishu".into()),
-            win_title:    Some("工作群".into()),
+            app_name: Some("Feishu".into()),
+            win_title: Some("工作群".into()),
             focused_role: Some("AXTextField".into()),
             ..Default::default()
         };
@@ -825,13 +832,22 @@ mod tests {
             fallback_extractor_for_context(Some("com.microsoft.VSCode"), Some("Code")),
             None
         );
-        assert_eq!(fallback_extractor_for_context(None, Some("Visual Studio Code")), None);
+        assert_eq!(
+            fallback_extractor_for_context(None, Some("Visual Studio Code")),
+            None
+        );
     }
 
     #[test]
     fn test_sanitize_extracted_text_rejects_short_or_title_only_text() {
         assert_eq!(sanitize_extracted_text("保存 取消", Some("设置")), None);
-        assert_eq!(sanitize_extracted_text("Investigate OCR memory f — gzdz", Some("Investigate OCR memory f — gzdz")), None);
+        assert_eq!(
+            sanitize_extracted_text(
+                "Investigate OCR memory f — gzdz",
+                Some("Investigate OCR memory f — gzdz")
+            ),
+            None
+        );
     }
 
     #[test]
@@ -845,6 +861,9 @@ mod tests {
 
     #[test]
     fn test_sanitize_extracted_text_rejects_low_information_token_list() {
-        assert_eq!(sanitize_extracted_text("文件 编辑 选择 视图 运行", Some("Code")), None);
+        assert_eq!(
+            sanitize_extracted_text("文件 编辑 选择 视图 运行", Some("Code")),
+            None
+        );
     }
 }

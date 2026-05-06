@@ -2,10 +2,10 @@
 //!
 //! 通过 HTTP 调用 ai-sidecar 的 RAG 服务进行智能问答
 
-use std::sync::Arc;
+use crate::api::{error::ApiError, state::AppState};
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use crate::api::{error::ApiError, state::AppState};
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct RagQueryRequest {
@@ -14,7 +14,9 @@ pub struct RagQueryRequest {
     pub top_k: usize,
 }
 
-fn default_top_k() -> usize { 5 }
+fn default_top_k() -> usize {
+    5
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RagContext {
@@ -26,9 +28,9 @@ pub struct RagContext {
 
 #[derive(Serialize, Deserialize)]
 pub struct RagQueryResponse {
-    pub answer:   String,
+    pub answer: String,
     pub contexts: Vec<RagContext>,
-    pub model:    String,
+    pub model: String,
 }
 
 /// RAG 查询实现：调用 ai-sidecar 的 RAG 服务
@@ -57,10 +59,18 @@ pub async fn rag_query(
             let msg = e.to_string();
             if msg.contains("timed out") || msg.contains("timeout") {
                 tracing::warn!("RAG 服务响应超时: {}", e);
-                ApiError::Internal("AI 正在处理其他任务，请稍候再试".to_string())
+                ApiError::Upstream {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    code: "GATEWAY_TIMEOUT",
+                    message: "AI 正在处理其他任务，请稍候再试".to_string(),
+                }
             } else {
                 tracing::warn!("无法连接到 RAG 服务: {}", e);
-                ApiError::Internal(format!("RAG 服务不可用，请确认 AI Sidecar 已正常启动: {}", e))
+                ApiError::Upstream {
+                    status: StatusCode::BAD_GATEWAY,
+                    code: "BAD_GATEWAY",
+                    message: format!("RAG 服务不可用，请确认 AI Sidecar 已正常启动: {}", e),
+                }
             }
         })?;
 
@@ -84,10 +94,19 @@ pub async fn rag_query(
             _ => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
         };
 
-        let message = if body_text.trim().is_empty() {
+        // 尝试解析 JSON 错误体，提取友好消息
+        let message = if let Ok(json_err) = serde_json::from_str::<serde_json::Value>(&body_text) {
+            if let Some(msg) = json_err.get("message").and_then(|v| v.as_str()) {
+                msg.to_string()
+            } else if let Some(err) = json_err.get("error").and_then(|v| v.as_str()) {
+                err.to_string()
+            } else {
+                format!("RAG 服务返回错误 ({})", status)
+            }
+        } else if body_text.trim().is_empty() {
             format!("RAG 服务返回错误 ({})", status)
         } else {
-            format!("RAG 服务返回错误 ({})：{}", status, body_text)
+            body_text
         };
 
         Err(ApiError::Upstream {

@@ -6,13 +6,13 @@ use serde::Serialize;
 /// 健康检查响应体
 #[derive(Serialize)]
 pub struct HealthResponse {
-    pub status:  &'static str,
+    pub status: &'static str,
     pub version: &'static str,
 }
 
 pub async fn health_handler() -> Json<HealthResponse> {
     Json(HealthResponse {
-        status:  "ok",
+        status: "ok",
         version: env!("CARGO_PKG_VERSION"),
     })
 }

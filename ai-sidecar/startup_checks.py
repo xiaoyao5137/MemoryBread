@@ -3,34 +3,39 @@
 """
 
 import logging
+import sqlite3
 import sys
-import subprocess
+from pathlib import Path
+
+from model_manager import ModelManager
 
 logger = logging.getLogger(__name__)
+_model_manager = ModelManager()
+
+
+def get_ollama_setup_detail() -> dict:
+    try:
+        return _model_manager.get_ollama_setup_status()
+    except Exception as exc:
+        logger.error(f"获取 Ollama 安装状态失败: {exc}")
+        return {
+            'ollama_installed': False,
+            'ollama_running': False,
+            'message': f'获取 Ollama 状态失败: {exc}',
+            'recommended_install_method': 'brew install ollama',
+        }
 
 
 def check_ollama_installed() -> bool:
     """检查 Ollama 是否已安装"""
-    try:
-        result = subprocess.run(
-            ["which", "ollama"],
-            capture_output=True,
-            text=True
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    detail = get_ollama_setup_detail()
+    return bool(detail.get('ollama_installed'))
 
 
 def check_ollama_running() -> bool:
     """检查 Ollama 服务是否运行"""
-    try:
-        from ollama import Client
-        client = Client()
-        client.list()
-        return True
-    except Exception:
-        return False
+    detail = get_ollama_setup_detail()
+    return bool(detail.get('ollama_running'))
 
 
 def check_model_available(model_name: str = "qwen2.5:3b") -> bool:
@@ -63,6 +68,58 @@ def check_embedding_model() -> bool:
         return False
 
 
+def check_knowledge_fts() -> bool:
+    """检查 knowledge_fts 表是否存在"""
+    try:
+        db_path = Path.home() / ".memory-bread" / "memory-bread.db"
+        if not db_path.exists():
+            return False
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='knowledge_fts'")
+        exists = cursor.fetchone() is not None
+        conn.close()
+        return exists
+    except Exception as e:
+        logger.error(f"检查 knowledge_fts 失败: {e}")
+        return False
+
+
+def init_knowledge_fts() -> bool:
+    """初始化 knowledge_fts 表"""
+    try:
+        db_path = Path.home() / ".memory-bread" / "memory-bread.db"
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+                summary, entities, content='timelines', content_rowid='id'
+            )
+        """)
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON timelines BEGIN
+                INSERT INTO knowledge_fts(rowid, summary, entities) VALUES (new.id, new.summary, new.entities);
+            END
+        """)
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON timelines BEGIN
+                UPDATE knowledge_fts SET summary = new.summary, entities = new.entities WHERE rowid = new.id;
+            END
+        """)
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON timelines BEGIN
+                DELETE FROM knowledge_fts WHERE rowid = old.id;
+            END
+        """)
+        cursor.execute("INSERT INTO knowledge_fts(rowid, summary, entities) SELECT id, summary, entities FROM timelines")
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"初始化 knowledge_fts 失败: {e}")
+        return False
+
+
 def run_startup_checks() -> bool:
     """
     运行启动前置检查
@@ -77,13 +134,18 @@ def run_startup_checks() -> bool:
 
     all_passed = True
 
+    ollama_detail = get_ollama_setup_detail()
+
     # 1. 检查 Ollama 安装
     print("1️⃣  检查 Ollama 安装...")
     if check_ollama_installed():
         print("   ✅ Ollama 已安装")
+        if ollama_detail.get('ollama_path'):
+            print(f"   ℹ️  路径: {ollama_detail.get('ollama_path')}")
     else:
         print("   ❌ Ollama 未安装")
-        print("   📝 安装方法：brew install ollama")
+        print(f"   📝 {ollama_detail.get('message', '请安装 Ollama')}")
+        print(f"   📝 安装方法：{ollama_detail.get('recommended_install_method', 'brew install ollama')}")
         all_passed = False
 
     print()
@@ -120,6 +182,20 @@ def run_startup_checks() -> bool:
         all_passed = False
 
     print()
+
+    # 5. 检查 knowledge_fts 表
+    print("5️⃣  检查知识库全文索引...")
+    if check_knowledge_fts():
+        print("   ✅ knowledge_fts 表已创建")
+    else:
+        print("   ⚠️  knowledge_fts 表不存在，正在初始化...")
+        if init_knowledge_fts():
+            print("   ✅ knowledge_fts 表初始化成功")
+        else:
+            print("   ❌ knowledge_fts 表初始化失败")
+            all_passed = False
+
+    print()
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     if all_passed:
@@ -128,10 +204,11 @@ def run_startup_checks() -> bool:
         print("❌ 部分检查未通过，请先完成上述配置")
         print()
         print("📚 快速配置指南：")
-        print("   1. 安装 Ollama: brew install ollama")
+        print(f"   1. 安装 Ollama: {ollama_detail.get('recommended_install_method', 'brew install ollama')}")
         print("   2. 启动 Ollama: ollama serve &")
         print("   3. 下载模型: ollama pull qwen2.5:3b")
-        print("   4. 重新启动记忆面包")
+        print("   4. 或在安装引导/模型页面点击“检测并安装 Ollama”")
+        print("   5. 重新启动记忆面包")
 
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print()

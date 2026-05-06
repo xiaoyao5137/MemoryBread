@@ -64,16 +64,19 @@ MODEL_API_PID_FILE="$LOG_DIR/model_api.pid"
 CORE_PID_FILE="$LOG_DIR/core.pid"
 UI_PID_FILE="$LOG_DIR/ui.pid"
 UI_APP_PID_FILE="$LOG_DIR/ui_app.pid"
+OLLAMA_PID_FILE="$LOG_DIR/ollama.pid"
 
 # 日志文件
 SIDECAR_LOG="$LOG_DIR/sidecar.log"
 MODEL_API_LOG="$LOG_DIR/model_api.log"
 CORE_LOG="$LOG_DIR/core.log"
 UI_LOG="$LOG_DIR/ui.log"
+OLLAMA_LOG="$LOG_DIR/ollama.log"
 
 CORE_PORT=7070
 MODEL_API_PORT=7071
 UI_PORT=1420
+OLLAMA_PORT=11434
 
 # 打印带颜色的消息
 log_info() {
@@ -102,6 +105,49 @@ is_running() {
         fi
     fi
     return 1
+}
+
+is_ollama_ready() {
+    curl -fsS "http://localhost:${OLLAMA_PORT}/api/tags" > /dev/null 2>&1
+}
+
+ensure_ollama_running() {
+    if ! command -v ollama &> /dev/null; then
+        log_error "未找到 ollama 命令，请先安装 Ollama: https://ollama.com/download"
+        exit 1
+    fi
+
+    if is_ollama_ready; then
+        log_info "Ollama 已在运行，复用现有服务"
+        return 0
+    fi
+
+    if is_running "$OLLAMA_PID_FILE"; then
+        local pid=$(cat "$OLLAMA_PID_FILE")
+        log_warn "检测到 Ollama 进程存在但未就绪，先清理旧进程 (PID: $pid)"
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        if ps -p "$pid" > /dev/null 2>&1; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$OLLAMA_PID_FILE"
+    fi
+
+    cleanup_port "$OLLAMA_PORT" "Ollama"
+
+    log_info "启动 Ollama 服务..."
+    nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
+    echo $! > "$OLLAMA_PID_FILE"
+
+    if wait_for_http "http://localhost:${OLLAMA_PORT}/api/tags" "Ollama" 30 1; then
+        log_success "Ollama 已启动 (PID: $(cat "$OLLAMA_PID_FILE"))"
+    else
+        log_error "Ollama 启动失败，请查看日志: $OLLAMA_LOG"
+        if ! ps -p "$(cat "$OLLAMA_PID_FILE" 2>/dev/null)" > /dev/null 2>&1; then
+            rm -f "$OLLAMA_PID_FILE"
+        fi
+        exit 1
+    fi
 }
 
 cleanup_port() {
@@ -186,6 +232,27 @@ wait_for_http() {
     return 1
 }
 
+is_http_ok() {
+    local url=$1
+    curl -fsS "$url" > /dev/null 2>&1
+}
+
+check_core_api_readiness() {
+    local failed=0
+
+    wait_for_http "http://localhost:${CORE_PORT}/health" "Core Engine" 20 1 || failed=1
+    wait_for_http "http://localhost:${CORE_PORT}/api/bake/captures?limit=1" "Core API /api/bake/captures" 10 1 || failed=1
+    wait_for_http "http://localhost:${CORE_PORT}/api/monitor/overview?range=7d" "Core API /api/monitor/overview" 10 1 || failed=1
+
+    if [ "$failed" -ne 0 ]; then
+        log_warn "Core API 自检未全部通过，请优先检查: $CORE_LOG"
+        return 1
+    fi
+
+    log_success "Core API 关键接口自检通过"
+    return 0
+}
+
 show_status() {
     echo ""
     if is_running "$SIDECAR_PID_FILE"; then
@@ -195,13 +262,33 @@ show_status() {
     fi
 
     if is_running "$MODEL_API_PID_FILE"; then
-        log_success "Model API / RAG API: 运行中 (PID: $(cat "$MODEL_API_PID_FILE"), Port: ${MODEL_API_PORT})"
+        local model_api_pid=$(cat "$MODEL_API_PID_FILE")
+        if is_http_ok "http://localhost:${MODEL_API_PORT}/health"; then
+            log_success "Model API / RAG API: 运行中 (PID: ${model_api_pid}, Port: ${MODEL_API_PORT})"
+        else
+            log_error "Model API / RAG API: 进程存在但接口未就绪 (PID: ${model_api_pid}, Port: ${MODEL_API_PORT})"
+        fi
     else
         log_error "Model API / RAG API: 未运行"
     fi
 
+    if is_ollama_ready; then
+        if is_running "$OLLAMA_PID_FILE"; then
+            log_success "Ollama: 运行中 (PID: $(cat "$OLLAMA_PID_FILE"), Port: ${OLLAMA_PORT})"
+        else
+            log_success "Ollama: 运行中 (Port: ${OLLAMA_PORT})"
+        fi
+    else
+        log_error "Ollama: 未运行 (Port: ${OLLAMA_PORT})"
+    fi
+
     if is_running "$CORE_PID_FILE"; then
-        log_success "Core Engine: 运行中 (PID: $(cat "$CORE_PID_FILE"), Port: ${CORE_PORT})"
+        local core_pid=$(cat "$CORE_PID_FILE")
+        if is_http_ok "http://localhost:${CORE_PORT}/health"; then
+            log_success "Core Engine: 运行中 (PID: ${core_pid}, Port: ${CORE_PORT})"
+        else
+            log_error "Core Engine: 进程存在但接口未就绪 (PID: ${core_pid}, Port: ${CORE_PORT})"
+        fi
     else
         log_error "Core Engine: 未运行"
     fi
@@ -300,6 +387,18 @@ stop_all() {
 
     cleanup_port "$MODEL_API_PORT" "Model API / RAG API"
 
+    # 停止由脚本启动的 Ollama
+    if is_running "$OLLAMA_PID_FILE"; then
+        local pid=$(cat "$OLLAMA_PID_FILE")
+        log_info "停止 Ollama (PID: $pid)"
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        if ps -p "$pid" > /dev/null 2>&1; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$OLLAMA_PID_FILE"
+    fi
+
     log_success "所有服务已停止"
 }
 
@@ -332,6 +431,7 @@ check_dependencies() {
 start_sidecar() {
     if is_running "$SIDECAR_PID_FILE" && is_running "$MODEL_API_PID_FILE"; then
         log_info "AI Sidecar 与 Model API 已在运行，复用现有进程"
+        wait_for_http "http://localhost:${MODEL_API_PORT}/health" "Model API / RAG API" 10 1 || log_warn "现有 Model API 进程健康检查失败，建议执行 ./start.sh restart"
         return 0
     fi
 
@@ -391,6 +491,9 @@ start_sidecar() {
     sleep 3
     wait_for_http "http://localhost:${MODEL_API_PORT}/health" "Model API / RAG API" 40 2 || {
         log_warn "Model API / RAG API 未就绪，可查看日志: $MODEL_API_LOG"
+        if ! ps -p "$(cat "$MODEL_API_PID_FILE" 2>/dev/null)" > /dev/null 2>&1; then
+            rm -f "$MODEL_API_PID_FILE"
+        fi
     }
 }
 
@@ -398,6 +501,7 @@ start_sidecar() {
 start_core() {
     if is_running "$CORE_PID_FILE"; then
         log_info "Core Engine 已在运行，复用现有进程"
+        check_core_api_readiness || log_warn "当前 Core Engine 进程存在接口异常，建议执行 ./start.sh restart 进行完整重启"
         return 0
     fi
 
@@ -422,13 +526,14 @@ start_core() {
     log_info "等待 Core Engine 初始化..."
     sleep 3
 
-    wait_for_http "http://localhost:${CORE_PORT}/health" "Core Engine"
+    check_core_api_readiness
 }
 
 # 启动 Desktop UI
 start_ui() {
     if is_running "$UI_PID_FILE"; then
         log_info "Desktop UI 已在运行，复用现有进程"
+        wait_for_http "http://localhost:${UI_PORT}" "Desktop UI / Vite" 10 1 || log_warn "现有 Desktop UI 进程健康检查失败，建议执行 ./start.sh restart"
         return 0
     fi
 
@@ -484,6 +589,7 @@ main() {
         start)
             check_path_leaks
             check_dependencies
+            ensure_ollama_running
             start_sidecar
             start_core
             start_ui
@@ -499,6 +605,7 @@ main() {
             sleep 2
             check_path_leaks
             check_dependencies
+            ensure_ollama_running
             start_sidecar
             start_core
             start_ui

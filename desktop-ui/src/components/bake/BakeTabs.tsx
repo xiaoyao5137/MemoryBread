@@ -4,10 +4,10 @@ import { BakeButton } from './BakeShared'
 
 const tabs: Array<{ key: BakeTab; label: string }> = [
   { key: 'overview', label: '总览' },
-  { key: 'memories', label: '情节记忆' },
-  { key: 'knowledge', label: '知识（芝士）' },
-  { key: 'templates', label: '文档模板（面包片）' },
-  { key: 'sop', label: '操作手册（火腿）' },
+  { key: 'memories', label: '时间线' },
+  { key: 'knowledge', label: '知识' },
+  { key: 'templates', label: '设计' },
+  { key: 'sop', label: '操作手册' },
   { key: 'style', label: '写作自然感提升' },
 ]
 

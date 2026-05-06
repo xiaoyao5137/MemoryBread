@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use memory_bread_core::{
     api::{server::start_server, state::AppState},
     capture::{start_listener, CaptureConfig, CaptureEngine, ListenerConfig},
@@ -11,6 +10,7 @@ use memory_bread_core::{
     scheduler::Scheduler,
     storage::{db::current_ts_ms, StorageManager},
 };
+use tokio::sync::mpsc;
 
 fn parse_capture_interval_secs(storage: &StorageManager) -> u64 {
     storage
@@ -34,9 +34,7 @@ fn parse_screenshot_keep_days(storage: &StorageManager) -> i64 {
 
 fn screenshot_captures_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".memory-bread")
-        .join("captures")
+    PathBuf::from(home).join(".memory-bread").join("captures")
 }
 
 async fn run_screenshot_cleanup_loop(storage: StorageManager) {

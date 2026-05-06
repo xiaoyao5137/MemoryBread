@@ -16,6 +16,7 @@ import time
 import fcntl
 import asyncio
 import sys
+import threading
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -34,21 +35,88 @@ CORS(app)
 
 # RAG 查询期间持有此文件锁，阻止知识提炼同时占用 Ollama
 _RAG_LOCK_FILE = "/tmp/memory-bread-rag.lock"
-# 注意：不能在模块加载时 open() 并持有文件句柄。
-# 进程正常运行时 fd 不会被 flock，但只要进程在运行，OS 就会一直保持
-# 对该文件的引用（fd 不关闭），这会导致 _rag_is_active() 中的 flock
-# 探测行为出现竞态：当 model_api_server 本身持有该 fd 时，同进程内
-# 另一个线程的非阻塞探测会成功（同进程锁重入），但 background_processor
-# 是独立进程，会拿不到锁（如果 model_api_server crash 后 fd 未正确释放）。
-# 解决方案：每次加锁前临时 open，用 with 确保 close，彻底避免 fd 泄漏。
-_rag_lock_fd = None  # 已废弃全局 fd，改为按需打开（见 _rag_acquire_lock）
+_RAG_LOCK_OWNER_FILE = "/tmp/memory-bread-rag-owner.txt"
+_PREEMPT_SIGNAL_FILE = "/tmp/memory-bread-preempt.signal"
 
 
-def _rag_acquire_lock():
-    """返回一个已持有独占锁的文件对象，调用方负责 unlock + close。"""
+def _write_lock_owner(owner: str):
+    """记录当前锁持有者（query/extract）"""
+    try:
+        with open(_RAG_LOCK_OWNER_FILE, "w") as f:
+            f.write(owner)
+    except Exception:
+        pass
+
+
+def _read_lock_owner() -> str:
+    """读取当前锁持有者"""
+    try:
+        with open(_RAG_LOCK_OWNER_FILE, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _send_preempt_signal():
+    """发送抢占信号，通知提炼任务释放锁"""
+    try:
+        with open(_PREEMPT_SIGNAL_FILE, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _clear_preempt_signal():
+    """清除抢占信号"""
+    try:
+        import os
+        if os.path.exists(_PREEMPT_SIGNAL_FILE):
+            os.remove(_PREEMPT_SIGNAL_FILE)
+    except Exception:
+        pass
+
+
+def _check_preempt_signal() -> bool:
+    """检查是否收到抢占信号"""
+    import os
+    return os.path.exists(_PREEMPT_SIGNAL_FILE)
+
+
+def _rag_acquire_lock(timeout_sec=3.0, owner="query", can_preempt=True):
+    """返回一个已持有独占锁的文件对象，调用方负责 unlock + close。
+
+    Args:
+        timeout_sec: 获取锁的超时时间（秒），超时抛出 TimeoutError
+        owner: 锁持有者标识（query/extract）
+        can_preempt: 是否可以抢占提炼任务
+
+    Raises:
+        TimeoutError: 在指定时间内未能获取锁
+    """
+    import time
     fd = open(_RAG_LOCK_FILE, "w")
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    return fd
+    deadline = time.time() + timeout_sec
+    preempt_sent = False
+
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _write_lock_owner(owner)
+            _clear_preempt_signal()
+            return fd
+        except (IOError, OSError) as e:
+            # 查询任务可以抢占提炼任务
+            if can_preempt and not preempt_sent:
+                current_owner = _read_lock_owner()
+                if current_owner == "extract":
+                    logger.info(f"{owner} 检测到提炼任务占用锁，发送抢占信号")
+                    _send_preempt_signal()
+                    preempt_sent = True
+
+            if time.time() >= deadline:
+                fd.close()
+                raise TimeoutError(f"获取 RAG 锁超时（{timeout_sec}s）") from e
+            time.sleep(0.05)
 
 
 def _rag_release_lock(fd):
@@ -157,6 +225,11 @@ def get_rag_pipeline():
                     _log_model_event("load_start", "embedding", "RAG Embedding · BGE-M3-INT8", memory_mb=650)
                     embed_start_ms = int(time.time() * 1000)
                     embedding_model = EmbeddingModel.create_default()
+
+                    # 验证向量模型是否可用
+                    if not embedding_model or not hasattr(embedding_model, 'encode'):
+                        raise RuntimeError("向量模型初始化失败，无法启动 RAG 服务")
+
                     _log_model_event(
                         "load_done",
                         "embedding",
@@ -165,7 +238,7 @@ def get_rag_pipeline():
                         memory_mb=650,
                     )
                     _log_model_event("load_start", "llm", f"RAG LLM · {ollama_model}", memory_mb=2500)
-                    _rag_pipeline = RagPipeline(
+                    pipeline = RagPipeline(
                         embedding_model=embedding_model,
                         vector_retriever=VectorRetriever(
                             collection="memory_bread_captures",
@@ -180,9 +253,15 @@ def get_rag_pipeline():
                     _log_model_event("load_done", "llm", f"RAG LLM · {ollama_model}", memory_mb=2500)
                     # 强制预热 embedding，避免首次查询时再加载 BGE 导致超时
                     try:
-                        _rag_pipeline._embed.encode(["预热"])
+                        test_result = pipeline._embed.encode(["预热"])
+                        if not test_result or len(test_result) == 0:
+                            raise RuntimeError("向量模型预热失败，返回空结果")
+                        logger.info("✅ 向量模型预热成功")
                     except Exception as e:
-                        logger.warning(f"Embedding 预热失败: {e}")
+                        logger.error(f"❌ 向量模型预热失败: {e}")
+                        raise RuntimeError(f"向量模型不可用: {e}") from e
+                    # 预热完成后才设置全局变量，确保查询不会在模型加载期间进入
+                    _rag_pipeline = pipeline
                     logger.info(f"RAG pipeline 初始化完成，模型: {ollama_model}")
                 except Exception as exc:
                     logger.error("RAG pipeline 初始化失败: %s", exc, exc_info=True)
@@ -194,11 +273,21 @@ def get_rag_pipeline():
 def _model_to_dict(meta, status_info: dict) -> dict:
     """将 ModelMeta + 状态信息合并为前端所需的 dict"""
     d = dataclasses.asdict(meta)
-    d['status']            = status_info.get('status', 'not_installed')
+    status = status_info.get('status', 'not_installed')
+
+    # 特殊处理：本地模型需要检查 RAG pipeline 是否就绪
+    # 如果配置为 active 但 RAG pipeline 未就绪，则显示为 loading
+    if status_info.get('is_active') and meta.provider == 'ollama':
+        if meta.category in ('llm', 'embedding') and _rag_pipeline is None:
+            status = 'loading'
+
+    d['status']            = status
     d['download_progress'] = status_info.get('download_progress', 0)
     d['is_active']         = status_info.get('is_active', False)
     d['recommended']       = status_info.get('recommended', False)
     d['recommend_reason']  = status_info.get('recommend_reason', '')
+    if 'error' in status_info:
+        d['error'] = status_info['error']
     return d
 
 
@@ -253,6 +342,22 @@ def list_models():
             status_info['recommended'] = meta.id in recommended_ids
             status_info['recommend_reason'] = rec['reason'] if meta.id in recommended_ids else ''
             result.append(_model_to_dict(meta, status_info))
+
+        # 添加 Ollama 推理引擎状态
+        ollama_status = model_manager.get_ollama_setup_status()
+        result.append({
+            'id': 'ollama',
+            'name': 'Ollama',
+            'category': 'inference_engine',
+            'provider': 'ollama',
+            'status': 'active' if ollama_status['ollama_running'] else 'not_installed' if not ollama_status['ollama_installed'] else 'installed',
+            'is_active': ollama_status['ollama_running'],
+            'download_progress': 100 if ollama_status['ollama_installed'] else 0,
+            'recommended': True,
+            'recommend_reason': 'Ollama 是本地推理引擎，必须运行才能使用 LLM 模型',
+            'version': ollama_status.get('ollama_version'),
+            'can_upgrade': ollama_status['ollama_installed'] and ollama_status['brew_available'],
+        })
 
         return jsonify({'status': 'ok', 'models': result})
     except Exception as e:
@@ -375,6 +480,13 @@ def activate_model(model_id: str):
         if success:
             with _rag_pipeline_lock:
                 _rag_pipeline = None
+            # 后台初始化 RAG pipeline
+            def init_pipeline():
+                try:
+                    get_rag_pipeline()
+                except Exception as e:
+                    logger.warning(f"RAG pipeline 初始化失败: {e}")
+            threading.Thread(target=init_pipeline, daemon=True).start()
             return jsonify({'status': 'ok', 'message': f'模型 {model_id} 已激活'})
         return jsonify({'status': 'error', 'message': f'模型 {model_id} 激活失败'}), 500
     except Exception as e:
@@ -416,6 +528,60 @@ def set_api_key():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
+@app.route('/api/ollama/setup-status', methods=['GET'])
+def ollama_setup_status():
+    try:
+        detail = model_manager.get_ollama_setup_status()
+        return jsonify({'status': 'ok', 'stage': 'detect', 'detail': detail, 'message': detail.get('message', '')})
+    except Exception as e:
+        logger.error(f"获取 Ollama 安装状态失败: {e}")
+        return jsonify({'status': 'error', 'stage': 'detect', 'message': str(e)}), 500
+
+
+@app.route('/api/ollama/install', methods=['POST'])
+def ollama_install():
+    try:
+        result = model_manager.install_ollama_auto()
+        code = 200 if result.get('status') == 'ok' else 400
+        return jsonify(result), code
+    except Exception as e:
+        logger.error(f"自动安装 Ollama 失败: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'stage': 'install', 'message': str(e)}), 500
+
+
+@app.route('/api/ollama/start', methods=['POST'])
+def ollama_start():
+    try:
+        result = model_manager.start_ollama_service()
+        code = 200 if result.get('status') == 'ok' else 400
+        return jsonify(result), code
+    except Exception as e:
+        logger.error(f"启动 Ollama 服务失败: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'stage': 'start', 'message': str(e)}), 500
+
+
+@app.route('/api/ollama/upgrade', methods=['POST'])
+def ollama_upgrade():
+    """启动 Ollama 升级任务"""
+    try:
+        result = model_manager.upgrade_ollama()
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"升级 Ollama 失败: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/ollama/upgrade/status', methods=['GET'])
+def ollama_upgrade_status():
+    """获取 Ollama 升级状态"""
+    try:
+        status = model_manager.get_upgrade_status()
+        return jsonify(status), 200
+    except Exception as e:
+        logger.error(f"获取升级状态失败: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
 @app.route('/query', methods=['POST'])
 def rag_query():
     """RAG 查询接口，与模型管理 API 共用 7071 端口。"""
@@ -431,10 +597,21 @@ def rag_query():
         top_k = data.get('top_k', 5)
         logger.info(f"收到 RAG 查询: {query}")
 
-        pipeline = get_rag_pipeline()
+        # 检查模型是否就绪
+        if _rag_pipeline is None:
+            return jsonify({
+                'error': 'MODEL_NOT_READY',
+                'message': '向量模型或推理模型未就绪，请前往「烤箱型号」界面检查模型状态'
+            }), 503
+
+        pipeline = _rag_pipeline
         # 持有 RAG 锁，阻止知识提炼同时占用 Ollama
-        # 使用按需 open+close 确保进程崩溃时 fd 不会永久泄漏
-        _lock_fd = _rag_acquire_lock()
+        # 查询任务可以抢占提炼任务
+        try:
+            _lock_fd = _rag_acquire_lock(timeout_sec=3.0, owner="query", can_preempt=True)
+        except TimeoutError as te:
+            logger.warning(f"RAG 查询获取锁超时: {te}")
+            return jsonify({'error': 'AI 正在处理其他任务，请稍候再试'}), 503
         try:
             result = pipeline.query(query, top_k=top_k)
         finally:
@@ -572,7 +749,11 @@ def extract_bake():
             trigger_reason,
         )
         extractor = get_bake_extractor()
-        _lock_fd = _rag_acquire_lock()
+        try:
+            _lock_fd = _rag_acquire_lock(timeout_sec=5.0, owner="extract", can_preempt=False)
+        except TimeoutError as te:
+            logger.warning(f"bake extract 获取锁超时: {te}")
+            return jsonify({'error': 'AI 正在处理其他任务，请稍候再试'}), 503
         lock_wait_ms = int(time.time() * 1000) - lock_wait_start_ms
         logger.info(
             "bake extract lock acquired source_knowledge_id=%s lock_wait_ms=%s",
@@ -580,7 +761,7 @@ def extract_bake():
             lock_wait_ms,
         )
         try:
-            result = extractor.extract_bake_bundle(candidate)
+            result = extractor.extract_bake_bundle(candidate, preempt_check=_check_preempt_signal)
         finally:
             _rag_release_lock(_lock_fd)
             logger.info("bake extract lock released source_knowledge_id=%s", source_knowledge_id)
@@ -636,11 +817,18 @@ def _get_hardware() -> dict:
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    # 启动时同步预热 RAG pipeline，避免首个查询遭遇 embedding 冷启动超时
-    try:
-        get_rag_pipeline()
-        logger.info('RAG pipeline 预热完成')
-    except Exception as e:
-        logger.warning(f'RAG pipeline 预热失败: {e}')
+
+    # 异步预热 RAG pipeline，避免阻塞启动
+    def _warmup_rag_pipeline_async():
+        try:
+            get_rag_pipeline()
+            logger.info('RAG pipeline 预热完成')
+        except Exception as e:
+            logger.error(f'RAG pipeline 预热失败: {e}', exc_info=True)
+
+    import threading
+    threading.Thread(target=_warmup_rag_pipeline_async, daemon=True, name='rag-warmup').start()
+    logger.info('RAG pipeline 异步预热已启动')
+
     app.run(host='0.0.0.0', port=7071, debug=False, threaded=True)
 

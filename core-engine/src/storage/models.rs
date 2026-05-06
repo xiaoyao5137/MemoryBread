@@ -25,12 +25,12 @@ pub enum EventType {
 impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            EventType::AppSwitch  => "app_switch",
+            EventType::AppSwitch => "app_switch",
             EventType::MouseClick => "mouse_click",
-            EventType::Scroll     => "scroll",
-            EventType::KeyPause   => "key_pause",
-            EventType::Manual     => "manual",
-            EventType::Auto       => "auto",
+            EventType::Scroll => "scroll",
+            EventType::KeyPause => "key_pause",
+            EventType::Manual => "manual",
+            EventType::Auto => "auto",
         }
     }
 }
@@ -39,13 +39,13 @@ impl TryFrom<&str> for EventType {
     type Error = String;
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
-            "app_switch"  => Ok(EventType::AppSwitch),
+            "app_switch" => Ok(EventType::AppSwitch),
             "mouse_click" => Ok(EventType::MouseClick),
-            "scroll"      => Ok(EventType::Scroll),
-            "key_pause"   => Ok(EventType::KeyPause),
-            "manual"      => Ok(EventType::Manual),
-            "auto"        => Ok(EventType::Auto),
-            other         => Err(format!("未知事件类型: {other}")),
+            "scroll" => Ok(EventType::Scroll),
+            "key_pause" => Ok(EventType::KeyPause),
+            "manual" => Ok(EventType::Manual),
+            "auto" => Ok(EventType::Auto),
+            other => Err(format!("未知事件类型: {other}")),
         }
     }
 }
@@ -53,21 +53,21 @@ impl TryFrom<&str> for EventType {
 /// 从 captures 表读出的完整行
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureRecord {
-    pub id:              i64,
-    pub ts:              i64,
-    pub app_name:        Option<String>,
-    pub app_bundle_id:   Option<String>,
-    pub win_title:       Option<String>,
-    pub event_type:      String,
-    pub ax_text:         Option<String>,
+    pub id: i64,
+    pub ts: i64,
+    pub app_name: Option<String>,
+    pub app_bundle_id: Option<String>,
+    pub win_title: Option<String>,
+    pub event_type: String,
+    pub ax_text: Option<String>,
     pub ax_focused_role: Option<String>,
-    pub ax_focused_id:   Option<String>,
-    pub ocr_text:        Option<String>,
+    pub ax_focused_id: Option<String>,
+    pub ocr_text: Option<String>,
     pub screenshot_path: Option<String>,
-    pub input_text:      Option<String>,
-    pub audio_text:      Option<String>,
-    pub is_sensitive:    bool,
-    pub pii_scrubbed:    bool,
+    pub input_text: Option<String>,
+    pub audio_text: Option<String>,
+    pub is_sensitive: bool,
+    pub pii_scrubbed: bool,
 }
 
 impl CaptureRecord {
@@ -80,17 +80,18 @@ impl CaptureRecord {
 /// 插入 captures 时使用的参数
 #[derive(Debug, Clone)]
 pub struct NewCapture {
-    pub ts:              i64,
-    pub app_name:        Option<String>,
-    pub app_bundle_id:   Option<String>,
-    pub win_title:       Option<String>,
-    pub event_type:      EventType,
-    pub ax_text:         Option<String>,
+    pub ts: i64,
+    pub app_name: Option<String>,
+    pub app_bundle_id: Option<String>,
+    pub win_title: Option<String>,
+    pub event_type: EventType,
+    pub ax_text: Option<String>,
     pub ax_focused_role: Option<String>,
-    pub ax_focused_id:   Option<String>,
+    pub ax_focused_id: Option<String>,
+    pub ocr_text: Option<String>,
     pub screenshot_path: Option<String>,
-    pub input_text:      Option<String>,
-    pub is_sensitive:    bool,
+    pub input_text: Option<String>,
+    pub is_sensitive: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,12 +100,12 @@ pub struct NewCapture {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreferenceRecord {
-    pub id:           i64,
-    pub key:          String,
-    pub value:        String,
-    pub source:       String,
-    pub confidence:   f64,
-    pub updated_at:   i64,
+    pub id: i64,
+    pub key: String,
+    pub value: String,
+    pub source: String,
+    pub confidence: f64,
+    pub updated_at: i64,
     pub sample_count: i64,
 }
 
@@ -125,10 +126,10 @@ pub enum ActionStatus {
 impl ActionStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            ActionStatus::Pending     => "pending",
-            ActionStatus::Success     => "success",
-            ActionStatus::Failed      => "failed",
-            ActionStatus::Cancelled   => "cancelled",
+            ActionStatus::Pending => "pending",
+            ActionStatus::Success => "success",
+            ActionStatus::Failed => "failed",
+            ActionStatus::Cancelled => "cancelled",
             ActionStatus::Interrupted => "interrupted",
         }
     }
@@ -136,25 +137,25 @@ impl ActionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionLogRecord {
-    pub id:                i64,
-    pub ts:                i64,
-    pub trigger_source:    String,
-    pub app_name:          Option<String>,
-    pub action_type:       String,
-    pub action_payload:    String,          // JSON 字符串
+    pub id: i64,
+    pub ts: i64,
+    pub trigger_source: String,
+    pub app_name: Option<String>,
+    pub action_type: String,
+    pub action_payload: String, // JSON 字符串
     pub confirmed_by_user: bool,
-    pub status:            String,
-    pub user_correction:   Option<String>,
-    pub error_msg:         Option<String>,
+    pub status: String,
+    pub user_correction: Option<String>,
+    pub error_msg: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NewActionLog {
-    pub ts:                i64,
-    pub trigger_source:    String,
-    pub app_name:          Option<String>,
-    pub action_type:       String,
-    pub action_payload:    String,          // JSON 序列化后的字符串
+    pub ts: i64,
+    pub trigger_source: String,
+    pub app_name: Option<String>,
+    pub action_type: String,
+    pub action_payload: String, // JSON 序列化后的字符串
     pub confirmed_by_user: bool,
 }
 
@@ -164,22 +165,22 @@ pub struct NewActionLog {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StyleSampleRecord {
-    pub id:         i64,
-    pub ts:         i64,
+    pub id: i64,
+    pub ts: i64,
     pub scene_type: String,
-    pub content:    String,
-    pub app_name:   Option<String>,
-    pub quality:    f64,
+    pub content: String,
+    pub app_name: Option<String>,
+    pub quality: f64,
     pub word_count: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct NewStyleSample {
-    pub ts:         i64,
+    pub ts: i64,
     pub scene_type: String,
-    pub content:    String,
-    pub app_name:   Option<String>,
-    pub quality:    f64,
+    pub content: String,
+    pub app_name: Option<String>,
+    pub quality: f64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -188,59 +189,59 @@ pub struct NewStyleSample {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorIndexRecord {
-    pub id:                i64,
-    pub capture_id:        i64,
-    pub qdrant_point_id:   String,
-    pub chunk_index:       i64,
-    pub chunk_text:        String,
-    pub model_name:        String,
-    pub created_at:        i64,
-    pub doc_key:           String,
-    pub source_type:       String,
-    pub knowledge_id:      Option<i64>,
-    pub time:              Option<i64>,
-    pub start_time:        Option<i64>,
-    pub end_time:          Option<i64>,
-    pub observed_at:       Option<i64>,
-    pub event_time_start:  Option<i64>,
-    pub event_time_end:    Option<i64>,
-    pub history_view:      bool,
-    pub content_origin:    Option<String>,
-    pub activity_type:     Option<String>,
+    pub id: i64,
+    pub capture_id: i64,
+    pub qdrant_point_id: String,
+    pub chunk_index: i64,
+    pub chunk_text: String,
+    pub model_name: String,
+    pub created_at: i64,
+    pub doc_key: String,
+    pub source_type: String,
+    pub knowledge_id: Option<i64>,
+    pub time: Option<i64>,
+    pub start_time: Option<i64>,
+    pub end_time: Option<i64>,
+    pub observed_at: Option<i64>,
+    pub event_time_start: Option<i64>,
+    pub event_time_end: Option<i64>,
+    pub history_view: bool,
+    pub content_origin: Option<String>,
+    pub activity_type: Option<String>,
     pub is_self_generated: bool,
     pub evidence_strength: Option<String>,
-    pub app_name:          Option<String>,
-    pub win_title:         Option<String>,
-    pub category:          Option<String>,
-    pub user_verified:     bool,
+    pub app_name: Option<String>,
+    pub win_title: Option<String>,
+    pub category: Option<String>,
+    pub user_verified: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct NewVectorIndex {
-    pub capture_id:        i64,
-    pub qdrant_point_id:   String,
-    pub chunk_index:       i64,
-    pub chunk_text:        String,
-    pub model_name:        String,
-    pub created_at:        i64,
-    pub doc_key:           String,
-    pub source_type:       String,
-    pub knowledge_id:      Option<i64>,
-    pub time:              Option<i64>,
-    pub start_time:        Option<i64>,
-    pub end_time:          Option<i64>,
-    pub observed_at:       Option<i64>,
-    pub event_time_start:  Option<i64>,
-    pub event_time_end:    Option<i64>,
-    pub history_view:      bool,
-    pub content_origin:    Option<String>,
-    pub activity_type:     Option<String>,
+    pub capture_id: i64,
+    pub qdrant_point_id: String,
+    pub chunk_index: i64,
+    pub chunk_text: String,
+    pub model_name: String,
+    pub created_at: i64,
+    pub doc_key: String,
+    pub source_type: String,
+    pub knowledge_id: Option<i64>,
+    pub time: Option<i64>,
+    pub start_time: Option<i64>,
+    pub end_time: Option<i64>,
+    pub observed_at: Option<i64>,
+    pub event_time_start: Option<i64>,
+    pub event_time_end: Option<i64>,
+    pub history_view: bool,
+    pub content_origin: Option<String>,
+    pub activity_type: Option<String>,
     pub is_self_generated: bool,
     pub evidence_strength: Option<String>,
-    pub app_name:          Option<String>,
-    pub win_title:         Option<String>,
-    pub category:          Option<String>,
-    pub user_verified:     bool,
+    pub app_name: Option<String>,
+    pub win_title: Option<String>,
+    pub category: Option<String>,
+    pub user_verified: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -249,24 +250,24 @@ pub struct NewVectorIndex {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagSessionRecord {
-    pub id:            i64,
-    pub ts:            i64,
-    pub scene_type:    Option<String>,
-    pub user_query:    String,
-    pub retrieved_ids: Option<String>,  // JSON 数组字符串
-    pub prompt_used:   Option<String>,
-    pub llm_response:  Option<String>,
+    pub id: i64,
+    pub ts: i64,
+    pub scene_type: Option<String>,
+    pub user_query: String,
+    pub retrieved_ids: Option<String>, // JSON 数组字符串
+    pub prompt_used: Option<String>,
+    pub llm_response: Option<String>,
     pub user_feedback: Option<String>,
-    pub latency_ms:    Option<i64>,
+    pub latency_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NewRagSession {
-    pub ts:            i64,
-    pub scene_type:    Option<String>,
-    pub user_query:    String,
+    pub ts: i64,
+    pub scene_type: Option<String>,
+    pub user_query: String,
     pub retrieved_ids: Option<String>,
-    pub prompt_used:   Option<String>,
-    pub llm_response:  Option<String>,
-    pub latency_ms:    Option<i64>,
+    pub prompt_used: Option<String>,
+    pub llm_response: Option<String>,
+    pub latency_ms: Option<i64>,
 }

@@ -1,8 +1,19 @@
 import React, { useEffect, useRef, useState } from 'react'
-import type { ModelEntry, ModelCategory } from '../types'
-import { useAppStore } from '../store/useAppStore'
+import type { ModelEntry } from '../types'
 
 const SIDECAR = 'http://localhost:7071'
+
+type OllamaSetupDetail = {
+  message?: string
+  is_macos?: boolean
+  system_version?: string
+  arch?: string
+  ollama_installed?: boolean
+  ollama_running?: boolean
+  ollama_version?: string
+  brew_available?: boolean
+  recommended_install_method?: string
+}
 
 const PROVIDER_LABEL: Record<string, string> = {
   ollama: 'Ollama', huggingface: 'HuggingFace',
@@ -18,11 +29,11 @@ const CATEGORY_LABEL: Record<string, string> = {
   llm: 'LLM', embedding: '向量模型', ocr: 'OCR', asr: '语音识别', vlm: '视觉模型',
 }
 const STATUS_COLOR: Record<string, string> = {
-  not_installed: '#AEAEB2', downloading: '#FF9500',
+  not_installed: '#AEAEB2', downloading: '#FF9500', loading: '#FF9500',
   installed: '#34C759', active: '#007AFF', error: '#FF3B30',
 }
 const STATUS_LABEL: Record<string, string> = {
-  not_installed: '未安装', downloading: '下载中',
+  not_installed: '未安装', downloading: '下载中', loading: '加载中',
   installed: '已安装', active: '使用中', error: '错误',
 }
 
@@ -118,12 +129,16 @@ const ModelCard: React.FC<{
   onActivate: () => void
   onDelete: () => void
   onConfigure: () => void
+  onUpgrade?: () => void
   downloading: boolean
-}> = ({ model, onDownload, onActivate, onDelete, onConfigure, downloading }) => {
+  activating?: boolean
+}> = ({ model, onDownload, onActivate, onDelete, onConfigure, onUpgrade, downloading, activating }) => {
   const isApi = model.requires_api_key
+  const isInferenceEngine = model.category === 'inference_engine'
   const isActive = model.status === 'active'
   const isInstalled = model.status === 'installed' || isActive
   const isDownloading = model.status === 'downloading' || downloading
+  const isLoading = model.status === 'loading' || activating
 
   return (
     <div style={{
@@ -137,6 +152,9 @@ const ModelCard: React.FC<{
             <span style={{ fontSize: 13, fontWeight: 600 }}>{model.name}</span>
             {model.size_gb > 0 && (
               <span style={{ fontSize: 11, color: '#AEAEB2' }}>{model.size_gb}GB</span>
+            )}
+            {(model as any).version && (
+              <span style={{ fontSize: 11, color: '#AEAEB2' }}>v{(model as any).version}</span>
             )}
             <span style={{
               fontSize: 10, padding: '1px 6px', borderRadius: 4,
@@ -175,6 +193,11 @@ const ModelCard: React.FC<{
               </div>
             </div>
           )}
+          {model.error && (
+            <div style={{ marginTop: 8, fontSize: 11, color: '#FF3B30', background: '#FF3B3010', padding: '4px 8px', borderRadius: 4 }}>
+              ⚠️ {model.error}
+            </div>
+          )}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 5, flexShrink: 0, alignItems: 'flex-end' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -189,16 +212,22 @@ const ModelCard: React.FC<{
                 {isInstalled ? '重新配置' : '配置 Key'}
               </button>
             )}
-            {!isApi && !isInstalled && !isDownloading && (
+            {isInferenceEngine && isInstalled && onUpgrade && (model as any).can_upgrade && (
+              <button onClick={onUpgrade} style={btn('#007AFF', 'white', 11)}>更新</button>
+            )}
+            {!isApi && !isInstalled && !isDownloading && !isLoading && !isInferenceEngine && (
               <button onClick={onDownload} style={btn('#007AFF', 'white', 11)}>下载</button>
             )}
-            {isInstalled && !isActive && (
+            {isInstalled && !isActive && !isLoading && !isInferenceEngine && (
               <button onClick={onActivate} style={btn('#34C759', 'white', 11)}>激活</button>
             )}
             {isActive && (
               <span style={{ fontSize: 11, color: '#007AFF', fontWeight: 600 }}>使用中</span>
             )}
-            {isInstalled && !isActive && (
+            {isLoading && (
+              <span style={{ fontSize: 11, color: '#FF9500', fontWeight: 600 }}>加载中</span>
+            )}
+            {isInstalled && !isActive && !isLoading && !isInferenceEngine && (
               <button onClick={onDelete} style={btn('#FF3B3018', '#FF3B30', 11)}>删除</button>
             )}
           </div>
@@ -212,12 +241,17 @@ const ModelCard: React.FC<{
 type TabType = 'local' | 'quantized' | 'api'
 
 const ModelManager: React.FC = () => {
-  const { setWindowMode } = useAppStore()
   const [tab, setTab] = useState<TabType>('local')
   const [models, setModels] = useState<ModelEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [configuringModel, setConfiguringModel] = useState<ModelEntry | null>(null)
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set())
+  const [activatingIds, setActivatingIds] = useState<Set<string>>(new Set())
+  const [ollamaSetup, setOllamaSetup] = useState<OllamaSetupDetail | null>(null)
+  const [ollamaChecking, setOllamaChecking] = useState(false)
+  const [ollamaInstalling, setOllamaInstalling] = useState(false)
+  const [ollamaUpgrading, setOllamaUpgrading] = useState(false)
+  const [ollamaError, setOllamaError] = useState('')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const loadModels = async () => {
@@ -229,7 +263,53 @@ const ModelManager: React.FC = () => {
     } catch { } finally { setLoading(false) }
   }
 
-  useEffect(() => { loadModels() }, [])
+  const refreshOllamaSetup = async () => {
+    setOllamaChecking(true)
+    setOllamaError('')
+    try {
+      const r = await fetch(`${SIDECAR}/api/ollama/setup-status`)
+      const d = await r.json()
+      if (d.status === 'ok') setOllamaSetup(d.detail || null)
+      else setOllamaSetup(null)
+    } catch {
+      setOllamaSetup(null)
+      setOllamaError('无法获取 Ollama 状态')
+    } finally {
+      setOllamaChecking(false)
+    }
+  }
+
+  const handleInstallOllama = async () => {
+    setOllamaInstalling(true)
+    setOllamaError('')
+    try {
+      const installResp = await fetch(`${SIDECAR}/api/ollama/install`, { method: 'POST' })
+      const installData = await installResp.json()
+      if (installData.status !== 'ok') {
+        setOllamaError(installData.message || 'Ollama 安装失败')
+        await refreshOllamaSetup()
+        return
+      }
+
+      const startResp = await fetch(`${SIDECAR}/api/ollama/start`, { method: 'POST' })
+      const startData = await startResp.json()
+      if (startData.status !== 'ok') {
+        setOllamaError(startData.message || 'Ollama 启动失败，请手动执行 ollama serve')
+      }
+
+      await refreshOllamaSetup()
+      await loadModels()
+    } catch {
+      setOllamaError('无法连接到 AI 服务，请确保 ai-sidecar 已启动')
+    } finally {
+      setOllamaInstalling(false)
+    }
+  }
+
+  useEffect(() => {
+    loadModels()
+    refreshOllamaSetup()
+  }, [])
 
   // 轮询下载进度
   useEffect(() => {
@@ -263,18 +343,31 @@ const ModelManager: React.FC = () => {
   }, [downloadingIds])
 
   const handleDownload = async (model: ModelEntry) => {
+    if (model.provider === 'ollama' && !ollamaSetup?.ollama_running) {
+      setOllamaError('请先安装并启动 Ollama，再下载本地模型')
+      return
+    }
+
     try {
       await fetch(`${SIDECAR}/api/models/${model.id}/download`, { method: 'POST' })
       setDownloadingIds(prev => new Set(prev).add(model.id))
       setModels(prev => prev.map(m => m.id === model.id ? { ...m, status: 'downloading', download_progress: 0 } : m))
-    } catch { }
+    } catch {
+      setOllamaError('下载请求失败，请稍后重试')
+    }
   }
 
   const handleActivate = async (model: ModelEntry) => {
+    setActivatingIds(prev => new Set(prev).add(model.id))
     try {
       await fetch(`${SIDECAR}/api/models/${model.id}/activate`, { method: 'POST' })
       await loadModels()
     } catch { }
+    setActivatingIds(prev => {
+      const next = new Set(prev)
+      next.delete(model.id)
+      return next
+    })
   }
 
   const handleDelete = async (model: ModelEntry) => {
@@ -284,11 +377,58 @@ const ModelManager: React.FC = () => {
     } catch { }
   }
 
+  const handleUpgrade = async () => {
+    setOllamaUpgrading(true)
+    setOllamaError('')
+    try {
+      const res = await fetch(`${SIDECAR}/api/ollama/upgrade`, { method: 'POST' })
+      const data = await res.json()
+      if (data.status === 'upgrading') {
+        // 启动轮询
+        pollUpgradeStatus()
+      } else if (data.status === 'error') {
+        setOllamaError(data.message || '升级失败')
+        setOllamaUpgrading(false)
+      }
+    } catch (e) {
+      setOllamaError('升级失败')
+      setOllamaUpgrading(false)
+    }
+  }
+
+  const pollUpgradeStatus = async () => {
+    const poll = async () => {
+      try {
+        const res = await fetch(`${SIDECAR}/api/ollama/upgrade/status`)
+        const data = await res.json()
+
+        if (data.status === 'upgrading') {
+          setOllamaError(data.message || '升级中...')
+          setTimeout(poll, 2000)
+        } else if (data.status === 'success') {
+          setOllamaError('')
+          setOllamaUpgrading(false)
+          await refreshOllamaSetup()
+          await loadModels()
+        } else if (data.status === 'error') {
+          setOllamaError(data.message || '升级失败')
+          setOllamaUpgrading(false)
+        } else {
+          setTimeout(poll, 2000)
+        }
+      } catch {
+        setOllamaError('获取升级状态失败')
+        setOllamaUpgrading(false)
+      }
+    }
+    poll()
+  }
+
   // 按 tab 过滤
   const filtered = models.filter(m => {
-    if (tab === 'local') return m.provider === 'ollama'
+    if (tab === 'local') return m.provider === 'ollama' || m.category === 'inference_engine'
     if (tab === 'quantized') return m.provider === 'huggingface'
-    if (tab === 'api') return !['ollama', 'huggingface'].includes(m.provider)
+    if (tab === 'api') return !['ollama', 'huggingface'].includes(m.provider) && m.category !== 'inference_engine'
     return true
   })
 
@@ -356,6 +496,50 @@ const ModelManager: React.FC = () => {
 
       {/* 内容区 */}
       <div style={{ flex: 1, overflow: 'auto', padding: '10px 14px 14px' }}>
+        {tab === 'local' && (
+          <div style={{ background: 'white', borderRadius: 10, padding: 12, border: '1px solid rgba(0,0,0,0.07)', marginBottom: 10 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Ollama 运行环境</div>
+            {ollamaChecking ? (
+              <div style={{ fontSize: 12, color: '#AEAEB2' }}>检测中...</div>
+            ) : (
+              <>
+                <div style={{ fontSize: 12, color: ollamaSetup?.ollama_running ? '#34C759' : '#6E6E73', marginBottom: 4 }}>
+                  {ollamaSetup?.message || '无法获取 Ollama 状态'}
+                </div>
+                {(ollamaSetup?.system_version || ollamaSetup?.arch || ollamaSetup?.ollama_version) && (
+                  <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 8 }}>
+                    macOS {ollamaSetup?.system_version || 'unknown'} · {ollamaSetup?.arch || 'unknown'}
+                    {ollamaSetup?.ollama_version && ` · Ollama v${ollamaSetup.ollama_version}`}
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button onClick={refreshOllamaSetup} style={btn('#F2F2F7', '#333', 11)}>重新检测</button>
+                  {ollamaSetup?.ollama_installed && ollamaSetup?.brew_available && (
+                    <button onClick={handleUpgrade} disabled={ollamaUpgrading} style={btn('#007AFF', 'white', 11)}>
+                      {ollamaUpgrading ? '升级中...' : '更新 Ollama'}
+                    </button>
+                  )}
+                  {!ollamaSetup?.ollama_running && (
+                    <button
+                      onClick={handleInstallOllama}
+                      disabled={ollamaInstalling}
+                      style={btn('#007AFF', 'white', 11)}
+                    >
+                      {ollamaInstalling ? '安装中...' : '检测并安装 Ollama'}
+                    </button>
+                  )}
+                </div>
+                {ollamaSetup?.recommended_install_method && !ollamaSetup?.ollama_running && (
+                  <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 6 }}>
+                    推荐命令：{ollamaSetup.recommended_install_method}
+                  </div>
+                )}
+                {ollamaError && <div style={{ fontSize: 11, color: '#FF3B30', marginTop: 6 }}>{ollamaError}</div>}
+              </>
+            )}
+          </div>
+        )}
+
         {loading && models.length === 0 && (
           <div style={{ textAlign: 'center', color: '#AEAEB2', fontSize: 13, padding: 40 }}>加载中...</div>
         )}
@@ -369,10 +553,12 @@ const ModelManager: React.FC = () => {
               <ModelCard
                 key={m.id} model={m}
                 downloading={downloadingIds.has(m.id)}
+                activating={activatingIds.has(m.id)}
                 onDownload={() => handleDownload(m)}
                 onActivate={() => handleActivate(m)}
                 onDelete={() => handleDelete(m)}
                 onConfigure={() => setConfiguringModel(m)}
+                onUpgrade={m.category === 'inference_engine' ? handleUpgrade : undefined}
               />
             ))}
           </div>
@@ -393,6 +579,7 @@ const ModelManager: React.FC = () => {
               <ModelCard
                 key={m.id} model={m}
                 downloading={false}
+                activating={activatingIds.has(m.id)}
                 onDownload={() => {}}
                 onActivate={() => handleActivate(m)}
                 onDelete={() => {}}

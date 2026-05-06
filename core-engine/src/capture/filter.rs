@@ -29,9 +29,20 @@ const DEFAULT_BLOCKED_BUNDLE_IDS: &[&str] = &[
 
 /// 窗口标题中出现这些关键词时判定为敏感
 const SENSITIVE_WIN_KEYWORDS: &[&str] = &[
-    "密码", "password", "Password", "PIN", "私钥", "secret", "Secret",
-    "passphrase", "Passphrase", "memory-bread", "记忆面包",
-    "KnowledgePanel", "MonitorPanel", "RagPanel",
+    "密码",
+    "password",
+    "Password",
+    "PIN",
+    "私钥",
+    "secret",
+    "Secret",
+    "passphrase",
+    "Passphrase",
+    "memory-bread",
+    "记忆面包",
+    "KnowledgePanel",
+    "MonitorPanel",
+    "RagPanel",
 ];
 
 /// 被判定为密码输入框的 AX Role
@@ -44,7 +55,7 @@ const PASSWORD_AX_ROLES: &[&str] = &["AXSecureTextField"];
 /// 隐私过滤器，判断当前场景是否应跳过详细采集。
 #[derive(Debug, Clone)]
 pub struct PrivacyFilter {
-    blocked_apps:       HashSet<String>,
+    blocked_apps: HashSet<String>,
     blocked_bundle_ids: HashSet<String>,
 }
 
@@ -52,7 +63,10 @@ impl Default for PrivacyFilter {
     fn default() -> Self {
         Self {
             blocked_apps: DEFAULT_BLOCKED_APPS.iter().map(|s| s.to_string()).collect(),
-            blocked_bundle_ids: DEFAULT_BLOCKED_BUNDLE_IDS.iter().map(|s| s.to_string()).collect(),
+            blocked_bundle_ids: DEFAULT_BLOCKED_BUNDLE_IDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -84,9 +98,9 @@ impl PrivacyFilter {
     /// 任意一条规则命中即返回 `true`（应跳过详细采集）。
     pub fn is_sensitive(
         &self,
-        app_name:  Option<&str>,
+        app_name: Option<&str>,
         bundle_id: Option<&str>,
-        ax_role:   Option<&str>,
+        ax_role: Option<&str>,
         win_title: Option<&str>,
     ) -> bool {
         // 1. 应用名黑名单
@@ -184,8 +198,8 @@ mod tests {
 
     #[test]
     fn test_extra_blocked_bundle_ids() {
-        let filter = PrivacyFilter::new()
-            .with_extra_blocked_bundle_ids(&["com.tencent.xinWeChat".into()]);
+        let filter =
+            PrivacyFilter::new().with_extra_blocked_bundle_ids(&["com.tencent.xinWeChat".into()]);
         assert!(filter.is_sensitive(None, Some("com.tencent.xinWeChat"), None, None));
     }
 

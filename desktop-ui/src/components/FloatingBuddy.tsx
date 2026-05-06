@@ -26,7 +26,7 @@ interface MenuItem {
 const MENU_ITEMS: MenuItem[] = [
   {
     mode: 'rag',
-    label: '吃面包',
+    label: '咨询',
     testId: 'buddy-avatar',
     icon: (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -36,7 +36,7 @@ const MENU_ITEMS: MenuItem[] = [
   },
   {
     mode: 'bake',
-    label: '烤面包',
+    label: '收藏',
     testId: 'bake-btn',
     icon: (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -50,7 +50,7 @@ const MENU_ITEMS: MenuItem[] = [
   },
   {
     mode: 'knowledge',
-    label: '醒发箱',
+    label: '采集',
     testId: 'knowledge-btn',
     icon: (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -62,7 +62,7 @@ const MENU_ITEMS: MenuItem[] = [
   },
   {
     mode: 'tasks',
-    label: '定时烤',
+    label: '任务',
     testId: 'tasks-btn',
     icon: (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -73,7 +73,7 @@ const MENU_ITEMS: MenuItem[] = [
   },
   {
     mode: 'models',
-    label: '烤箱型号',
+    label: '模型',
     testId: 'models-btn',
     icon: (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -88,7 +88,7 @@ const MENU_ITEMS: MenuItem[] = [
   },
   {
     mode: 'monitor',
-    label: '温度计',
+    label: '监控',
     testId: 'monitor-btn',
     icon: (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -100,7 +100,7 @@ const MENU_ITEMS: MenuItem[] = [
   },
   {
     mode: 'settings',
-    label: '手艺调教',
+    label: '配置',
     testId: 'settings-btn',
     icon: (
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

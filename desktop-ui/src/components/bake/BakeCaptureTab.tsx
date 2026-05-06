@@ -40,6 +40,8 @@ const BakeCaptureTab: React.FC<{
   onClearFilters: () => void
   onClearScope: () => void
   onViewLinkedKnowledge: (knowledgeId?: string | null) => void
+  canGoBack: boolean
+  onGoBack: () => void
 }> = ({
   captures,
   total,
@@ -64,6 +66,8 @@ const BakeCaptureTab: React.FC<{
   onClearFilters,
   onClearScope,
   onViewLinkedKnowledge,
+  canGoBack,
+  onGoBack,
 }) => {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
   const [pageInput, setPageInput] = useState('')
@@ -103,8 +107,9 @@ const BakeCaptureTab: React.FC<{
     <div className="bake-split-list-detail bake-split-list-detail--capture">
       <BakeCard className="bake-capture-list-card">
         <BakeSectionHeader
-          title="记忆片段"
+          title="采集记录"
           subtitle="浏览原始采集片段与关联知识"
+          right={canGoBack ? <BakeButton compact onClick={onGoBack}>返回上一步</BakeButton> : undefined}
         />
 
         <form
@@ -167,7 +172,7 @@ const BakeCaptureTab: React.FC<{
 
         <div className="bake-list bake-capture-list">
           {captures.length === 0 ? (
-            <div className="bake-muted">当前筛选条件下没有可浏览的记忆片段。</div>
+            <div className="bake-muted">当前筛选条件下没有可浏览的采集记录。</div>
           ) : captures.map(item => (
             <button
               key={item.id}
@@ -312,7 +317,7 @@ const BakeCaptureTab: React.FC<{
             </div>
           </div>
         ) : (
-          <div className="bake-muted">暂无记忆片段详情</div>
+          <div className="bake-muted">暂无采集记录详情</div>
         )}
       </BakeCard>
 

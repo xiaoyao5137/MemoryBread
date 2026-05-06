@@ -22,23 +22,69 @@ use super::error::StorageError;
 
 /// 按版本顺序排列的迁移列表：(版本号, SQL)
 static MIGRATIONS: &[(&str, &str)] = &[
-    ("001_init",                  include_str!("migrations/001_init.sql")),
-    ("002_seed_defaults",         include_str!("migrations/002_seed_defaults.sql")),
-    ("003_views",                 include_str!("migrations/003_views.sql")),
-    ("004_captures_knowledge_id", include_str!("../../../shared/db-schema/migrations/004_captures_knowledge_id.sql")),
-    ("005_monitor_tables",        include_str!("../../../shared/db-schema/migrations/005_monitor_tables.sql")),
-    ("006_monitor_metric_scopes", include_str!("../../../shared/db-schema/migrations/006_monitor_metric_scopes.sql")),
-    ("007_vector_index_rag_metadata", include_str!("../../../shared/db-schema/migrations/007_vector_index_rag_metadata.sql")),
-    ("008_knowledge_semantic_metadata", include_str!("../../../shared/db-schema/migrations/008_knowledge_semantic_metadata.sql")),
-    ("009_bake_templates", include_str!("migrations/009_bake_templates.sql")),
-    ("010_knowledge_entries", include_str!("migrations/010_knowledge_entries.sql")),
-    ("011_bake_pipeline", include_str!("migrations/011_bake_pipeline.sql")),
-    ("012_fix_knowledge_fts_triggers", include_str!("migrations/012_fix_knowledge_fts_triggers.sql")),
-    ("013_rebuild_knowledge_fts", include_str!("migrations/013_rebuild_knowledge_fts.sql")),
-    ("014_add_knowledge_timestamp_ms", include_str!("migrations/014_add_knowledge_timestamp_ms.sql")),
-    ("015_split_knowledge_tables", include_str!("migrations/015_split_knowledge_tables.sql")),
+    ("001_init", include_str!("migrations/001_init.sql")),
+    (
+        "002_seed_defaults",
+        include_str!("migrations/002_seed_defaults.sql"),
+    ),
+    ("003_views", include_str!("migrations/003_views.sql")),
+    (
+        "004_captures_knowledge_id",
+        include_str!("../../../shared/db-schema/migrations/004_captures_knowledge_id.sql"),
+    ),
+    (
+        "005_monitor_tables",
+        include_str!("../../../shared/db-schema/migrations/005_monitor_tables.sql"),
+    ),
+    (
+        "006_monitor_metric_scopes",
+        include_str!("../../../shared/db-schema/migrations/006_monitor_metric_scopes.sql"),
+    ),
+    (
+        "007_vector_index_rag_metadata",
+        include_str!("../../../shared/db-schema/migrations/007_vector_index_rag_metadata.sql"),
+    ),
+    (
+        "008_knowledge_semantic_metadata",
+        include_str!("../../../shared/db-schema/migrations/008_knowledge_semantic_metadata.sql"),
+    ),
+    (
+        "009_bake_templates",
+        include_str!("migrations/009_bake_templates.sql"),
+    ),
+    (
+        "010_knowledge_entries",
+        include_str!("migrations/010_knowledge_entries.sql"),
+    ),
+    (
+        "011_bake_pipeline",
+        include_str!("migrations/011_bake_pipeline.sql"),
+    ),
+    (
+        "012_fix_knowledge_fts_triggers",
+        include_str!("migrations/012_fix_knowledge_fts_triggers.sql"),
+    ),
+    (
+        "013_rebuild_knowledge_fts",
+        include_str!("migrations/013_rebuild_knowledge_fts.sql"),
+    ),
+    (
+        "014_add_knowledge_timestamp_ms",
+        include_str!("migrations/014_add_knowledge_timestamp_ms.sql"),
+    ),
+    (
+        "015_split_knowledge_tables",
+        include_str!("migrations/015_split_knowledge_tables.sql"),
+    ),
+    (
+        "016_fix_split_tables_fts_triggers",
+        include_str!("migrations/016_fix_split_tables_fts_triggers.sql"),
+    ),
+    (
+        "018_create_bake_designs",
+        include_str!("migrations/018_create_bake_designs.sql"),
+    ),
 ];
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StorageManager
@@ -61,11 +107,9 @@ impl StorageManager {
     pub fn open(db_path: &Path) -> Result<Self, StorageError> {
         // 确保父目录存在
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                StorageError::MigrationFailed {
-                    version: "open",
-                    reason:  e.to_string(),
-                }
+            std::fs::create_dir_all(parent).map_err(|e| StorageError::MigrationFailed {
+                version: "open",
+                reason: e.to_string(),
             })?;
         }
 
@@ -133,10 +177,11 @@ impl StorageManager {
             }
 
             info!("执行迁移: {}", version);
-            conn.execute_batch(sql).map_err(|e| StorageError::MigrationFailed {
-                version,
-                reason: e.to_string(),
-            })?;
+            conn.execute_batch(sql)
+                .map_err(|e| StorageError::MigrationFailed {
+                    version,
+                    reason: e.to_string(),
+                })?;
 
             // 如果迁移 SQL 本身没有插入迁移记录，这里补插
             // （001_init.sql 末尾已有 INSERT，此处做幂等保护）

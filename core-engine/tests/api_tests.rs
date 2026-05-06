@@ -22,24 +22,24 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
-use tower::ServiceExt;
+use memory_bread_core::storage::models::{EventType, NewCapture};
+use memory_bread_core::{
+    api::{state::DebugLogSpec, AppState},
+    storage::{NewBakeSop, NewKnowledgeEntry, StorageManager},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use memory_bread_core::{
-    api::{AppState, state::DebugLogSpec},
-    storage::{NewKnowledgeEntry, StorageManager},
-};
-use memory_bread_core::storage::models::{EventType, NewCapture};
+use tower::ServiceExt;
 
 // ── 辅助函数 ──────────────────────────────────────────────────────────────────
 
 /// 创建测试用 axum Router（使用内存临时 SQLite）
 async fn make_test_router() -> (axum::Router, tempfile::TempDir) {
-    let tmp    = tempfile::tempdir().unwrap();
-    let db     = tmp.path().join("test.db");
-    let sm     = StorageManager::open(&db).unwrap();
-    let state  = AppState::new(sm);
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("test.db");
+    let sm = StorageManager::open(&db).unwrap();
+    let state = AppState::new(sm);
     let router = memory_bread_core::api::create_router(state);
     (router, tmp)
 }
@@ -157,15 +157,57 @@ fn seed_capture(sm: &StorageManager) -> i64 {
         ax_text: Some("测试来源文本".to_string()),
         ax_focused_role: None,
         ax_focused_id: None,
+        ocr_text: None,
         screenshot_path: None,
         input_text: None,
         is_sensitive: false,
-    }).unwrap()
+    })
+    .unwrap()
 }
 
-fn seed_knowledge_entry(sm: &StorageManager, category: &str, summary: &str, overview: &str, details: serde_json::Value) -> i64 {
+fn seed_knowledge_entry(
+    sm: &StorageManager,
+    category: &str,
+    summary: &str,
+    overview: &str,
+    details: serde_json::Value,
+) -> i64 {
+    let capture_id = seed_capture(sm);
+    if category == "bake_sop" {
+        let source_id = sm
+            .insert_knowledge_entry(&NewKnowledgeEntry {
+                capture_id,
+                summary: summary.to_string(),
+                overview: Some(overview.to_string()),
+                details: Some(details.to_string()),
+                entities: r#"["流程","模板"]"#.to_string(),
+                category: "meeting".to_string(),
+                importance: 4,
+                occurrence_count: Some(3),
+                observed_at: Some(1_710_000_000_000),
+                event_time_start: None,
+                event_time_end: None,
+                history_view: false,
+                content_origin: Some("manual".to_string()),
+                activity_type: Some("reading".to_string()),
+                is_self_generated: false,
+                evidence_strength: Some("high".to_string()),
+            })
+            .unwrap();
+        return sm
+            .insert_bake_sop(&NewBakeSop {
+                episodic_memory_id: source_id,
+                title: overview.to_string(),
+                summary: summary.to_string(),
+                content: Some(details.to_string()),
+                entities: r#"["流程","模板"]"#.to_string(),
+                importance: 4,
+            })
+            .unwrap();
+    }
+
     sm.insert_knowledge_entry(&NewKnowledgeEntry {
-        capture_id: seed_capture(sm),
+        capture_id,
         summary: summary.to_string(),
         overview: Some(overview.to_string()),
         details: Some(details.to_string()),
@@ -181,7 +223,8 @@ fn seed_knowledge_entry(sm: &StorageManager, category: &str, summary: &str, over
         activity_type: Some("reading".to_string()),
         is_self_generated: false,
         evidence_strength: Some("high".to_string()),
-    }).unwrap()
+    })
+    .unwrap()
 }
 
 fn bake_rejected(reason: &str) -> serde_json::Value {
@@ -259,7 +302,10 @@ fn bake_sop_artifact(summary: &str, review_status: Option<&str>) -> serde_json::
     })
 }
 
-async fn run_bake(router: axum::Router, trigger_reason: &str) -> (StatusCode, serde_json::Value, String) {
+async fn run_bake(
+    router: axum::Router,
+    trigger_reason: &str,
+) -> (StatusCode, serde_json::Value, String) {
     let req = Request::builder()
         .method(Method::POST)
         .uri("/api/bake/run")
@@ -291,13 +337,15 @@ async fn test_bake_style_config_roundtrip() {
         .method(Method::PUT)
         .uri("/api/bake/style-config")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{
+        .body(Body::from(
+            r#"{
             "preferred_phrases": ["整体看"],
             "replacement_rules": [{"from":"综上所述","to":"整体看"}],
             "style_samples": ["这里建议先收敛范围。"],
             "apply_to_creation": true,
             "apply_to_template_editing": false
-        }"#))
+        }"#,
+        ))
         .unwrap();
     let (put_status, put_body) = oneshot(router.clone(), put_req).await;
     assert_eq!(put_status, StatusCode::OK, "body: {put_body}");
@@ -322,7 +370,8 @@ async fn test_bake_templates_crud_flow() {
         .method(Method::POST)
         .uri("/api/bake/templates")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{
+        .body(Body::from(
+            r#"{
             "name":"周报模板",
             "category":"周报",
             "status":"draft",
@@ -338,7 +387,8 @@ async fn test_bake_templates_crud_flow() {
             "diagram_code":null,
             "image_assets":[],
             "usage_count":0
-        }"#))
+        }"#,
+        ))
         .unwrap();
     let (create_status, create_body) = oneshot(router.clone(), create_req).await;
     assert_eq!(create_status, StatusCode::OK, "body: {create_body}");
@@ -360,7 +410,8 @@ async fn test_bake_templates_crud_flow() {
         .method(Method::PUT)
         .uri(format!("/api/bake/templates/{template_id}"))
         .header("content-type", "application/json")
-        .body(Body::from(r#"{
+        .body(Body::from(
+            r#"{
             "name":"周报模板-更新",
             "category":"周报",
             "status":"pending_review",
@@ -376,13 +427,17 @@ async fn test_bake_templates_crud_flow() {
             "diagram_code":null,
             "image_assets":[],
             "usage_count":2
-        }"#))
+        }"#,
+        ))
         .unwrap();
     let (update_status, update_body) = oneshot(router.clone(), update_req).await;
     assert_eq!(update_status, StatusCode::OK, "body: {update_body}");
     let update_json: serde_json::Value = serde_json::from_str(&update_body).unwrap();
     assert_eq!(update_json["name"], "周报模板-更新");
-    assert_eq!(update_json["source_memory_ids"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        update_json["source_memory_ids"].as_array().unwrap().len(),
+        0
+    );
 
     let toggle_req = Request::builder()
         .method(Method::POST)
@@ -435,6 +490,221 @@ async fn test_bake_sops_list_and_adopt() {
     assert_eq!(adopt_status, StatusCode::OK, "body: {adopt_body}");
     let adopt_json: serde_json::Value = serde_json::from_str(&adopt_body).unwrap();
     assert_eq!(adopt_json["status"], "confirmed");
+}
+
+#[tokio::test]
+async fn test_bake_templates_bucket_filter_separates_pending_and_extracted() {
+    let (router, _tmp) = make_test_router().await;
+
+    let create_candidate_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/bake/templates")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+            "name":"候选模板",
+            "category":"周报",
+            "status":"draft",
+            "tags":["周报"],
+            "applicable_tasks":["creation"],
+            "source_article_ids":[],
+            "source_memory_ids":[],
+            "linked_knowledge_ids":[],
+            "structure_sections":[{"title":"背景","keywords":["背景"],"notes":null}],
+            "style_phrases":["整体看"],
+            "replacement_rules":[],
+            "prompt_hint":"候选提示",
+            "diagram_code":null,
+            "image_assets":[],
+            "usage_count":0,
+            "review_status":"candidate"
+        }"#,
+        ))
+        .unwrap();
+    let (candidate_status, candidate_body) = oneshot(router.clone(), create_candidate_req).await;
+    assert_eq!(candidate_status, StatusCode::OK, "body: {candidate_body}");
+
+    let create_confirmed_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/bake/templates")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+            "name":"已提炼模板",
+            "category":"周报",
+            "status":"enabled",
+            "tags":["周报"],
+            "applicable_tasks":["creation"],
+            "source_article_ids":[],
+            "source_memory_ids":[],
+            "linked_knowledge_ids":[],
+            "structure_sections":[{"title":"进展","keywords":["进展"],"notes":null}],
+            "style_phrases":["先结论后展开"],
+            "replacement_rules":[],
+            "prompt_hint":"已提炼提示",
+            "diagram_code":null,
+            "image_assets":[],
+            "usage_count":1,
+            "review_status":"confirmed"
+        }"#,
+        ))
+        .unwrap();
+    let (confirmed_status, confirmed_body) = oneshot(router.clone(), create_confirmed_req).await;
+    assert_eq!(confirmed_status, StatusCode::OK, "body: {confirmed_body}");
+
+    let pending_req = Request::builder()
+        .uri("/api/bake/templates?bucket=pending")
+        .body(Body::empty())
+        .unwrap();
+    let (pending_status, pending_body) = oneshot(router.clone(), pending_req).await;
+    assert_eq!(pending_status, StatusCode::OK, "body: {pending_body}");
+    let pending_json: serde_json::Value = serde_json::from_str(&pending_body).unwrap();
+    assert_eq!(pending_json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(pending_json["items"][0]["name"], "候选模板");
+
+    let extracted_req = Request::builder()
+        .uri("/api/bake/templates?bucket=extracted")
+        .body(Body::empty())
+        .unwrap();
+    let (extracted_status, extracted_body) = oneshot(router, extracted_req).await;
+    assert_eq!(extracted_status, StatusCode::OK, "body: {extracted_body}");
+    let extracted_json: serde_json::Value = serde_json::from_str(&extracted_body).unwrap();
+    assert_eq!(extracted_json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(extracted_json["items"][0]["name"], "已提炼模板");
+}
+
+#[tokio::test]
+async fn test_bake_sops_bucket_filter_separates_pending_and_extracted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("test.db");
+    let sm = StorageManager::open(&db).unwrap();
+
+    seed_knowledge_entry(
+        &sm,
+        "bake_sop",
+        "候选 SOP",
+        "候选流程",
+        serde_json::json!({
+            "source_capture_id": "1",
+            "source_title": "候选 SOP",
+            "trigger_keywords": ["候选"],
+            "confidence": "medium",
+            "steps": ["步骤一", "步骤二", "步骤三"],
+            "linked_knowledge_ids": ["11"],
+            "status": "candidate"
+        }),
+    );
+    seed_knowledge_entry(
+        &sm,
+        "bake_sop",
+        "已采纳 SOP",
+        "已采纳流程",
+        serde_json::json!({
+            "source_capture_id": "2",
+            "source_title": "已采纳 SOP",
+            "trigger_keywords": ["采纳"],
+            "confidence": "high",
+            "steps": ["确认问题", "执行流程", "回写结果"],
+            "linked_knowledge_ids": ["22"],
+            "status": "confirmed"
+        }),
+    );
+
+    let router = memory_bread_core::api::create_router(AppState::new(sm));
+
+    let pending_req = Request::builder()
+        .uri("/api/bake/sops?bucket=pending")
+        .body(Body::empty())
+        .unwrap();
+    let (pending_status, pending_body) = oneshot(router.clone(), pending_req).await;
+    assert_eq!(pending_status, StatusCode::OK, "body: {pending_body}");
+    let pending_json: serde_json::Value = serde_json::from_str(&pending_body).unwrap();
+    assert_eq!(pending_json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(pending_json["items"][0]["status"], "candidate");
+
+    let extracted_req = Request::builder()
+        .uri("/api/bake/sops?bucket=extracted")
+        .body(Body::empty())
+        .unwrap();
+    let (extracted_status, extracted_body) = oneshot(router, extracted_req).await;
+    assert_eq!(extracted_status, StatusCode::OK, "body: {extracted_body}");
+    let extracted_json: serde_json::Value = serde_json::from_str(&extracted_body).unwrap();
+    assert_eq!(extracted_json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(extracted_json["items"][0]["status"], "confirmed");
+}
+
+#[tokio::test]
+async fn test_bake_pipeline_chain_from_memory_to_knowledge_template_and_sop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("test.db");
+    let sm = StorageManager::open(&db).unwrap();
+
+    seed_knowledge_entry(
+        &sm,
+        "meeting",
+        "周报写作需求讨论",
+        "讨论周报标准化产出流程",
+        serde_json::json!({}),
+    );
+
+    let sidecar_url = spawn_bake_sidecar(vec![make_bake_response(
+        bake_knowledge_artifact("链路知识", None),
+        bake_template_artifact("链路模板", None),
+        bake_sop_artifact("链路 SOP", None),
+    )])
+    .await;
+    let router = memory_bread_core::api::create_router(make_bake_state(sm, sidecar_url));
+
+    let init_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/bake/memories/init")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"limit":10}"#))
+        .unwrap();
+    let (init_status, init_body) = oneshot(router.clone(), init_req).await;
+    assert_eq!(init_status, StatusCode::OK, "body: {init_body}");
+    let init_json: serde_json::Value = serde_json::from_str(&init_body).unwrap();
+    assert_eq!(init_json["created_count"], 1);
+
+    let (run_status, run_json, run_body) = run_bake(router.clone(), "manual_debug").await;
+    assert_eq!(run_status, StatusCode::OK, "body: {run_body}");
+    assert_eq!(run_json["knowledge_created_count"], 1);
+    assert_eq!(run_json["template_created_count"], 1);
+    assert_eq!(run_json["sop_created_count"], 1);
+
+    let knowledge_req = Request::builder()
+        .uri("/api/bake/knowledge?bucket=extracted")
+        .body(Body::empty())
+        .unwrap();
+    let (knowledge_status, knowledge_body) = oneshot(router.clone(), knowledge_req).await;
+    assert_eq!(knowledge_status, StatusCode::OK, "body: {knowledge_body}");
+    let knowledge_json: serde_json::Value = serde_json::from_str(&knowledge_body).unwrap();
+    assert_eq!(knowledge_json["items"].as_array().unwrap().len(), 1);
+
+    let templates_req = Request::builder()
+        .uri("/api/bake/templates?bucket=extracted")
+        .body(Body::empty())
+        .unwrap();
+    let (templates_status, templates_body) = oneshot(router.clone(), templates_req).await;
+    assert_eq!(templates_status, StatusCode::OK, "body: {templates_body}");
+    let templates_json: serde_json::Value = serde_json::from_str(&templates_body).unwrap();
+    let template_item = &templates_json["items"][0];
+    assert_eq!(templates_json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(template_item["name"], "链路模板");
+    assert!(template_item["source_memory_ids"].as_array().unwrap().len() >= 1);
+    assert!(template_item["structure_sections"].as_array().unwrap().len() >= 2);
+
+    let sops_req = Request::builder()
+        .uri("/api/bake/sops?bucket=extracted")
+        .body(Body::empty())
+        .unwrap();
+    let (sops_status, sops_body) = oneshot(router, sops_req).await;
+    assert_eq!(sops_status, StatusCode::OK, "body: {sops_body}");
+    let sops_json: serde_json::Value = serde_json::from_str(&sops_body).unwrap();
+    let sop_item = &sops_json["items"][0];
+    assert_eq!(sops_json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(sop_item["status"], "auto_created");
+    assert!(sop_item["linked_knowledge_ids"].as_array().unwrap().len() >= 1);
 }
 
 #[tokio::test]
@@ -498,9 +768,15 @@ async fn test_bake_memories_promote_and_ignore_flow() {
         .uri(format!("/api/bake/memories/{memory_id}/promote-template"))
         .body(Body::empty())
         .unwrap();
-    let (promote_template_status, promote_template_body) = oneshot(router.clone(), promote_template_req).await;
-    assert_eq!(promote_template_status, StatusCode::OK, "body: {promote_template_body}");
-    let promote_template_json: serde_json::Value = serde_json::from_str(&promote_template_body).unwrap();
+    let (promote_template_status, promote_template_body) =
+        oneshot(router.clone(), promote_template_req).await;
+    assert_eq!(
+        promote_template_status,
+        StatusCode::OK,
+        "body: {promote_template_body}"
+    );
+    let promote_template_json: serde_json::Value =
+        serde_json::from_str(&promote_template_body).unwrap();
     assert_eq!(promote_template_json["name"], "高价值情节记忆");
 
     let promote_sop_req = Request::builder()
@@ -509,7 +785,11 @@ async fn test_bake_memories_promote_and_ignore_flow() {
         .body(Body::empty())
         .unwrap();
     let (promote_sop_status, promote_sop_body) = oneshot(router.clone(), promote_sop_req).await;
-    assert_eq!(promote_sop_status, StatusCode::OK, "body: {promote_sop_body}");
+    assert_eq!(
+        promote_sop_status,
+        StatusCode::OK,
+        "body: {promote_sop_body}"
+    );
     let promote_sop_json: serde_json::Value = serde_json::from_str(&promote_sop_body).unwrap();
     assert_eq!(promote_sop_json["status"], "candidate");
 
@@ -541,10 +821,34 @@ async fn test_bake_knowledge_api_only_returns_bake_knowledge() {
     let db = tmp.path().join("test.db");
     let sm = StorageManager::open(&db).unwrap();
 
-    seed_knowledge_entry(&sm, "meeting", "普通 knowledge", "普通概述", serde_json::json!({}));
-    seed_knowledge_entry(&sm, "bake_article", "情节记忆", "记忆概述", serde_json::json!({}));
-    seed_knowledge_entry(&sm, "bake_sop", "操作手册", "SOP 概述", serde_json::json!({}));
-    seed_knowledge_entry(&sm, "bake_knowledge", "已提炼知识", "知识概述", serde_json::json!({}));
+    seed_knowledge_entry(
+        &sm,
+        "meeting",
+        "普通 knowledge",
+        "普通概述",
+        serde_json::json!({}),
+    );
+    seed_knowledge_entry(
+        &sm,
+        "bake_article",
+        "情节记忆",
+        "记忆概述",
+        serde_json::json!({}),
+    );
+    seed_knowledge_entry(
+        &sm,
+        "bake_sop",
+        "操作手册",
+        "SOP 概述",
+        serde_json::json!({}),
+    );
+    seed_knowledge_entry(
+        &sm,
+        "bake_knowledge",
+        "已提炼知识",
+        "知识概述",
+        serde_json::json!({}),
+    );
 
     let router = memory_bread_core::api::create_router(AppState::new(sm));
     let req = Request::builder()
@@ -566,9 +870,27 @@ async fn test_bake_overview_counts_only_bake_knowledge() {
     let db = tmp.path().join("test.db");
     let sm = StorageManager::open(&db).unwrap();
 
-    seed_knowledge_entry(&sm, "meeting", "普通 knowledge", "普通概述", serde_json::json!({}));
-    seed_knowledge_entry(&sm, "bake_article", "情节记忆", "记忆概述", serde_json::json!({}));
-    seed_knowledge_entry(&sm, "bake_knowledge", "已提炼知识", "知识概述", serde_json::json!({}));
+    seed_knowledge_entry(
+        &sm,
+        "meeting",
+        "普通 knowledge",
+        "普通概述",
+        serde_json::json!({}),
+    );
+    seed_knowledge_entry(
+        &sm,
+        "bake_article",
+        "情节记忆",
+        "记忆概述",
+        serde_json::json!({}),
+    );
+    seed_knowledge_entry(
+        &sm,
+        "bake_knowledge",
+        "已提炼知识",
+        "知识概述",
+        serde_json::json!({}),
+    );
 
     let router = memory_bread_core::api::create_router(AppState::new(sm));
     let req = Request::builder()
@@ -578,7 +900,7 @@ async fn test_bake_overview_counts_only_bake_knowledge() {
     let (status, body) = oneshot(router, req).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["memory_count"], 1);
+    assert_eq!(json["memory_count"], 2);
     assert_eq!(json["knowledge_count"], 1);
 }
 
@@ -596,10 +918,12 @@ async fn test_bake_captures_search_matches_win_title() {
         ax_text: Some("无关正文".to_string()),
         ax_focused_role: None,
         ax_focused_id: None,
+        ocr_text: None,
         screenshot_path: None,
         input_text: None,
         is_sensitive: false,
-    }).unwrap();
+    })
+    .unwrap();
 
     let router = memory_bread_core::api::create_router(AppState::new(sm));
     let req = Request::builder()
@@ -686,8 +1010,8 @@ async fn test_bake_run_pipeline_creates_only_template() {
     let (status, run_json, run_body) = run_bake(router.clone(), "manual_debug").await;
     assert_eq!(status, StatusCode::OK, "body: {run_body}");
     assert_eq!(run_json["processed_episode_count"], 1);
-    assert_eq!(run_json["auto_created_count"], 0);
-    assert_eq!(run_json["candidate_count"], 2);
+    assert_eq!(run_json["auto_created_count"], 1);
+    assert_eq!(run_json["candidate_count"], 1);
     assert_eq!(run_json["discarded_count"], 2);
     assert_eq!(run_json["knowledge_created_count"], 0);
     assert_eq!(run_json["template_created_count"], 1);
@@ -760,8 +1084,8 @@ async fn test_bake_run_pipeline_creates_only_sop() {
     let (status, run_json, run_body) = run_bake(router.clone(), "manual_debug").await;
     assert_eq!(status, StatusCode::OK, "body: {run_body}");
     assert_eq!(run_json["processed_episode_count"], 1);
-    assert_eq!(run_json["auto_created_count"], 0);
-    assert_eq!(run_json["candidate_count"], 2);
+    assert_eq!(run_json["auto_created_count"], 1);
+    assert_eq!(run_json["candidate_count"], 1);
     assert_eq!(run_json["discarded_count"], 2);
     assert_eq!(run_json["knowledge_created_count"], 0);
     assert_eq!(run_json["template_created_count"], 0);
@@ -864,7 +1188,10 @@ async fn test_bake_run_pipeline_creates_only_knowledge_and_updates_overview() {
     assert_eq!(overview_json["template_auto_count"], 0);
     assert_eq!(overview_json["sop_auto_count"], 0);
     assert!(overview_json["last_bake_run_at"].as_i64().unwrap() > 0);
-    assert!(!overview_json["recent_activities"].as_array().unwrap().is_empty());
+    assert!(!overview_json["recent_activities"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     let knowledge_req = Request::builder()
         .uri("/api/bake/knowledge")
@@ -905,7 +1232,10 @@ async fn test_bake_run_pipeline_creates_only_knowledge_and_updates_overview() {
     assert_eq!(memories_json["memories"][0]["source_knowledge_id"], "1");
     assert_eq!(memories_json["memories"][0]["status"], "candidate");
     assert_eq!(memories_json["memories"][0]["knowledge_match_score"], 0.91);
-    assert_eq!(memories_json["memories"][0]["knowledge_match_level"], "high");
+    assert_eq!(
+        memories_json["memories"][0]["knowledge_match_level"],
+        "high"
+    );
     assert!(memories_json["memories"][0]["template_match_score"].is_null());
     assert!(memories_json["memories"][0]["template_match_level"].is_null());
     assert!(memories_json["memories"][0]["sop_match_score"].is_null());
@@ -944,7 +1274,130 @@ async fn test_bake_overview_recent_activity_highlights_knowledge_background_runs
     let overview_json: serde_json::Value = serde_json::from_str(&overview_body).unwrap();
     assert_eq!(overview_json["last_trigger_reason"], "knowledge_background");
     let recent_activities = overview_json["recent_activities"].as_array().unwrap();
-    assert!(recent_activities.iter().any(|item| item.as_str().unwrap_or_default().contains("知识后台提炼后已自动执行分类烤面包")));
+    assert!(recent_activities.iter().any(|item| item
+        .as_str()
+        .unwrap_or_default()
+        .contains("知识后台提炼后已自动执行分类烤面包")));
+}
+
+#[tokio::test]
+async fn test_bake_run_pipeline_demotes_inconsistent_auto_created_scores_to_candidate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("test.db");
+    let sm = StorageManager::open(&db).unwrap();
+    seed_knowledge_entry(
+        &sm,
+        "meeting",
+        "周报模板流程沉淀",
+        "沉淀步骤化标准方案",
+        serde_json::json!({}),
+    );
+
+    let sidecar_url = spawn_bake_sidecar(vec![make_bake_response(
+        serde_json::json!({
+            "accepted": true,
+            "reason": null,
+            "payload": {
+                "summary": "提炼后的知识",
+                "overview": "提炼后的知识 overview",
+                "entities": ["周报", "流程"],
+                "importance": 5,
+                "occurrence_count": 2,
+                "evidence_summary": "来自测试 sidecar",
+                "match_score": 0.95,
+                "match_level": "low",
+                "review_status": "auto_created"
+            }
+        }),
+        serde_json::json!({
+            "accepted": true,
+            "reason": null,
+            "payload": {
+                "name": "周报模板",
+                "category": "周报",
+                "status": "enabled",
+                "tags": ["周报", "模板"],
+                "applicable_tasks": ["creation"],
+                "linked_knowledge_ids": [],
+                "structure_sections": [
+                    {"title": "背景", "keywords": ["背景"], "notes": null},
+                    {"title": "进展", "keywords": ["进展"], "notes": null}
+                ],
+                "style_phrases": ["整体看"],
+                "replacement_rules": [],
+                "prompt_hint": "按周报结构填写",
+                "diagram_code": null,
+                "image_assets": [],
+                "evidence_summary": "来自测试 sidecar",
+                "match_score": 0.95,
+                "match_level": "low",
+                "review_status": "auto_created"
+            }
+        }),
+        serde_json::json!({
+            "accepted": true,
+            "reason": null,
+            "payload": {
+                "summary": "标准操作流程",
+                "overview": "标准操作流程 overview",
+                "source_title": "标准操作流程",
+                "trigger_keywords": ["周报", "提炼"],
+                "extracted_problem": "如何沉淀周报流程",
+                "steps": ["确认输入", "整理素材", "生成输出"],
+                "linked_knowledge_ids": [],
+                "confidence": "high",
+                "evidence_summary": "来自测试 sidecar",
+                "match_score": 0.95,
+                "match_level": "low",
+                "review_status": "auto_created"
+            }
+        }),
+    )])
+    .await;
+    let router = memory_bread_core::api::create_router(make_bake_state(sm, sidecar_url));
+
+    let (run_status, _run_json, run_body) = run_bake(router.clone(), "manual_debug").await;
+    assert_eq!(run_status, StatusCode::OK, "body: {run_body}");
+
+    let knowledge_req = Request::builder()
+        .uri("/api/bake/knowledge")
+        .body(Body::empty())
+        .unwrap();
+    let (knowledge_status, knowledge_body) = oneshot(router.clone(), knowledge_req).await;
+    assert_eq!(knowledge_status, StatusCode::OK, "body: {knowledge_body}");
+    let knowledge_json: serde_json::Value = serde_json::from_str(&knowledge_body).unwrap();
+    let knowledge_review_status = knowledge_json["items"][0]["review_status"]
+        .as_str()
+        .or_else(|| knowledge_json["items"][0]["reviewStatus"].as_str())
+        .unwrap();
+    assert_eq!(knowledge_review_status, "candidate");
+
+    let templates_req = Request::builder()
+        .uri("/api/bake/templates")
+        .body(Body::empty())
+        .unwrap();
+    let (templates_status, templates_body) = oneshot(router.clone(), templates_req).await;
+    assert_eq!(templates_status, StatusCode::OK, "body: {templates_body}");
+    let templates_json: serde_json::Value = serde_json::from_str(&templates_body).unwrap();
+    let template_review_status = templates_json["items"][0]["review_status"]
+        .as_str()
+        .or_else(|| templates_json["items"][0]["reviewStatus"].as_str())
+        .unwrap();
+    assert_eq!(template_review_status, "candidate");
+
+    let sops_req = Request::builder()
+        .uri("/api/bake/sops")
+        .body(Body::empty())
+        .unwrap();
+    let (sops_status, sops_body) = oneshot(router, sops_req).await;
+    assert_eq!(sops_status, StatusCode::OK, "body: {sops_body}");
+    let sops_json: serde_json::Value = serde_json::from_str(&sops_body).unwrap();
+    let sop_review_status = sops_json["items"][0]["review_status"]
+        .as_str()
+        .or_else(|| sops_json["items"][0]["reviewStatus"].as_str())
+        .or_else(|| sops_json["items"][0]["status"].as_str())
+        .unwrap();
+    assert_eq!(sop_review_status, "candidate");
 }
 
 #[tokio::test]
@@ -971,8 +1424,8 @@ async fn test_bake_run_pipeline_is_idempotent() {
     assert_eq!(first_status, StatusCode::OK, "body: {first_body}");
     assert_eq!(first_json["status"], "completed");
     assert_eq!(first_json["processed_episode_count"], 1);
-    assert_eq!(first_json["auto_created_count"], 1);
-    assert_eq!(first_json["candidate_count"], 3);
+    assert_eq!(first_json["auto_created_count"], 3);
+    assert_eq!(first_json["candidate_count"], 1);
     assert_eq!(first_json["discarded_count"], 0);
     assert_eq!(first_json["knowledge_created_count"], 1);
     assert_eq!(first_json["template_created_count"], 1);
@@ -1095,9 +1548,16 @@ async fn test_bake_run_pipeline_malformed_json_does_not_advance_watermark() {
     let router = memory_bread_core::api::create_router(make_bake_state(sm, sidecar_url));
 
     let (first_status, first_json, first_body) = run_bake(router.clone(), "manual_debug").await;
-    assert_eq!(first_status, StatusCode::INTERNAL_SERVER_ERROR, "body: {first_body}");
+    assert_eq!(
+        first_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "body: {first_body}"
+    );
     assert_eq!(first_json["error"], "INTERNAL_ERROR");
-    assert!(first_json["message"].as_str().unwrap_or_default().contains("解析 bake sidecar 响应失败"));
+    assert!(first_json["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("解析 bake sidecar 响应失败"));
 
     let (second_status, second_json, second_body) = run_bake(router.clone(), "manual_debug").await;
     assert_eq!(second_status, StatusCode::OK, "body: {second_body}");
@@ -1137,7 +1597,10 @@ async fn test_bake_run_pipeline_maps_sidecar_http_errors() {
     let (status, json, body) = run_bake(router.clone(), "manual_debug").await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
     assert_eq!(json["error"], "BAD_GATEWAY");
-    assert!(json["message"].as_str().unwrap_or_default().contains("bake 提炼服务返回错误"));
+    assert!(json["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("bake 提炼服务返回错误"));
 
     let (retry_status, retry_json, retry_body) = run_bake(router, "manual_debug").await;
     assert_eq!(retry_status, StatusCode::BAD_GATEWAY, "body: {retry_body}");
@@ -1172,7 +1635,12 @@ async fn test_debug_log_files_marks_missing_file_as_not_exists() {
     std::fs::create_dir_all(&log_dir).unwrap();
     let router = memory_bread_core::api::create_router(make_test_state(
         sm,
-        vec![DebugLogSpec::new("core", "core.log · Core Engine", log_dir, "core.log")],
+        vec![DebugLogSpec::new(
+            "core",
+            "core.log · Core Engine",
+            log_dir,
+            "core.log",
+        )],
     ));
 
     let req = Request::builder()
@@ -1186,7 +1654,7 @@ async fn test_debug_log_files_marks_missing_file_as_not_exists() {
     assert_eq!(item["key"], "core");
     assert_eq!(item["exists"], false);
     assert_eq!(item["size_bytes"], 0);
-  }
+}
 
 #[tokio::test]
 async fn test_debug_log_content_returns_whitelisted_log() {
@@ -1198,7 +1666,12 @@ async fn test_debug_log_content_returns_whitelisted_log() {
     std::fs::write(log_dir.join("core.log"), "line1\nline2\n").unwrap();
     let router = memory_bread_core::api::create_router(make_test_state(
         sm,
-        vec![DebugLogSpec::new("core", "core.log · Core Engine", log_dir, "core.log")],
+        vec![DebugLogSpec::new(
+            "core",
+            "core.log · Core Engine",
+            log_dir,
+            "core.log",
+        )],
     ));
 
     let req = Request::builder()
@@ -1239,7 +1712,12 @@ async fn test_debug_log_content_truncates_large_file() {
     std::fs::write(log_dir.join("core.log"), content).unwrap();
     let router = memory_bread_core::api::create_router(make_test_state(
         sm,
-        vec![DebugLogSpec::new("core", "core.log · Core Engine", log_dir, "core.log")],
+        vec![DebugLogSpec::new(
+            "core",
+            "core.log · Core Engine",
+            log_dir,
+            "core.log",
+        )],
     ));
 
     let req = Request::builder()
@@ -1266,7 +1744,12 @@ async fn test_debug_log_content_rejects_path_escape_via_symlink() {
     std::os::unix::fs::symlink(&outside, log_dir.join("core.log")).unwrap();
     let router = memory_bread_core::api::create_router(make_test_state(
         sm,
-        vec![DebugLogSpec::new("core", "core.log · Core Engine", log_dir, "core.log")],
+        vec![DebugLogSpec::new(
+            "core",
+            "core.log · Core Engine",
+            log_dir,
+            "core.log",
+        )],
     ));
 
     let req = Request::builder()
@@ -1283,7 +1766,10 @@ async fn test_debug_log_content_rejects_path_escape_via_symlink() {
 #[tokio::test]
 async fn test_health_200() {
     let (router, _tmp) = make_test_router().await;
-    let req = Request::builder().uri("/health").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
     let (status, body) = oneshot(router, req).await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1293,7 +1779,10 @@ async fn test_health_200() {
 #[tokio::test]
 async fn test_health_version_present() {
     let (router, _tmp) = make_test_router().await;
-    let req = Request::builder().uri("/health").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
     let (_, body) = oneshot(router, req).await;
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(json["version"].as_str().unwrap().len() > 0);
@@ -1304,7 +1793,10 @@ async fn test_health_version_present() {
 #[tokio::test]
 async fn test_captures_empty_db() {
     let (router, _tmp) = make_test_router().await;
-    let req = Request::builder().uri("/captures").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/captures")
+        .body(Body::empty())
+        .unwrap();
     let (status, body) = oneshot(router, req).await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1327,7 +1819,7 @@ async fn test_captures_with_time_filter() {
 async fn test_captures_fts_query() {
     let (router, _tmp) = make_test_router().await;
     let req = Request::builder()
-        .uri("/captures?q=%E5%B7%A5%E4%BD%9C")  // URL-encoded "工作"
+        .uri("/captures?q=%E5%B7%A5%E4%BD%9C") // URL-encoded "工作"
         .body(Body::empty())
         .unwrap();
     let (status, body) = oneshot(router, req).await;
@@ -1340,7 +1832,7 @@ async fn test_captures_fts_query() {
 async fn test_captures_app_filter() {
     let (router, _tmp) = make_test_router().await;
     let req = Request::builder()
-        .uri("/captures?app=%E5%BE%AE%E4%BF%A1")  // URL-encoded "微信"
+        .uri("/captures?app=%E5%BE%AE%E4%BF%A1") // URL-encoded "微信"
         .body(Body::empty())
         .unwrap();
     let (status, _) = oneshot(router, req).await;
@@ -1365,7 +1857,10 @@ async fn test_captures_limit_respected() {
 #[tokio::test]
 async fn test_preferences_list() {
     let (router, _tmp) = make_test_router().await;
-    let req = Request::builder().uri("/preferences").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/preferences")
+        .body(Body::empty())
+        .unwrap();
     let (status, body) = oneshot(router, req).await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1482,7 +1977,6 @@ async fn test_query_sidecar_error_response_returns_502() {
     assert!(body.contains("502 Bad Gateway"), "body: {body}");
 }
 
-
 #[tokio::test]
 async fn test_action_stub_returns_200() {
     let (router, _tmp) = make_test_router().await;
@@ -1490,7 +1984,9 @@ async fn test_action_stub_returns_200() {
         .method(Method::POST)
         .uri("/action/execute")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"action_type":"click","coords":[100.0,200.0]}"#))
+        .body(Body::from(
+            r#"{"action_type":"click","coords":[100.0,200.0]}"#,
+        ))
         .unwrap();
     let (status, body) = oneshot(router, req).await;
     assert_eq!(status, StatusCode::OK);
@@ -1526,35 +2022,31 @@ async fn test_knowledge_api_returns_semantic_fields() {
     let sm = StorageManager::open(&db).unwrap();
     let capture_id = seed_capture(&sm);
 
-    sm.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO knowledge_entries (capture_id, summary, overview, details, entities, category, importance, occurrence_count, observed_at, event_time_start, event_time_end, history_view, content_origin, activity_type, is_self_generated, evidence_strength, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, datetime(?17/1000, 'unixepoch'), datetime(?18/1000, 'unixepoch'))",
-            rusqlite::params![
-                capture_id,
-                "今天回看飞书消息",
-                "今天回看飞书消息",
-                "确认了昨天的发布安排",
-                "[\"飞书\",\"发布\"]",
-                "聊天",
-                4_i64,
-                1_i64,
-                1_710_000_100_000_i64,
-                1_709_913_600_000_i64,
-                1_709_914_000_000_i64,
-                1_i64,
-                "historical_content",
-                "reviewing_history",
-                0_i64,
-                "high",
-                1_710_000_100_000_i64,
-                1_710_000_100_000_i64,
-            ],
-        )?;
-        Ok::<_, memory_bread_core::storage::StorageError>(())
-    }).unwrap();
+    sm.insert_knowledge_entry(&NewKnowledgeEntry {
+        capture_id,
+        summary: "今天回看飞书消息".to_string(),
+        overview: Some("今天回看飞书消息".to_string()),
+        details: Some("确认了昨天的发布安排".to_string()),
+        entities: "[\"飞书\",\"发布\"]".to_string(),
+        category: "聊天".to_string(),
+        importance: 4,
+        occurrence_count: Some(1),
+        observed_at: Some(1_710_000_100_000_i64),
+        event_time_start: Some(1_709_913_600_000_i64),
+        event_time_end: Some(1_709_914_000_000_i64),
+        history_view: true,
+        content_origin: Some("historical_content".to_string()),
+        activity_type: Some("reviewing_history".to_string()),
+        is_self_generated: false,
+        evidence_strength: Some("high".to_string()),
+    })
+    .unwrap();
 
     let router = memory_bread_core::api::create_router(AppState::new(sm));
-    let req = Request::builder().uri("/api/knowledge").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/api/knowledge")
+        .body(Body::empty())
+        .unwrap();
     let (status, body) = oneshot(router, req).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1568,4 +2060,3 @@ async fn test_knowledge_api_returns_semantic_fields() {
     assert_eq!(entry["is_self_generated"], false);
     assert_eq!(entry["evidence_strength"], "high");
 }
-

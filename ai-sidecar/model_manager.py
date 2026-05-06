@@ -8,13 +8,24 @@
 
 import json
 import logging
+import os
+import platform
+import re
+import shutil
 import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+MIN_MACOS_MAJOR_FOR_OLLAMA = 13
+OLLAMA_API_BASE = "http://localhost:11434"
 
 
 class ModelType(str, Enum):
@@ -163,6 +174,15 @@ class ModelManager:
         # 加载配置
         self.config = self._load_config()
 
+        # 下载进度跟踪
+        self._download_progress: Dict[str, int] = {}
+        self._download_errors: Dict[str, str] = {}
+        self._download_lock = threading.Lock()
+
+        # Ollama 升级状态
+        self._upgrade_status: Dict[str, str] = {}  # {'status': 'upgrading'/'success'/'error', 'message': '...'}
+        self._upgrade_lock = threading.Lock()
+
     def _load_config(self) -> Dict:
         """加载模型配置"""
         if self.config_path.exists():
@@ -180,6 +200,265 @@ class ModelManager:
         """保存模型配置"""
         with open(self.config_path, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, indent=2, ensure_ascii=False)
+
+    def _parse_macos_major_version(self) -> Optional[int]:
+        version = (platform.mac_ver()[0] or "").strip()
+        if not version:
+            return None
+        try:
+            return int(version.split('.')[0])
+        except Exception:
+            return None
+
+    def _resolve_ollama_command(self) -> Optional[str]:
+        cmd = shutil.which('ollama')
+        if cmd:
+            return cmd
+
+        arch = platform.machine().lower()
+        candidates = []
+        if arch == 'arm64':
+            candidates.append('/opt/homebrew/bin/ollama')
+            candidates.append('/usr/local/bin/ollama')
+        elif arch == 'x86_64':
+            candidates.append('/usr/local/bin/ollama')
+            candidates.append('/opt/homebrew/bin/ollama')
+        else:
+            candidates.append('/opt/homebrew/bin/ollama')
+            candidates.append('/usr/local/bin/ollama')
+
+        for candidate in candidates:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    def _is_ollama_running(self, base_url: str = OLLAMA_API_BASE) -> bool:
+        url = f"{base_url.rstrip('/')}/api/tags"
+        req = urllib.request.Request(url, method='GET')
+        try:
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                return getattr(resp, 'status', 0) == 200
+        except Exception:
+            return False
+
+    def get_ollama_setup_status(self) -> Dict:
+        system = platform.system()
+        is_macos = system == 'Darwin'
+        arch = platform.machine().lower()
+        macos_version = (platform.mac_ver()[0] or '').strip() if is_macos else ''
+        major = self._parse_macos_major_version() if is_macos else None
+        version_compatible = True if not is_macos else (major is not None and major >= MIN_MACOS_MAJOR_FOR_OLLAMA)
+
+        ollama_path = self._resolve_ollama_command()
+        installed = bool(ollama_path)
+        running = self._is_ollama_running() if installed else False
+        brew_path = shutil.which('brew')
+        brew_available = bool(brew_path)
+
+        # 获取 Ollama 版本
+        ollama_version = None
+        if installed:
+            try:
+                result = subprocess.run([ollama_path, '--version'], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    # 输出格式: "ollama version is 0.1.23"
+                    version_line = result.stdout.strip()
+                    if 'version' in version_line:
+                        ollama_version = version_line.split()[-1]
+            except Exception:
+                pass
+
+        if not is_macos:
+            message = '当前系统非 macOS，不支持自动安装 Ollama。'
+        elif not version_compatible:
+            message = f'当前 macOS {macos_version or "unknown"}，建议升级到 {MIN_MACOS_MAJOR_FOR_OLLAMA}+ 后再安装 Ollama。'
+        elif installed and running:
+            message = 'Ollama 已安装且服务运行中。'
+        elif installed:
+            message = 'Ollama 已安装，但服务未启动。'
+        elif brew_available:
+            message = 'Ollama 未安装，可自动执行 brew install ollama。'
+        else:
+            message = '未检测到 Ollama 和 Homebrew，请先安装 Homebrew。'
+
+        if arch == 'arm64':
+            recommended = 'brew install ollama (Homebrew: /opt/homebrew/bin)'
+        elif arch == 'x86_64':
+            recommended = 'brew install ollama (Homebrew: /usr/local/bin)'
+        else:
+            recommended = 'brew install ollama'
+
+        can_auto_install = is_macos and version_compatible and (installed or brew_available)
+
+        return {
+            'platform': system.lower(),
+            'is_macos': is_macos,
+            'system_version': macos_version,
+            'arch': arch,
+            'version_compatible': version_compatible,
+            'ollama_path': ollama_path,
+            'ollama_installed': installed,
+            'ollama_running': running,
+            'ollama_version': ollama_version,
+            'brew_available': brew_available,
+            'brew_path': brew_path,
+            'recommended_install_method': recommended,
+            'can_auto_install': can_auto_install,
+            'message': message,
+        }
+
+    def install_ollama_auto(self) -> Dict:
+        status = self.get_ollama_setup_status()
+        if not status['is_macos']:
+            return {'status': 'error', 'stage': 'detect', 'message': status['message'], 'detail': status}
+        if not status['version_compatible']:
+            return {'status': 'error', 'stage': 'detect', 'message': status['message'], 'detail': status}
+        if status['ollama_installed']:
+            return {'status': 'ok', 'stage': 'install', 'message': 'Ollama 已安装，无需重复安装。', 'detail': status}
+        if not status['brew_available']:
+            return {'status': 'error', 'stage': 'install', 'message': '未检测到 Homebrew，无法自动安装 Ollama。', 'detail': status}
+
+        try:
+            result = subprocess.run(
+                [status['brew_path'], 'install', 'ollama'],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+            )
+        except subprocess.TimeoutExpired:
+            return {'status': 'error', 'stage': 'install', 'message': '安装 Ollama 超时，请稍后重试。', 'detail': status}
+        except Exception as exc:
+            return {'status': 'error', 'stage': 'install', 'message': f'安装 Ollama 失败: {exc}', 'detail': status}
+
+        refreshed = self.get_ollama_setup_status()
+        if result.returncode == 0 and refreshed['ollama_installed']:
+            return {'status': 'ok', 'stage': 'install', 'message': 'Ollama 安装完成。', 'detail': refreshed}
+
+        err = (result.stderr or result.stdout or '').strip()[-500:]
+        return {
+            'status': 'error',
+            'stage': 'install',
+            'message': f"Ollama 安装失败{('：' + err) if err else ''}",
+            'detail': refreshed,
+        }
+
+    def start_ollama_service(self) -> Dict:
+        status = self.get_ollama_setup_status()
+        if not status['ollama_installed']:
+            return {'status': 'error', 'stage': 'start', 'message': 'Ollama 未安装，无法启动服务。', 'detail': status}
+        if status['ollama_running']:
+            return {'status': 'ok', 'stage': 'verify', 'message': 'Ollama 服务已在运行。', 'detail': status}
+
+        cmd = status['ollama_path'] or self._resolve_ollama_command()
+        if not cmd:
+            return {'status': 'error', 'stage': 'start', 'message': '未找到 ollama 可执行文件。', 'detail': status}
+
+        try:
+            subprocess.Popen(
+                [cmd, 'serve'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            return {'status': 'error', 'stage': 'start', 'message': f'启动 Ollama 服务失败: {exc}', 'detail': status}
+
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if self._is_ollama_running():
+                refreshed = self.get_ollama_setup_status()
+                return {'status': 'ok', 'stage': 'verify', 'message': 'Ollama 服务已启动。', 'detail': refreshed}
+            time.sleep(0.5)
+
+        refreshed = self.get_ollama_setup_status()
+        return {'status': 'error', 'stage': 'verify', 'message': 'Ollama 服务启动超时，请手动执行 ollama serve。', 'detail': refreshed}
+
+    def upgrade_ollama(self) -> Dict:
+        """启动 Ollama 升级任务"""
+        status = self.get_ollama_setup_status()
+        if not status['is_macos']:
+            return {'status': 'error', 'message': '当前系统非 macOS，不支持自动升级。'}
+        if not status['brew_available']:
+            return {'status': 'error', 'message': '未检测到 Homebrew，无法自动升级。'}
+
+        with self._upgrade_lock:
+            if self._upgrade_status.get('status') == 'upgrading':
+                return {'status': 'upgrading', 'message': self._upgrade_status.get('message', '升级中...')}
+            self._upgrade_status = {'status': 'upgrading', 'message': '准备升级...'}
+
+        threading.Thread(target=self._upgrade_ollama_task, args=(status,), daemon=True).start()
+        return {'status': 'upgrading', 'message': '升级任务已启动'}
+
+    def _upgrade_ollama_task(self, status: Dict):
+        """后台升级任务"""
+        try:
+            logger.info("开始升级 Ollama...")
+
+            # 清理手动安装的 ollama 目录
+            with self._upgrade_lock:
+                self._upgrade_status = {'status': 'upgrading', 'message': '清理旧版本...'}
+
+            import shutil
+            opt_dir = '/opt/homebrew/opt/ollama'
+            if os.path.exists(opt_dir) and not os.path.islink(opt_dir):
+                logger.info(f"删除手动安装的目录: {opt_dir}")
+                shutil.rmtree(opt_dir)
+
+            # unlink 可能的旧链接
+            subprocess.run([status['brew_path'], 'unlink', 'ollama'], capture_output=True, timeout=30)
+
+            with self._upgrade_lock:
+                self._upgrade_status = {'status': 'upgrading', 'message': '正在执行 brew install ollama...'}
+
+            result = subprocess.run(
+                [status['brew_path'], 'install', 'ollama'],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+
+            if result.returncode == 0:
+                # 确保链接创建
+                with self._upgrade_lock:
+                    self._upgrade_status = {'status': 'upgrading', 'message': '创建符号链接...'}
+                subprocess.run([status['brew_path'], 'link', 'ollama'], capture_output=True, timeout=30)
+
+                # 重启 Ollama 服务（后台启动）
+                with self._upgrade_lock:
+                    self._upgrade_status = {'status': 'upgrading', 'message': '重启 Ollama 服务...'}
+                subprocess.run(['pkill', '-9', 'ollama'], capture_output=True)
+                time.sleep(1)
+                # 后台启动 ollama serve
+                subprocess.Popen(['ollama', 'serve'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(2)
+
+                refreshed = self.get_ollama_setup_status()
+                with self._upgrade_lock:
+                    self._upgrade_status = {
+                        'status': 'success',
+                        'message': f"升级完成，当前版本: {refreshed.get('ollama_version', 'unknown')}",
+                        'version': refreshed.get('ollama_version'),
+                    }
+            else:
+                output = (result.stderr or result.stdout or '').lower()
+                if 'already locked' in output or 'process has already locked' in output:
+                    with self._upgrade_lock:
+                        self._upgrade_status = {'status': 'error', 'message': '有其他 Homebrew 进程正在运行，请稍后重试'}
+                else:
+                    err = (result.stderr or result.stdout or '').strip()[-300:]
+                    with self._upgrade_lock:
+                        self._upgrade_status = {'status': 'error', 'message': f'升级失败: {err}'}
+        except subprocess.TimeoutExpired:
+            with self._upgrade_lock:
+                self._upgrade_status = {'status': 'error', 'message': '升级超时（超过10分钟），请检查网络或手动执行 brew install ollama'}
+        except Exception as e:
+            with self._upgrade_lock:
+                self._upgrade_status = {'status': 'error', 'message': f'升级失败: {str(e)}'}
+
+    def get_upgrade_status(self) -> Dict:
+        """获取升级状态"""
+        with self._upgrade_lock:
+            return dict(self._upgrade_status) if self._upgrade_status else {'status': 'idle'}
 
     def list_models(self, model_type: Optional[ModelType] = None) -> List[Dict]:
         """
@@ -228,23 +507,22 @@ class ModelManager:
 
     def _check_ollama_model(self, model_id: str) -> ModelStatus:
         """检查 Ollama 模型是否已安装"""
+        cmd = self._resolve_ollama_command()
+        if not cmd:
+            return ModelStatus.NOT_INSTALLED
+
         try:
             result = subprocess.run(
-                ['ollama', 'list'],
+                [cmd, 'list'],
                 capture_output=True,
                 text=True,
                 timeout=5
             )
 
-            if result.returncode == 0:
-                # 检查模型是否在列表中
-                if model_id in result.stdout:
-                    return ModelStatus.INSTALLED
-
+            if result.returncode == 0 and model_id in result.stdout:
+                return ModelStatus.INSTALLED
             return ModelStatus.NOT_INSTALLED
-
         except (subprocess.TimeoutExpired, FileNotFoundError):
-            # Ollama 未安装
             return ModelStatus.NOT_INSTALLED
 
     def _check_huggingface_model(self, model_id: str) -> ModelStatus:
@@ -288,12 +566,72 @@ class ModelManager:
     def _download_ollama_model(self, model_info: ModelInfo) -> Dict:
         """下载 Ollama 模型"""
         try:
-            # 启动后台下载
-            subprocess.Popen(
-                ['ollama', 'pull', model_info.model_id],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            def download_thread():
+                url = "http://localhost:11434/api/pull"
+                data = json.dumps({"name": model_info.model_id}).encode('utf-8')
+
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        data=data,
+                        headers={'Content-Type': 'application/json'}
+                    )
+                    with urllib.request.urlopen(req, timeout=3600) as resp:
+                        for line in resp:
+                            try:
+                                obj = json.loads(line.decode('utf-8'))
+
+                                # 检查错误
+                                if 'error' in obj:
+                                    error_msg = obj['error']
+                                    logger.error(f"下载失败: {error_msg}")
+                                    with self._download_lock:
+                                        self._download_progress.pop(model_info.id, None)
+                                        # 保存错误信息
+                                        if "newer version" in error_msg:
+                                            self._download_errors[model_info.id] = "需要更新 Ollama 版本"
+                                        else:
+                                            self._download_errors[model_info.id] = "下载失败"
+                                        logger.info(f"已保存错误信息: {model_info.id} -> {self._download_errors[model_info.id]}")
+                                    break
+
+                                status = obj.get('status', '')
+
+                                # 计算进度
+                                if 'total' in obj and 'completed' in obj:
+                                    total = obj['total']
+                                    completed = obj['completed']
+                                    if total > 0:
+                                        progress = int(completed * 100 / total)
+                                        with self._download_lock:
+                                            self._download_progress[model_info.id] = progress
+
+                                # 检查是否完成
+                                if status == 'success':
+                                    with self._download_lock:
+                                        self._download_progress[model_info.id] = 100
+                                    break
+                            except json.JSONDecodeError:
+                                pass
+
+                    # 下载完成后清理
+                    with self._download_lock:
+                        if model_info.id in self._download_progress:
+                            if self._download_progress[model_info.id] >= 100:
+                                self._download_progress.pop(model_info.id, None)
+
+                except Exception as e:
+                    logger.error(f"下载失败: {e}")
+                    with self._download_lock:
+                        self._download_progress.pop(model_info.id, None)
+
+            thread = threading.Thread(target=download_thread, daemon=True)
+            thread.start()
+
+            with self._download_lock:
+                self._download_progress[model_info.id] = 0
+                # 清理之前的错误
+                self._download_errors.pop(model_info.id, None)
 
             logger.info(f"开始下载 Ollama 模型: {model_info.model_id}")
             return {
@@ -301,10 +639,10 @@ class ModelManager:
                 "message": f"正在后台下载 {model_info.name}，请稍候..."
             }
 
-        except FileNotFoundError:
+        except Exception as e:
             return {
                 "status": "error",
-                "message": "Ollama 未安装，请先安装 Ollama: https://ollama.ai"
+                "message": f"下载失败: {str(e)}"
             }
 
     def _download_huggingface_model(self, model_info: ModelInfo) -> Dict:
@@ -383,25 +721,37 @@ class ModelManager:
         }
 
     def get_all_status(self) -> Dict[str, dict]:
-        """返回所有模型的运行时状态 {model_id: {status, download_progress, is_active}}"""
+        """返回所有模型的运行时状态 {model_id: {status, download_progress, is_active, error}}"""
         result = {}
         active_llm = self.config.get('active_llm')
         active_emb = self.config.get('active_embedding')
-        downloading = self.config.get('downloading', {})
 
         for model_id, info in AVAILABLE_MODELS.items():
-            if model_id in downloading:
-                status = 'downloading'
-                progress = downloading[model_id].get('progress', 0)
-            elif self._is_installed(model_id, info):
-                status = 'installed'
-                progress = 100
-            else:
-                status = 'not_installed'
-                progress = 0
+            error_msg = None
+            # 检查是否正在下载
+            with self._download_lock:
+                if model_id in self._download_progress:
+                    progress = self._download_progress[model_id]
+                    if progress >= 100:
+                        # 下载完成，清理进度
+                        self._download_progress.pop(model_id, None)
+                        status = 'installed'
+                    else:
+                        status = 'downloading'
+                elif model_id in self._download_errors:
+                    # 有下载错误
+                    error_msg = self._download_errors[model_id]
+                    status = 'not_installed'
+                    progress = 0
+                elif self._is_installed(model_id, info):
+                    status = 'installed'
+                    progress = 100
+                else:
+                    status = 'not_installed'
+                    progress = 0
 
             is_active = (model_id == active_llm or model_id == active_emb)
-            if is_active:
+            if is_active and status == 'installed':
                 status = 'active'
 
             result[model_id] = {
@@ -409,6 +759,9 @@ class ModelManager:
                 'download_progress': progress,
                 'is_active': is_active,
             }
+            if error_msg:
+                result[model_id]['error'] = error_msg
+
         return result
 
     def set_config_field(self, model_id: str, field_key: str, value: str) -> None:
@@ -511,7 +864,7 @@ class ModelManager:
         if info.provider == 'ollama':
             try:
                 import urllib.request
-                resp = urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
+                resp = urllib.request.urlopen(f"{OLLAMA_API_BASE}/api/tags", timeout=2)
                 data = __import__('json').loads(resp.read())
                 installed = {m['name'] for m in data.get('models', [])}
                 aliases = self._ollama_names_for_model(model_id)
@@ -555,9 +908,13 @@ class ModelManager:
             return False
         aliases = self._ollama_names_for_model(model_id)
         ollama_tag = aliases[0] if aliases else model_id
+        cmd = self._resolve_ollama_command()
+        if not cmd:
+            logger.error("delete_model: 未找到 ollama 可执行文件")
+            return False
         try:
             result = subprocess.run(
-                ['ollama', 'rm', ollama_tag],
+                [cmd, 'rm', ollama_tag],
                 capture_output=True, text=True, timeout=30
             )
             if result.returncode == 0:

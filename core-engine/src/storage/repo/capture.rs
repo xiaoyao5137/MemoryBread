@@ -30,8 +30,8 @@ impl StorageManager {
     /// 在 Sidecar 完成 OCR 后，将结果回写到 captures 表。
     pub fn update_ocr_text(
         &self,
-        id:         i64,
-        ocr_text:   &str,
+        id: i64,
+        ocr_text: &str,
         confidence: f32,
     ) -> Result<(), StorageError> {
         self.with_conn(|conn| {
@@ -73,8 +73,8 @@ fn insert_capture_inner(conn: &Connection, c: &NewCapture) -> Result<i64, Storag
         "INSERT INTO captures
             (ts, app_name, app_bundle_id, win_title, event_type,
              ax_text, ax_focused_role, ax_focused_id,
-             screenshot_path, input_text, is_sensitive)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             ocr_text, screenshot_path, input_text, is_sensitive)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             c.ts,
             c.app_name,
@@ -84,6 +84,7 @@ fn insert_capture_inner(conn: &Connection, c: &NewCapture) -> Result<i64, Storag
             c.ax_text,
             c.ax_focused_role,
             c.ax_focused_id,
+            c.ocr_text,
             c.screenshot_path,
             c.input_text,
             c.is_sensitive as i64,
@@ -100,9 +101,9 @@ fn insert_capture_inner(conn: &Connection, c: &NewCapture) -> Result<i64, Storag
 #[derive(Debug, Default)]
 pub struct CaptureFilter {
     /// 起始时间（Unix ms，含）
-    pub from_ts:  Option<i64>,
+    pub from_ts: Option<i64>,
     /// 结束时间（Unix ms，含）
-    pub to_ts:    Option<i64>,
+    pub to_ts: Option<i64>,
     /// 按应用名过滤
     pub app_name: Option<String>,
     /// 关键词搜索
@@ -112,9 +113,9 @@ pub struct CaptureFilter {
     /// 是否过滤掉隐私记录（默认 true）
     pub exclude_sensitive: bool,
     /// 最多返回条数
-    pub limit:    usize,
+    pub limit: usize,
     /// 偏移
-    pub offset:   usize,
+    pub offset: usize,
 }
 
 impl CaptureFilter {
@@ -157,7 +158,10 @@ impl StorageManager {
     }
 
     /// 按过滤条件列举采集记录，按 ts 倒序。
-    pub fn list_captures(&self, filter: &CaptureFilter) -> Result<Vec<CaptureRecord>, StorageError> {
+    pub fn list_captures(
+        &self,
+        filter: &CaptureFilter,
+    ) -> Result<Vec<CaptureRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut sql = String::from(
                 "SELECT c.id, c.ts, c.app_name, c.app_bundle_id, c.win_title, c.event_type,
@@ -266,7 +270,8 @@ impl StorageManager {
             let rows = stmt.query_map(params![query, limit as i64, offset as i64], |row| {
                 Ok(row_to_capture(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
@@ -280,7 +285,8 @@ impl StorageManager {
                    AND c.is_sensitive = 0",
                 params![query],
                 |row| row.get(0),
-            ).map_err(StorageError::Sqlite)
+            )
+            .map_err(StorageError::Sqlite)
         })
     }
 
@@ -299,15 +305,18 @@ impl StorageManager {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT capture_id, id, summary
-                 FROM knowledge_entries
-                 WHERE capture_id IN ({})
-                   AND category = 'bake_knowledge'
-                 ORDER BY updated_at DESC, id DESC",
+                "SELECT em.capture_id, bk.id, bk.summary
+                 FROM bake_knowledge bk
+                 JOIN timelines em ON em.id = bk.timeline_id
+                 WHERE em.capture_id IN ({})
+                 ORDER BY bk.updated_at DESC, bk.id DESC",
                 placeholders
             );
             let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> = capture_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let params: Vec<&dyn rusqlite::ToSql> = capture_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
             let rows = stmt.query_map(params.as_slice(), |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -326,7 +335,11 @@ impl StorageManager {
     }
 
     /// 简单列举最近的 N 条采集记录（用于调试面板）。
-    pub fn list_recent(&self, limit: usize, offset: usize) -> Result<Vec<CaptureRecord>, StorageError> {
+    pub fn list_recent(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<CaptureRecord>, StorageError> {
         let filter = CaptureFilter {
             exclude_sensitive: false,
             limit,
@@ -339,11 +352,8 @@ impl StorageManager {
     /// 统计总采集数（用于调试面板）。
     pub fn count(&self) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM captures",
-                [],
-                |row| row.get(0),
-            )?;
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM captures", [], |row| row.get(0))?;
             Ok(count)
         })
     }
@@ -370,7 +380,8 @@ impl StorageManager {
             let rows = stmt.query_map(params![query, limit as i64], |row| {
                 Ok(row_to_capture(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 }
@@ -381,21 +392,21 @@ impl StorageManager {
 
 fn row_to_capture(row: &rusqlite::Row<'_>) -> Result<CaptureRecord, StorageError> {
     Ok(CaptureRecord {
-        id:              row.get(0)?,
-        ts:              row.get(1)?,
-        app_name:        row.get(2)?,
-        app_bundle_id:   row.get(3)?,
-        win_title:       row.get(4)?,
-        event_type:      row.get(5)?,
-        ax_text:         row.get(6)?,
+        id: row.get(0)?,
+        ts: row.get(1)?,
+        app_name: row.get(2)?,
+        app_bundle_id: row.get(3)?,
+        win_title: row.get(4)?,
+        event_type: row.get(5)?,
+        ax_text: row.get(6)?,
         ax_focused_role: row.get(7)?,
-        ax_focused_id:   row.get(8)?,
-        ocr_text:        row.get(9)?,
+        ax_focused_id: row.get(8)?,
+        ocr_text: row.get(9)?,
         screenshot_path: row.get(10)?,
-        input_text:      row.get(11)?,
-        audio_text:      row.get(12)?,
-        is_sensitive:    row.get::<_, i64>(13)? != 0,
-        pii_scrubbed:    row.get::<_, i64>(14)? != 0,
+        input_text: row.get(11)?,
+        audio_text: row.get(12)?,
+        is_sensitive: row.get::<_, i64>(13)? != 0,
+        pii_scrubbed: row.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -414,17 +425,18 @@ mod tests {
 
     fn sample_capture() -> NewCapture {
         NewCapture {
-            ts:              1_700_000_000_000,
-            app_name:        Some("Feishu".into()),
-            app_bundle_id:   Some("com.feishu.feishu".into()),
-            win_title:       Some("飞书 - 工作群".into()),
-            event_type:      EventType::MouseClick,
-            ax_text:         Some("欢迎使用飞书".into()),
+            ts: 1_700_000_000_000,
+            app_name: Some("Feishu".into()),
+            app_bundle_id: Some("com.feishu.feishu".into()),
+            win_title: Some("飞书 - 工作群".into()),
+            event_type: EventType::MouseClick,
+            ax_text: Some("欢迎使用飞书".into()),
             ax_focused_role: Some("AXTextField".into()),
-            ax_focused_id:   Some("input-1".into()),
+            ax_focused_id: Some("input-1".into()),
+            ocr_text: None,
             screenshot_path: Some("2026/03/04/test.jpg".into()),
-            input_text:      Some("你好".into()),
-            is_sensitive:    false,
+            input_text: Some("你好".into()),
+            is_sensitive: false,
         }
     }
 

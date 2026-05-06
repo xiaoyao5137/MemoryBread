@@ -27,11 +27,6 @@ const bucketMeta: Record<BakeBucket, { title: string; subtitle: string; empty: s
   },
 }
 
-const buildPromptPreview = (candidate: SopCandidate) => {
-  const title = candidate.extractedProblem || candidate.sourceTitle || '未命名问题'
-  return `当用户提到“${title}”相关问题时，可按以下流程处理：${candidate.steps.join(' → ')}。回答时优先引用关联 Knowledge，并补充标准说明。`
-}
-
 const BakeSopTab: React.FC<{
   bucket: BakeBucket
   candidates: SopCandidate[]
@@ -46,7 +41,7 @@ const BakeSopTab: React.FC<{
   onIgnoreSop: (id: string) => void
   onDeleteSop: (id: string) => void
   onCopySteps: (candidate: SopCandidate) => void
-  onCopyPrompt: (candidate: SopCandidate) => void
+  onViewLinkedKnowledge: (knowledgeId: string) => void
   onPageChange: (offset: number) => void
   onLimitChange: (limit: number) => void
   onQueryChange: (query: string) => void
@@ -64,7 +59,7 @@ const BakeSopTab: React.FC<{
   onIgnoreSop,
   onDeleteSop,
   onCopySteps,
-  onCopyPrompt,
+  onViewLinkedKnowledge,
   onPageChange,
   onLimitChange,
   onQueryChange,
@@ -75,20 +70,21 @@ const BakeSopTab: React.FC<{
   const totalPages = Math.max(1, Math.ceil(total / limit))
 
   return (
-    <div className="bake-split-list-detail bake-split-list-detail--sop">
-      <BakeCard className="bake-knowledge-list-card">
+    <>
+      <BakeCard>
         <BakeSectionHeader
-          title="操作手册（火腿）"
-          subtitle={bucketMeta[bucket].subtitle}
-          right={(
-            <div className="bake-segmented-actions">
-              <BakeButton compact active={bucket === 'extracted'} onClick={() => onBucketChange('extracted')}>已提炼</BakeButton>
-              <BakeButton compact active={bucket === 'pending'} onClick={() => onBucketChange('pending')}>待提炼</BakeButton>
-            </div>
-          )}
+          title="操作手册"
+          subtitle="管理可复用的操作流程和最佳实践"
         />
         <div className="bake-list-toolbar">
           <div className="bake-list-toolbar__filters">
+            <label className="bake-form-field bake-filter-field">
+              <span className="bake-filter-label">分组</span>
+              <div className="bake-segmented-actions">
+                <BakeButton compact active={bucket === 'extracted'} onClick={() => onBucketChange('extracted')}>已提炼</BakeButton>
+                <BakeButton compact active={bucket === 'pending'} onClick={() => onBucketChange('pending')}>待提炼</BakeButton>
+              </div>
+            </label>
             <label className="bake-form-field bake-filter-field bake-filter-field--search">
               <span className="bake-filter-label">关键词</span>
               <input
@@ -99,12 +95,13 @@ const BakeSopTab: React.FC<{
               />
             </label>
           </div>
-          <div className="bake-list-toolbar__meta">
+          <div className="bake-list-toolbar__actions">
             {query && <BakeButton compact onClick={() => onQueryChange('')}>清除筛选</BakeButton>}
-            <BakePill text={bucketMeta[bucket].title} />
-            <BakePill text={`第 ${page}/${totalPages} 页`} />
           </div>
         </div>
+      </BakeCard>
+      <div className="bake-split-list-detail bake-split-list-detail--sop">
+        <BakeCard className="bake-knowledge-list-card">
         <div className="bake-list bake-knowledge-list">
           {candidates.length === 0 ? (
             <div className="bake-muted">{query.trim() ? '当前筛选条件下没有操作手册。' : bucketMeta[bucket].empty}</div>
@@ -199,12 +196,26 @@ const BakeSopTab: React.FC<{
               </div>
             </div>
             <div className="bake-knowledge-detail__section">
-              <div className="bake-kv__title">关联 Knowledge</div>
-              <div className="bake-muted">{selected.linkedKnowledgeIds.join('、') || '暂无'}</div>
-            </div>
-            <div className="bake-knowledge-detail__section">
-              <div className="bake-kv__title">工作提示预览</div>
-              <div className="bake-muted" style={{ lineHeight: 1.7 }}>{buildPromptPreview(selected)}</div>
+              <div className="bake-kv__title">关联知识</div>
+              <div className="bake-muted">
+                {selected.linkedKnowledgeIds.length > 0
+                  ? `已关联 ${selected.linkedKnowledgeIds.length} 条知识（用于补充背景和术语）`
+                  : '暂无关联知识'}
+              </div>
+              {selected.linkedKnowledgeSummaries.length > 0 && (
+                <div className="bake-memory-detail__stats" style={{ marginTop: 10 }}>
+                  {selected.linkedKnowledgeSummaries.map((knowledge) => (
+                    <button
+                      key={knowledge.id}
+                      type="button"
+                      className="bake-stat-chip bake-stat-chip--button"
+                      onClick={() => onViewLinkedKnowledge(knowledge.id)}
+                    >
+                      {knowledge.summary}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
             <div className="bake-actions--primary">
               {bucket === 'pending' && (
@@ -217,14 +228,14 @@ const BakeSopTab: React.FC<{
                 ? <BakeButton onClick={() => onIgnoreSop(selected.id)}>忽略候选</BakeButton>
                 : <BakeButton onClick={() => onDeleteSop(selected.id)}>删除操作手册</BakeButton>}
               <BakeButton compact onClick={() => onCopySteps(selected)}>复制流程</BakeButton>
-              <BakeButton compact onClick={() => onCopyPrompt(selected)}>复制工作提示</BakeButton>
             </div>
           </div>
         ) : (
           <div className="bake-muted">暂无操作手册</div>
         )}
       </BakeCard>
-    </div>
+      </div>
+    </>
   )
 }
 

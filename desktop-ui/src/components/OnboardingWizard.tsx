@@ -4,6 +4,17 @@ import { useAppStore } from '../store/useAppStore'
 
 const SIDECAR = 'http://localhost:7071'
 
+type OllamaSetupDetail = {
+  message?: string
+  is_macos?: boolean
+  system_version?: string
+  arch?: string
+  version_compatible?: boolean
+  ollama_installed?: boolean
+  ollama_running?: boolean
+  recommended_install_method?: string
+}
+
 // ── 硬件档次颜色 ──────────────────────────────────────────────────────────────
 const TIER_COLOR = { low: '#FF9500', mid: '#007AFF', high: '#34C759' }
 const TIER_LABEL = { low: '入门配置', mid: '标准配置', high: '高性能配置' }
@@ -161,6 +172,10 @@ const OnboardingWizard: React.FC = () => {
   const [downloadProgress, setDownloadProgress] = useState(0)
   const [error, setError] = useState('')
 
+  const [ollamaSetup, setOllamaSetup] = useState<OllamaSetupDetail | null>(null)
+  const [ollamaChecking, setOllamaChecking] = useState(false)
+  const [ollamaInstalling, setOllamaInstalling] = useState(false)
+
   // 检测硬件
   useEffect(() => {
     setHwLoading(true)
@@ -177,9 +192,25 @@ const OnboardingWizard: React.FC = () => {
       .finally(() => setHwLoading(false))
   }, [])
 
-  // 加载模型列表
+  const refreshOllamaSetup = async () => {
+    setOllamaChecking(true)
+    try {
+      const r = await fetch(`${SIDECAR}/api/ollama/setup-status`)
+      const d = await r.json()
+      if (d.status === 'ok') setOllamaSetup(d.detail || null)
+      else setOllamaSetup(null)
+    } catch {
+      setOllamaSetup(null)
+    } finally {
+      setOllamaChecking(false)
+    }
+  }
+
+  useEffect(() => { refreshOllamaSetup() }, [])
+
   useEffect(() => {
     if (step === 1) {
+      refreshOllamaSetup()
       fetch(`${SIDECAR}/api/models?category=llm`)
         .then(r => r.json())
         .then(d => { if (d.status === 'ok') setLlmModels(d.models) })
@@ -222,8 +253,46 @@ const OnboardingWizard: React.FC = () => {
     setWindowMode('rag')
   }
 
+  const handleInstallOllama = async () => {
+    setError('')
+    setOllamaInstalling(true)
+    try {
+      const installResp = await fetch(`${SIDECAR}/api/ollama/install`, { method: 'POST' })
+      const installData = await installResp.json()
+      if (installData.status !== 'ok') {
+        setError(installData.message || 'Ollama 安装失败')
+        await refreshOllamaSetup()
+        return
+      }
+
+      const startResp = await fetch(`${SIDECAR}/api/ollama/start`, { method: 'POST' })
+      const startData = await startResp.json()
+      if (startData.status !== 'ok') {
+        setError(startData.message || 'Ollama 启动失败，请手动执行 ollama serve')
+      }
+
+      await refreshOllamaSetup()
+      if (step === 1) {
+        const r = await fetch(`${SIDECAR}/api/models?category=llm`)
+        const d = await r.json()
+        if (d.status === 'ok') setLlmModels(d.models)
+      }
+    } catch {
+      setError('无法连接到 AI 服务，请确保 ai-sidecar 已启动')
+    } finally {
+      setOllamaInstalling(false)
+    }
+  }
+
   const handleDownload = async (modelId: string) => {
     setError('')
+
+    const model = [...llmModels, ...embModels].find(m => m.id === modelId)
+    if (model?.provider === 'ollama' && !ollamaSetup?.ollama_running) {
+      setError('请先完成 Ollama 安装并启动服务，再下载本地模型')
+      return
+    }
+
     try {
       const r = await fetch(`${SIDECAR}/api/models/${modelId}/download`, { method: 'POST' })
       const d = await r.json()
@@ -345,6 +414,41 @@ const OnboardingWizard: React.FC = () => {
               <div style={{ marginBottom: 16 }}>
                 <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>选择语言模型（LLM）</div>
                 <div style={{ fontSize: 12, color: '#6E6E73' }}>LLM 是核心功能，用于知识提炼和问答。必须选择一个。</div>
+              </div>
+
+              <div style={{ background: 'white', borderRadius: 12, padding: 12, marginBottom: 12, border: '1px solid rgba(0,0,0,0.08)' }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Ollama 运行环境</div>
+                {ollamaChecking ? (
+                  <div style={{ fontSize: 12, color: '#AEAEB2' }}>检测中...</div>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 12, color: ollamaSetup?.ollama_running ? '#34C759' : '#6E6E73', marginBottom: 4 }}>
+                      {ollamaSetup?.message || '无法获取 Ollama 状态'}
+                    </div>
+                    {(ollamaSetup?.system_version || ollamaSetup?.arch) && (
+                      <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 8 }}>
+                        macOS {ollamaSetup?.system_version || 'unknown'} · {ollamaSetup?.arch || 'unknown'}
+                      </div>
+                    )}
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button onClick={refreshOllamaSetup} style={btnStyle('#F2F2F7', '#333', 12)}>重新检测</button>
+                      {!ollamaSetup?.ollama_running && (
+                        <button
+                          onClick={handleInstallOllama}
+                          disabled={ollamaInstalling}
+                          style={btnStyle('#007AFF', 'white', 12)}
+                        >
+                          {ollamaInstalling ? '安装中...' : '检测并安装 Ollama'}
+                        </button>
+                      )}
+                    </div>
+                    {ollamaSetup?.recommended_install_method && !ollamaSetup?.ollama_running && (
+                      <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 6 }}>
+                        推荐命令：{ollamaSetup.recommended_install_method}
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
 
               {/* 本地模型 */}

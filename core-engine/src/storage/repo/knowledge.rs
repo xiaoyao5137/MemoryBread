@@ -5,129 +5,247 @@ use crate::storage::{
     error::StorageError,
     models_bake::{
         BakeArticleRecord, BakeKnowledgeRecord, BakeMemorySourceRecord, BakeSopRecord,
-        EpisodicMemoryRecord, KnowledgeEntryRecord, NewBakeArticle, NewBakeKnowledge,
-        NewBakeSop, NewEpisodicMemory, NewKnowledgeEntry,
+        EpisodicMemoryRecord, KnowledgeEntryRecord, NewBakeArticle, NewBakeKnowledge, NewBakeSop,
+        NewEpisodicMemory, NewKnowledgeEntry,
     },
     StorageManager,
 };
 
 impl StorageManager {
+    pub fn insert_knowledge_entry(&self, entry: &NewKnowledgeEntry) -> Result<i64, StorageError> {
+        self.with_conn(|conn| {
+            match entry.category.as_str() {
+                "bake_knowledge" | "bake_sop" => {
+                    let source = NewEpisodicMemory {
+                        capture_id: entry.capture_id,
+                        summary: entry.summary.clone(),
+                        overview: entry.overview.clone(),
+                        details: entry.details.clone(),
+                        entities: entry.entities.clone(),
+                        category: "bake_article".to_string(),
+                        importance: entry.importance,
+                        occurrence_count: entry.occurrence_count,
+                        observed_at: entry.observed_at,
+                        event_time_start: entry.event_time_start,
+                        event_time_end: entry.event_time_end,
+                        history_view: entry.history_view,
+                        content_origin: entry.content_origin.clone(),
+                        activity_type: entry.activity_type.clone(),
+                        is_self_generated: entry.is_self_generated,
+                        evidence_strength: entry.evidence_strength.clone(),
+            capture_ids: None,
+            start_time: None,
+            end_time: None,
+            duration_minutes: None,
+            frag_app_name: None,
+            frag_win_title: None,
+            time_range_start: None,
+            time_range_end: None,
+            key_timestamps: None,
+        };
+                    let source_id = insert_episodic_memory_inner(conn, &source)?;
+                    let now = current_ts_ms();
+                    let title = entry.overview.as_deref().unwrap_or(&entry.summary);
+                    let sql = if entry.category == "bake_knowledge" {
+                        "INSERT INTO bake_knowledge (
+                            timeline_id, title, summary, content, entities, importance,
+                            user_verified, user_edited,
+                            created_at, updated_at, created_at_ms, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0,
+                                   datetime(?7 / 1000, 'unixepoch'), datetime(?7 / 1000, 'unixepoch'), ?7, ?7)"
+                    } else {
+                        "INSERT INTO bake_sops (
+                            timeline_id, title, summary, content, entities, importance,
+                            user_verified, user_edited,
+                            created_at, updated_at, created_at_ms, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0,
+                                   datetime(?7 / 1000, 'unixepoch'), datetime(?7 / 1000, 'unixepoch'), ?7, ?7)"
+                    };
+                    conn.execute(
+                        sql,
+                        params![
+                            source_id,
+                            title,
+                            entry.summary,
+                            entry.details,
+                            entry.entities,
+                            entry.importance,
+                            now,
+                        ],
+                    )?;
+                    Ok(conn.last_insert_rowid())
+                }
+                _ => insert_episodic_memory_inner(conn, entry),
+            }
+        })
+    }
+
     /// 向后兼容函数：根据 category 查询对应的表
-    pub fn list_knowledge_by_category(&self, category: &str) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
+    pub fn list_knowledge_by_category(
+        &self,
+        category: &str,
+    ) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
         match category {
             "bake_article" => {
-                // 查询 bake_articles 表并转换为 KnowledgeEntryRecord
-                let articles = self.list_bake_articles_paginated(5000, 0)?;
-                Ok(articles.into_iter().map(|a| KnowledgeEntryRecord {
-                    id: a.id,
-                    capture_id: a.episodic_memory_id, // 使用 episodic_memory_id 作为 capture_id
-                    summary: a.summary,
-                    overview: Some(a.title),
-                    details: a.content, // content 字段包含完整的 JSON（从迁移中继承）
-                    entities: a.entities,
-                    category: "bake_article".to_string(),
-                    importance: a.importance,
-                    occurrence_count: None,
-                    observed_at: None,
-                    event_time_start: None,
-                    event_time_end: None,
-                    history_view: false,
-                    content_origin: None,
-                    activity_type: None,
-                    is_self_generated: false,
-                    evidence_strength: None,
-                    user_verified: a.user_verified,
-                    user_edited: a.user_edited,
-                    created_at: a.created_at,
-                    updated_at: a.updated_at,
-                    created_at_ms: a.created_at_ms,
-                    updated_at_ms: a.updated_at_ms,
-                }).collect())
-            },
+                let memories = self.list_timelines_paginated(Some("bake_article"), 5000, 0)?;
+                Ok(memories
+                    .into_iter()
+                    .map(|m| KnowledgeEntryRecord {
+                        id: m.id,
+                        capture_id: m.capture_id,
+                        summary: m.summary,
+                        overview: m.overview,
+                        details: m.details,
+                        entities: m.entities,
+                        category: m.category,
+                        importance: m.importance,
+                        occurrence_count: m.occurrence_count,
+                        observed_at: m.observed_at,
+                        event_time_start: m.event_time_start,
+                        event_time_end: m.event_time_end,
+                        history_view: m.history_view,
+                        content_origin: m.content_origin,
+                        activity_type: m.activity_type,
+                        is_self_generated: m.is_self_generated,
+                        evidence_strength: m.evidence_strength,
+                        user_verified: m.user_verified,
+                        user_edited: m.user_edited,
+                        created_at: m.created_at,
+                        updated_at: m.updated_at,
+                        created_at_ms: m.created_at_ms,
+                        updated_at_ms: m.updated_at_ms,
+                capture_ids: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                frag_app_name: None,
+                frag_win_title: None,
+                time_range_start: None,
+                time_range_end: None,
+                key_timestamps: None,
+            })
+                    .collect())
+            }
             "bake_knowledge" => {
                 let knowledge = self.list_bake_knowledge_new(5000, 0)?;
-                Ok(knowledge.into_iter().map(|k| KnowledgeEntryRecord {
-                    id: k.id,
-                    capture_id: k.episodic_memory_id,
-                    summary: k.summary,
-                    overview: Some(k.title),
-                    details: k.content,
-                    entities: k.entities,
-                    category: "bake_knowledge".to_string(),
-                    importance: k.importance,
-                    occurrence_count: None,
-                    observed_at: None,
-                    event_time_start: None,
-                    event_time_end: None,
-                    history_view: false,
-                    content_origin: None,
-                    activity_type: None,
-                    is_self_generated: false,
-                    evidence_strength: None,
-                    user_verified: k.user_verified,
-                    user_edited: k.user_edited,
-                    created_at: k.created_at,
-                    updated_at: k.updated_at,
-                    created_at_ms: k.created_at_ms,
-                    updated_at_ms: k.updated_at_ms,
-                }).collect())
-            },
+                Ok(knowledge
+                    .into_iter()
+                    .map(|k| KnowledgeEntryRecord {
+                        id: k.id,
+                        capture_id: k.timeline_id,
+                        summary: k.summary,
+                        overview: Some(k.title),
+                        details: k.content,
+                        entities: k.entities,
+                        category: "bake_knowledge".to_string(),
+                        importance: k.importance,
+                        occurrence_count: None,
+                        observed_at: None,
+                        event_time_start: None,
+                        event_time_end: None,
+                        history_view: false,
+                        content_origin: None,
+                        activity_type: None,
+                        is_self_generated: false,
+                        evidence_strength: None,
+                        user_verified: k.user_verified,
+                        user_edited: k.user_edited,
+                        created_at: k.created_at,
+                        updated_at: k.updated_at,
+                        created_at_ms: k.created_at_ms,
+                        updated_at_ms: k.updated_at_ms,
+                capture_ids: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                frag_app_name: None,
+                frag_win_title: None,
+                time_range_start: None,
+                time_range_end: None,
+                key_timestamps: None,
+            })
+                    .collect())
+            }
             "bake_sop" => {
                 let sops = self.list_bake_sops_paginated(5000, 0)?;
-                Ok(sops.into_iter().map(|s| KnowledgeEntryRecord {
-                    id: s.id,
-                    capture_id: s.episodic_memory_id,
-                    summary: s.summary,
-                    overview: Some(s.title),
-                    details: s.content,
-                    entities: s.entities,
-                    category: "bake_sop".to_string(),
-                    importance: s.importance,
-                    occurrence_count: None,
-                    observed_at: None,
-                    event_time_start: None,
-                    event_time_end: None,
-                    history_view: false,
-                    content_origin: None,
-                    activity_type: None,
-                    is_self_generated: false,
-                    evidence_strength: None,
-                    user_verified: s.user_verified,
-                    user_edited: s.user_edited,
-                    created_at: s.created_at,
-                    updated_at: s.updated_at,
-                    created_at_ms: s.created_at_ms,
-                    updated_at_ms: s.updated_at_ms,
-                }).collect())
-            },
+                Ok(sops
+                    .into_iter()
+                    .map(|s| KnowledgeEntryRecord {
+                        id: s.id,
+                        capture_id: s.timeline_id,
+                        summary: s.summary,
+                        overview: Some(s.title),
+                        details: s.content,
+                        entities: s.entities,
+                        category: "bake_sop".to_string(),
+                        importance: s.importance,
+                        occurrence_count: None,
+                        observed_at: None,
+                        event_time_start: None,
+                        event_time_end: None,
+                        history_view: false,
+                        content_origin: None,
+                        activity_type: None,
+                        is_self_generated: false,
+                        evidence_strength: None,
+                        user_verified: s.user_verified,
+                        user_edited: s.user_edited,
+                        created_at: s.created_at,
+                        updated_at: s.updated_at,
+                        created_at_ms: s.created_at_ms,
+                        updated_at_ms: s.updated_at_ms,
+                capture_ids: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                frag_app_name: None,
+                frag_win_title: None,
+                time_range_start: None,
+                time_range_end: None,
+                key_timestamps: None,
+            })
+                    .collect())
+            }
             _ => {
-                // 查询 episodic_memories 表
-                let memories = self.list_episodic_memories_paginated(Some(category), 5000, 0)?;
-                Ok(memories.into_iter().map(|m| KnowledgeEntryRecord {
-                    id: m.id,
-                    capture_id: m.capture_id,
-                    summary: m.summary,
-                    overview: m.overview,
-                    details: m.details,
-                    entities: m.entities,
-                    category: m.category,
-                    importance: m.importance,
-                    occurrence_count: m.occurrence_count,
-                    observed_at: m.observed_at,
-                    event_time_start: m.event_time_start,
-                    event_time_end: m.event_time_end,
-                    history_view: m.history_view,
-                    content_origin: m.content_origin,
-                    activity_type: m.activity_type,
-                    is_self_generated: m.is_self_generated,
-                    evidence_strength: m.evidence_strength,
-                    user_verified: m.user_verified,
-                    user_edited: m.user_edited,
-                    created_at: m.created_at,
-                    updated_at: m.updated_at,
-                    created_at_ms: m.created_at_ms,
-                    updated_at_ms: m.updated_at_ms,
-                }).collect())
+                // 查询 timelines 表
+                let memories = self.list_timelines_paginated(Some(category), 5000, 0)?;
+                Ok(memories
+                    .into_iter()
+                    .map(|m| KnowledgeEntryRecord {
+                        id: m.id,
+                        capture_id: m.capture_id,
+                        summary: m.summary,
+                        overview: m.overview,
+                        details: m.details,
+                        entities: m.entities,
+                        category: m.category,
+                        importance: m.importance,
+                        occurrence_count: m.occurrence_count,
+                        observed_at: m.observed_at,
+                        event_time_start: m.event_time_start,
+                        event_time_end: m.event_time_end,
+                        history_view: m.history_view,
+                        content_origin: m.content_origin,
+                        activity_type: m.activity_type,
+                        is_self_generated: m.is_self_generated,
+                        evidence_strength: m.evidence_strength,
+                        user_verified: m.user_verified,
+                        user_edited: m.user_edited,
+                        created_at: m.created_at,
+                        updated_at: m.updated_at,
+                        created_at_ms: m.created_at_ms,
+                        updated_at_ms: m.updated_at_ms,
+                capture_ids: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                frag_app_name: None,
+                frag_win_title: None,
+                time_range_start: None,
+                time_range_end: None,
+                key_timestamps: None,
+            })
+                    .collect())
             }
         }
     }
@@ -147,10 +265,10 @@ impl StorageManager {
                         k.history_view, k.content_origin, k.activity_type, k.is_self_generated,
                         k.evidence_strength, k.user_verified, k.user_edited, k.created_at, k.updated_at,
                         k.created_at_ms, k.updated_at_ms
-                 FROM episodic_memories k
-                 WHERE k.category = ?",
+                 FROM timelines k
+                 WHERE 1=1",
             );
-            let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new("bake_article".to_string())];
+            let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             if let Some(q) = query {
                 sql.push_str(" AND (k.summary LIKE ? OR COALESCE(k.overview, '') LIKE ? OR COALESCE(k.details, '') LIKE ?)");
                 let pattern = format!("%{}%", q);
@@ -159,11 +277,11 @@ impl StorageManager {
                 bind_values.push(Box::new(pattern));
             }
             if let Some(value) = from_ts {
-                sql.push_str(" AND COALESCE(k.observed_at, k.created_at_ms) >= ?");
+                sql.push_str(" AND k.created_at_ms >= ?");
                 bind_values.push(Box::new(value));
             }
             if let Some(value) = to_ts {
-                sql.push_str(" AND COALESCE(k.observed_at, k.created_at_ms) <= ?");
+                sql.push_str(" AND k.created_at_ms <= ?");
                 bind_values.push(Box::new(value));
             }
             sql.push_str(" ORDER BY k.updated_at_ms DESC, k.id DESC LIMIT ? OFFSET ?");
@@ -188,10 +306,10 @@ impl StorageManager {
         self.with_conn(|conn| {
             let mut sql = String::from(
                 "SELECT COUNT(*)
-                 FROM episodic_memories k
-                 WHERE k.category = ?",
+                 FROM timelines k
+                 WHERE 1=1",
             );
-            let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new("bake_article".to_string())];
+            let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             if let Some(q) = query {
                 sql.push_str(" AND (k.summary LIKE ? OR COALESCE(k.overview, '') LIKE ? OR COALESCE(k.details, '') LIKE ?)");
                 let pattern = format!("%{}%", q);
@@ -200,11 +318,11 @@ impl StorageManager {
                 bind_values.push(Box::new(pattern));
             }
             if let Some(value) = from_ts {
-                sql.push_str(" AND COALESCE(k.observed_at, k.created_at_ms) >= ?");
+                sql.push_str(" AND k.created_at_ms >= ?");
                 bind_values.push(Box::new(value));
             }
             if let Some(value) = to_ts {
-                sql.push_str(" AND COALESCE(k.observed_at, k.created_at_ms) <= ?");
+                sql.push_str(" AND k.created_at_ms <= ?");
                 bind_values.push(Box::new(value));
             }
 
@@ -222,31 +340,43 @@ impl StorageManager {
     ) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
         // 使用新表，但返回旧格式以保持兼容
         let knowledge = self.list_bake_knowledge_new(limit, offset)?;
-        Ok(knowledge.into_iter().map(|k| KnowledgeEntryRecord {
-            id: k.id,
-            capture_id: k.episodic_memory_id,
-            summary: k.summary,
-            overview: Some(k.title),
-            details: k.content,
-            entities: k.entities,
-            category: "bake_knowledge".to_string(),
-            importance: k.importance,
-            occurrence_count: None,
-            observed_at: None,
-            event_time_start: None,
-            event_time_end: None,
-            history_view: false,
-            content_origin: None,
-            activity_type: None,
-            is_self_generated: false,
-            evidence_strength: None,
-            user_verified: k.user_verified,
-            user_edited: k.user_edited,
-            created_at: k.created_at,
-            updated_at: k.updated_at,
-            created_at_ms: k.created_at_ms,
-            updated_at_ms: k.updated_at_ms,
-        }).collect())
+        Ok(knowledge
+            .into_iter()
+            .map(|k| KnowledgeEntryRecord {
+                id: k.id,
+                capture_id: k.timeline_id,
+                summary: k.summary,
+                overview: Some(k.title),
+                details: k.content,
+                entities: k.entities,
+                category: "bake_knowledge".to_string(),
+                importance: k.importance,
+                occurrence_count: None,
+                observed_at: None,
+                event_time_start: None,
+                event_time_end: None,
+                history_view: false,
+                content_origin: None,
+                activity_type: None,
+                is_self_generated: false,
+                evidence_strength: None,
+                user_verified: k.user_verified,
+                user_edited: k.user_edited,
+                created_at: k.created_at,
+                updated_at: k.updated_at,
+                created_at_ms: k.created_at_ms,
+                updated_at_ms: k.updated_at_ms,
+                capture_ids: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                frag_app_name: None,
+                frag_win_title: None,
+                time_range_start: None,
+                time_range_end: None,
+                key_timestamps: None,
+            })
+            .collect())
     }
 
     /// 新的 bake_knowledge 查询函数（返回新类型）
@@ -257,7 +387,7 @@ impl StorageManager {
     ) -> Result<Vec<BakeKnowledgeRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, episodic_memory_id, title, summary, content, entities, importance,
+                "SELECT id, timeline_id, title, summary, content, entities, importance,
                         user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms
                  FROM bake_knowledge ORDER BY updated_at_ms DESC LIMIT ? OFFSET ?"
             )?;
@@ -300,7 +430,7 @@ impl StorageManager {
                         history_view, content_origin, activity_type, is_self_generated,
                         evidence_strength, user_verified, user_edited, created_at, updated_at,
                         created_at_ms, updated_at_ms
-                 FROM episodic_memories
+                 FROM timelines
                  WHERE category NOT IN (?, ?, ?)",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![
@@ -329,10 +459,13 @@ impl StorageManager {
         })
     }
 
-    pub fn count_non_bake_knowledge_filtered(&self, query: Option<&str>) -> Result<i64, StorageError> {
+    pub fn count_non_bake_knowledge_filtered(
+        &self,
+        query: Option<&str>,
+    ) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
             let mut sql = String::from(
-                "SELECT COUNT(*) FROM episodic_memories WHERE category NOT IN (?, ?, ?)",
+                "SELECT COUNT(*) FROM timelines WHERE category NOT IN (?, ?, ?)",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![
                 Box::new("bake_article".to_string()),
@@ -354,7 +487,11 @@ impl StorageManager {
         })
     }
 
-    pub fn list_non_bake_knowledge(&self, limit: usize, offset: usize) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
+    pub fn list_non_bake_knowledge(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, capture_id, summary, overview, details, entities, category, importance,
@@ -362,29 +499,41 @@ impl StorageManager {
                         history_view, content_origin, activity_type, is_self_generated,
                         evidence_strength, user_verified, user_edited, created_at, updated_at,
                         created_at_ms, updated_at_ms
-                 FROM episodic_memories
+                 FROM timelines
                  WHERE category NOT IN (?1, ?2, ?3)
                  ORDER BY updated_at_ms DESC, id DESC
                  LIMIT ?4 OFFSET ?5",
             )?;
-            let rows = stmt.query_map(params!["bake_article", "bake_sop", "bake_knowledge", limit as i64, offset as i64], |row| {
-                Ok(row_to_knowledge_entry(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
-            })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            let rows = stmt.query_map(
+                params![
+                    "bake_article",
+                    "bake_sop",
+                    "bake_knowledge",
+                    limit as i64,
+                    offset as i64
+                ],
+                |row| Ok(row_to_knowledge_entry(row).map_err(|_| rusqlite::Error::InvalidQuery)?),
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
     pub fn count_non_bake_knowledge(&self) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT COUNT(*) FROM episodic_memories WHERE category NOT IN (?1, ?2, ?3)",
+                "SELECT COUNT(*) FROM timelines WHERE category NOT IN (?1, ?2, ?3)",
                 params!["bake_article", "bake_sop", "bake_knowledge"],
                 |row| row.get(0),
-            ).map_err(StorageError::Sqlite)
+            )
+            .map_err(StorageError::Sqlite)
         })
     }
 
-    pub fn list_bake_memory_init_candidates(&self, limit: usize) -> Result<Vec<BakeMemorySourceRecord>, StorageError> {
+    pub fn list_bake_memory_init_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<BakeMemorySourceRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT k.id, k.capture_id, k.summary, k.overview, k.details, k.entities, k.category, k.importance,
@@ -393,8 +542,9 @@ impl StorageManager {
                         k.evidence_strength, k.user_verified, k.user_edited, k.created_at, k.updated_at,
                         k.created_at_ms, k.updated_at_ms,
                         c.ts, c.app_name, c.win_title, c.ax_text, c.ocr_text, c.input_text, c.audio_text
-                 FROM episodic_memories k
+                 FROM timelines k
                  INNER JOIN captures c ON c.id = k.capture_id
+                 WHERE k.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop')
                  ORDER BY k.importance DESC, COALESCE(k.occurrence_count, 0) DESC, k.updated_at_ms DESC, k.id DESC
                  LIMIT ?1",
             )?;
@@ -414,11 +564,14 @@ impl StorageManager {
         })
     }
 
-    pub fn get_knowledge_entry(&self, id: i64) -> Result<Option<KnowledgeEntryRecord>, StorageError> {
+    pub fn get_knowledge_entry(
+        &self,
+        id: i64,
+    ) -> Result<Option<KnowledgeEntryRecord>, StorageError> {
         if let Some(article) = self.get_bake_article(id)? {
             return Ok(Some(KnowledgeEntryRecord {
                 id: article.id,
-                capture_id: article.episodic_memory_id,
+                capture_id: article.timeline_id,
                 summary: article.summary,
                 overview: Some(article.title),
                 details: article.content,
@@ -440,13 +593,22 @@ impl StorageManager {
                 updated_at: article.updated_at,
                 created_at_ms: article.created_at_ms,
                 updated_at_ms: article.updated_at_ms,
+                capture_ids: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                frag_app_name: None,
+                frag_win_title: None,
+                time_range_start: None,
+                time_range_end: None,
+                key_timestamps: None,
             }));
         }
 
         if let Some(knowledge) = self.get_bake_knowledge(id)? {
             return Ok(Some(KnowledgeEntryRecord {
                 id: knowledge.id,
-                capture_id: knowledge.episodic_memory_id,
+                capture_id: knowledge.timeline_id,
                 summary: knowledge.summary,
                 overview: Some(knowledge.title),
                 details: knowledge.content,
@@ -468,13 +630,22 @@ impl StorageManager {
                 updated_at: knowledge.updated_at,
                 created_at_ms: knowledge.created_at_ms,
                 updated_at_ms: knowledge.updated_at_ms,
+                capture_ids: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                frag_app_name: None,
+                frag_win_title: None,
+                time_range_start: None,
+                time_range_end: None,
+                key_timestamps: None,
             }));
         }
 
         if let Some(sop) = self.get_bake_sop(id)? {
             return Ok(Some(KnowledgeEntryRecord {
                 id: sop.id,
-                capture_id: sop.episodic_memory_id,
+                capture_id: sop.timeline_id,
                 summary: sop.summary,
                 overview: Some(sop.title),
                 details: sop.content,
@@ -496,6 +667,15 @@ impl StorageManager {
                 updated_at: sop.updated_at,
                 created_at_ms: sop.created_at_ms,
                 updated_at_ms: sop.updated_at_ms,
+                capture_ids: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                frag_app_name: None,
+                frag_win_title: None,
+                time_range_start: None,
+                time_range_end: None,
+                key_timestamps: None,
             }));
         }
 
@@ -524,6 +704,15 @@ impl StorageManager {
                 updated_at: memory.updated_at,
                 created_at_ms: memory.created_at_ms,
                 updated_at_ms: memory.updated_at_ms,
+                capture_ids: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                frag_app_name: None,
+                frag_win_title: None,
+                time_range_start: None,
+                time_range_end: None,
+                key_timestamps: None,
             }));
         }
 
@@ -543,10 +732,7 @@ impl StorageManager {
         };
 
         match entry.category.as_str() {
-            "bake_article" => {
-                let title = overview.or(entry.overview.as_deref()).unwrap_or(summary);
-                self.update_bake_article(id, title, summary, details, entities)
-            }
+            "bake_article" => self.update_episodic_memory(id, summary, overview, details, entities),
             "bake_knowledge" => {
                 let title = overview.or(entry.overview.as_deref()).unwrap_or(summary);
                 self.update_bake_knowledge(id, title, summary, details, entities)
@@ -576,11 +762,11 @@ impl StorageManager {
             let title = overview.or(entry.overview.as_deref()).unwrap_or(summary);
             let affected = match entry.category.as_str() {
                 "bake_article" => conn.execute(
-                    "UPDATE bake_articles
-                     SET title = ?1, summary = ?2, content = ?3, entities = ?4,
+                    "UPDATE timelines
+                     SET summary = ?1, overview = ?2, details = ?3, entities = ?4,
                          updated_at = datetime(?6 / 1000, 'unixepoch'), updated_at_ms = ?6
                      WHERE id = ?5",
-                    params![title, summary, details, entities, id, now],
+                    params![summary, overview, details, entities, id, now],
                 )?,
                 "bake_knowledge" => conn.execute(
                     "UPDATE bake_knowledge
@@ -597,7 +783,7 @@ impl StorageManager {
                     params![title, summary, details, entities, id, now],
                 )?,
                 _ => conn.execute(
-                    "UPDATE episodic_memories
+                    "UPDATE timelines
                      SET summary = ?1, overview = ?2, details = ?3, entities = ?4,
                          updated_at = datetime(?6 / 1000, 'unixepoch'), updated_at_ms = ?6
                      WHERE id = ?5",
@@ -617,7 +803,7 @@ impl StorageManager {
             let now = current_ts_ms();
             let affected = match entry.category.as_str() {
                 "bake_article" => conn.execute(
-                    "UPDATE bake_articles SET user_verified = ?1,
+                    "UPDATE timelines SET user_verified = ?1,
                      updated_at = datetime(?3 / 1000, 'unixepoch'), updated_at_ms = ?3
                      WHERE id = ?2",
                     params![verified, id, now],
@@ -635,7 +821,7 @@ impl StorageManager {
                     params![verified, id, now],
                 )?,
                 _ => conn.execute(
-                    "UPDATE episodic_memories SET user_verified = ?1,
+                    "UPDATE timelines SET user_verified = ?1,
                      updated_at = datetime(?3 / 1000, 'unixepoch'), updated_at_ms = ?3
                      WHERE id = ?2",
                     params![verified, id, now],
@@ -651,7 +837,7 @@ impl StorageManager {
         };
 
         match entry.category.as_str() {
-            "bake_article" => self.delete_bake_article(id),
+            "bake_article" => self.delete_episodic_memory(id),
             "bake_knowledge" => self.delete_bake_knowledge(id),
             "bake_sop" => self.delete_bake_sop(id),
             _ => self.delete_episodic_memory(id),
@@ -659,7 +845,10 @@ impl StorageManager {
     }
 }
 
-fn insert_knowledge_entry_inner(conn: &Connection, entry: &NewKnowledgeEntry) -> Result<i64, StorageError> {
+fn insert_knowledge_entry_inner(
+    conn: &Connection,
+    entry: &NewKnowledgeEntry,
+) -> Result<i64, StorageError> {
     let now = current_ts_ms();
     conn.execute(
         "INSERT INTO knowledge_entries (
@@ -718,11 +907,22 @@ fn row_to_knowledge_entry(row: &rusqlite::Row<'_>) -> Result<KnowledgeEntryRecor
         updated_at: row.get(20)?,
         created_at_ms: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
         updated_at_ms: row.get::<_, Option<i64>>(22)?.unwrap_or(0),
+        capture_ids: None,
+        start_time: None,
+        end_time: None,
+        duration_minutes: None,
+        frag_app_name: None,
+        frag_win_title: None,
+        time_range_start: None,
+        time_range_end: None,
+        key_timestamps: None,
     })
 }
 
 /// 将 episodic_memory 行转换为 KnowledgeEntryRecord（用于向后兼容）
-fn row_to_episodic_memory_as_knowledge(row: &rusqlite::Row<'_>) -> Result<KnowledgeEntryRecord, StorageError> {
+fn row_to_episodic_memory_as_knowledge(
+    row: &rusqlite::Row<'_>,
+) -> Result<KnowledgeEntryRecord, StorageError> {
     Ok(KnowledgeEntryRecord {
         id: row.get(0)?,
         capture_id: row.get(1)?,
@@ -747,6 +947,15 @@ fn row_to_episodic_memory_as_knowledge(row: &rusqlite::Row<'_>) -> Result<Knowle
         updated_at: row.get(20)?,
         created_at_ms: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
         updated_at_ms: row.get::<_, Option<i64>>(22)?.unwrap_or(0),
+        capture_ids: None,
+        start_time: None,
+        end_time: None,
+        duration_minutes: None,
+        frag_app_name: None,
+        frag_win_title: None,
+        time_range_start: None,
+        time_range_end: None,
+        key_timestamps: None,
     })
 }
 
@@ -761,7 +970,7 @@ impl StorageManager {
     }
 
     /// 查询情节记忆（分页）
-    pub fn list_episodic_memories_paginated(
+    pub fn list_timelines_paginated(
         &self,
         category: Option<&str>,
         limit: usize,
@@ -774,7 +983,7 @@ impl StorageManager {
                         history_view, content_origin, activity_type, is_self_generated,
                         evidence_strength, user_verified, user_edited, created_at, updated_at,
                         created_at_ms, updated_at_ms
-                 FROM episodic_memories"
+                 FROM timelines",
             );
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
 
@@ -792,26 +1001,35 @@ impl StorageManager {
             let rows = stmt.query_map(param_refs.as_slice(), |row| {
                 Ok(row_to_episodic_memory(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
     /// 统计情节记忆数量
-    pub fn count_episodic_memories(&self, category: Option<&str>) -> Result<i64, StorageError> {
+    pub fn count_timelines(&self, category: Option<&str>) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
-            let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(cat) = category {
-                ("SELECT COUNT(*) FROM episodic_memories WHERE category = ?".to_string(), vec![Box::new(cat.to_string())])
+            let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(cat) = category
+            {
+                (
+                    "SELECT COUNT(*) FROM timelines WHERE category = ?".to_string(),
+                    vec![Box::new(cat.to_string())],
+                )
             } else {
-                ("SELECT COUNT(*) FROM episodic_memories".to_string(), vec![])
+                ("SELECT COUNT(*) FROM timelines".to_string(), vec![])
             };
 
             let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-            conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0)).map_err(StorageError::Sqlite)
+            conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))
+                .map_err(StorageError::Sqlite)
         })
     }
 
     /// 获取单条情节记忆
-    pub fn get_episodic_memory(&self, id: i64) -> Result<Option<EpisodicMemoryRecord>, StorageError> {
+    pub fn get_episodic_memory(
+        &self,
+        id: i64,
+    ) -> Result<Option<EpisodicMemoryRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, capture_id, summary, overview, details, entities, category, importance,
@@ -819,7 +1037,7 @@ impl StorageManager {
                         history_view, content_origin, activity_type, is_self_generated,
                         evidence_strength, user_verified, user_edited, created_at, updated_at,
                         created_at_ms, updated_at_ms
-                 FROM episodic_memories WHERE id = ?1"
+                 FROM timelines WHERE id = ?1",
             )?;
             match stmt.query_row(params![id], |row| {
                 row_to_episodic_memory(row).map_err(|_| rusqlite::Error::InvalidQuery)
@@ -843,7 +1061,7 @@ impl StorageManager {
         self.with_conn(|conn| {
             let now = current_ts_ms();
             let affected = conn.execute(
-                "UPDATE episodic_memories
+                "UPDATE timelines
                  SET summary = ?1, overview = ?2, details = ?3, entities = ?4, user_edited = 1,
                      updated_at = datetime(?6 / 1000, 'unixepoch'), updated_at_ms = ?6
                  WHERE id = ?5",
@@ -854,11 +1072,15 @@ impl StorageManager {
     }
 
     /// 设置情节记忆验证状态
-    pub fn set_episodic_memory_verified(&self, id: i64, verified: bool) -> Result<bool, StorageError> {
+    pub fn set_episodic_memory_verified(
+        &self,
+        id: i64,
+        verified: bool,
+    ) -> Result<bool, StorageError> {
         self.with_conn(|conn| {
             let now = current_ts_ms();
             let affected = conn.execute(
-                "UPDATE episodic_memories SET user_verified = ?1,
+                "UPDATE timelines SET user_verified = ?1,
                  updated_at = datetime(?3 / 1000, 'unixepoch'), updated_at_ms = ?3
                  WHERE id = ?2",
                 params![verified, id, now],
@@ -870,19 +1092,53 @@ impl StorageManager {
     /// 删除情节记忆
     pub fn delete_episodic_memory(&self, id: i64) -> Result<bool, StorageError> {
         self.with_conn(|conn| {
+            let affected =
+                conn.execute("DELETE FROM timelines WHERE id = ?1", params![id])?;
+            Ok(affected > 0)
+        })
+    }
+
+    /// 获取时间线关联的Capture IDs
+    pub fn get_timeline_capture_ids(&self, timeline_id: i64) -> Result<Vec<i64>, StorageError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT capture_ids FROM timelines WHERE id = ?1"
+            )?;
+            match stmt.query_row(params![timeline_id], |row| {
+                let json_str: Option<String> = row.get(0)?;
+                Ok(json_str)
+            }) {
+                Ok(Some(json)) => {
+                    let ids: Vec<i64> = serde_json::from_str(&json).unwrap_or_default();
+                    Ok(ids)
+                }
+                Ok(None) => Ok(vec![]),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(vec![]),
+                Err(e) => Err(StorageError::Sqlite(e)),
+            }
+        })
+    }
+
+    /// 更新时间线的关联Capture IDs
+    pub fn update_timeline_capture_ids(&self, timeline_id: i64, capture_ids: &[i64]) -> Result<bool, StorageError> {
+        self.with_conn(|conn| {
+            let json = serde_json::to_string(capture_ids).unwrap_or_else(|_| "[]".to_string());
             let affected = conn.execute(
-                "DELETE FROM episodic_memories WHERE id = ?1",
-                params![id],
+                "UPDATE timelines SET capture_ids = ?1 WHERE id = ?2",
+                params![json, timeline_id],
             )?;
             Ok(affected > 0)
         })
     }
 }
 
-fn insert_episodic_memory_inner(conn: &Connection, entry: &NewEpisodicMemory) -> Result<i64, StorageError> {
+fn insert_episodic_memory_inner(
+    conn: &Connection,
+    entry: &NewEpisodicMemory,
+) -> Result<i64, StorageError> {
     let now = current_ts_ms();
     conn.execute(
-        "INSERT INTO episodic_memories (
+        "INSERT INTO timelines (
             capture_id, summary, overview, details, entities, category, importance,
             occurrence_count, observed_at, event_time_start, event_time_end,
             history_view, content_origin, activity_type, is_self_generated,
@@ -907,7 +1163,7 @@ fn insert_episodic_memory_inner(conn: &Connection, entry: &NewEpisodicMemory) ->
             entry.activity_type,
             entry.is_self_generated,
             entry.evidence_strength,
-            now,
+            now,  // ?17: 用于 created_at, updated_at, created_at_ms, updated_at_ms
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -938,6 +1194,15 @@ fn row_to_episodic_memory(row: &rusqlite::Row<'_>) -> Result<EpisodicMemoryRecor
         updated_at: row.get(20)?,
         created_at_ms: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
         updated_at_ms: row.get::<_, Option<i64>>(22)?.unwrap_or(0),
+        capture_ids: None,
+        start_time: None,
+        end_time: None,
+        duration_minutes: None,
+        frag_app_name: None,
+        frag_win_title: None,
+        time_range_start: None,
+        time_range_end: None,
+        key_timestamps: None,
     })
 }
 
@@ -950,14 +1215,14 @@ impl StorageManager {
         self.with_conn(|conn| {
             let now = current_ts_ms();
             conn.execute(
-                "INSERT INTO bake_articles (
-                    episodic_memory_id, title, summary, content, entities, importance,
+                "INSERT INTO designs (
+                    timeline_id, title, summary, content, entities, importance,
                     user_verified, user_edited,
                     created_at, updated_at, created_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0,
                            datetime(?7 / 1000, 'unixepoch'), datetime(?7 / 1000, 'unixepoch'), ?7, ?7)",
                 params![
-                    article.episodic_memory_id,
+                    article.timeline_id,
                     article.title,
                     article.summary,
                     article.content,
@@ -970,16 +1235,16 @@ impl StorageManager {
         })
     }
 
-    pub fn list_bake_articles_paginated(
+    pub fn list_designs_paginated(
         &self,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<BakeArticleRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, episodic_memory_id, title, summary, content, entities, importance,
+                "SELECT id, timeline_id, title, summary, content, entities, importance,
                         user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms
-                 FROM bake_articles ORDER BY updated_at_ms DESC LIMIT ? OFFSET ?"
+                 FROM designs ORDER BY updated_at_ms DESC LIMIT ? OFFSET ?"
             )?;
             let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
                 Ok(row_to_bake_article(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
@@ -988,9 +1253,9 @@ impl StorageManager {
         })
     }
 
-    pub fn count_bake_articles(&self) -> Result<i64, StorageError> {
+    pub fn count_designs(&self) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
-            conn.query_row("SELECT COUNT(*) FROM bake_articles", [], |row| row.get(0))
+            conn.query_row("SELECT COUNT(*) FROM designs", [], |row| row.get(0))
                 .map_err(StorageError::Sqlite)
         })
     }
@@ -998,9 +1263,9 @@ impl StorageManager {
     pub fn get_bake_article(&self, id: i64) -> Result<Option<BakeArticleRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, episodic_memory_id, title, summary, content, entities, importance,
+                "SELECT id, timeline_id, title, summary, content, entities, importance,
                         user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms
-                 FROM bake_articles WHERE id = ?1"
+                 FROM designs WHERE id = ?1"
             )?;
             match stmt.query_row(params![id], |row| {
                 row_to_bake_article(row).map_err(|_| rusqlite::Error::InvalidQuery)
@@ -1023,7 +1288,7 @@ impl StorageManager {
         self.with_conn(|conn| {
             let now = current_ts_ms();
             let affected = conn.execute(
-                "UPDATE bake_articles
+                "UPDATE designs
                  SET title = ?1, summary = ?2, content = ?3, entities = ?4, user_edited = 1,
                      updated_at = datetime(?6 / 1000, 'unixepoch'), updated_at_ms = ?6
                  WHERE id = ?5",
@@ -1035,7 +1300,7 @@ impl StorageManager {
 
     pub fn delete_bake_article(&self, id: i64) -> Result<bool, StorageError> {
         self.with_conn(|conn| {
-            let affected = conn.execute("DELETE FROM bake_articles WHERE id = ?1", params![id])?;
+            let affected = conn.execute("DELETE FROM designs WHERE id = ?1", params![id])?;
             Ok(affected > 0)
         })
     }
@@ -1044,7 +1309,7 @@ impl StorageManager {
 fn row_to_bake_article(row: &rusqlite::Row<'_>) -> Result<BakeArticleRecord, StorageError> {
     Ok(BakeArticleRecord {
         id: row.get(0)?,
-        episodic_memory_id: row.get(1)?,
+        timeline_id: row.get(1)?,
         title: row.get(2)?,
         summary: row.get(3)?,
         content: row.get(4)?,
@@ -1056,6 +1321,7 @@ fn row_to_bake_article(row: &rusqlite::Row<'_>) -> Result<BakeArticleRecord, Sto
         updated_at: row.get(10)?,
         created_at_ms: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
         updated_at_ms: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
+        source_capture_ids: None,
     })
 }
 
@@ -1069,13 +1335,13 @@ impl StorageManager {
             let now = current_ts_ms();
             conn.execute(
                 "INSERT INTO bake_knowledge (
-                    episodic_memory_id, title, summary, content, entities, importance,
+                    timeline_id, title, summary, content, entities, importance,
                     user_verified, user_edited,
                     created_at, updated_at, created_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0,
                            datetime(?7 / 1000, 'unixepoch'), datetime(?7 / 1000, 'unixepoch'), ?7, ?7)",
                 params![
-                    knowledge.episodic_memory_id,
+                    knowledge.timeline_id,
                     knowledge.title,
                     knowledge.summary,
                     knowledge.content,
@@ -1098,7 +1364,7 @@ impl StorageManager {
     pub fn get_bake_knowledge(&self, id: i64) -> Result<Option<BakeKnowledgeRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, episodic_memory_id, title, summary, content, entities, importance,
+                "SELECT id, timeline_id, title, summary, content, entities, importance,
                         user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms
                  FROM bake_knowledge WHERE id = ?1"
             )?;
@@ -1144,7 +1410,7 @@ impl StorageManager {
 fn row_to_bake_knowledge(row: &rusqlite::Row<'_>) -> Result<BakeKnowledgeRecord, StorageError> {
     Ok(BakeKnowledgeRecord {
         id: row.get(0)?,
-        episodic_memory_id: row.get(1)?,
+        timeline_id: row.get(1)?,
         title: row.get(2)?,
         summary: row.get(3)?,
         content: row.get(4)?,
@@ -1156,6 +1422,7 @@ fn row_to_bake_knowledge(row: &rusqlite::Row<'_>) -> Result<BakeKnowledgeRecord,
         updated_at: row.get(10)?,
         created_at_ms: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
         updated_at_ms: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
+        source_capture_ids: None,
     })
 }
 
@@ -1169,13 +1436,13 @@ impl StorageManager {
             let now = current_ts_ms();
             conn.execute(
                 "INSERT INTO bake_sops (
-                    episodic_memory_id, title, summary, content, entities, importance,
+                    timeline_id, title, summary, content, entities, importance,
                     user_verified, user_edited,
                     created_at, updated_at, created_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0,
                            datetime(?7 / 1000, 'unixepoch'), datetime(?7 / 1000, 'unixepoch'), ?7, ?7)",
                 params![
-                    sop.episodic_memory_id,
+                    sop.timeline_id,
                     sop.title,
                     sop.summary,
                     sop.content,
@@ -1195,7 +1462,7 @@ impl StorageManager {
     ) -> Result<Vec<BakeSopRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, episodic_memory_id, title, summary, content, entities, importance,
+                "SELECT id, timeline_id, title, summary, content, entities, importance,
                         user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms
                  FROM bake_sops ORDER BY updated_at_ms DESC LIMIT ? OFFSET ?"
             )?;
@@ -1216,7 +1483,7 @@ impl StorageManager {
     pub fn get_bake_sop(&self, id: i64) -> Result<Option<BakeSopRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, episodic_memory_id, title, summary, content, entities, importance,
+                "SELECT id, timeline_id, title, summary, content, entities, importance,
                         user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms
                  FROM bake_sops WHERE id = ?1"
             )?;
@@ -1262,7 +1529,7 @@ impl StorageManager {
 fn row_to_bake_sop(row: &rusqlite::Row<'_>) -> Result<BakeSopRecord, StorageError> {
     Ok(BakeSopRecord {
         id: row.get(0)?,
-        episodic_memory_id: row.get(1)?,
+        timeline_id: row.get(1)?,
         title: row.get(2)?,
         summary: row.get(3)?,
         content: row.get(4)?,
@@ -1274,6 +1541,7 @@ fn row_to_bake_sop(row: &rusqlite::Row<'_>) -> Result<BakeSopRecord, StorageErro
         updated_at: row.get(10)?,
         created_at_ms: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
         updated_at_ms: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
+        source_capture_ids: None,
     })
 }
 
@@ -1297,10 +1565,12 @@ mod tests {
             ax_text: Some("知识来源内容".to_string()),
             ax_focused_role: None,
             ax_focused_id: None,
+            ocr_text: None,
             screenshot_path: None,
             input_text: None,
             is_sensitive: false,
-        }).expect("插入 capture 失败")
+        })
+        .expect("插入 capture 失败")
     }
 
     fn sample_entry(mgr: &StorageManager, category: &str) -> NewKnowledgeEntry {
@@ -1327,7 +1597,8 @@ mod tests {
     #[test]
     fn test_insert_and_list_knowledge_by_category() {
         let mgr = make_mgr();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_sop")).unwrap();
+        mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_sop"))
+            .unwrap();
         let entries = mgr.list_knowledge_by_category("bake_sop").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].summary, "客服问题处理");
@@ -1336,7 +1607,9 @@ mod tests {
     #[test]
     fn test_set_knowledge_verified() {
         let mgr = make_mgr();
-        let id = mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_article")).unwrap();
+        let id = mgr
+            .insert_knowledge_entry(&sample_entry(&mgr, "bake_article"))
+            .unwrap();
         assert!(mgr.set_knowledge_verified(id, true).unwrap());
         let entry = mgr.get_knowledge_entry(id).unwrap().unwrap();
         assert!(entry.user_verified);
@@ -1345,21 +1618,73 @@ mod tests {
     #[test]
     fn test_count_non_bake_knowledge_filtered_excludes_bake_knowledge() {
         let mgr = make_mgr();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_knowledge")).unwrap();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "meeting")).unwrap();
+        mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_knowledge"))
+            .unwrap();
+        mgr.insert_knowledge_entry(&sample_entry(&mgr, "meeting"))
+            .unwrap();
 
         assert_eq!(mgr.count_non_bake_knowledge_filtered(None).unwrap(), 1);
-        assert_eq!(mgr.count_non_bake_knowledge_filtered(Some("客服")).unwrap(), 1);
+        assert_eq!(
+            mgr.count_non_bake_knowledge_filtered(Some("客服")).unwrap(),
+            1
+        );
     }
 
     #[test]
     fn test_list_bake_memory_init_candidates_excludes_bake_knowledge() {
         let mgr = make_mgr();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_knowledge")).unwrap();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "meeting")).unwrap();
+        mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_knowledge"))
+            .unwrap();
+        mgr.insert_knowledge_entry(&sample_entry(&mgr, "meeting"))
+            .unwrap();
 
         let candidates = mgr.list_bake_memory_init_candidates(10).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].knowledge.category, "meeting");
+    }
+
+    #[test]
+    fn test_update_bake_article_details_system_works() {
+        let mgr = make_mgr();
+        let id = mgr
+            .insert_knowledge_entry(&sample_entry(&mgr, "meeting"))
+            .unwrap();
+
+        assert!(mgr
+            .update_knowledge_details_system(
+                id,
+                "更新后的情节记忆",
+                Some("新的概述"),
+                Some(r#"{"template_match_score":0.89,"template_match_level":"high"}"#),
+                r#"["模板"]"#,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn test_update_bake_sop_details_system_works() {
+        let mgr = make_mgr();
+        let source_id = mgr.insert_episodic_memory(&sample_entry(&mgr, "meeting")).unwrap();
+        let id = mgr
+            .insert_bake_sop(&NewBakeSop {
+                timeline_id: source_id,
+                title: "原始 SOP".to_string(),
+                summary: "原始 SOP".to_string(),
+                content: Some(r#"{"status":"candidate"}"#.to_string()),
+                entities: r#"["SOP"]"#.to_string(),
+                importance: 4,
+            })
+            .unwrap();
+
+        assert!(mgr
+            .update_knowledge_details_system(
+                id,
+                "更新后的 SOP",
+                Some("新的概述"),
+                Some(r#"{"status":"candidate"}"#),
+                r#"["SOP"]"#,
+            )
+            .unwrap());
+        assert!(mgr.set_knowledge_verified(id, true).unwrap());
     }
 }

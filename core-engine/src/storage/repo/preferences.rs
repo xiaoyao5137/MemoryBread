@@ -3,10 +3,7 @@
 use rusqlite::{params, Connection};
 
 use crate::storage::{
-    db::current_ts_ms,
-    error::StorageError,
-    models::PreferenceRecord,
-    StorageManager,
+    db::current_ts_ms, error::StorageError, models::PreferenceRecord, StorageManager,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,9 +15,9 @@ impl StorageManager {
     /// 若 key 已存在则更新 value/confidence/updated_at/sample_count。
     pub fn upsert_preference(
         &self,
-        key:        &str,
-        value:      &str,
-        source:     &str,
+        key: &str,
+        value: &str,
+        source: &str,
         confidence: f64,
     ) -> Result<(), StorageError> {
         let now = current_ts_ms();
@@ -55,10 +52,8 @@ impl StorageManager {
     /// 删除一条偏好记录。
     pub fn delete_preference(&self, key: &str) -> Result<bool, StorageError> {
         self.with_conn(|conn| {
-            let affected = conn.execute(
-                "DELETE FROM user_preferences WHERE key = ?1",
-                params![key],
-            )?;
+            let affected =
+                conn.execute("DELETE FROM user_preferences WHERE key = ?1", params![key])?;
             Ok(affected > 0)
         })
     }
@@ -100,7 +95,8 @@ impl StorageManager {
             let rows = stmt.query_map([], |row| {
                 Ok(row_to_preference(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
@@ -117,7 +113,8 @@ impl StorageManager {
             let rows = stmt.query_map(params![source], |row| {
                 Ok(row_to_preference(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 }
@@ -128,12 +125,12 @@ impl StorageManager {
 
 fn row_to_preference(row: &rusqlite::Row<'_>) -> Result<PreferenceRecord, StorageError> {
     Ok(PreferenceRecord {
-        id:           row.get(0)?,
-        key:          row.get(1)?,
-        value:        row.get(2)?,
-        source:       row.get(3)?,
-        confidence:   row.get(4)?,
-        updated_at:   row.get(5)?,
+        id: row.get(0)?,
+        key: row.get(1)?,
+        value: row.get(2)?,
+        source: row.get(3)?,
+        confidence: row.get(4)?,
+        updated_at: row.get(5)?,
         sample_count: row.get(6)?,
     })
 }
@@ -153,7 +150,8 @@ mod tests {
     #[test]
     fn test_upsert_and_get() {
         let mgr = make_mgr();
-        mgr.upsert_preference("style.greeting", "嗨", "learned", 0.8).unwrap();
+        mgr.upsert_preference("style.greeting", "嗨", "learned", 0.8)
+            .unwrap();
 
         let p = mgr.get_preference("style.greeting").unwrap().unwrap();
         assert_eq!(p.key, "style.greeting");
@@ -166,8 +164,10 @@ mod tests {
     #[test]
     fn test_upsert_increments_sample_count() {
         let mgr = make_mgr();
-        mgr.upsert_preference("style.greeting", "嗨", "learned", 0.7).unwrap();
-        mgr.upsert_preference("style.greeting", "你好", "learned", 0.9).unwrap();
+        mgr.upsert_preference("style.greeting", "嗨", "learned", 0.7)
+            .unwrap();
+        mgr.upsert_preference("style.greeting", "你好", "learned", 0.9)
+            .unwrap();
 
         let p = mgr.get_preference("style.greeting").unwrap().unwrap();
         assert_eq!(p.value, "你好");
@@ -177,7 +177,8 @@ mod tests {
     #[test]
     fn test_get_preference_value() {
         let mgr = make_mgr();
-        mgr.upsert_preference("format.list_style", "markdown", "manual", 1.0).unwrap();
+        mgr.upsert_preference("format.list_style", "markdown", "manual", 1.0)
+            .unwrap();
 
         let v = mgr.get_preference_value("format.list_style").unwrap();
         assert_eq!(v.as_deref(), Some("markdown"));
@@ -190,7 +191,8 @@ mod tests {
     fn test_list_preferences() {
         let mgr = make_mgr();
         mgr.upsert_preference("a.key", "v1", "manual", 1.0).unwrap();
-        mgr.upsert_preference("b.key", "v2", "learned", 0.5).unwrap();
+        mgr.upsert_preference("b.key", "v2", "learned", 0.5)
+            .unwrap();
 
         // list_preferences 返回全部偏好（含 002_seed_defaults 预置的 28 条）
         let list = mgr.list_preferences().unwrap();
@@ -206,7 +208,8 @@ mod tests {
     #[test]
     fn test_delete_preference() {
         let mgr = make_mgr();
-        mgr.upsert_preference("tmp.key", "val", "manual", 1.0).unwrap();
+        mgr.upsert_preference("tmp.key", "val", "manual", 1.0)
+            .unwrap();
         let deleted = mgr.delete_preference("tmp.key").unwrap();
         assert!(deleted);
 

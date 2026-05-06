@@ -36,7 +36,7 @@ class KnowledgeManager:
 
         # 创建知识条目表
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS episodic_memories (
+            CREATE TABLE IF NOT EXISTS timelines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 capture_id INTEGER NOT NULL,
                 summary TEXT NOT NULL,
@@ -62,28 +62,28 @@ class KnowledgeManager:
             CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
                 summary,
                 entities,
-                content='episodic_memories',
+                content='timelines',
                 content_rowid='id'
             )
         """)
 
         # 创建触发器
         cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON episodic_memories BEGIN
+            CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON timelines BEGIN
                 INSERT INTO knowledge_fts(rowid, summary, entities)
                 VALUES (new.id, new.summary, new.entities);
             END
         """)
 
         cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON episodic_memories BEGIN
+            CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON timelines BEGIN
                 UPDATE knowledge_fts SET summary = new.summary, entities = new.entities
                 WHERE rowid = new.id;
             END
         """)
 
         cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON episodic_memories BEGIN
+            CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON timelines BEGIN
                 DELETE FROM knowledge_fts WHERE rowid = old.id;
             END
         """)
@@ -95,7 +95,7 @@ class KnowledgeManager:
     @staticmethod
     def _ensure_semantic_columns(cursor: sqlite3.Cursor) -> None:
         """兼容旧数据库：补齐知识语义字段。"""
-        cursor.execute("PRAGMA table_info(episodic_memories)")
+        cursor.execute("PRAGMA table_info(timelines)")
         existing = {row[1] for row in cursor.fetchall()}
 
         expected_columns = {
@@ -111,19 +111,19 @@ class KnowledgeManager:
 
         for name, col_type in expected_columns.items():
             if name not in existing:
-                logger.info("为 episodic_memories 自动补列: %s", name)
-                cursor.execute(f"ALTER TABLE episodic_memories ADD COLUMN {name} {col_type}")
+                logger.info("为 timelines 自动补列: %s", name)
+                cursor.execute(f"ALTER TABLE timelines ADD COLUMN {name} {col_type}")
 
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_observed_at ON episodic_memories(observed_at)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_event_time ON episodic_memories(event_time_start, event_time_end)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_activity_type ON episodic_memories(activity_type)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_history_view ON episodic_memories(history_view)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_self_generated ON episodic_memories(is_self_generated)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_observed_at ON timelines(observed_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_event_time ON timelines(event_time_start, event_time_end)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_activity_type ON timelines(activity_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_history_view ON timelines(history_view)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_self_generated ON timelines(is_self_generated)")
 
     @staticmethod
     def _ensure_fragment_columns(cursor: sqlite3.Cursor) -> None:
         """兼容旧数据库：补齐片段知识相关列与索引。"""
-        cursor.execute("PRAGMA table_info(episodic_memories)")
+        cursor.execute("PRAGMA table_info(timelines)")
         existing = {row[1] for row in cursor.fetchall()}
 
         expected_columns = {
@@ -137,11 +137,11 @@ class KnowledgeManager:
 
         for name, col_type in expected_columns.items():
             if name not in existing:
-                logger.info("为 episodic_memories 自动补列: %s", name)
-                cursor.execute(f"ALTER TABLE episodic_memories ADD COLUMN {name} {col_type}")
+                logger.info("为 timelines 自动补列: %s", name)
+                cursor.execute(f"ALTER TABLE timelines ADD COLUMN {name} {col_type}")
 
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_time ON episodic_memories(start_time, end_time)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_app ON episodic_memories(frag_app_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_time ON timelines(start_time, end_time)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_app ON timelines(frag_app_name)")
 
     def add_entry(self, knowledge: Dict[str, Any]) -> int:
         """
@@ -161,7 +161,7 @@ class KnowledgeManager:
         details = knowledge.get('details', '')
 
         cursor.execute("""
-            INSERT INTO episodic_memories (
+            INSERT INTO timelines (
                 capture_id, summary, overview, details, entities, category,
                 importance, occurrence_count, observed_at, event_time_start,
                 event_time_end, history_view, content_origin, activity_type,
@@ -216,7 +216,7 @@ class KnowledgeManager:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        query = "SELECT * FROM episodic_memories WHERE 1=1"
+        query = "SELECT * FROM timelines WHERE 1=1"
         params = []
 
         if category:
@@ -254,7 +254,7 @@ class KnowledgeManager:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        cursor.execute("SELECT * FROM episodic_memories WHERE id = ?", (entry_id,))
+        cursor.execute("SELECT * FROM timelines WHERE id = ?", (entry_id,))
         row = cursor.fetchone()
         conn.close()
 
@@ -315,7 +315,7 @@ class KnowledgeManager:
         params.append(datetime.now().isoformat())
         params.append(entry_id)
 
-        query = f"UPDATE episodic_memories SET {', '.join(set_clauses)} WHERE id = ?"
+        query = f"UPDATE timelines SET {', '.join(set_clauses)} WHERE id = ?"
         cursor.execute(query, params)
 
         success = cursor.rowcount > 0
@@ -332,7 +332,7 @@ class KnowledgeManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("DELETE FROM episodic_memories WHERE id = ?", (entry_id,))
+        cursor.execute("DELETE FROM timelines WHERE id = ?", (entry_id,))
         success = cursor.rowcount > 0
 
         conn.commit()
@@ -359,7 +359,7 @@ class KnowledgeManager:
         cursor = conn.cursor()
 
         cursor.execute("""
-            SELECT ke.* FROM episodic_memories ke
+            SELECT ke.* FROM timelines ke
             JOIN knowledge_fts kf ON ke.id = kf.rowid
             WHERE knowledge_fts MATCH ?
             ORDER BY rank
@@ -401,7 +401,7 @@ class KnowledgeManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        query = "SELECT COUNT(*) FROM episodic_memories WHERE 1=1"
+        query = "SELECT COUNT(*) FROM timelines WHERE 1=1"
         params = []
 
         if category:
@@ -423,17 +423,17 @@ class KnowledgeManager:
         cursor = conn.cursor()
 
         # 总条目数
-        cursor.execute("SELECT COUNT(*) FROM episodic_memories")
+        cursor.execute("SELECT COUNT(*) FROM timelines")
         total = cursor.fetchone()[0]
 
         # 已验证条目数
-        cursor.execute("SELECT COUNT(*) FROM episodic_memories WHERE user_verified = 1")
+        cursor.execute("SELECT COUNT(*) FROM timelines WHERE user_verified = 1")
         verified = cursor.fetchone()[0]
 
         # 分类统计
         cursor.execute("""
             SELECT category, COUNT(*) as count
-            FROM episodic_memories
+            FROM timelines
             GROUP BY category
         """)
         categories = {row[0]: row[1] for row in cursor.fetchall()}

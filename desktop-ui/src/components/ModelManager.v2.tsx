@@ -20,7 +20,7 @@ interface Model {
   model_id: string
   size_gb: number
   description: string
-  status: 'not_installed' | 'downloading' | 'installed' | 'active'
+  status: 'not_installed' | 'downloading' | 'loading' | 'installed' | 'active'
   is_active: boolean
   is_default: boolean
   requires_api_key: boolean
@@ -240,6 +240,7 @@ const ModelManager: React.FC = () => {
     const labels: Record<string, string> = {
       not_installed: '未安装',
       downloading: '下载中...',
+      loading: '加载中...',
       installed: '已安装',
       active: '使用中',
     }
@@ -506,6 +507,25 @@ const ModelManager: React.FC = () => {
                       </svg>
                       {model.requires_api_key ? '配置' : '下载'}
                     </button>
+                  )}
+
+                  {(model.status === 'downloading' || model.status === 'loading') && (
+                    <span className="model-manager-v2__loading-badge">
+                      <svg
+                        width="14"
+                        height="14"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        className="model-manager-v2__spinner"
+                      >
+                        <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                      </svg>
+                      {model.status === 'downloading' ? '下载中...' : '加载中...'}
+                    </span>
                   )}
 
                   {model.status === 'installed' && !model.is_active && (

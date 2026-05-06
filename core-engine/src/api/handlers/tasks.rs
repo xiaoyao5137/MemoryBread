@@ -34,11 +34,11 @@ pub async fn create_task(
 }
 
 /// GET /api/tasks - 列出所有任务
-pub async fn list_tasks(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
+pub async fn list_tasks(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     let tasks = TaskRepo::list_all(&state.storage)?;
-    Ok(Json(serde_json::json!({ "tasks": tasks, "total": tasks.len() })))
+    Ok(Json(
+        serde_json::json!({ "tasks": tasks, "total": tasks.len() }),
+    ))
 }
 
 /// GET /api/tasks/:id - 获取单个任务
@@ -121,7 +121,9 @@ pub async fn trigger_task(
             .await;
     });
 
-    Ok(Json(serde_json::json!({ "message": "任务已触发", "task_id": id })))
+    Ok(Json(
+        serde_json::json!({ "message": "任务已触发", "task_id": id }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]

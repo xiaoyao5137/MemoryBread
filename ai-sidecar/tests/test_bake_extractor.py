@@ -89,6 +89,13 @@ def make_extractor() -> KnowledgeExtractorV2:
 
 
 
+def make_raw_extractor() -> KnowledgeExtractorV2:
+    extractor = KnowledgeExtractorV2.__new__(KnowledgeExtractorV2)
+    extractor.model = "mock-model"
+    return extractor
+
+
+
 def test_extract_json_object_accepts_python_like_dict():
     raw = "```json\n{'accepted': True, 'reason': None, 'payload': {'summary': 'ok'}}\n```"
 
@@ -429,5 +436,130 @@ def test_extract_bake_sop_accepts_valid_payload():
     assert meta["degraded"] is False
     assert meta["model"] == "mock-model"
     assert meta["elapsed_ms"] >= 0
+
+
+
+def test_build_bake_candidate_text_strips_score_metadata_from_details():
+    extractor = make_raw_extractor()
+    candidate = {
+        **SAMPLE_CANDIDATE,
+        "details": {
+            "summary": "保留语义内容",
+            "match_score": 0.95,
+            "match_level": "high",
+            "review_status": "auto_created",
+            "inner": {
+                "confidence": "high",
+                "facts": "需要保留",
+            },
+        },
+    }
+
+    text = extractor._build_bake_candidate_text(candidate)
+
+    assert "match_score" not in text
+    assert "match_level" not in text
+    assert "review_status" not in text
+    assert "保留语义内容" in text
+    assert "需要保留" in text
+
+
+
+def test_extract_bake_template_downgrades_sop_like_high_score_payload():
+    extractor = make_extractor()
+    sop_like_candidate = {
+        **SAMPLE_CANDIDATE,
+        "summary": "启动故障排查步骤",
+        "overview": "按步骤执行排查流程",
+        "details": "触发条件: 启动失败；前置条件: 有日志；步骤: 检查 health、检查端口、验证结果",
+        "entities": ["步骤", "排查", "触发条件"],
+    }
+    payload = {
+        "name": "启动排查模板",
+        "category": "analysis",
+        "status": "active",
+        "tags": ["排查"],
+        "applicable_tasks": ["creation"],
+        "linked_knowledge_ids": [],
+        "structure_sections": [{"title": "步骤", "keywords": ["检查"], "notes": "逐条执行"}],
+        "style_phrases": ["先检查再验证"],
+        "replacement_rules": [],
+        "prompt_hint": "按步骤排查",
+        "diagram_code": None,
+        "image_assets": [],
+        "evidence_summary": "原始候选强调流程步骤",
+        "match_score": 0.96,
+        "match_level": "high",
+        "review_status": "auto_created",
+    }
+    extractor._call_bake_llm = types.MethodType(
+        lambda self, caller_id, system_prompt, user_prompt: (
+            {"accepted": True, "reason": None, "payload": payload},
+            {
+                "usage": {"prompt_tokens": 20, "completion_tokens": 22},
+                "model": "mock-model",
+                "raw_content": '{"accepted": true}',
+                "raw_preview": '{"accepted": true}',
+                "response_preview": '{"accepted": true}',
+                "empty_content": False,
+                "elapsed_ms": 18,
+            },
+        ),
+        extractor,
+    )
+
+    artifact, _ = extractor._extract_bake_artifact(sop_like_candidate, "template", "prompt")
+
+    assert artifact["accepted"] is True
+    assert artifact["payload"]["match_level"] == "low"
+    assert artifact["payload"]["review_status"] == "candidate"
+    assert artifact["payload"]["match_score"] <= 0.49
+
+
+
+def test_extract_bake_sop_downgrades_template_like_high_score_payload():
+    extractor = make_extractor()
+    template_like_candidate = {
+        **TEMPLATE_ONLY_CANDIDATE,
+        "summary": "周报模板结构沉淀",
+        "details": "模板骨架包含背景、进展、风险、计划四段；按槽位填写。",
+        "entities": ["模板", "骨架", "槽位"],
+    }
+    payload = {
+        "summary": "周报输出 SOP",
+        "overview": "执行周报产出流程",
+        "source_title": "周报模板实践",
+        "trigger_keywords": ["周报", "产出"],
+        "extracted_problem": "如何稳定产出周报",
+        "steps": ["收集素材", "填充结构", "输出结果"],
+        "linked_knowledge_ids": [],
+        "confidence": "high",
+        "evidence_summary": "候选中出现模板骨架",
+        "match_score": 0.94,
+        "match_level": "high",
+        "review_status": "auto_created",
+    }
+    extractor._call_bake_llm = types.MethodType(
+        lambda self, caller_id, system_prompt, user_prompt: (
+            {"accepted": True, "reason": None, "payload": payload},
+            {
+                "usage": {"prompt_tokens": 20, "completion_tokens": 22},
+                "model": "mock-model",
+                "raw_content": '{"accepted": true}',
+                "raw_preview": '{"accepted": true}',
+                "response_preview": '{"accepted": true}',
+                "empty_content": False,
+                "elapsed_ms": 18,
+            },
+        ),
+        extractor,
+    )
+
+    artifact, _ = extractor._extract_bake_artifact(template_like_candidate, "sop", "prompt")
+
+    assert artifact["accepted"] is True
+    assert artifact["payload"]["match_level"] == "low"
+    assert artifact["payload"]["review_status"] == "candidate"
+    assert artifact["payload"]["match_score"] <= 0.49
 
 

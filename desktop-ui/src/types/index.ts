@@ -107,7 +107,7 @@ export interface BakeOverview {
   recentActivities: string[]
 }
 
-export interface EpisodicMemoryItem {
+export interface TimelineItem {
   id: string
   title: string
   url?: string
@@ -224,6 +224,11 @@ export interface WritingStyleConfig {
   applyToTemplateEditing: boolean
 }
 
+export interface LinkedKnowledgeSummary {
+  id: string
+  summary: string
+}
+
 export interface SopCandidate {
   id: string
   sourceCaptureId: string
@@ -233,6 +238,7 @@ export interface SopCandidate {
   extractedProblem?: string
   steps: string[]
   linkedKnowledgeIds: string[]
+  linkedKnowledgeSummaries: LinkedKnowledgeSummary[]
   status: 'candidate' | 'confirmed' | 'ignored'
 }
 
@@ -336,7 +342,7 @@ export type ModelProvider =
   | 'tongyi' | 'doubao' | 'deepseek' | 'kimi'
 
 export type ModelCategory = 'llm' | 'embedding' | 'ocr' | 'asr' | 'vlm'
-export type ModelStatus = 'not_installed' | 'downloading' | 'installed' | 'active' | 'error'
+export type ModelStatus = 'not_installed' | 'downloading' | 'installed' | 'active' | 'loading' | 'error'
 
 export interface ApiKeyField {
   key:         string
@@ -355,6 +361,7 @@ export interface ModelEntry {
   description:      string
   status:           ModelStatus
   download_progress?: number
+  error?:           string
   is_active:        boolean
   is_default:       boolean
   requires_api_key: boolean

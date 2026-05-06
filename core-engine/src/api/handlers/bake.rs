@@ -10,22 +10,10 @@ use axum::{
 use crate::{
     api::{error::ApiError, state::AppState},
     services::bake_service::{
-        BakeBucket,
-        BakeMemoryFilter,
-        BakeMemoryPayload,
-        BakeCaptureFilter,
-        BakeCapturePayload,
-        BakeKnowledgePayload,
-        BakeListFilter,
-        BakeOverviewPayload,
-        BakePagedResponse,
-        BakeRunPayload,
-        BakeService,
-        BakeSopPayload,
-        BakeStyleConfig,
-        BakeTemplatePayload,
-        BakeExtractResponse,
-        CreateOrUpdateTemplateRequest,
+        BakeBucket, BakeCaptureFilter, BakeCapturePayload, BakeExtractResponse,
+        BakeKnowledgePayload, BakeListFilter, BakeMemoryFilter, BakeMemoryPayload,
+        BakeOverviewPayload, BakePagedResponse, BakeRunPayload, BakeService, BakeSopPayload,
+        BakeStyleConfig, BakeDesignPayload, CreateOrUpdateDesignRequest,
         InitializeBakeMemoriesResponse,
     },
 };
@@ -43,7 +31,7 @@ pub struct BakePaginationQuery {
 
 #[derive(serde::Serialize)]
 pub struct BakeTemplatesResponse {
-    pub items: Vec<BakeTemplatePayload>,
+    pub items: Vec<BakeDesignPayload>,
     pub total: i64,
     pub limit: usize,
     pub offset: usize,
@@ -77,6 +65,14 @@ pub struct BakeCapturesResponse {
 #[derive(serde::Serialize)]
 pub struct BakeSopsResponse {
     pub items: Vec<BakeSopPayload>,
+    pub total: i64,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct BakeDesignsResponse {
+    pub items: Vec<BakeDesignPayload>,
     pub total: i64,
     pub limit: usize,
     pub offset: usize,
@@ -128,9 +124,10 @@ pub async fn list_bake_templates(
         limit,
         offset,
     };
-    let response: BakePagedResponse<BakeTemplatePayload> = tokio::task::spawn_blocking(move || service.list_templates_paginated(filter))
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    let response: BakePagedResponse<BakeDesignPayload> =
+        tokio::task::spawn_blocking(move || service.list_templates_paginated(filter))
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))??;
     Ok(Json(BakeTemplatesResponse {
         items: response.items,
         total: response.total,
@@ -141,8 +138,8 @@ pub async fn list_bake_templates(
 
 pub async fn create_bake_template(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateOrUpdateTemplateRequest>,
-) -> Result<Json<BakeTemplatePayload>, ApiError> {
+    Json(body): Json<CreateOrUpdateDesignRequest>,
+) -> Result<Json<BakeDesignPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
     let template = tokio::task::spawn_blocking(move || service.create_template(body))
         .await
@@ -153,8 +150,8 @@ pub async fn create_bake_template(
 pub async fn update_bake_template(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-    Json(body): Json<CreateOrUpdateTemplateRequest>,
-) -> Result<Json<BakeTemplatePayload>, ApiError> {
+    Json(body): Json<CreateOrUpdateDesignRequest>,
+) -> Result<Json<BakeDesignPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
     let template = tokio::task::spawn_blocking(move || service.update_template(id, body))
         .await
@@ -165,9 +162,20 @@ pub async fn update_bake_template(
 pub async fn toggle_bake_template_status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-) -> Result<Json<BakeTemplatePayload>, ApiError> {
+) -> Result<Json<BakeDesignPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
     let template = tokio::task::spawn_blocking(move || service.toggle_template_status(id))
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    Ok(Json(template))
+}
+
+pub async fn adopt_bake_template(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<BakeDesignPayload>, ApiError> {
+    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
+    let template = tokio::task::spawn_blocking(move || service.adopt_template(id))
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
     Ok(Json(template))
@@ -198,9 +206,10 @@ pub async fn list_bake_sops(
         limit,
         offset,
     };
-    let response: BakePagedResponse<BakeSopPayload> = tokio::task::spawn_blocking(move || service.list_sops_paginated(filter))
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    let response: BakePagedResponse<BakeSopPayload> =
+        tokio::task::spawn_blocking(move || service.list_sops_paginated(filter))
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))??;
     Ok(Json(BakeSopsResponse {
         items: response.items,
         total: response.total,
@@ -242,6 +251,54 @@ pub async fn delete_bake_sop(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn list_bake_designs(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<BakePaginationQuery>,
+) -> Result<Json<BakeDesignsResponse>, ApiError> {
+    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    let offset = params.offset.unwrap_or(0);
+    let bucket = BakeBucket::from_query(params.bucket.as_deref())?;
+    let filter = BakeListFilter {
+        q: params.q.filter(|value| !value.trim().is_empty()),
+        bucket,
+        limit,
+        offset,
+    };
+    let response: BakePagedResponse<BakeDesignPayload> =
+        tokio::task::spawn_blocking(move || service.list_designs_paginated(filter))
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))??;
+    Ok(Json(BakeDesignsResponse {
+        items: response.items,
+        total: response.total,
+        limit: response.limit,
+        offset: response.offset,
+    }))
+}
+
+pub async fn adopt_bake_design(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<BakeDesignPayload>, ApiError> {
+    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
+    let candidate = tokio::task::spawn_blocking(move || service.adopt_design(id))
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    Ok(Json(candidate))
+}
+
+pub async fn delete_bake_design(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
+    tokio::task::spawn_blocking(move || service.delete_design(id))
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_bake_memories(
     State(state): State<Arc<AppState>>,
     Query(params): Query<BakePaginationQuery>,
@@ -256,9 +313,10 @@ pub async fn list_bake_memories(
         limit,
         offset,
     };
-    let response: BakePagedResponse<BakeMemoryPayload> = tokio::task::spawn_blocking(move || service.list_memories_paginated(filter))
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    let response: BakePagedResponse<BakeMemoryPayload> =
+        tokio::task::spawn_blocking(move || service.list_memories_paginated(filter))
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))??;
     Ok(Json(BakeMemoriesResponse {
         articles: response.items.clone(),
         memories: response.items,
@@ -271,7 +329,7 @@ pub async fn list_bake_memories(
 pub async fn list_bake_knowledge(
     State(state): State<Arc<AppState>>,
     Query(params): Query<BakePaginationQuery>,
-) -> Result<Json<BakeKnowledgeResponse>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let offset = params.offset.unwrap_or(0);
@@ -282,15 +340,30 @@ pub async fn list_bake_knowledge(
         limit,
         offset,
     };
-    let response: BakePagedResponse<BakeKnowledgePayload> = tokio::task::spawn_blocking(move || service.list_knowledge_paginated(filter))
+    let response: BakePagedResponse<BakeKnowledgePayload> =
+        tokio::task::spawn_blocking(move || service.list_knowledge_paginated(filter))
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))??;
+    Ok((
+        [(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")],
+        Json(BakeKnowledgeResponse {
+            items: response.items,
+            total: response.total,
+            limit: response.limit,
+            offset: response.offset,
+        })
+    ))
+}
+
+pub async fn adopt_bake_knowledge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<BakeKnowledgePayload>, ApiError> {
+    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
+    let knowledge = tokio::task::spawn_blocking(move || service.adopt_knowledge(id))
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(BakeKnowledgeResponse {
-        items: response.items,
-        total: response.total,
-        limit: response.limit,
-        offset: response.offset,
-    }))
+    Ok(Json(knowledge))
 }
 
 pub async fn ignore_bake_knowledge(
@@ -330,9 +403,10 @@ pub async fn list_bake_captures(
         limit,
         offset,
     };
-    let response: BakePagedResponse<BakeCapturePayload> = tokio::task::spawn_blocking(move || service.list_capture_records_paginated(filter))
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    let response: BakePagedResponse<BakeCapturePayload> =
+        tokio::task::spawn_blocking(move || service.list_capture_records_paginated(filter))
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))??;
     Ok(Json(BakeCapturesResponse {
         items: response.items,
         total: response.total,
@@ -371,15 +445,16 @@ pub async fn get_bake_capture_screenshot(
         .join("captures")
         .join(&relative_path);
 
-    let bytes = tokio::fs::read(&full_path)
-        .await
-        .map_err(|err| ApiError::NotFound(format!("failed to read screenshot {relative_path}: {err}")))?;
+    let bytes = tokio::fs::read(&full_path).await.map_err(|err| {
+        ApiError::NotFound(format!("failed to read screenshot {relative_path}: {err}"))
+    })?;
 
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "image/jpeg")],
         bytes,
-    ).into_response())
+    )
+        .into_response())
 }
 
 pub async fn initialize_bake_memories(
@@ -408,7 +483,7 @@ pub async fn ignore_bake_memory(
 pub async fn promote_bake_memory_to_template(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-) -> Result<Json<BakeTemplatePayload>, ApiError> {
+) -> Result<Json<BakeDesignPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
     let template = tokio::task::spawn_blocking(move || service.promote_memory_to_template(id))
         .await
@@ -432,7 +507,9 @@ pub async fn run_bake_pipeline(
     Json(body): Json<RunBakeRequest>,
 ) -> Result<Json<BakeRunPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let trigger_reason = body.trigger_reason.unwrap_or_else(|| "manual_debug".to_string());
+    let trigger_reason = body
+        .trigger_reason
+        .unwrap_or_else(|| "manual_debug".to_string());
     let limit = body.limit.unwrap_or(20).clamp(1, 100);
     let result = service.run_bake_pipeline(&trigger_reason, limit).await?;
     Ok(Json(result))

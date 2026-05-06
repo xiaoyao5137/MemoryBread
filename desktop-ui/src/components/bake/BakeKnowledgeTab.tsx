@@ -10,7 +10,7 @@ const bucketMeta: Record<BakeBucket, { title: string; subtitle: string; empty: s
   },
   pending: {
     title: '待提炼',
-    subtitle: '处理中贴合度候选，可选择忽略',
+    subtitle: '处理中贴合度候选，可选择采纳或忽略',
     empty: '当前还没有待提炼知识候选。',
   },
 }
@@ -46,6 +46,7 @@ const BakeKnowledgeTab: React.FC<{
   onSearch: () => void
   onClearFilters: () => void
   onIgnoreKnowledge: (id: string) => void
+  onAdoptKnowledge: (id: string) => void
   onDeleteKnowledge: (id: string) => void
   onOpenCapture: (captureId?: string) => void
 }> = ({
@@ -65,6 +66,7 @@ const BakeKnowledgeTab: React.FC<{
   onSearch,
   onClearFilters,
   onIgnoreKnowledge,
+  onAdoptKnowledge,
   onDeleteKnowledge,
   onOpenCapture,
 }) => {
@@ -80,56 +82,49 @@ const BakeKnowledgeTab: React.FC<{
   }, [bucket, query])
 
   return (
-    <div className="bake-split-list-detail bake-split-list-detail--knowledge">
-      <BakeCard className="bake-knowledge-list-card">
+    <>
+      <BakeCard>
         <BakeSectionHeader
-          title="知识（芝士）"
-          subtitle={`${bucketMeta[bucket].subtitle}，并追溯其来源记忆片段`}
-          right={(
-            <div className="bake-segmented-actions">
-              <BakeButton compact active={bucket === 'extracted'} onClick={() => onBucketChange('extracted')}>已提炼</BakeButton>
-              <BakeButton compact active={bucket === 'pending'} onClick={() => onBucketChange('pending')}>待提炼</BakeButton>
-            </div>
-          )}
+          title="知识"
+          subtitle="浏览已提炼的知识条目，并追溯其来源采集记录"
         />
-        <form
-          className="bake-list-toolbar"
-          onSubmit={(event) => {
-            event.preventDefault()
-            onSearch()
-          }}
-        >
-          <div className="bake-list-toolbar__filters bake-list-toolbar__filters--single">
+        <div className="bake-list-toolbar">
+          <div className="bake-list-toolbar__filters">
+            <label className="bake-form-field bake-filter-field">
+              <span className="bake-filter-label">分组</span>
+              <div className="bake-segmented-actions">
+                <BakeButton compact active={bucket === 'extracted'} onClick={() => onBucketChange('extracted')}>已提炼</BakeButton>
+                <BakeButton compact active={bucket === 'pending'} onClick={() => onBucketChange('pending')}>待提炼</BakeButton>
+              </div>
+            </label>
             <label className="bake-form-field bake-filter-field bake-filter-field--search">
               <span className="bake-filter-label">关键词</span>
               <input
                 className="bake-input"
                 value={draftQuery}
                 onChange={(event) => onDraftQueryChange(event.target.value)}
+                onKeyDown={(event) => event.key === 'Enter' && onSearch()}
                 placeholder="搜索知识摘要、概述、详情或分类"
               />
             </label>
           </div>
           <div className="bake-list-toolbar__actions">
-            <BakeButton compact primary type="submit">搜索</BakeButton>
+            <BakeButton compact primary onClick={onSearch}>搜索</BakeButton>
             {(draftQuery || query) && <BakeButton compact onClick={onClearFilters}>清除筛选</BakeButton>}
           </div>
-        </form>
+        </div>
         {filterPills.length > 0 && (
           <div className="bake-filter-summary">
             {filterPills.map(item => <BakePill key={item} text={item} />)}
           </div>
         )}
+      </BakeCard>
+      <div className="bake-split-list-detail bake-split-list-detail--knowledge">
+        <BakeCard className="bake-knowledge-list-card">
         <div className="bake-list bake-knowledge-list">
           {items.length === 0 ? (
             <div className="bake-muted">{query.trim() ? '当前筛选条件下没有可展示的知识条目。' : bucketMeta[bucket].empty}</div>
           ) : items.map(item => {
-            const metaPills = [
-              formatReviewStatus(item.reviewStatus),
-              item.matchLevel || null,
-              formatMatchScore(item.matchScore),
-            ].filter(Boolean) as string[]
-
             return (
               <button
                 key={item.id}
@@ -143,12 +138,10 @@ const BakeKnowledgeTab: React.FC<{
                   <span>{item.category || '未分类'}</span>
                   <span>重要度 {item.importance}</span>
                   <span>重复观察 {item.occurrenceCount} 次</span>
+                  {item.reviewStatus && <span>{formatReviewStatus(item.reviewStatus)}</span>}
+                  {item.matchLevel && <span>{item.matchLevel}</span>}
+                  {item.matchScore != null && <span>匹配 {item.matchScore.toFixed(2)}</span>}
                 </div>
-                {metaPills.length > 0 && (
-                  <div className="bake-inline-pills">
-                    {metaPills.map(pill => <BakePill key={`${item.id}-${pill}`} text={pill} />)}
-                  </div>
-                )}
               </button>
             )
           })}
@@ -206,9 +199,9 @@ const BakeKnowledgeTab: React.FC<{
                 </div>
               </div>
               <div className="bake-inline-pills">
-                <BakePill text={bucketMeta[bucket].title} />
                 <BakePill text={formatReviewStatus(selected.reviewStatus)} />
                 {selected.matchLevel && <BakePill text={selected.matchLevel} />}
+                {selected.matchScore != null && <BakePill text={`匹配 ${selected.matchScore.toFixed(2)}`} />}
               </div>
             </div>
             <div className="bake-knowledge-detail__section">
@@ -217,7 +210,17 @@ const BakeKnowledgeTab: React.FC<{
             </div>
             <div className="bake-knowledge-detail__section">
               <div className="bake-kv__title">详情</div>
-              <div className="bake-muted" style={{ lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>{selected.details || '暂无详情'}</div>
+              <div className="bake-muted" style={{ lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>
+                {(() => {
+                  if (!selected.details) return '暂无详情'
+                  try {
+                    const parsed = JSON.parse(selected.details)
+                    return JSON.stringify(parsed, null, 2)
+                  } catch {
+                    return selected.details
+                  }
+                })()}
+              </div>
             </div>
             <div className="bake-knowledge-detail__section">
               <div className="bake-kv__title">提炼状态</div>
@@ -238,7 +241,10 @@ const BakeKnowledgeTab: React.FC<{
               </div>
             </div>
             <div className="bake-actions--primary">
-              <BakeButton onClick={() => onOpenCapture(selected.captureId)}>来源记忆片段</BakeButton>
+              <BakeButton onClick={() => onOpenCapture(selected.captureId)}>来源采集记录</BakeButton>
+              {bucket === 'pending' && (
+                <BakeButton primary onClick={() => onAdoptKnowledge(selected.id)}>采纳为知识</BakeButton>
+              )}
               {bucket === 'pending'
                 ? <BakeButton onClick={() => onIgnoreKnowledge(selected.id)}>忽略候选</BakeButton>
                 : <BakeButton onClick={() => onDeleteKnowledge(selected.id)}>删除知识</BakeButton>}
@@ -248,7 +254,8 @@ const BakeKnowledgeTab: React.FC<{
           <div className="bake-muted">暂无知识条目</div>
         )}
       </BakeCard>
-    </div>
+      </div>
+    </>
   )
 }
 

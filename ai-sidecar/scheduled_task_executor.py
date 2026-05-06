@@ -291,7 +291,7 @@ class TaskExecutor:
                    user_verified, observed_at, event_time_start, event_time_end,
                    history_view, content_origin, activity_type, is_self_generated,
                    evidence_strength, created_at
-            FROM episodic_memories
+            FROM timelines
             WHERE importance >= 2
               AND (start_time IS NULL OR start_time >= ?)
             ORDER BY COALESCE(start_time, created_at) DESC
@@ -611,7 +611,8 @@ class TaskExecutor:
             "4. 以下类型的活动禁止直接写入报告：纯阅读/查看文档、安装配置环境、无结论的调研、中间态的失败尝试。"
             "若这些活动产生了明确结论或结果，则以结论为主语来描述。\n"
             "5. 凡有可量化数据（测试通过率、性能指标、完成模块数等），必须写出具体数字。\n"
-            "6. 每条工作项须能回答「这件事带来了什么价值？」，否则删除该条。"
+            "6. 每条工作项须能回答「这件事带来了什么价值？」，否则删除该条。\n"
+            "7. 【格式规范】所有章节标题必须使用 ## 二级标题格式（如 ## 开发、## 阅读、## 今日小结），章节内的列表项必须统一使用无序列表格式（以 - 或 * 开头，无额外缩进）。"
             f"{weekly_rules}"
         )
         user_prompt = f"## 工作记录\n\n{context}\n\n---\n\n## 用户指令\n\n{user_instruction}"

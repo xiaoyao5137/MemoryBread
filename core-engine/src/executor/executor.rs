@@ -74,9 +74,12 @@ impl AutomationExecutor {
     }
 
     /// 在用户已确认的情况下执行动作（全自动或半自动已确认后调用）
-    pub async fn execute_confirmed(&self, cmd: ActionCommand) -> Result<ActionResult, ExecutorError> {
+    pub async fn execute_confirmed(
+        &self,
+        cmd: ActionCommand,
+    ) -> Result<ActionResult, ExecutorError> {
         let start = Instant::now();
-        let desc  = cmd.describe();
+        let desc = cmd.describe();
 
         info!("执行动作: {desc}");
 
@@ -132,18 +135,10 @@ fn execute_sync(cmd: ActionCommand) -> Result<(), ExecutorError> {
         Click { x, y } | RightClick { x, y } | DoubleClick { x, y } | MoveTo { x, y } => {
             enigo_mouse_action(cmd, x, y)
         }
-        TypeText { ref text } => {
-            enigo_type_text(text)
-        }
-        Hotkey { ref keys } => {
-            enigo_hotkey(keys)
-        }
-        KeyPress { ref key } => {
-            enigo_key_press(key)
-        }
-        Scroll { x, y, delta_y } => {
-            enigo_scroll(x, y, delta_y)
-        }
+        TypeText { ref text } => enigo_type_text(text),
+        Hotkey { ref keys } => enigo_hotkey(keys),
+        KeyPress { ref key } => enigo_key_press(key),
+        Scroll { x, y, delta_y } => enigo_scroll(x, y, delta_y),
         Wait { ms } => {
             std::thread::sleep(Duration::from_millis(ms));
             Ok(())
@@ -161,7 +156,7 @@ fn execute_sync(cmd: ActionCommand) -> Result<(), ExecutorError> {
 
 fn enigo_mouse_action(cmd: ActionCommand, x: f64, y: f64) -> Result<(), ExecutorError> {
     try_enigo(|| {
-        use enigo::{Enigo, Mouse, Settings, Button, Coordinate};  // type: ignore
+        use enigo::{Button, Coordinate, Enigo, Mouse, Settings}; // type: ignore
         let mut e = Enigo::new(&Settings::default())
             .map_err(|err| ExecutorError::DriverError(err.to_string()))?;
         e.move_mouse(x as i32, y as i32, Coordinate::Abs)
@@ -183,7 +178,7 @@ fn enigo_mouse_action(cmd: ActionCommand, x: f64, y: f64) -> Result<(), Executor
                 e.button(Button::Left, enigo::Direction::Click)
                     .map_err(|err| ExecutorError::DriverError(err.to_string()))?;
             }
-            _ => {}   // MoveTo 不需要点击
+            _ => {} // MoveTo 不需要点击
         }
         Ok(())
     })
@@ -191,7 +186,7 @@ fn enigo_mouse_action(cmd: ActionCommand, x: f64, y: f64) -> Result<(), Executor
 
 fn enigo_type_text(text: &str) -> Result<(), ExecutorError> {
     try_enigo(|| {
-        use enigo::{Enigo, Keyboard, Settings};  // type: ignore
+        use enigo::{Enigo, Keyboard, Settings}; // type: ignore
         let mut e = Enigo::new(&Settings::default())
             .map_err(|err| ExecutorError::DriverError(err.to_string()))?;
         e.text(text)
@@ -202,7 +197,7 @@ fn enigo_type_text(text: &str) -> Result<(), ExecutorError> {
 
 fn enigo_hotkey(keys: &[String]) -> Result<(), ExecutorError> {
     try_enigo(|| {
-        use enigo::{Enigo, Key, Keyboard, Settings, Direction};  // type: ignore
+        use enigo::{Direction, Enigo, Key, Keyboard, Settings}; // type: ignore
         let mut e = Enigo::new(&Settings::default())
             .map_err(|err| ExecutorError::DriverError(err.to_string()))?;
         let parsed: Vec<Key> = keys.iter().map(|k| parse_key(k)).collect();
@@ -222,7 +217,7 @@ fn enigo_hotkey(keys: &[String]) -> Result<(), ExecutorError> {
 
 fn enigo_key_press(key: &str) -> Result<(), ExecutorError> {
     try_enigo(|| {
-        use enigo::{Enigo, Key, Keyboard, Settings, Direction};  // type: ignore
+        use enigo::{Direction, Enigo, Key, Keyboard, Settings}; // type: ignore
         let mut e = Enigo::new(&Settings::default())
             .map_err(|err| ExecutorError::DriverError(err.to_string()))?;
         let k = parse_key(key);
@@ -234,7 +229,7 @@ fn enigo_key_press(key: &str) -> Result<(), ExecutorError> {
 
 fn enigo_scroll(x: f64, y: f64, delta_y: i32) -> Result<(), ExecutorError> {
     try_enigo(|| {
-        use enigo::{Enigo, Mouse, Settings, Axis, Coordinate};  // type: ignore
+        use enigo::{Axis, Coordinate, Enigo, Mouse, Settings}; // type: ignore
         let mut e = Enigo::new(&Settings::default())
             .map_err(|err| ExecutorError::DriverError(err.to_string()))?;
         e.move_mouse(x as i32, y as i32, Coordinate::Abs)
@@ -256,36 +251,36 @@ fn try_enigo<F: FnOnce() -> Result<(), ExecutorError>>(f: F) -> Result<(), Execu
 fn parse_key(key: &str) -> enigo::Key {
     use enigo::Key;
     match key.to_lowercase().as_str() {
-        "ctrl" | "control"       => Key::Control,
-        "alt"                    => Key::Alt,
-        "shift"                  => Key::Shift,
+        "ctrl" | "control" => Key::Control,
+        "alt" => Key::Alt,
+        "shift" => Key::Shift,
         "meta" | "cmd" | "super" => Key::Meta,
-        "enter" | "return"       => Key::Return,
-        "tab"                    => Key::Tab,
-        "escape" | "esc"         => Key::Escape,
-        "backspace"              => Key::Backspace,
-        "delete" | "del"         => Key::Delete,
-        "space"                  => Key::Space,
-        "left"                   => Key::LeftArrow,
-        "right"                  => Key::RightArrow,
-        "up"                     => Key::UpArrow,
-        "down"                   => Key::DownArrow,
-        "home"                   => Key::Home,
-        "end"                    => Key::End,
-        "pageup"                 => Key::PageUp,
-        "pagedown"               => Key::PageDown,
-        "f1"                     => Key::F1,
-        "f2"                     => Key::F2,
-        "f3"                     => Key::F3,
-        "f4"                     => Key::F4,
-        "f5"                     => Key::F5,
-        "f6"                     => Key::F6,
-        "f7"                     => Key::F7,
-        "f8"                     => Key::F8,
-        "f9"                     => Key::F9,
-        "f10"                    => Key::F10,
-        "f11"                    => Key::F11,
-        "f12"                    => Key::F12,
+        "enter" | "return" => Key::Return,
+        "tab" => Key::Tab,
+        "escape" | "esc" => Key::Escape,
+        "backspace" => Key::Backspace,
+        "delete" | "del" => Key::Delete,
+        "space" => Key::Space,
+        "left" => Key::LeftArrow,
+        "right" => Key::RightArrow,
+        "up" => Key::UpArrow,
+        "down" => Key::DownArrow,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" => Key::PageUp,
+        "pagedown" => Key::PageDown,
+        "f1" => Key::F1,
+        "f2" => Key::F2,
+        "f3" => Key::F3,
+        "f4" => Key::F4,
+        "f5" => Key::F5,
+        "f6" => Key::F6,
+        "f7" => Key::F7,
+        "f8" => Key::F8,
+        "f9" => Key::F9,
+        "f10" => Key::F10,
+        "f11" => Key::F11,
+        "f12" => Key::F12,
         other => {
             // 单字符键
             if let Some(c) = other.chars().next() {
@@ -307,8 +302,8 @@ mod tests {
     #[tokio::test]
     async fn test_semi_auto_returns_requires_confirmation() {
         let executor = AutomationExecutor::semi_auto();
-        let cmd      = ActionCommand::Click { x: 100.0, y: 100.0 };
-        let result   = executor.execute(cmd).await;
+        let cmd = ActionCommand::Click { x: 100.0, y: 100.0 };
+        let result = executor.execute(cmd).await;
         assert!(matches!(result, Err(ExecutorError::RequiresConfirmation)));
     }
 
@@ -321,13 +316,17 @@ mod tests {
 
     #[test]
     fn test_action_describe_type_text() {
-        let cmd = ActionCommand::TypeText { text: "hello world".into() };
+        let cmd = ActionCommand::TypeText {
+            text: "hello world".into(),
+        };
         assert!(cmd.describe().contains("hello world"));
     }
 
     #[test]
     fn test_action_describe_hotkey() {
-        let cmd = ActionCommand::Hotkey { keys: vec!["ctrl".into(), "c".into()] };
+        let cmd = ActionCommand::Hotkey {
+            keys: vec!["ctrl".into(), "c".into()],
+        };
         let desc = cmd.describe();
         assert!(desc.contains("ctrl") && desc.contains("c"));
     }
@@ -337,7 +336,9 @@ mod tests {
         let cmd = ActionCommand::Sequence {
             steps: vec![
                 ActionCommand::Click { x: 0.0, y: 0.0 },
-                ActionCommand::TypeText { text: "test".into() },
+                ActionCommand::TypeText {
+                    text: "test".into(),
+                },
             ],
         };
         assert!(cmd.describe().contains("2"));
@@ -392,7 +393,9 @@ mod tests {
 
     #[test]
     fn test_type_text_serde() {
-        let cmd = ActionCommand::TypeText { text: "测试输入".into() };
+        let cmd = ActionCommand::TypeText {
+            text: "测试输入".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: ActionCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, parsed);

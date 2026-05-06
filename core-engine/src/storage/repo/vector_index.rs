@@ -36,10 +36,7 @@ impl StorageManager {
     }
 
     /// 删除指定 capture 的所有向量索引记录（capture 被删除时级联清理）。
-    pub fn delete_vector_indices_by_capture(
-        &self,
-        capture_id: i64,
-    ) -> Result<usize, StorageError> {
+    pub fn delete_vector_indices_by_capture(&self, capture_id: i64) -> Result<usize, StorageError> {
         self.with_conn(|conn| {
             let affected = conn.execute(
                 "DELETE FROM vector_index WHERE capture_id = ?1",
@@ -64,10 +61,7 @@ impl StorageManager {
     }
 }
 
-fn insert_vector_index_inner(
-    conn: &Connection,
-    v:    &NewVectorIndex,
-) -> Result<i64, StorageError> {
+fn insert_vector_index_inner(conn: &Connection, v: &NewVectorIndex) -> Result<i64, StorageError> {
     conn.execute(
         "INSERT INTO vector_index
             (capture_id, qdrant_point_id, chunk_index, chunk_text, model_name, created_at,
@@ -112,10 +106,7 @@ fn insert_vector_index_inner(
 
 impl StorageManager {
     /// 按 id 获取单条向量索引记录。
-    pub fn get_vector_index(
-        &self,
-        id: i64,
-    ) -> Result<Option<VectorIndexRecord>, StorageError> {
+    pub fn get_vector_index(&self, id: i64) -> Result<Option<VectorIndexRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, capture_id, qdrant_point_id, chunk_index, chunk_text, model_name, created_at,
@@ -234,7 +225,8 @@ impl StorageManager {
                  ORDER BY c.ts ASC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, i64>(0))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
@@ -273,31 +265,31 @@ impl StorageManager {
 
 fn row_to_vector_index(row: &rusqlite::Row<'_>) -> Result<VectorIndexRecord, StorageError> {
     Ok(VectorIndexRecord {
-        id:                row.get(0)?,
-        capture_id:        row.get(1)?,
-        qdrant_point_id:   row.get(2)?,
-        chunk_index:       row.get(3)?,
-        chunk_text:        row.get(4)?,
-        model_name:        row.get(5)?,
-        created_at:        row.get(6)?,
-        doc_key:           row.get(7)?,
-        source_type:       row.get(8)?,
-        knowledge_id:      row.get(9)?,
-        time:              row.get(10)?,
-        start_time:        row.get(11)?,
-        end_time:          row.get(12)?,
-        observed_at:       row.get(13)?,
-        event_time_start:  row.get(14)?,
-        event_time_end:    row.get(15)?,
-        history_view:      row.get(16)?,
-        content_origin:    row.get(17)?,
-        activity_type:     row.get(18)?,
+        id: row.get(0)?,
+        capture_id: row.get(1)?,
+        qdrant_point_id: row.get(2)?,
+        chunk_index: row.get(3)?,
+        chunk_text: row.get(4)?,
+        model_name: row.get(5)?,
+        created_at: row.get(6)?,
+        doc_key: row.get(7)?,
+        source_type: row.get(8)?,
+        knowledge_id: row.get(9)?,
+        time: row.get(10)?,
+        start_time: row.get(11)?,
+        end_time: row.get(12)?,
+        observed_at: row.get(13)?,
+        event_time_start: row.get(14)?,
+        event_time_end: row.get(15)?,
+        history_view: row.get(16)?,
+        content_origin: row.get(17)?,
+        activity_type: row.get(18)?,
         is_self_generated: row.get(19)?,
         evidence_strength: row.get(20)?,
-        app_name:          row.get(21)?,
-        win_title:         row.get(22)?,
-        category:          row.get(23)?,
-        user_verified:     row.get(24)?,
+        app_name: row.get(21)?,
+        win_title: row.get(22)?,
+        category: row.get(23)?,
+        user_verified: row.get(24)?,
     })
 }
 
@@ -315,17 +307,18 @@ mod tests {
 
     fn insert_test_capture(mgr: &StorageManager) -> i64 {
         mgr.insert_capture(&NewCapture {
-            ts:              current_ts_ms(),
-            app_name:        Some("TestApp".into()),
-            app_bundle_id:   None,
-            win_title:       None,
-            event_type:      EventType::Auto,
-            ax_text:         Some("测试文本".into()),
+            ts: current_ts_ms(),
+            app_name: Some("TestApp".into()),
+            app_bundle_id: None,
+            win_title: None,
+            event_type: EventType::Auto,
+            ax_text: Some("测试文本".into()),
             ax_focused_role: None,
-            ax_focused_id:   None,
+            ax_focused_id: None,
+            ocr_text: None,
             screenshot_path: None,
-            input_text:      None,
-            is_sensitive:    false,
+            input_text: None,
+            is_sensitive: false,
         })
         .unwrap()
     }
@@ -334,28 +327,28 @@ mod tests {
         NewVectorIndex {
             capture_id,
             qdrant_point_id: point_id.into(),
-            chunk_index:     chunk_idx,
-            chunk_text:      "测试分块文本".into(),
-            model_name:      "bge-m3".into(),
-            created_at:      current_ts_ms(),
-            doc_key:         format!("capture:{}", capture_id),
-            source_type:     "capture".into(),
-            knowledge_id:    None,
-            time:            Some(current_ts_ms()),
-            start_time:      None,
-            end_time:        None,
-            observed_at:     None,
+            chunk_index: chunk_idx,
+            chunk_text: "测试分块文本".into(),
+            model_name: "bge-m3".into(),
+            created_at: current_ts_ms(),
+            doc_key: format!("capture:{}", capture_id),
+            source_type: "capture".into(),
+            knowledge_id: None,
+            time: Some(current_ts_ms()),
+            start_time: None,
+            end_time: None,
+            observed_at: None,
             event_time_start: None,
-            event_time_end:  None,
-            history_view:    false,
-            content_origin:  None,
-            activity_type:   None,
+            event_time_end: None,
+            history_view: false,
+            content_origin: None,
+            activity_type: None,
             is_self_generated: false,
             evidence_strength: None,
-            app_name:        Some("TestApp".into()),
-            win_title:       Some("Test Window".into()),
-            category:        None,
-            user_verified:   false,
+            app_name: Some("TestApp".into()),
+            win_title: Some("Test Window".into()),
+            category: None,
+            user_verified: false,
         }
     }
 
@@ -363,7 +356,9 @@ mod tests {
     fn test_insert_and_get() {
         let mgr = make_mgr();
         let capture_id = insert_test_capture(&mgr);
-        let id = mgr.insert_vector_index(&sample_index(capture_id, "uuid-001", 0)).unwrap();
+        let id = mgr
+            .insert_vector_index(&sample_index(capture_id, "uuid-001", 0))
+            .unwrap();
         assert!(id > 0);
 
         let rec = mgr.get_vector_index(id).unwrap().unwrap();
@@ -378,8 +373,10 @@ mod tests {
     fn test_get_by_capture() {
         let mgr = make_mgr();
         let capture_id = insert_test_capture(&mgr);
-        mgr.insert_vector_index(&sample_index(capture_id, "uuid-001", 0)).unwrap();
-        mgr.insert_vector_index(&sample_index(capture_id, "uuid-002", 1)).unwrap();
+        mgr.insert_vector_index(&sample_index(capture_id, "uuid-001", 0))
+            .unwrap();
+        mgr.insert_vector_index(&sample_index(capture_id, "uuid-002", 1))
+            .unwrap();
 
         let indices = mgr.get_vector_indices_by_capture(capture_id).unwrap();
         assert_eq!(indices.len(), 2);
@@ -390,7 +387,8 @@ mod tests {
     fn test_get_by_point_id() {
         let mgr = make_mgr();
         let capture_id = insert_test_capture(&mgr);
-        mgr.insert_vector_index(&sample_index(capture_id, "uuid-abc", 0)).unwrap();
+        mgr.insert_vector_index(&sample_index(capture_id, "uuid-abc", 0))
+            .unwrap();
 
         let rec = mgr.get_vector_index_by_point_id("uuid-abc").unwrap();
         assert!(rec.is_some());
@@ -405,7 +403,8 @@ mod tests {
         let capture_id = insert_test_capture(&mgr);
 
         assert!(!mgr.is_capture_vectorized(capture_id).unwrap());
-        mgr.insert_vector_index(&sample_index(capture_id, "uuid-xyz", 0)).unwrap();
+        mgr.insert_vector_index(&sample_index(capture_id, "uuid-xyz", 0))
+            .unwrap();
         assert!(mgr.is_capture_vectorized(capture_id).unwrap());
     }
 
@@ -415,7 +414,8 @@ mod tests {
         let c1 = insert_test_capture(&mgr);
         let c2 = insert_test_capture(&mgr);
 
-        mgr.insert_vector_index(&sample_index(c1, "uuid-001", 0)).unwrap();
+        mgr.insert_vector_index(&sample_index(c1, "uuid-001", 0))
+            .unwrap();
 
         let unvectorized = mgr.list_unvectorized_capture_ids(10).unwrap();
         assert_eq!(unvectorized.len(), 1);
@@ -426,8 +426,10 @@ mod tests {
     fn test_delete_by_capture() {
         let mgr = make_mgr();
         let capture_id = insert_test_capture(&mgr);
-        mgr.insert_vector_index(&sample_index(capture_id, "uuid-d1", 0)).unwrap();
-        mgr.insert_vector_index(&sample_index(capture_id, "uuid-d2", 1)).unwrap();
+        mgr.insert_vector_index(&sample_index(capture_id, "uuid-d1", 0))
+            .unwrap();
+        mgr.insert_vector_index(&sample_index(capture_id, "uuid-d2", 1))
+            .unwrap();
 
         let deleted = mgr.delete_vector_indices_by_capture(capture_id).unwrap();
         assert_eq!(deleted, 2);
@@ -438,8 +440,10 @@ mod tests {
     fn test_batch_query_by_point_ids() {
         let mgr = make_mgr();
         let capture_id = insert_test_capture(&mgr);
-        mgr.insert_vector_index(&sample_index(capture_id, "p-001", 0)).unwrap();
-        mgr.insert_vector_index(&sample_index(capture_id, "p-002", 1)).unwrap();
+        mgr.insert_vector_index(&sample_index(capture_id, "p-001", 0))
+            .unwrap();
+        mgr.insert_vector_index(&sample_index(capture_id, "p-002", 1))
+            .unwrap();
 
         let results = mgr
             .get_vector_indices_by_point_ids(&["p-001".into(), "p-002".into()])

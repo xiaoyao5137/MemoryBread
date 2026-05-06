@@ -1,6 +1,18 @@
 import { create } from 'zustand'
 import type { ActionCommand, BakeTab, RagContext, RepositoryTab, WindowMode } from '../types'
 
+interface CaptureBackTarget {
+  windowMode: WindowMode
+  bakeTab?: BakeTab
+  repositoryTab?: RepositoryTab
+  selectedMemoryId?: string | null
+  selectedTemplateId?: string | null
+  selectedSopId?: string | null
+  selectedKnowledgeId?: string | null
+  selectedCaptureId?: string | null
+  repositoryCaptureSourceCaptureId?: string | null
+}
+
 export interface AppState {
   // ── 窗口模式 ────────────────────────────────────────────────────────────────
   windowMode: WindowMode
@@ -31,6 +43,7 @@ export interface AppState {
   repositoryCaptureTo: string
   repositoryCaptureLimit: number
   repositoryCaptureSourceCaptureId: string | null
+  captureBackTarget: CaptureBackTarget | null
 
   // ── RAG Panel ───────────────────────────────────────────────────────────────
   ragQuery:     string
@@ -80,6 +93,8 @@ export interface AppState {
   setRepositoryCaptureTo:    (value: string) => void
   setRepositoryCaptureLimit: (limit: number) => void
   setRepositoryCaptureSourceCaptureId: (id: string | null) => void
+  setCaptureBackTarget: (target: CaptureBackTarget | null) => void
+  clearCaptureBackTarget: () => void
   setRagQuery:           (q: string) => void
   setRagResult:          (answer: string, contexts: RagContext[]) => void
   setRagLoading:         (loading: boolean) => void
@@ -130,6 +145,7 @@ const initialState = {
   repositoryCaptureTo:    '',
   repositoryCaptureLimit: 20,
   repositoryCaptureSourceCaptureId: null,
+  captureBackTarget: null,
   ragQuery:            '',
   ragAnswer:           '',
   ragContexts:         [] as RagContext[],
@@ -201,6 +217,10 @@ export const useAppStore = create<AppState>((set) => ({
   setRepositoryCaptureLimit: (limit) => set({ repositoryCaptureLimit: limit, bakeCaptureOffset: 0 }),
 
   setRepositoryCaptureSourceCaptureId: (id) => set({ repositoryCaptureSourceCaptureId: id, bakeCaptureOffset: 0 }),
+
+  setCaptureBackTarget: (target) => set({ captureBackTarget: target }),
+
+  clearCaptureBackTarget: () => set({ captureBackTarget: null }),
 
   setRagQuery:   (q) => set({ ragQuery: q }),
 

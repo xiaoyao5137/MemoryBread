@@ -209,7 +209,7 @@ describe('显式搜索交互', () => {
     expect(screen.getByText('第 2/2 页')).toBeInTheDocument()
   })
 
-  it('RepositoryPanel 展示醒发箱标题以及情节记忆创建时间', async () => {
+  it('RepositoryPanel 展示采集标题以及情节记忆创建时间', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('/api/bake/memories')) {
@@ -247,7 +247,7 @@ describe('显式搜索交互', () => {
       expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/memories?limit=20&offset=0')
     })
 
-    expect(screen.getByText('醒发箱')).toBeInTheDocument()
+    expect(screen.getByText('采集')).toBeInTheDocument()
     expect(screen.getAllByText('创建于 2026-04-11 09:30').length).toBeGreaterThan(1)
   })
 
@@ -268,7 +268,7 @@ describe('显式搜索交互', () => {
     })
 
     const callsBeforeTyping = fetchMock.mock.calls.length
-    fireEvent.change(screen.getByPlaceholderText('搜索情节记忆标题、摘要或详情'), { target: { value: '周报' } })
+    fireEvent.change(screen.getByPlaceholderText('搜索时间线标题、摘要或详情'), { target: { value: '周报' } })
     fireEvent.change(screen.getByLabelText('开始日期'), { target: { value: '2026-04-01' } })
     fireEvent.change(screen.getByLabelText('结束日期'), { target: { value: '2026-04-11' } })
 

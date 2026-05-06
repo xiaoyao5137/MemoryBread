@@ -37,6 +37,100 @@ SYSTEM_PROMPT = """你是一个专业的工作记录提炼助手。你的任务�
 }"""
 
 
+MENU_NOISE_PATTERNS = (
+    re.compile(r'^(file|edit|selection|view|go|run|terminal|window|help)(\s+\w+){0,10}$', re.IGNORECASE),
+    re.compile(r'^(welcome|explorer|extensions?)$', re.IGNORECASE),
+    re.compile(r'^[\d\s]{4,}$'),
+    re.compile(r'^[=+\-_*~•·。，、…<>|/\\]{3,}$'),
+)
+
+MENU_NOISE_KEYWORDS = {
+    'file', 'edit', 'selection', 'view', 'go', 'run', 'terminal', 'window', 'help',
+    'welcome', 'explorer', 'taskoutput tool output', 'bash tool output',
+}
+
+ACTION_HINTS = (
+    ('修复', '修复问题'),
+    ('排查', '排查异常'),
+    ('提炼', '执行知识提炼'),
+    ('启动', '启动服务'),
+    ('重启', '重启服务'),
+    ('日志', '查看日志'),
+    ('sql', '查询数据库'),
+    ('api', '调用接口验证'),
+    ('test', '执行测试验证'),
+    ('ocr', '处理 OCR 识别结果'),
+)
+
+RESULT_HINTS = (
+    ('成功', '并得到成功结果'),
+    ('完成', '并完成关键操作'),
+    ('超时', '但出现超时需继续优化'),
+    ('失败', '但遇到失败需继续排查'),
+    ('error', '并出现错误需继续排查'),
+)
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r'\s+', ' ', str(text or '').replace('\r', ' ').replace('\n', ' ')).strip()
+
+
+def _sanitize_ocr_text(raw_text: str) -> str:
+    lines = str(raw_text or '').replace('\r', '\n').split('\n')
+    cleaned = []
+    for line in lines:
+        normalized = _normalize_text(line)
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if any(pattern.match(normalized) for pattern in MENU_NOISE_PATTERNS):
+            continue
+        if lowered in MENU_NOISE_KEYWORDS:
+            continue
+        cleaned.append(normalized)
+    if cleaned:
+        return '\n'.join(cleaned)
+    return _normalize_text(raw_text)
+
+
+def _is_noise_dominant(text: str) -> bool:
+    compact = _normalize_text(text).lower()
+    if not compact:
+        return True
+    words = re.findall(r'[a-zA-Z]+|\d+', compact)
+    if len(words) < 8:
+        return False
+    noisy_terms = sum(1 for word in words if word.isdigit() or word in MENU_NOISE_KEYWORDS)
+    return (noisy_terms / len(words)) >= 0.35
+
+
+def _build_work_summary(app_name: str, window_title: str, text: str) -> Optional[str]:
+    compact = _normalize_text(text)
+    if not compact:
+        return None
+
+    lower_text = compact.lower()
+    actions = [label for keyword, label in ACTION_HINTS if keyword in lower_text]
+    unique_actions = list(dict.fromkeys(actions))
+    action_text = '、'.join(unique_actions[:2]) if unique_actions else ''
+    result_text = ''
+    for keyword, label in RESULT_HINTS:
+        if keyword in lower_text:
+            result_text = label
+            break
+
+    scene = window_title or app_name or '当前应用'
+    if action_text:
+        summary = f"在{scene}中{action_text}{result_text}"
+    else:
+        # 没有动作词时，只保留有信息密度的前段文本作为概述
+        summary = compact[:72].rstrip()
+
+    if len(summary) > 120:
+        summary = summary[:120].rstrip() + '…'
+    return summary
+
+
 def simple_extract(capture_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     基于规则的简单知识提炼（当 Ollama 不可用时使用）
@@ -47,70 +141,48 @@ def simple_extract(capture_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     Returns:
         提炼后的知识，如果无价值则返回 None
     """
-    ocr_text = capture_data.get('ocr_text', '').strip()
+    raw_text = capture_data.get('ocr_text') or capture_data.get('ax_text') or ''
+    ocr_text = _sanitize_ocr_text(raw_text)
     app_name = capture_data.get('app_name', '')
     window_title = capture_data.get('window_title', '')
 
-    # 过滤规则：跳过无价值内容
-    if not ocr_text or len(ocr_text) < 20:
+    if not ocr_text or len(_normalize_text(ocr_text)) < 24:
         return None
 
-    # 跳过纯 UI 元素
-    ui_keywords = ['按钮', '菜单', '工具栏', '状态栏', '关闭', '最小化', '最大化']
-    if any(kw in ocr_text for kw in ui_keywords) and len(ocr_text) < 50:
+    if _is_noise_dominant(ocr_text):
         return None
 
-    # 跳过重复的系统提示
-    skip_patterns = [
-        r'^(确定|取消|关闭|保存)$',
-        r'^(是|否)$',
-        r'^\d+$',  # 纯数字
-    ]
-    if any(re.match(pattern, ocr_text) for pattern in skip_patterns):
+    summary = _build_work_summary(app_name, window_title, ocr_text)
+    if not summary:
         return None
 
-    # 生成摘要（取前 200 字）
-    summary = ocr_text[:200]
-    if len(ocr_text) > 200:
-        summary += "..."
-
-    # 简单实体提取（提取大写单词、中文专有名词）
     entities = []
-
-    # 提取英文大写单词（可能是项目名、公司名）
     english_entities = re.findall(r'\b[A-Z][a-zA-Z]{2,}\b', ocr_text)
     entities.extend(english_entities[:5])
-
-    # 提取应用名和窗口标题作为实体
     if app_name:
         entities.append(app_name)
     if window_title and window_title != app_name:
         entities.append(window_title)
+    entities = list(dict.fromkeys(entities))[:10]
 
-    # 去重
-    entities = list(set(entities))[:10]
-
-    # 分类判断
     category = '其他'
-    if any(kw in app_name.lower() for kw in ['code', 'vscode', 'pycharm', 'idea']):
+    app_lower = app_name.lower()
+    if any(kw in app_lower for kw in ['code', 'vscode', 'pycharm', 'idea']):
         category = '代码'
-    elif any(kw in app_name.lower() for kw in ['chrome', 'safari', 'firefox', 'edge']):
+    elif any(kw in app_lower for kw in ['chrome', 'safari', 'firefox', 'edge']):
         category = '浏览器'
-    elif any(kw in app_name.lower() for kw in ['word', 'pages', 'notion', 'typora']):
+    elif any(kw in app_lower for kw in ['word', 'pages', 'notion', 'typora']):
         category = '文档'
-    elif any(kw in app_name.lower() for kw in ['wechat', 'slack', 'feishu', 'dingtalk']):
+    elif any(kw in app_lower for kw in ['wechat', 'slack', 'feishu', 'dingtalk']):
         category = '聊天'
-    elif any(kw in app_name.lower() for kw in ['zoom', 'teams', 'meet']):
+    elif any(kw in app_lower for kw in ['zoom', 'teams', 'meet']):
         category = '会议'
 
-    # 重要性判断（基于文本长度和内容）
-    importance = 3  # 默认中等重要
-    if len(ocr_text) > 500:
+    importance = 3
+    if any(kw in _normalize_text(ocr_text).lower() for kw in ['决策', '上线', '发布', '修复', '回归', '故障', '超时']):
         importance = 4
-    if len(ocr_text) > 1000:
-        importance = 5
-    if len(ocr_text) < 50:
-        importance = 2
+    if len(_normalize_text(ocr_text)) > 900:
+        importance = max(importance, 4)
 
     return {
         'capture_id': capture_data['id'],

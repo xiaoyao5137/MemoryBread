@@ -1,10 +1,10 @@
 import React from 'react'
-import type { EpisodicMemoryItem } from '../../types'
+import type { TimelineItem } from '../../types'
 import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './BakeShared'
 
 const PAGE_SIZE = 20
 
-const formatMemoryTime = (item: Pick<EpisodicMemoryItem, 'createdAt' | 'createdAtMs'>) => {
+const formatMemoryTime = (item: Pick<TimelineItem, 'createdAt' | 'createdAtMs'>) => {
   if (item.createdAtMs > 0) {
     return new Date(item.createdAtMs).toLocaleString('zh-CN', {
       year: 'numeric',
@@ -26,7 +26,7 @@ const formatMatchPill = (label: string, score?: number, level?: string) => (
 )
 
 const BakeMemoriesTab: React.FC<{
-  memories: EpisodicMemoryItem[]
+  memories: TimelineItem[]
   total: number
   offset: number
   selectedMemoryId: string | null
@@ -36,10 +36,12 @@ const BakeMemoriesTab: React.FC<{
   onPromoteToSop: (id: string) => void
   onPromoteToKnowledge: (id: string) => void
   onIgnoreMemory: (id: string) => void
-  onCopyMemory: (memory: EpisodicMemoryItem) => void
+  onCopyMemory: (memory: TimelineItem) => void
   onOpenMemoryLink: (url?: string, sourceCaptureId?: string) => void
   onInitializeMemories: () => void
   isInitializing: boolean
+  modelsReady?: boolean
+  modelStatusLoading?: boolean
 }> = ({
   memories,
   total,
@@ -55,6 +57,8 @@ const BakeMemoriesTab: React.FC<{
   onOpenMemoryLink,
   onInitializeMemories,
   isInitializing,
+  modelsReady = true,
+  modelStatusLoading = false,
 }) => {
   const selected = memories.find(item => item.id === selectedMemoryId) ?? memories[0]
   const page = Math.floor(offset / PAGE_SIZE) + 1
@@ -66,14 +70,20 @@ const BakeMemoriesTab: React.FC<{
     <div className="bake-split-list-detail bake-split-list-detail--memories-fixed">
       <BakeCard className="bake-memory-list-card bake-memory-list-card--fixed">
         <BakeSectionHeader
-          title="情节记忆"
-          subtitle="左侧只展示 20 条，选中后在下方完成提炼与查看来源记忆片段"
+          title="时间线"
+          subtitle="左侧只展示 20 条，选中后在下方完成提炼与查看来源采集记录"
         />
         {memories.length === 0 ? (
           <div className="bake-kv">
-            <div className="bake-muted">当前还没有初始化出的情节记忆，可以基于现有 knowledge 与关联 capture 回填一批候选。</div>
+            <div className="bake-muted">当前还没有初始化出的时间线，可以基于现有 knowledge 与关联 capture 回填一批候选。</div>
             <div className="bake-actions">
-              <BakeButton primary onClick={onInitializeMemories}>{isInitializing ? '初始化中…' : '初始化情节记忆'}</BakeButton>
+              <BakeButton
+                primary
+                onClick={onInitializeMemories}
+                disabled={!modelsReady || isInitializing}
+              >
+                {isInitializing ? '初始化中…' : (modelStatusLoading ? '检查模型状态…' : (modelsReady ? '初始化时间线' : '模型未就绪'))}
+              </BakeButton>
             </div>
           </div>
         ) : (
@@ -161,11 +171,11 @@ const BakeMemoriesTab: React.FC<{
               <div className="bake-memory-action-card bake-memory-action-card--primary">
                 <div>
                   <div className="bake-kv__title">提炼</div>
-                  <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>将当前情节记忆加工为稳定、可复用的内容资产，三种提炼方式同级处理。</div>
+                  <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>将当前时间线加工为稳定、可复用的内容资产，三种提炼方式同级处理。</div>
                 </div>
                 <div className="bake-actions bake-actions--primary bake-memory-detail__action-copy">
-                  <BakeButton onClick={() => onPromoteToTemplate(selected.id)}>文档模板（面包片）</BakeButton>
-                  <BakeButton onClick={() => onPromoteToSop(selected.id)}>操作手册（火腿）</BakeButton>
+                  <BakeButton onClick={() => onPromoteToTemplate(selected.id)}>设计</BakeButton>
+                  <BakeButton onClick={() => onPromoteToSop(selected.id)}>操作手册</BakeButton>
                   <BakeButton onClick={() => onPromoteToKnowledge(selected.id)}>知识</BakeButton>
                 </div>
               </div>
@@ -173,10 +183,10 @@ const BakeMemoriesTab: React.FC<{
               <div className="bake-memory-action-card bake-memory-action-card--secondary">
                 <div>
                   <div className="bake-kv__title">辅助操作</div>
-                  <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>回看来源记忆片段、复制链接与忽略操作单独放置，避免和提炼动作混在一起。</div>
+                  <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>回看来源采集记录、复制链接与忽略操作单独放置，避免和提炼动作混在一起。</div>
                 </div>
                 <div className="bake-actions bake-actions--secondary bake-memory-detail__action-copy">
-                  <BakeButton compact onClick={() => onOpenMemoryLink(selected.url, selected.sourceCaptureId)}>来源记忆片段</BakeButton>
+                  <BakeButton compact onClick={() => onOpenMemoryLink(selected.url, selected.sourceCaptureId)}>来源采集记录</BakeButton>
                   <BakeButton compact onClick={() => onCopyMemory(selected)}>复制标题/链接</BakeButton>
                   <BakeButton compact onClick={() => onIgnoreMemory(selected.id)}>忽略</BakeButton>
                 </div>
@@ -184,7 +194,7 @@ const BakeMemoriesTab: React.FC<{
             </div>
           </div>
         ) : (
-          <div className="bake-muted">暂无情节记忆</div>
+          <div className="bake-muted">暂无时间线</div>
         )}
       </BakeCard>
     </div>

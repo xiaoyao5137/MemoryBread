@@ -25,11 +25,9 @@ pub async fn list_preferences(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PreferencesResponse>, ApiError> {
     let storage = state.storage.clone();
-    let prefs = tokio::task::spawn_blocking(move || {
-        storage.list_preferences()
-    })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))??;
+    let prefs = tokio::task::spawn_blocking(move || storage.list_preferences())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))??;
 
     Ok(Json(PreferencesResponse { preferences: prefs }))
 }
@@ -42,8 +40,8 @@ pub struct UpdatePreferenceRequest {
 
 #[derive(Serialize)]
 pub struct UpdatePreferenceResponse {
-    pub key:        String,
-    pub value:      String,
+    pub key: String,
+    pub value: String,
     pub updated_at: i64,
 }
 
@@ -66,9 +64,7 @@ fn parse_screenshot_keep_days(storage: &crate::storage::StorageManager) -> i64 {
 
 fn screenshot_captures_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".memory-bread")
-        .join("captures")
+    PathBuf::from(home).join(".memory-bread").join("captures")
 }
 
 pub async fn run_screenshot_cleanup_now(
@@ -102,25 +98,25 @@ pub async fn update_preference(
         return Err(ApiError::BadRequest("key 不能为空".into()));
     }
 
-    let key_clone   = key.clone();
+    let key_clone = key.clone();
     let value_clone = body.value.clone();
-    let storage     = state.storage.clone();
+    let storage = state.storage.clone();
 
     let record = tokio::task::spawn_blocking(move || {
         // 用户手动设置：source="user"，confidence=1.0
         storage.upsert_preference(&key_clone, &value_clone, "user", 1.0)?;
-        storage
-            .get_preference(&key_clone)?
-            .ok_or_else(|| crate::storage::StorageError::NotFound(
-                format!("preference '{key_clone}' not found after upsert"),
+        storage.get_preference(&key_clone)?.ok_or_else(|| {
+            crate::storage::StorageError::NotFound(format!(
+                "preference '{key_clone}' not found after upsert"
             ))
+        })
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))??;
 
     Ok(Json(UpdatePreferenceResponse {
-        key:        record.key,
-        value:      record.value,
+        key: record.key,
+        value: record.value,
         updated_at: record.updated_at,
     }))
 }

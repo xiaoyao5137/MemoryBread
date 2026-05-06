@@ -52,7 +52,9 @@ impl StorageManager {
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
             if let Some(q) = query {
-                sql.push_str(" AND (name LIKE ? OR category LIKE ? OR COALESCE(prompt_hint, '') LIKE ?)");
+                sql.push_str(
+                    " AND (name LIKE ? OR category LIKE ? OR COALESCE(prompt_hint, '') LIKE ?)",
+                );
                 let pattern = format!("%{}%", q);
                 bind_values.push(Box::new(pattern.clone()));
                 bind_values.push(Box::new(pattern.clone()));
@@ -63,20 +65,25 @@ impl StorageManager {
             bind_values.push(Box::new(offset as i64));
 
             let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
+            let params: Vec<&dyn rusqlite::ToSql> =
+                bind_values.iter().map(|b| b.as_ref()).collect();
             let rows = stmt.query_map(params.as_slice(), |row| {
                 Ok(row_to_bake_template(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
     pub fn count_bake_templates_filtered(&self, query: Option<&str>) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
-            let mut sql = String::from("SELECT COUNT(*) FROM bake_templates WHERE deleted_at IS NULL");
+            let mut sql =
+                String::from("SELECT COUNT(*) FROM bake_templates WHERE deleted_at IS NULL");
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
             if let Some(q) = query {
-                sql.push_str(" AND (name LIKE ? OR category LIKE ? OR COALESCE(prompt_hint, '') LIKE ?)");
+                sql.push_str(
+                    " AND (name LIKE ? OR category LIKE ? OR COALESCE(prompt_hint, '') LIKE ?)",
+                );
                 let pattern = format!("%{}%", q);
                 bind_values.push(Box::new(pattern.clone()));
                 bind_values.push(Box::new(pattern.clone()));
@@ -84,8 +91,10 @@ impl StorageManager {
             }
 
             let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
-            stmt.query_row(params.as_slice(), |row| row.get(0)).map_err(StorageError::Sqlite)
+            let params: Vec<&dyn rusqlite::ToSql> =
+                bind_values.iter().map(|b| b.as_ref()).collect();
+            stmt.query_row(params.as_slice(), |row| row.get(0))
+                .map_err(StorageError::Sqlite)
         })
     }
 
@@ -106,11 +115,16 @@ impl StorageManager {
             let rows = stmt.query_map([], |row| {
                 Ok(row_to_bake_template(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
-    pub fn update_bake_template(&self, id: i64, template: &NewBakeTemplate) -> Result<bool, StorageError> {
+    pub fn update_bake_template(
+        &self,
+        id: i64,
+        template: &NewBakeTemplate,
+    ) -> Result<bool, StorageError> {
         let updated_at = current_ts_ms();
         self.with_conn(|conn| {
             let affected = conn.execute(
@@ -155,13 +169,20 @@ impl StorageManager {
         })
     }
 
-    pub fn toggle_bake_template_status(&self, id: i64) -> Result<Option<BakeTemplateRecord>, StorageError> {
+    pub fn toggle_bake_template_status(
+        &self,
+        id: i64,
+    ) -> Result<Option<BakeTemplateRecord>, StorageError> {
         let maybe_template = self.get_bake_template(id)?;
         let Some(template) = maybe_template else {
             return Ok(None);
         };
 
-        let next_status = if template.status == "enabled" { "disabled" } else { "enabled" };
+        let next_status = if template.status == "enabled" {
+            "disabled"
+        } else {
+            "enabled"
+        };
         let updated_at = current_ts_ms();
         self.with_conn(|conn| {
             conn.execute(
@@ -186,7 +207,10 @@ impl StorageManager {
     }
 }
 
-fn insert_bake_template_inner(conn: &Connection, template: &NewBakeTemplate) -> Result<i64, StorageError> {
+fn insert_bake_template_inner(
+    conn: &Connection,
+    template: &NewBakeTemplate,
+) -> Result<i64, StorageError> {
     let now = current_ts_ms();
     conn.execute(
         "INSERT INTO bake_templates (

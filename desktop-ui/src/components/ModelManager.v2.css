@@ -355,6 +355,42 @@
   background: #E5E5EA;
 }
 
+.model-manager-v2__active-badge,
+.model-manager-v2__loading-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  flex: 1;
+  justify-content: center;
+}
+
+.model-manager-v2__active-badge {
+  background: rgba(52, 199, 89, 0.1);
+  color: #34C759;
+}
+
+.model-manager-v2__loading-badge {
+  background: rgba(0, 122, 255, 0.1);
+  color: #007AFF;
+}
+
+.model-manager-v2__spinner {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* API Key 对话框 */
 .model-manager-v2__dialog-overlay {
   position: fixed;

@@ -137,72 +137,73 @@ async def _main() -> None:
     # 启动内部向量搜索 HTTP 服务（daemon 线程）
     threading.Thread(target=_start_vector_search_server, daemon=True, name="vector-search-server").start()
 
-    if args.dry_run:
-        # 干运行：只处理 ping，其余任务返回 NOT_IMPLEMENTED
-        from memory_bread_ipc.transport import default_dispatch
-        dispatch_fn = default_dispatch
-        logger.info("dry-run 模式：使用内置 ping-only 分发器")
-        bg_processor = None
-    else:
-        # 基础 OCR 模式：跳过大模型/向量模型启动检查，只保留 ping + OCR
+    from memory_bread_ipc import IpcResponse, PingResult
+    from ocr.worker import OcrWorker
+    from ocr.engine import OcrEngine
+
+    ocr_worker = OcrWorker(engine=OcrEngine.create_default())
+    runtime_state = {
+        "dispatch": None,
+        "bg_processor": None,
+    }
+
+    async def limited_dispatch(req):
+        if req.task.type == "ping":
+            return IpcResponse.make_ok(req.id, PingResult(), 0)
+        if req.task.type == "ocr":
+            return await ocr_worker.handle(req)
+        return IpcResponse.make_error(req.id, "NOT_IMPLEMENTED", f"任务类型 '{req.task.type}' 在基础 IPC 模式下不可用", 0)
+
+    runtime_state["dispatch"] = limited_dispatch
+
+    async def dispatch_proxy(req):
+        dispatch_fn = runtime_state["dispatch"]
+        return await dispatch_fn(req)
+
+    async def bootstrap_full_dispatch() -> None:
         if limited_mode:
-            logger.warning("SIDECAR_LIMITED_MODE=1，启用基础 IPC 模式，仅保留 ping/OCR 能力")
-            from memory_bread_ipc import IpcResponse, PingResult
-            from ocr.worker import OcrWorker
-            from ocr.engine import OcrEngine
+            logger.warning("SIDECAR_LIMITED_MODE=1，保持基础 IPC 模式，仅保留 ping/OCR 能力")
+            return
 
-            ocr_worker = OcrWorker(engine=OcrEngine.create_default())
+        try:
+            from startup_checks import run_startup_checks, get_ollama_setup_detail
+            checks_passed = await asyncio.to_thread(run_startup_checks)
+            if not checks_passed:
+                detail = await asyncio.to_thread(get_ollama_setup_detail)
+                logger.warning(
+                    "启动检查未通过，保持基础 IPC 模式，仅保留 ping/OCR 能力（原因: %s）",
+                    detail.get('message', 'unknown'),
+                )
+                return
 
-            async def limited_dispatch(req):
-                if req.task.type == "ping":
-                    return IpcResponse.make_ok(req.id, PingResult(), 0)
-                if req.task.type == "ocr":
-                    return await ocr_worker.handle(req)
-                return IpcResponse.make_error(req.id, "NOT_IMPLEMENTED", f"任务类型 '{req.task.type}' 在基础 IPC 模式下不可用", 0)
+            from dispatcher_v2 import Dispatcher
+            dispatcher = Dispatcher()
+            await dispatcher.initialize()
+            runtime_state["dispatch"] = dispatcher.dispatch
+            logger.info("生产模式：已切换到完整任务分发器")
 
-            dispatch_fn = limited_dispatch
-            bg_processor = None
-        else:
-            # 生产模式：运行启动检查
-            from startup_checks import run_startup_checks
-            if not run_startup_checks():
-                logger.warning("启动检查未通过，退回基础 IPC 模式，仅保留 ping/OCR 能力")
-                from memory_bread_ipc import IpcResponse, PingResult
-                from ocr.worker import OcrWorker
-                from ocr.engine import OcrEngine
+            from background_processor import BackgroundProcessor
+            db_path = str(Path.home() / ".memory-bread" / "memory-bread.db")
+            bg_processor = BackgroundProcessor(db_path=db_path, interval=90, batch_size=8)
+            runtime_state["bg_processor"] = bg_processor
+            asyncio.create_task(bg_processor.run())
+            logger.info("后台处理器已启动（向量化 + 知识提炼）")
+        except Exception as exc:
+            logger.error("完整能力初始化失败，保持基础 IPC 模式: %s", exc, exc_info=True)
 
-                ocr_worker = OcrWorker(engine=OcrEngine.create_default())
+    if args.dry_run:
+        logger.info("dry-run 模式：使用基础 IPC 分发器（ping + OCR）")
+    else:
+        asyncio.create_task(bootstrap_full_dispatch())
 
-                async def limited_dispatch(req):
-                    if req.task.type == "ping":
-                        return IpcResponse.make_ok(req.id, PingResult(), 0)
-                    if req.task.type == "ocr":
-                        return await ocr_worker.handle(req)
-                    return IpcResponse.make_error(req.id, "NOT_IMPLEMENTED", f"任务类型 '{req.task.type}' 在基础 IPC 模式下不可用", 0)
-
-                dispatch_fn = limited_dispatch
-                bg_processor = None
-            else:
-                from dispatcher_v2 import Dispatcher
-                d = Dispatcher()
-                await d.initialize()
-                dispatch_fn = d.dispatch
-                logger.info("生产模式：使用完整任务分发器")
-
-                # 启动后台处理器（向量化 + 知识提炼）
-                from background_processor import BackgroundProcessor
-                from pathlib import Path
-                db_path = str(Path.home() / ".memory-bread" / "memory-bread.db")
-                bg_processor = BackgroundProcessor(db_path=db_path, interval=90, batch_size=8)
-                asyncio.create_task(bg_processor.run())
-                logger.info("后台处理器已启动（向量化 + 知识提炼）")
-
-    server = IpcServer(dispatch_fn=dispatch_fn)
+    server = IpcServer(dispatch_fn=dispatch_proxy)
 
     # 注册优雅关闭信号
     loop = asyncio.get_running_loop()
+
     def shutdown():
         server.stop()
+        bg_processor = runtime_state.get("bg_processor")
         if bg_processor:
             bg_processor.stop()
 

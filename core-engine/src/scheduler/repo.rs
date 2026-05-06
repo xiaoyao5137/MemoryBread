@@ -2,14 +2,18 @@
 
 use rusqlite::params;
 
-use crate::storage::{StorageManager, StorageError};
 use super::models::{NewScheduledTask, ScheduledTask, TaskExecution, UpdateScheduledTask};
+use crate::storage::{StorageError, StorageManager};
 
 pub struct TaskRepo;
 
 impl TaskRepo {
     /// 创建任务，返回新 id
-    pub fn create(storage: &StorageManager, task: &NewScheduledTask, now_ms: i64) -> Result<i64, StorageError> {
+    pub fn create(
+        storage: &StorageManager,
+        task: &NewScheduledTask,
+        now_ms: i64,
+    ) -> Result<i64, StorageError> {
         storage.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO scheduled_tasks
@@ -92,13 +96,18 @@ impl TaskRepo {
     /// 删除任务（级联删除执行历史）
     pub fn delete(storage: &StorageManager, id: i64) -> Result<bool, StorageError> {
         storage.with_conn(|conn| {
-            let affected = conn.execute("DELETE FROM scheduled_tasks WHERE id = ?1", params![id])?;
+            let affected =
+                conn.execute("DELETE FROM scheduled_tasks WHERE id = ?1", params![id])?;
             Ok(affected > 0)
         })
     }
 
     /// 更新 next_run_at
-    pub fn set_next_run(storage: &StorageManager, id: i64, next_ms: i64) -> Result<(), StorageError> {
+    pub fn set_next_run(
+        storage: &StorageManager,
+        id: i64,
+        next_ms: i64,
+    ) -> Result<(), StorageError> {
         storage.with_conn(|conn| {
             conn.execute(
                 "UPDATE scheduled_tasks SET next_run_at = ?1 WHERE id = ?2",
@@ -123,16 +132,16 @@ impl TaskRepo {
             )?;
             let rows = stmt.query_map(params![task_id, limit], |row| {
                 Ok(TaskExecution {
-                    id:              row.get(0)?,
-                    task_id:         row.get(1)?,
-                    started_at:      row.get(2)?,
-                    completed_at:    row.get(3)?,
-                    status:          row.get(4)?,
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    started_at: row.get(2)?,
+                    completed_at: row.get(3)?,
+                    status: row.get(4)?,
                     knowledge_count: row.get(5)?,
-                    token_used:      row.get(6)?,
-                    result_text:     row.get(7)?,
-                    error_message:   row.get(8)?,
-                    latency_ms:      row.get(9)?,
+                    token_used: row.get(6)?,
+                    result_text: row.get(7)?,
+                    error_message: row.get(8)?,
+                    latency_ms: row.get(9)?,
                 })
             })?;
             Ok(rows.filter_map(|r| r.ok()).collect())
@@ -141,18 +150,18 @@ impl TaskRepo {
 
     fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask> {
         Ok(ScheduledTask {
-            id:               row.get(0)?,
-            name:             row.get(1)?,
+            id: row.get(0)?,
+            name: row.get(1)?,
             user_instruction: row.get(2)?,
-            cron_expression:  row.get(3)?,
-            enabled:          row.get::<_, i64>(4)? != 0,
-            template_id:      row.get(5)?,
-            run_count:        row.get(6)?,
-            last_run_at:      row.get(7)?,
-            last_run_status:  row.get(8)?,
-            next_run_at:      row.get(9)?,
-            created_at:       row.get(10)?,
-            updated_at:       row.get(11)?,
+            cron_expression: row.get(3)?,
+            enabled: row.get::<_, i64>(4)? != 0,
+            template_id: row.get(5)?,
+            run_count: row.get(6)?,
+            last_run_at: row.get(7)?,
+            last_run_status: row.get(8)?,
+            next_run_at: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
         })
     }
 }

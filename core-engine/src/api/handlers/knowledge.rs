@@ -102,7 +102,9 @@ pub async fn extract_knowledge(
             if msg.contains("timed out") || msg.contains("timeout") {
                 ApiError::Internal("知识提炼执行超时，请稍后刷新知识列表确认结果".to_string())
             } else {
-                ApiError::Internal(format!("知识提炼服务不可用，请确认 AI Sidecar 已正常启动: {e}"))
+                ApiError::Internal(format!(
+                    "知识提炼服务不可用，请确认 AI Sidecar 已正常启动: {e}"
+                ))
             }
         })?;
 
@@ -115,7 +117,11 @@ pub async fn extract_knowledge(
     } else {
         let status = response.status();
         let body_text = response.text().await.unwrap_or_default();
-        tracing::warn!("knowledge extract upstream error status={} body={}", status, body_text);
+        tracing::warn!(
+            "knowledge extract upstream error status={} body={}",
+            status,
+            body_text
+        );
 
         let (mapped_status, code) = match status.as_u16() {
             400 | 422 => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
@@ -150,9 +156,9 @@ pub async fn list_knowledge(
             match category.as_str() {
                 "bake_article" => {
                     let mut stmt = conn.prepare(
-                        "SELECT b.id, b.episodic_memory_id, b.summary, b.title, b.content, b.entities,
+                        "SELECT b.id, b.timeline_id, b.summary, b.title, b.content, b.entities,
                          b.importance, b.created_at, b.updated_at, b.created_at_ms, b.updated_at_ms
-                         FROM bake_articles b
+                         FROM designs b
                          ORDER BY b.created_at DESC LIMIT ?1 OFFSET ?2"
                     ).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
@@ -189,14 +195,14 @@ pub async fn list_knowledge(
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
-                    let total: i64 = conn.query_row("SELECT COUNT(*) FROM bake_articles", [], |row| row.get(0))
+                    let total: i64 = conn.query_row("SELECT COUNT(*) FROM designs", [], |row| row.get(0))
                         .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
                     (entries, total)
                 },
                 "bake_knowledge" => {
                     let mut stmt = conn.prepare(
-                        "SELECT b.id, b.episodic_memory_id, b.summary, b.title, b.content, b.entities,
+                        "SELECT b.id, b.timeline_id, b.summary, b.title, b.content, b.entities,
                          b.importance, b.created_at, b.updated_at, b.created_at_ms, b.updated_at_ms
                          FROM bake_knowledge b
                          ORDER BY b.created_at DESC LIMIT ?1 OFFSET ?2"
@@ -242,7 +248,7 @@ pub async fn list_knowledge(
                 },
                 "bake_sop" => {
                     let mut stmt = conn.prepare(
-                        "SELECT b.id, b.episodic_memory_id, b.summary, b.title, b.content, b.entities,
+                        "SELECT b.id, b.timeline_id, b.summary, b.title, b.content, b.entities,
                          b.importance, b.created_at, b.updated_at, b.created_at_ms, b.updated_at_ms
                          FROM bake_sops b
                          ORDER BY b.created_at DESC LIMIT ?1 OFFSET ?2"
@@ -287,16 +293,16 @@ pub async fn list_knowledge(
                     (entries, total)
                 },
                 _ => {
-                    // 其他 category 查询 episodic_memories
+                    // 其他 category 查询 timelines
                     let mut stmt = conn.prepare(
                         "SELECT id, capture_id, summary, overview, details, entities, category, importance,
                          occurrence_count, observed_at, event_time_start, event_time_end,
                          history_view, content_origin, activity_type, is_self_generated,
                          evidence_strength, user_verified, user_edited, created_at, updated_at,
                          created_at_ms, updated_at_ms
-                         FROM episodic_memories WHERE category = ?1
+                         FROM timelines WHERE category = ?1
                            AND summary NOT LIKE ?2
-                         ORDER BY created_at DESC LIMIT ?3 OFFSET ?4"
+                         ORDER BY updated_at_ms DESC LIMIT ?3 OFFSET ?4"
                     ).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
                     let entries = stmt.query_map(rusqlite::params![category, format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX), params.limit, params.offset], |row: &rusqlite::Row| {
@@ -329,7 +335,7 @@ pub async fn list_knowledge(
                     .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
                     let total: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM episodic_memories WHERE category = ?1 AND summary NOT LIKE ?2",
+                        "SELECT COUNT(*) FROM timelines WHERE category = ?1 AND summary NOT LIKE ?2",
                         rusqlite::params![category, format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX)],
                         |row| row.get(0),
                     ).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
@@ -338,16 +344,16 @@ pub async fn list_knowledge(
                 }
             }
         } else {
-            // 没有 category 参数，查询 episodic_memories
+            // 没有 category 参数，查询 timelines
             let mut stmt = conn.prepare(
                 "SELECT id, capture_id, summary, overview, details, entities, category, importance,
                  occurrence_count, observed_at, event_time_start, event_time_end,
                  history_view, content_origin, activity_type, is_self_generated,
                  evidence_strength, user_verified, user_edited, created_at, updated_at,
                  created_at_ms, updated_at_ms
-                 FROM episodic_memories
+                 FROM timelines
                  WHERE summary NOT LIKE ?1
-                 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
+                 ORDER BY updated_at_ms DESC LIMIT ?2 OFFSET ?3"
             ).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
             let entries = stmt.query_map(rusqlite::params![format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX), params.limit, params.offset], |row: &rusqlite::Row| {
@@ -380,7 +386,7 @@ pub async fn list_knowledge(
             .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
             let total: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM episodic_memories WHERE summary NOT LIKE ?1",
+                "SELECT COUNT(*) FROM timelines WHERE summary NOT LIKE ?1",
                 [format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX)],
                 |row| row.get(0),
             ).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
@@ -391,7 +397,10 @@ pub async fn list_knowledge(
         Ok(KnowledgeListResponse { entries, total })
     }).await?;
 
-    Ok(Json(result))
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")],
+        Json(result)
+    ))
 }
 
 /// POST /api/knowledge/:id/verify - 验证知识条目
@@ -402,12 +411,12 @@ pub async fn verify_knowledge(
     state.storage.with_conn_async(move |conn| {
         // 尝试在各个表中查找并更新
         let updated = conn.execute(
-            "UPDATE episodic_memories SET user_verified = 1, updated_at = CURRENT_TIMESTAMP, updated_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = ?",
+            "UPDATE timelines SET user_verified = 1, updated_at = CURRENT_TIMESTAMP, updated_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = ?",
             [id],
         ).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
         if updated == 0 {
-            // 如果在 episodic_memories 中没找到，尝试 bake 表
+            // 如果在 timelines 中没找到，尝试 bake 表
             // 注意：bake 表没有 user_verified 字段，这里可能需要调整逻辑
             // 暂时返回成功，因为 bake 表的记录不需要验证
         }
@@ -422,26 +431,32 @@ pub async fn delete_knowledge(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    state.storage.with_conn_async(move |conn| {
-        // 尝试从各个表中删除
-        let deleted = conn.execute("DELETE FROM episodic_memories WHERE id = ?", [id])
-            .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
-
-        if deleted == 0 {
-            // 尝试 bake 表
-            let deleted = conn.execute("DELETE FROM bake_articles WHERE id = ?", [id])
+    state
+        .storage
+        .with_conn_async(move |conn| {
+            // 尝试从各个表中删除
+            let deleted = conn
+                .execute("DELETE FROM timelines WHERE id = ?", [id])
                 .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
+
             if deleted == 0 {
-                let deleted = conn.execute("DELETE FROM bake_knowledge WHERE id = ?", [id])
+                // 尝试 bake 表
+                let deleted = conn
+                    .execute("DELETE FROM designs WHERE id = ?", [id])
                     .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
                 if deleted == 0 {
-                    conn.execute("DELETE FROM bake_sops WHERE id = ?", [id])
+                    let deleted = conn
+                        .execute("DELETE FROM bake_knowledge WHERE id = ?", [id])
                         .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
+                    if deleted == 0 {
+                        conn.execute("DELETE FROM bake_sops WHERE id = ?", [id])
+                            .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
+                    }
                 }
             }
-        }
 
-        Ok(())
-    }).await?;
+            Ok(())
+        })
+        .await?;
     Ok(StatusCode::OK)
 }

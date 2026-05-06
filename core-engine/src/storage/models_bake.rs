@@ -91,10 +91,10 @@ impl NewBakeTemplate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // ─────────────────────────────────────────────────────────────────────────────
-// episodic_memories 表 - 情节记忆
+// timelines 表 - 时间线（原 episodic_memories）
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub struct NewEpisodicMemory {
+pub struct NewTimeline {
     pub capture_id: i64,
     pub summary: String,
     pub overview: Option<String>,
@@ -111,10 +111,19 @@ pub struct NewEpisodicMemory {
     pub activity_type: Option<String>,
     pub is_self_generated: bool,
     pub evidence_strength: Option<String>,
+    pub capture_ids: Option<String>,
+    pub start_time: Option<i64>,
+    pub end_time: Option<i64>,
+    pub duration_minutes: Option<i64>,
+    pub frag_app_name: Option<String>,
+    pub frag_win_title: Option<String>,
+    pub time_range_start: Option<i64>,
+    pub time_range_end: Option<i64>,
+    pub key_timestamps: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpisodicMemoryRecord {
+pub struct TimelineRecord {
     pub id: i64,
     pub capture_id: i64,
     pub summary: String,
@@ -138,29 +147,41 @@ pub struct EpisodicMemoryRecord {
     pub updated_at: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub capture_ids: Option<String>,
+    pub start_time: Option<i64>,
+    pub end_time: Option<i64>,
+    pub duration_minutes: Option<i64>,
+    pub frag_app_name: Option<String>,
+    pub frag_win_title: Option<String>,
+    pub time_range_start: Option<i64>,
+    pub time_range_end: Option<i64>,
+    pub key_timestamps: Option<String>,
 }
 
 // 向后兼容的类型别名
-pub type NewKnowledgeEntry = NewEpisodicMemory;
-pub type KnowledgeEntryRecord = EpisodicMemoryRecord;
+pub type NewEpisodicMemory = NewTimeline;
+pub type EpisodicMemoryRecord = TimelineRecord;
+pub type NewKnowledgeEntry = NewTimeline;
+pub type KnowledgeEntryRecord = TimelineRecord;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// bake_articles 表 - 提炼后的文章
+// designs 表 - 设计（原 bake_articles）
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub struct NewBakeArticle {
-    pub episodic_memory_id: i64,
+pub struct NewDesign {
+    pub timeline_id: i64,
     pub title: String,
     pub summary: String,
     pub content: Option<String>,
     pub entities: String,
     pub importance: i64,
+    pub source_capture_ids: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BakeArticleRecord {
+pub struct DesignRecord {
     pub id: i64,
-    pub episodic_memory_id: i64,
+    pub timeline_id: i64,
     pub title: String,
     pub summary: String,
     pub content: Option<String>,
@@ -172,25 +193,31 @@ pub struct BakeArticleRecord {
     pub updated_at: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub source_capture_ids: Option<String>,
 }
+
+// 向后兼容的类型别名
+pub type NewBakeArticle = NewDesign;
+pub type BakeArticleRecord = DesignRecord;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // bake_knowledge 表 - 提炼后的知识
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct NewBakeKnowledge {
-    pub episodic_memory_id: i64,
+    pub timeline_id: i64,
     pub title: String,
     pub summary: String,
     pub content: Option<String>,
     pub entities: String,
     pub importance: i64,
+    pub source_capture_ids: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeKnowledgeRecord {
     pub id: i64,
-    pub episodic_memory_id: i64,
+    pub timeline_id: i64,
     pub title: String,
     pub summary: String,
     pub content: Option<String>,
@@ -202,6 +229,7 @@ pub struct BakeKnowledgeRecord {
     pub updated_at: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub source_capture_ids: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,18 +237,19 @@ pub struct BakeKnowledgeRecord {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct NewBakeSop {
-    pub episodic_memory_id: i64,
+    pub timeline_id: i64,
     pub title: String,
     pub summary: String,
     pub content: Option<String>,
     pub entities: String,
     pub importance: i64,
+    pub source_capture_ids: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeSopRecord {
     pub id: i64,
-    pub episodic_memory_id: i64,
+    pub timeline_id: i64,
     pub title: String,
     pub summary: String,
     pub content: Option<String>,
@@ -232,11 +261,12 @@ pub struct BakeSopRecord {
     pub updated_at: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub source_capture_ids: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeMemorySourceRecord {
-    pub knowledge: EpisodicMemoryRecord,
+    pub knowledge: TimelineRecord,
     pub capture_ts: i64,
     pub capture_app_name: Option<String>,
     pub capture_win_title: Option<String>,
@@ -312,7 +342,7 @@ pub struct BakeRunRecord {
     pub candidate_count: i64,
     pub discarded_count: i64,
     pub knowledge_created_count: i64,
-    pub template_created_count: i64,
+    pub design_created_count: i64,
     pub sop_created_count: i64,
     pub error_message: Option<String>,
     pub latency_ms: Option<i64>,
@@ -323,6 +353,32 @@ pub struct BakeWatermarkRecord {
     pub pipeline_name: String,
     pub last_processed_ts: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BakeDesignRecord {
+    pub id: i64,
+    pub title: String,
+    pub summary: String,
+    pub content: String,
+    pub design_type: Option<String>,
+    pub status: String,
+    pub tags: String,
+    pub key_decisions: String,
+    pub technologies: String,
+    pub entities: String,
+    pub diagram_code: Option<String>,
+    pub source_capture_ids: String,
+    pub source_episode_ids: String,
+    pub match_score: Option<f64>,
+    pub match_level: Option<String>,
+    pub creation_mode: String,
+    pub review_status: String,
+    pub evidence_summary: Option<String>,
+    pub generation_version: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deleted_at: Option<i64>,
 }
 
 pub fn now_ms() -> i64 {

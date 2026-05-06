@@ -14,7 +14,10 @@ pub enum StorageError {
     NotFound(String),
 
     #[error("数据库迁移失败（版本 {version}）: {reason}")]
-    MigrationFailed { version: &'static str, reason: String },
+    MigrationFailed {
+        version: &'static str,
+        reason: String,
+    },
 
     #[error("连接锁已中毒（Mutex poisoned）")]
     LockPoisoned,

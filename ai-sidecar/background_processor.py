@@ -13,6 +13,7 @@ import logging
 import os
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib import error as urllib_error, request as urllib_request
@@ -41,12 +42,86 @@ _SELF_GENERATED_WINDOW_KEYWORDS = (
 )
 
 
+def _check_preempt_signal() -> bool:
+    """检查是否收到抢占信号"""
+    import os
+    return os.path.exists("/tmp/memory-bread-preempt.signal")
+
+
 def _is_self_generated_capture(app_name: str | None, window_title: str | None) -> bool:
     app_lower = (app_name or "").lower()
     title_lower = (window_title or "").lower()
     return any(keyword in app_lower for keyword in _SELF_GENERATED_APP_KEYWORDS) or any(
         keyword.lower() in title_lower for keyword in _SELF_GENERATED_WINDOW_KEYWORDS
     )
+
+
+class _LegacyKnowledgeExtractorAdapter:
+    """兼容旧版提炼器的片段提炼适配器"""
+
+    def __init__(self, extractor):
+        self._extractor = extractor
+
+    def _find_similar_knowledge(self, overview, db_conn, **kwargs):
+        return None
+
+    def extract_merged(self, captures: list[dict]) -> Optional[dict]:
+        if not captures:
+            return None
+
+        merged_text_parts = []
+        for capture in captures:
+            text = (capture.get('ocr_text') or capture.get('ax_text') or '').strip()
+            if text:
+                merged_text_parts.append(text)
+
+        if not merged_text_parts:
+            return None
+
+        first_capture = captures[0]
+        last_capture = captures[-1]
+        merged_capture = {
+            'id': first_capture['id'],
+            'app_name': last_capture.get('app_name') or first_capture.get('app_name') or '',
+            'window_title': last_capture.get('window_title') or first_capture.get('window_title') or '',
+            'timestamp': datetime.fromtimestamp(last_capture['ts'] / 1000).isoformat(),
+            'ocr_text': '\n\n'.join(merged_text_parts),
+        }
+
+        extracted = self._extractor.extract_sync(merged_capture)
+        if not extracted:
+            return None
+
+        start_time = first_capture['ts']
+        end_time = last_capture['ts']
+        duration_minutes = max(0, int((end_time - start_time) / 60000))
+
+        return {
+            'capture_ids': json.dumps([capture['id'] for capture in captures]),
+            'summary': extracted.get('summary', ''),
+            'overview': extracted.get('summary', ''),
+            'details': '',
+            'entities': extracted.get('entities', '[]'),
+            'category': extracted.get('category', '其他'),
+            'importance': extracted.get('importance', 2),
+            'occurrence_count': 1,
+            'start_time': start_time,
+            'end_time': end_time,
+            'duration_minutes': duration_minutes,
+            'time_range_start': start_time,
+            'time_range_end': end_time,
+            'key_timestamps': json.dumps([start_time, end_time]),
+            'frag_app_name': last_capture.get('app_name') or first_capture.get('app_name'),
+            'frag_win_title': last_capture.get('window_title') or first_capture.get('window_title'),
+            'observed_at': end_time,
+            'event_time_start': None,
+            'event_time_end': None,
+            'history_view': False,
+            'content_origin': 'other',
+            'activity_type': 'other',
+            'is_self_generated': False,
+            'evidence_strength': 'low',
+        }
 
 
 class BackgroundProcessor:
@@ -103,29 +178,31 @@ class BackgroundProcessor:
             return ""
 
     def _get_knowledge_extractor(self):
-        """懒加载 KnowledgeExtractor V2，在身份发生变化时自动重建"""
+        """懒加载 KnowledgeExtractor，仅允许 V2 模型提炼"""
         current_identity = self._read_user_identity()
         if self._knowledge_extractor is None or getattr(self, '_cached_identity', None) != current_identity:
-            logger.info("开始初始化 KnowledgeExtractor V2（后台任务，identity=%r）", current_identity)
-            from knowledge.extractor_v2 import KnowledgeExtractorV2
-            from embedding.model import EmbeddingModel
+            logger.info("开始初始化 KnowledgeExtractor（后台任务，identity=%r）", current_identity)
+            try:
+                from knowledge.extractor_v2 import KnowledgeExtractorV2
 
-            start_ms = int(time.time() * 1000)
-            _log_model_event("load_start", "embedding", "Knowledge Extractor · BGE-M3-INT8", memory_mb=650)
-            embedding_model = EmbeddingModel.create_default()
-            _log_model_event(
-                "load_done",
-                "embedding",
-                "Knowledge Extractor · BGE-M3-INT8",
-                duration_ms=int(time.time() * 1000) - start_ms,
-                memory_mb=650,
-            )
-            self._knowledge_extractor = KnowledgeExtractorV2(
-                embedding_model=embedding_model,
-                user_identity=current_identity,
-            )
+                # 先初始化 EmbedWorker，确保向量模型可用
+                embed_worker = self._get_embed_worker()
+                embed_model = embed_worker._model if embed_worker else None
+
+                if not embed_model:
+                    logger.error("❌ 向量模型未就绪，知识去重功能将被禁用")
+                    raise RuntimeError("向量模型未就绪，无法启用知识去重")
+
+                self._knowledge_extractor = KnowledgeExtractorV2(
+                    embedding_model=embed_model,
+                    user_identity=current_identity,
+                )
+                logger.info("KnowledgeExtractor V2 已初始化（后台任务，模型提炼模式）")
+            except Exception as exc:
+                logger.error("KnowledgeExtractor V2 初始化失败: %s", exc)
+                raise RuntimeError(f"KnowledgeExtractor V2 初始化失败: {exc}") from exc
+
             self._cached_identity = current_identity
-            logger.info("KnowledgeExtractor V2 已初始化（后台任务，支持去重）")
         return self._knowledge_extractor
 
     def _get_unprocessed_captures(self, conn: sqlite3.Connection, limit: int):
@@ -167,7 +244,7 @@ class BackgroundProcessor:
         if not hasattr(self, '_fragment_grouper'):
             from knowledge.fragment_grouper import FragmentGrouper
             # 复用已有的 embedding model（如果已初始化）
-            embed_model = self._embed_worker.model if self._embed_worker else None
+            embed_model = self._embed_worker._model if self._embed_worker else None
             self._fragment_grouper = FragmentGrouper(embedding_model=embed_model)
             logger.info("FragmentGrouper 已初始化")
         return self._fragment_grouper
@@ -370,9 +447,9 @@ class BackgroundProcessor:
         try:
             processed = 0
             for group in groups_to_process:
-                await self._process_vectorization_batch(group)
                 if await self._process_capture_group(group):
                     processed += 1
+                asyncio.create_task(self._process_vectorization_batch(group))
                 await asyncio.sleep(0.5)
         finally:
             await asyncio.to_thread(self._release_process_file_lock, process_lock_fd)
@@ -400,10 +477,14 @@ class BackgroundProcessor:
         if primary_capture_id is None:
             raise ValueError('knowledge 缺少 capture_id/capture_ids，无法保存')
 
-        overview = knowledge.get('overview') or knowledge.get('summary', '')
+        overview = " ".join(str(knowledge.get('overview') or knowledge.get('summary', '')).split())
+        summary = " ".join(str(knowledge.get('summary') or '').split())
+        if not summary:
+            summary = overview[:42].rstrip() + ('…' if len(overview) > 42 else '')
         cursor = conn.cursor()
+        current_time_ms = int(time.time() * 1000)
         cursor.execute("""
-            INSERT INTO episodic_memories
+            INSERT INTO timelines
             (
                 capture_id,
                 summary,
@@ -417,6 +498,9 @@ class BackgroundProcessor:
                 start_time,
                 end_time,
                 duration_minutes,
+                time_range_start,
+                time_range_end,
+                key_timestamps,
                 frag_app_name,
                 frag_win_title,
                 observed_at,
@@ -426,12 +510,14 @@ class BackgroundProcessor:
                 content_origin,
                 activity_type,
                 is_self_generated,
-                evidence_strength
+                evidence_strength,
+                created_at_ms,
+                updated_at_ms
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             primary_capture_id,
-            overview,
+            summary,
             overview,
             knowledge.get('details', ''),
             knowledge.get('entities', '[]'),
@@ -442,6 +528,9 @@ class BackgroundProcessor:
             knowledge.get('start_time'),
             knowledge.get('end_time'),
             knowledge.get('duration_minutes'),
+            knowledge.get('time_range_start'),
+            knowledge.get('time_range_end'),
+            knowledge.get('key_timestamps'),
             knowledge.get('frag_app_name'),
             knowledge.get('frag_win_title'),
             knowledge.get('observed_at') or knowledge.get('end_time') or knowledge.get('start_time'),
@@ -452,6 +541,8 @@ class BackgroundProcessor:
             knowledge.get('activity_type'),
             int(bool(knowledge.get('is_self_generated', False))),
             knowledge.get('evidence_strength'),
+            current_time_ms,
+            current_time_ms,
         ))
         conn.commit()
         return cursor.lastrowid
@@ -515,7 +606,7 @@ class BackgroundProcessor:
             )
             extractor = self._get_knowledge_extractor()
             logger.info("KnowledgeExtractor 已就绪，开始执行 extract_merged")
-            knowledge = extractor.extract_merged(captures=group)
+            knowledge = extractor.extract_merged(captures=group, preempt_check=_check_preempt_signal)
 
             if not knowledge:
                 logger.warning(f"片段提炼未产出 knowledge ({len(group)} 条 captures)")
@@ -536,7 +627,7 @@ class BackgroundProcessor:
             if similar_id:
                 # 合并：occurrence_count+1，追加 details（去重保留新信息）
                 existing = conn.execute(
-                    "SELECT details FROM episodic_memories WHERE id = ?", (similar_id,)
+                    "SELECT details FROM timelines WHERE id = ?", (similar_id,)
                 ).fetchone()
                 existing_details = (existing[0] or "") if existing else ""
                 new_details = knowledge.get('details', '')
@@ -546,7 +637,7 @@ class BackgroundProcessor:
                 else:
                     merged_details = existing_details
                 conn.execute(
-                    "UPDATE episodic_memories SET occurrence_count = occurrence_count + 1, details = ? WHERE id = ?",
+                    "UPDATE timelines SET occurrence_count = occurrence_count + 1, details = ? WHERE id = ?",
                     (merged_details, similar_id),
                 )
                 conn.commit()
@@ -561,7 +652,7 @@ class BackgroundProcessor:
             self._mark_captures_processed(conn, capture_ids, knowledge_id)
             conn.close()
 
-            await self._process_knowledge_vectorization(group, knowledge_id, knowledge)
+            asyncio.create_task(self._process_knowledge_vectorization(group, knowledge_id, knowledge))
 
             logger.info(
                 f"✅ 片段提炼完成: {len(group)} captures → knowledge_id={knowledge_id}, "
@@ -629,6 +720,9 @@ class BackgroundProcessor:
         capture_id = capture['id']
         try:
             worker = self._get_embed_worker()
+            if not worker or not worker._model:
+                logger.error("❌ 向量模型未就绪，跳过向量化: capture_id=%s", capture_id)
+                return
 
             # 创建 IPC 请求格式
             from memory_bread_ipc import IpcRequest, EmbedRequest
@@ -690,6 +784,10 @@ class BackgroundProcessor:
                 return False
 
             worker = self._get_embed_worker()
+            if not worker or not worker._model:
+                logger.error("❌ 向量模型未就绪，跳过知识向量化: knowledge_id=%s", knowledge_id)
+                return False
+
             from memory_bread_ipc import IpcRequest, EmbedRequest
             from embedding.vector_storage import get_vector_storage
 
@@ -757,15 +855,16 @@ class BackgroundProcessor:
                 # 支持新旧两种格式
                 overview = knowledge.get('overview') or knowledge.get('summary', '')
                 details = knowledge.get('details', '')
+                current_time_ms = int(time.time() * 1000)
 
                 cursor.execute("""
-                    INSERT INTO episodic_memories
+                    INSERT INTO timelines
                     (
                         capture_id, summary, overview, details, entities, category, importance, occurrence_count,
                         observed_at, event_time_start, event_time_end, history_view, content_origin,
-                        activity_type, is_self_generated, evidence_strength
+                        activity_type, is_self_generated, evidence_strength, created_at_ms, updated_at_ms
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     capture_data['id'],
                     overview,  # 保持向后兼容
@@ -783,6 +882,8 @@ class BackgroundProcessor:
                     knowledge.get('activity_type'),
                     int(bool(knowledge.get('is_self_generated', False))),
                     knowledge.get('evidence_strength'),
+                    current_time_ms,
+                    current_time_ms,
                 ))
 
                 conn.commit()

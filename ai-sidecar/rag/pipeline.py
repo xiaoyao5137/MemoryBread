@@ -531,7 +531,7 @@ class RagPipeline:
                 if not knowledge_id:
                     continue
                 row = conn.execute(
-                    "SELECT overview, details FROM episodic_memories WHERE id = ?",
+                    "SELECT overview, details FROM timelines WHERE id = ?",
                     (knowledge_id,),
                 ).fetchone()
                 if not row:
@@ -626,7 +626,7 @@ class RagPipeline:
         try:
             conn = sqlite3.connect(self._db_path)
             rows = conn.execute(
-                f"SELECT id, details FROM episodic_memories WHERE id IN ({placeholders})",
+                f"SELECT id, details FROM timelines WHERE id IN ({placeholders})",
                 knowledge_ids,
             ).fetchall()
             conn.close()

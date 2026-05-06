@@ -1,35 +1,26 @@
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::error::ApiError;
-use crate::storage::{
-    now_ms,
-    BakeActivityRecord,
-    BakeMemorySourceRecord,
-    BakeOverviewRecord,
-    BakeRunRecord,
-    BakeTemplateRecord,
-    KnowledgeEntryRecord,
-    NewBakeRun,
-    NewBakeTemplate,
-    NewKnowledgeEntry,
-    StorageError,
-    StorageManager,
-};
 use crate::storage::models::CaptureRecord;
+use crate::storage::{
+    now_ms, BakeActivityRecord, BakeDesignRecord, BakeMemorySourceRecord, BakeOverviewRecord,
+    BakeRunRecord, BakeTemplateRecord, KnowledgeEntryRecord, NewBakeArticle, NewBakeKnowledge,
+    NewBakeRun, NewBakeSop, NewKnowledgeEntry, StorageError, StorageManager,
+};
 
 const BAKE_STYLE_CONFIG_KEY: &str = "bake.style.config";
 const CATEGORY_BAKE_ARTICLE: &str = "bake_article";
 const CATEGORY_BAKE_SOP: &str = "bake_sop";
 const CATEGORY_BAKE_KNOWLEDGE: &str = "bake_knowledge";
+const CATEGORY_BAKE_DESIGN: &str = "bake_design";
 const UNIFIED_BAKE_PIPELINE_NAME: &str = "unified";
 const BAKE_GENERATION_VERSION: &str = "bake-v1";
 const MATCH_LEVEL_HIGH: &str = "high";
-const MATCH_LEVEL_MEDIUM: &str = "medium";
-const MATCH_LEVEL_LOW: &str = "low";
+const AUTO_ADOPT_MATCH_SCORE_THRESHOLD: f64 = 0.72;
 const BAKE_SIDECAR_TIMEOUT_SECS: u64 = 360;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,7 +44,9 @@ impl BakeBucket {
             None => Ok(None),
             Some("extracted") => Ok(Some(Self::Extracted)),
             Some("pending") => Ok(Some(Self::Pending)),
-            Some(other) => Err(ApiError::BadRequest(format!("invalid bake bucket: {other}"))),
+            Some(other) => Err(ApiError::BadRequest(format!(
+                "invalid bake bucket: {other}"
+            ))),
         }
     }
 }
@@ -146,14 +139,14 @@ pub struct ReplacementRulePayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TemplateSectionPayload {
+pub struct DesignSectionPayload {
     pub title: String,
     pub keywords: Vec<String>,
     pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BakeTemplatePayload {
+pub struct BakeDesignPayload {
     pub id: String,
     pub name: String,
     pub category: String,
@@ -165,7 +158,7 @@ pub struct BakeTemplatePayload {
     pub source_capture_ids: Vec<String>,
     pub source_episode_ids: Vec<String>,
     pub linked_knowledge_ids: Vec<String>,
-    pub structure_sections: Vec<TemplateSectionPayload>,
+    pub structure_sections: Vec<DesignSectionPayload>,
     pub style_phrases: Vec<String>,
     pub replacement_rules: Vec<ReplacementRulePayload>,
     pub prompt_hint: Option<String>,
@@ -210,6 +203,12 @@ pub struct BakeMemoryPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BakeLinkedKnowledgeSummaryPayload {
+    pub id: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeSopPayload {
     pub id: String,
     pub source_capture_id: String,
@@ -219,6 +218,7 @@ pub struct BakeSopPayload {
     pub extracted_problem: Option<String>,
     pub steps: Vec<String>,
     pub linked_knowledge_ids: Vec<String>,
+    pub linked_knowledge_summaries: Vec<BakeLinkedKnowledgeSummaryPayload>,
     pub status: String,
 }
 
@@ -253,7 +253,7 @@ pub struct BakeRunPayload {
     pub candidate_count: i64,
     pub discarded_count: i64,
     pub knowledge_created_count: i64,
-    pub template_created_count: i64,
+    pub design_created_count: i64,
     pub sop_created_count: i64,
     pub error_message: Option<String>,
     pub latency_ms: Option<i64>,
@@ -302,7 +302,7 @@ pub struct BakeExtractCandidatePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeExtractResponse {
     pub knowledge: BakeArtifactExtraction,
-    pub template: BakeArtifactExtraction,
+    pub design: BakeArtifactExtraction,
     pub sop: BakeArtifactExtraction,
     pub usage: Option<Value>,
     pub model: Option<String>,
@@ -338,26 +338,21 @@ pub struct BakeKnowledgeArtifactPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BakeTemplateArtifactPayload {
-    pub name: String,
-    pub category: Option<String>,
+pub struct BakeDesignArtifactPayload {
+    pub title: String,
+    pub summary: String,
+    pub content: String,
+    pub design_type: Option<String>,
     pub status: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
-    pub applicable_tasks: Vec<String>,
+    pub key_decisions: Vec<String>,
     #[serde(default)]
-    pub linked_knowledge_ids: Vec<String>,
+    pub technologies: Vec<String>,
     #[serde(default)]
-    pub structure_sections: Vec<TemplateSectionPayload>,
-    #[serde(default)]
-    pub style_phrases: Vec<String>,
-    #[serde(default)]
-    pub replacement_rules: Vec<ReplacementRulePayload>,
-    pub prompt_hint: Option<String>,
+    pub entities: Vec<String>,
     pub diagram_code: Option<String>,
-    #[serde(default)]
-    pub image_assets: Vec<String>,
     pub evidence_summary: Option<String>,
     pub match_score: Option<f64>,
     pub match_level: Option<String>,
@@ -406,27 +401,42 @@ impl BakeService {
         }
     }
 
-    pub async fn preview_memory(&self, id: i64, trigger_reason: &str) -> Result<BakeExtractResponse, ApiError> {
-        let memory = self.storage
+    pub async fn preview_memory(
+        &self,
+        id: i64,
+        trigger_reason: &str,
+    ) -> Result<BakeExtractResponse, ApiError> {
+        let memory = self
+            .storage
             .get_knowledge_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found")))?;
         if memory.category != CATEGORY_BAKE_ARTICLE {
-            return Err(ApiError::BadRequest(format!("knowledge {id} is not in category {CATEGORY_BAKE_ARTICLE}")));
+            return Err(ApiError::BadRequest(format!(
+                "knowledge {id} is not in category {CATEGORY_BAKE_ARTICLE}"
+            )));
         }
 
         let details = parse_details(memory.details.as_deref());
         let source_knowledge_id = details
             .get("source_knowledge_id")
             .and_then(Value::as_i64)
-            .ok_or_else(|| ApiError::BadRequest(format!("memory {id} missing source_knowledge_id")))?;
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("memory {id} missing source_knowledge_id"))
+            })?;
 
-        let source_knowledge = self.storage
+        let source_knowledge = self
+            .storage
             .get_knowledge_entry(source_knowledge_id)?
-            .ok_or_else(|| ApiError::NotFound(format!("source knowledge {source_knowledge_id} not found")))?;
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("source knowledge {source_knowledge_id} not found"))
+            })?;
 
-        let capture = self.storage
+        let capture = self
+            .storage
             .get_capture(source_knowledge.capture_id)?
-            .ok_or_else(|| ApiError::NotFound(format!("capture {} not found", source_knowledge.capture_id)))?;
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("capture {} not found", source_knowledge.capture_id))
+            })?;
 
         let candidate = BakeMemorySourceRecord {
             knowledge: source_knowledge,
@@ -455,20 +465,27 @@ impl BakeService {
     pub fn save_style_config(&self, config: &BakeStyleConfig) -> Result<BakeStyleConfig, ApiError> {
         let value = serde_json::to_string(config)
             .map_err(|err| ApiError::Internal(format!("序列化写作自然感配置失败: {err}")))?;
-        self.storage.upsert_preference(BAKE_STYLE_CONFIG_KEY, &value, "user", 1.0)?;
+        self.storage
+            .upsert_preference(BAKE_STYLE_CONFIG_KEY, &value, "user", 1.0)?;
         Ok(config.clone())
     }
 
-    pub fn list_templates(&self) -> Result<Vec<BakeTemplatePayload>, ApiError> {
-        Ok(self.storage.list_bake_templates()?
+    pub fn list_templates(&self) -> Result<Vec<BakeDesignPayload>, ApiError> {
+        Ok(self
+            .storage
+            .list_bake_templates()?
             .into_iter()
             .filter(is_current_bake_template)
             .map(map_template_record)
             .collect())
     }
 
-    pub fn list_templates_paginated(&self, filter: BakeListFilter) -> Result<BakePagedResponse<BakeTemplatePayload>, ApiError> {
-        let mut items = self.storage
+    pub fn list_templates_paginated(
+        &self,
+        filter: BakeListFilter,
+    ) -> Result<BakePagedResponse<BakeDesignPayload>, ApiError> {
+        let mut items = self
+            .storage
             .list_bake_templates()?
             .into_iter()
             .filter(is_current_bake_template)
@@ -481,73 +498,90 @@ impl BakeService {
             items.retain(|item| {
                 item.name.to_lowercase().contains(&query_lower)
                     || item.category.to_lowercase().contains(&query_lower)
-                    || item.prompt_hint.as_deref().unwrap_or_default().to_lowercase().contains(&query_lower)
+                    || item
+                        .prompt_hint
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&query_lower)
             });
         }
 
         let total = items.len() as i64;
-        let items = items.into_iter().skip(filter.offset).take(filter.limit).collect();
-        Ok(BakePagedResponse { items, total, limit: filter.limit, offset: filter.offset })
+        let items = items
+            .into_iter()
+            .skip(filter.offset)
+            .take(filter.limit)
+            .collect();
+        Ok(BakePagedResponse {
+            items,
+            total,
+            limit: filter.limit,
+            offset: filter.offset,
+        })
     }
 
-    pub fn create_template(&self, payload: CreateOrUpdateTemplateRequest) -> Result<BakeTemplatePayload, ApiError> {
-        let record = request_to_new_template(payload)?;
-        let id = self.storage.insert_bake_template(&record)?;
-        let template = self.storage
-            .get_bake_template(id)?
-            .ok_or_else(|| ApiError::NotFound(format!("template {id} not found after insert")))?;
-        Ok(map_template_record(template))
+    pub fn create_template(&self, _payload: CreateOrUpdateDesignRequest) -> Result<BakeDesignPayload, ApiError> {
+        Err(ApiError::Internal("Design CRUD not yet implemented".to_string()))
     }
 
-    pub fn update_template(&self, id: i64, payload: CreateOrUpdateTemplateRequest) -> Result<BakeTemplatePayload, ApiError> {
-        let record = request_to_new_template(payload)?;
-        let updated = self.storage.update_bake_template(id, &record)?;
-        if !updated {
-            return Err(ApiError::NotFound(format!("template {id} not found")));
-        }
-        let template = self.storage
-            .get_bake_template(id)?
-            .ok_or_else(|| ApiError::NotFound(format!("template {id} not found after update")))?;
-        Ok(map_template_record(template))
+    pub fn adopt_template(&self, _id: i64) -> Result<BakeDesignPayload, ApiError> {
+        Err(ApiError::Internal("Design CRUD not yet implemented".to_string()))
     }
 
-    pub fn toggle_template_status(&self, id: i64) -> Result<BakeTemplatePayload, ApiError> {
-        let template = self.storage
-            .toggle_bake_template_status(id)?
-            .ok_or_else(|| ApiError::NotFound(format!("template {id} not found")))?;
-        Ok(map_template_record(template))
+    pub fn update_template(&self, _id: i64, _payload: CreateOrUpdateDesignRequest) -> Result<BakeDesignPayload, ApiError> {
+        Err(ApiError::Internal("Design CRUD not yet implemented".to_string()))
     }
 
-    pub fn delete_template(&self, id: i64) -> Result<(), ApiError> {
-        if !self.storage.soft_delete_bake_template(id)? {
-            return Err(ApiError::NotFound(format!("template {id} not found")));
-        }
-        Ok(())
+    pub fn toggle_template_status(&self, _id: i64) -> Result<BakeDesignPayload, ApiError> {
+        Err(ApiError::Internal("Design CRUD not yet implemented".to_string()))
     }
 
+    pub fn delete_template(&self, _id: i64) -> Result<(), ApiError> {
+        Err(ApiError::Internal("Design CRUD not yet implemented".to_string()))
+    }
     pub fn list_sops(&self) -> Result<Vec<BakeSopPayload>, ApiError> {
-        Ok(self.storage.list_knowledge_by_category(CATEGORY_BAKE_SOP)?
+        Ok(self
+            .storage
+            .list_knowledge_by_category(CATEGORY_BAKE_SOP)?
             .into_iter()
             .filter(is_current_bake_entry)
             .filter(|record| matches_entry_bucket(record, None))
-            .map(map_sop_record)
+            .map(|record| map_sop_record_with_linked_summaries(&self.storage, record))
             .collect())
     }
 
-    pub fn list_sops_paginated(&self, filter: BakeListFilter) -> Result<BakePagedResponse<BakeSopPayload>, ApiError> {
+    pub fn list_sops_paginated(
+        &self,
+        filter: BakeListFilter,
+    ) -> Result<BakePagedResponse<BakeSopPayload>, ApiError> {
         let records = self.storage.list_knowledge_by_category(CATEGORY_BAKE_SOP)?;
         let filtered_records = if let Some(query) = filter.q.as_deref() {
             let query_lower = query.to_lowercase();
-            records.into_iter().filter(|record| {
-                is_current_bake_entry(record)
-                    && matches_entry_bucket(record, filter.bucket)
-                    && (record.summary.to_lowercase().contains(&query_lower)
-                        || record.overview.as_deref().unwrap_or_default().to_lowercase().contains(&query_lower)
-                        || record.details.as_deref().unwrap_or_default().to_lowercase().contains(&query_lower)
-                        || record.category.to_lowercase().contains(&query_lower))
-            }).collect::<Vec<_>>()
+            records
+                .into_iter()
+                .filter(|record| {
+                    is_current_bake_entry(record)
+                        && matches_entry_bucket(record, filter.bucket)
+                        && (record.summary.to_lowercase().contains(&query_lower)
+                            || record
+                                .overview
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&query_lower)
+                            || record
+                                .details
+                                .as_deref()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&query_lower)
+                            || record.category.to_lowercase().contains(&query_lower))
+                })
+                .collect::<Vec<_>>()
         } else {
-            records.into_iter()
+            records
+                .into_iter()
                 .filter(is_current_bake_entry)
                 .filter(|record| matches_entry_bucket(record, filter.bucket))
                 .collect::<Vec<_>>()
@@ -557,17 +591,25 @@ impl BakeService {
             .into_iter()
             .skip(filter.offset)
             .take(filter.limit)
-            .map(map_sop_record)
+            .map(|record| map_sop_record_with_linked_summaries(&self.storage, record))
             .collect();
-        Ok(BakePagedResponse { items, total, limit: filter.limit, offset: filter.offset })
+        Ok(BakePagedResponse {
+            items,
+            total,
+            limit: filter.limit,
+            offset: filter.offset,
+        })
     }
 
     pub fn adopt_sop(&self, id: i64) -> Result<BakeSopPayload, ApiError> {
-        let entry = self.storage
+        let entry = self
+            .storage
             .get_knowledge_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("sop {id} not found")))?;
         if entry.category != CATEGORY_BAKE_SOP {
-            return Err(ApiError::BadRequest(format!("knowledge {id} is not a bake sop")));
+            return Err(ApiError::BadRequest(format!(
+                "knowledge {id} is not a bake sop"
+            )));
         }
         let details = parse_details(entry.details.as_deref())
             .as_object()
@@ -585,39 +627,108 @@ impl BakeService {
             &entities,
         )?;
         self.storage.set_knowledge_verified(id, true)?;
-        let updated = self.storage
+        let updated = self
+            .storage
             .get_knowledge_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("sop {id} not found after update")))?;
-        Ok(map_sop_record(updated))
+        Ok(map_sop_record_with_linked_summaries(&self.storage, updated))
     }
 
     pub fn ignore_sop(&self, id: i64) -> Result<BakeSopPayload, ApiError> {
         let updated = self.update_bake_artifact_status(id, CATEGORY_BAKE_SOP, "ignored")?;
-        Ok(map_sop_record(updated))
+        Ok(map_sop_record_with_linked_summaries(&self.storage, updated))
     }
 
     pub fn delete_sop(&self, id: i64) -> Result<(), ApiError> {
         self.delete_bake_artifact(id, CATEGORY_BAKE_SOP)
     }
 
+    pub fn list_designs_paginated(
+        &self,
+        filter: BakeListFilter,
+    ) -> Result<BakePagedResponse<BakeDesignPayload>, ApiError> {
+        let records = self.storage.list_bake_designs()?;
+        let filtered_records = if let Some(query) = filter.q.as_deref() {
+            let query_lower = query.to_lowercase();
+            records
+                .into_iter()
+                .filter(|record| {
+                    record.title.to_lowercase().contains(&query_lower)
+                        || record.summary.to_lowercase().contains(&query_lower)
+                        || record.content.to_lowercase().contains(&query_lower)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            records
+        };
+        let total = filtered_records.len() as i64;
+        let items = filtered_records
+            .into_iter()
+            .skip(filter.offset)
+            .take(filter.limit)
+            .map(map_design_record)
+            .collect();
+        Ok(BakePagedResponse {
+            items,
+            total,
+            limit: filter.limit,
+            offset: filter.offset,
+        })
+    }
+
+    pub fn adopt_design(&self, _id: i64) -> Result<BakeDesignPayload, ApiError> {
+        Err(ApiError::BadRequest("adopt_design not yet implemented".to_string()))
+    }
+
+    pub fn delete_design(&self, _id: i64) -> Result<(), ApiError> {
+        Err(ApiError::BadRequest("delete_design not yet implemented".to_string()))
+    }
+
     pub fn list_memories(&self) -> Result<Vec<BakeMemoryPayload>, ApiError> {
-        Ok(self.storage.list_knowledge_by_category(CATEGORY_BAKE_ARTICLE)?
+        Ok(self
+            .storage
+            .list_knowledge_by_category(CATEGORY_BAKE_ARTICLE)?
             .into_iter()
             .map(map_memory_record)
             .collect())
     }
 
-    pub fn list_memories_paginated(&self, filter: BakeMemoryFilter) -> Result<BakePagedResponse<BakeMemoryPayload>, ApiError> {
-        let total = self.storage.count_bake_memories_filtered(filter.q.as_deref(), filter.from_ts, filter.to_ts)?;
-        let items = self.storage.list_bake_memories_paginated(filter.q.as_deref(), filter.from_ts, filter.to_ts, filter.limit, filter.offset)?
+    pub fn list_memories_paginated(
+        &self,
+        filter: BakeMemoryFilter,
+    ) -> Result<BakePagedResponse<BakeMemoryPayload>, ApiError> {
+        let total = self.storage.count_bake_memories_filtered(
+            filter.q.as_deref(),
+            filter.from_ts,
+            filter.to_ts,
+        )?;
+        let items = self
+            .storage
+            .list_bake_memories_paginated(
+                filter.q.as_deref(),
+                filter.from_ts,
+                filter.to_ts,
+                filter.limit,
+                filter.offset,
+            )?
             .into_iter()
             .map(map_memory_record)
             .collect();
-        Ok(BakePagedResponse { items, total, limit: filter.limit, offset: filter.offset })
+        Ok(BakePagedResponse {
+            items,
+            total,
+            limit: filter.limit,
+            offset: filter.offset,
+        })
     }
 
-    pub fn list_knowledge_paginated(&self, filter: BakeListFilter) -> Result<BakePagedResponse<BakeKnowledgePayload>, ApiError> {
-        let records = self.storage.list_bake_knowledge_paginated(filter.q.as_deref(), 5000, 0)?;
+    pub fn list_knowledge_paginated(
+        &self,
+        filter: BakeListFilter,
+    ) -> Result<BakePagedResponse<BakeKnowledgePayload>, ApiError> {
+        let records = self
+            .storage
+            .list_bake_knowledge_paginated(filter.q.as_deref(), 5000, 0)?;
         let filtered = records
             .into_iter()
             .filter(is_current_bake_entry)
@@ -625,8 +736,22 @@ impl BakeService {
             .map(map_bake_knowledge_record)
             .collect::<Vec<_>>();
         let total = filtered.len() as i64;
-        let items = filtered.into_iter().skip(filter.offset).take(filter.limit).collect();
-        Ok(BakePagedResponse { items, total, limit: filter.limit, offset: filter.offset })
+        let items = filtered
+            .into_iter()
+            .skip(filter.offset)
+            .take(filter.limit)
+            .collect();
+        Ok(BakePagedResponse {
+            items,
+            total,
+            limit: filter.limit,
+            offset: filter.offset,
+        })
+    }
+
+    pub fn adopt_knowledge(&self, id: i64) -> Result<BakeKnowledgePayload, ApiError> {
+        let updated = self.update_bake_artifact_status(id, CATEGORY_BAKE_KNOWLEDGE, "confirmed")?;
+        Ok(map_bake_knowledge_record(updated))
     }
 
     pub fn ignore_knowledge(&self, id: i64) -> Result<BakeKnowledgePayload, ApiError> {
@@ -638,7 +763,10 @@ impl BakeService {
         self.delete_bake_artifact(id, CATEGORY_BAKE_KNOWLEDGE)
     }
 
-    pub fn list_capture_records_paginated(&self, filter: BakeCaptureFilter) -> Result<BakePagedResponse<BakeCapturePayload>, ApiError> {
+    pub fn list_capture_records_paginated(
+        &self,
+        filter: BakeCaptureFilter,
+    ) -> Result<BakePagedResponse<BakeCapturePayload>, ApiError> {
         let mut capture_filter = crate::storage::repo::capture::CaptureFilter::new();
         capture_filter.limit = filter.limit;
         capture_filter.offset = filter.offset;
@@ -657,24 +785,37 @@ impl BakeService {
                 map_capture_record(record, knowledge_links.get(&capture_id))
             })
             .collect();
-        Ok(BakePagedResponse { items, total, limit: capture_filter.limit, offset: capture_filter.offset })
+        Ok(BakePagedResponse {
+            items,
+            total,
+            limit: capture_filter.limit,
+            offset: capture_filter.offset,
+        })
     }
 
     pub fn get_capture_record(&self, id: i64) -> Result<BakeCapturePayload, ApiError> {
-        let record = self.storage
+        let record = self
+            .storage
             .get_capture(id)?
             .ok_or_else(|| ApiError::NotFound(format!("capture {id} not found")))?;
         let knowledge_links = self.storage.list_capture_knowledge_links(&[record.id])?;
         Ok(map_capture_record(record, knowledge_links.get(&id)))
     }
 
-    pub fn initialize_memories(&self, limit: usize) -> Result<InitializeBakeMemoriesResponse, ApiError> {
-        let existing_memories = self.storage.list_knowledge_by_category(CATEGORY_BAKE_ARTICLE)?;
+    pub fn initialize_memories(
+        &self,
+        limit: usize,
+    ) -> Result<InitializeBakeMemoriesResponse, ApiError> {
+        let existing_memories = self
+            .storage
+            .list_knowledge_by_category(CATEGORY_BAKE_ARTICLE)?;
         let existing_sops = self.storage.list_knowledge_by_category(CATEGORY_BAKE_SOP)?;
         let existing_sources = collect_source_knowledge_ids(&existing_memories);
         let existing_sop_sources = collect_source_knowledge_ids(&existing_sops);
 
-        let candidates = self.storage.list_bake_memory_init_candidates(limit.saturating_mul(4).max(limit))?;
+        let candidates = self
+            .storage
+            .list_bake_memory_init_candidates(limit.saturating_mul(4).max(limit))?;
         let mut created = Vec::new();
         let mut skipped = 0_i64;
 
@@ -686,15 +827,18 @@ impl BakeService {
                 skipped += 1;
                 continue;
             }
-            if existing_sources.contains(&candidate.knowledge.id) || existing_sop_sources.contains(&candidate.knowledge.id) {
+            if existing_sources.contains(&candidate.knowledge.id)
+                || existing_sop_sources.contains(&candidate.knowledge.id)
+            {
                 skipped += 1;
                 continue;
             }
 
             let score = score_candidate(&candidate.knowledge);
             let record = build_bake_memory_from_source(&candidate, score)?;
-            let id = self.storage.insert_knowledge_entry(&record)?;
-            let memory = self.storage
+            let id = self.storage.insert_episodic_memory(&record)?;
+            let memory = self
+                .storage
                 .get_knowledge_entry(id)?
                 .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found after init")))?;
             created.push(map_memory_record(memory));
@@ -718,11 +862,14 @@ impl BakeService {
         expected_category: &str,
         status: &str,
     ) -> Result<KnowledgeEntryRecord, ApiError> {
-        let entry = self.storage
+        let entry = self
+            .storage
             .get_knowledge_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("artifact {id} not found")))?;
         if entry.category != expected_category {
-            return Err(ApiError::BadRequest(format!("knowledge {id} is not in category {expected_category}")));
+            return Err(ApiError::BadRequest(format!(
+                "knowledge {id} is not in category {expected_category}"
+            )));
         }
 
         let details = parse_details(entry.details.as_deref())
@@ -742,18 +889,22 @@ impl BakeService {
         if matches!(status, "confirmed" | "auto_created") {
             self.storage.set_knowledge_verified(id, true)?;
         }
-        let updated = self.storage
+        let updated = self
+            .storage
             .get_knowledge_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("artifact {id} not found after update")))?;
         Ok(updated)
     }
 
     fn delete_bake_artifact(&self, id: i64, expected_category: &str) -> Result<(), ApiError> {
-        let entry = self.storage
+        let entry = self
+            .storage
             .get_knowledge_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("artifact {id} not found")))?;
         if entry.category != expected_category {
-            return Err(ApiError::BadRequest(format!("knowledge {id} is not in category {expected_category}")));
+            return Err(ApiError::BadRequest(format!(
+                "knowledge {id} is not in category {expected_category}"
+            )));
         }
         if extract_status(&entry) == "candidate" {
             self.update_bake_artifact_status(id, expected_category, "ignored")?;
@@ -765,46 +916,13 @@ impl BakeService {
         Ok(())
     }
 
-    pub fn promote_memory_to_template(&self, id: i64) -> Result<BakeTemplatePayload, ApiError> {
-        let memory = self.storage
-            .get_knowledge_entry(id)?
-            .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found")))?;
-        let memory_payload = map_memory_record(memory.clone());
-        let template = NewBakeTemplate {
-            name: memory_payload.title.clone(),
-            category: first_or_default(&memory_payload.tags, "精选文档"),
-            status: "draft".to_string(),
-            tags: to_json_string(&memory_payload.tags)?,
-            applicable_tasks: to_json_string(&vec!["creation".to_string()])?,
-            source_memory_ids: to_json_string(&vec![memory_payload.id.clone()])?,
-            source_capture_ids: to_json_string(&memory_payload.source_capture_id.clone().into_iter().collect::<Vec<_>>())?,
-            source_episode_ids: "[]".to_string(),
-            linked_knowledge_ids: to_json_string(&vec![memory_payload.id.clone()])?,
-            structure_sections: "[]".to_string(),
-            style_phrases: "[]".to_string(),
-            replacement_rules: "[]".to_string(),
-            prompt_hint: memory_payload.summary.clone(),
-            diagram_code: None,
-            image_assets: "[]".to_string(),
-            usage_count: 0,
-            match_score: None,
-            match_level: None,
-            creation_mode: "manual".to_string(),
-            review_status: "draft".to_string(),
-            evidence_summary: None,
-            generation_version: None,
-            deleted_at: None,
-        };
-        let template_id = self.storage.insert_bake_template(&template)?;
-        self.update_memory_status(id, "templated")?;
-        let created = self.storage
-            .get_bake_template(template_id)?
-            .ok_or_else(|| ApiError::NotFound(format!("template {template_id} not found after insert")))?;
-        Ok(map_template_record(created))
+    pub fn promote_memory_to_template(&self, _id: i64) -> Result<BakeDesignPayload, ApiError> {
+        Err(ApiError::Internal("Design promotion not yet implemented".to_string()))
     }
 
     pub fn promote_memory_to_sop(&self, id: i64) -> Result<BakeSopPayload, ApiError> {
-        let memory = self.storage
+        let memory = self
+            .storage
             .get_knowledge_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found")))?;
         let payload = map_memory_record(memory.clone());
@@ -834,15 +952,29 @@ impl BakeService {
             activity_type: memory.activity_type,
             is_self_generated: memory.is_self_generated,
             evidence_strength: memory.evidence_strength,
+            capture_ids: None,
+            start_time: None,
+            end_time: None,
+            duration_minutes: None,
+            frag_app_name: None,
+            frag_win_title: None,
+            time_range_start: None,
+            time_range_end: None,
+            key_timestamps: None,
         };
-        let sop_id = self.storage.insert_knowledge_entry(&new_entry)?;
-        let created = self.storage
+        let sop_id = self.storage.insert_episodic_memory(&new_entry)?;
+        let created = self
+            .storage
             .get_knowledge_entry(sop_id)?
             .ok_or_else(|| ApiError::NotFound(format!("sop {sop_id} not found after insert")))?;
-        Ok(map_sop_record(created))
+        Ok(map_sop_record_with_linked_summaries(&self.storage, created))
     }
 
-    pub async fn run_bake_pipeline(&self, trigger_reason: &str, limit: usize) -> Result<BakeRunPayload, ApiError> {
+    pub async fn run_bake_pipeline(
+        &self,
+        trigger_reason: &str,
+        limit: usize,
+    ) -> Result<BakeRunPayload, ApiError> {
         let started_at = now_ms();
         let run_id = self.storage.insert_bake_run(&NewBakeRun {
             trigger_reason: trigger_reason.to_string(),
@@ -850,7 +982,9 @@ impl BakeService {
             started_at,
         })?;
 
-        let result = self.execute_bake_pipeline(run_id, trigger_reason, started_at, limit).await;
+        let result = self
+            .execute_bake_pipeline(run_id, trigger_reason, started_at, limit)
+            .await;
         match result {
             Ok(payload) => Ok(payload),
             Err(err) => {
@@ -882,25 +1016,36 @@ impl BakeService {
         started_at: i64,
         limit: usize,
     ) -> Result<BakeRunPayload, ApiError> {
-        let existing_memories = self.storage.list_knowledge_by_category(CATEGORY_BAKE_ARTICLE)?;
+        let existing_memories = self
+            .storage
+            .list_knowledge_by_category(CATEGORY_BAKE_ARTICLE)?;
         let existing_sops = self.storage.list_knowledge_by_category(CATEGORY_BAKE_SOP)?;
         let existing_knowledge = self.storage.list_bake_knowledge_paginated(None, 500, 0)?;
         let existing_templates = self.storage.list_bake_templates()?;
-        let watermark = self.storage.get_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME)?;
+        let watermark = self
+            .storage
+            .get_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME)?;
         let mut existing_memory_sources = collect_source_knowledge_ids(&existing_memories);
         let mut existing_memory_ids = collect_source_memory_ids(&existing_memories);
         let mut existing_sop_sources = collect_current_bake_source_knowledge_ids(&existing_sops);
-        let mut existing_knowledge_sources = collect_current_bake_source_knowledge_ids(&existing_knowledge);
-        let mut existing_template_sources = collect_current_template_source_knowledge_ids(&existing_templates);
-        let mut max_processed_ts = watermark.as_ref().map(|item| item.last_processed_ts).unwrap_or(0);
+        let mut existing_knowledge_sources =
+            collect_current_bake_source_knowledge_ids(&existing_knowledge);
+        let mut existing_template_sources =
+            collect_current_template_source_knowledge_ids(&existing_templates);
+        let mut max_processed_ts = watermark
+            .as_ref()
+            .map(|item| item.last_processed_ts)
+            .unwrap_or(0);
 
-        let candidates = self.storage.list_bake_memory_init_candidates(limit.saturating_mul(6).max(limit))?;
+        let candidates = self
+            .storage
+            .list_bake_memory_init_candidates(limit.saturating_mul(6).max(limit))?;
         let mut processed_episode_count = 0_i64;
         let mut auto_created_count = 0_i64;
         let mut candidate_count = 0_i64;
         let mut discarded_count = 0_i64;
         let mut knowledge_created_count = 0_i64;
-        let mut template_created_count = 0_i64;
+        let mut design_created_count = 0_i64;
         let mut sop_created_count = 0_i64;
 
         for candidate in candidates {
@@ -924,7 +1069,7 @@ impl BakeService {
             } else {
                 let score = score_candidate(&candidate.knowledge);
                 let record = build_bake_memory_from_source(&candidate, score)?;
-                let memory_id = self.storage.insert_knowledge_entry(&record)?;
+                let memory_id = self.storage.insert_episodic_memory(&record)?;
                 existing_memory_sources.insert(candidate.knowledge.id);
                 existing_memory_ids.insert(candidate.knowledge.id, memory_id);
                 candidate_count += 1;
@@ -945,10 +1090,11 @@ impl BakeService {
             candidate_count += candidate_result.candidate_count;
             discarded_count += candidate_result.discarded_count;
             knowledge_created_count += candidate_result.knowledge_created_count;
-            template_created_count += candidate_result.template_created_count;
+            design_created_count += candidate_result.design_created_count;
             sop_created_count += candidate_result.sop_created_count;
 
-            self.storage.upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, max_processed_ts)?;
+            self.storage
+                .upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, max_processed_ts)?;
         }
 
         let completed_at = now_ms();
@@ -962,14 +1108,14 @@ impl BakeService {
             candidate_count,
             discarded_count,
             knowledge_created_count,
-            template_created_count,
+            design_created_count,
             sop_created_count,
             None,
             Some(latency_ms),
         )?;
-        let latest = self.storage
-            .get_latest_bake_run()?
-            .ok_or_else(|| ApiError::NotFound(format!("bake run {run_id} not found after completion")))?;
+        let latest = self.storage.get_latest_bake_run()?.ok_or_else(|| {
+            ApiError::NotFound(format!("bake run {run_id} not found after completion"))
+        })?;
         Ok(map_bake_run_record(latest))
     }
 
@@ -984,7 +1130,8 @@ impl BakeService {
             candidate: map_extract_candidate_payload(candidate),
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&request_body)
             .timeout(Duration::from_secs(BAKE_SIDECAR_TIMEOUT_SECS))
@@ -1001,8 +1148,7 @@ impl BakeService {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
             tracing::warn!("bake sidecar 返回错误 status={} body={}", status, body_text);
-            let status = StatusCode::from_u16(status.as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let error = map_sidecar_error(status, body_text, "bake 提炼服务");
             Err(ApiError::Upstream {
                 status: error.status,
@@ -1031,10 +1177,10 @@ impl BakeService {
             &extracted.knowledge,
             existing_knowledge_sources,
         )?);
-        result.apply(self.persist_template_artifact(
+        result.apply(self.persist_design_artifact(
             memory_id,
             candidate,
-            &extracted.template,
+            &extracted.design,
             existing_template_sources,
         )?);
         result.apply(self.persist_sop_artifact(
@@ -1063,9 +1209,15 @@ impl BakeService {
             return Ok(CandidatePersistResult::discarded());
         }
 
-        let payload = extraction.payload.clone().ok_or_else(|| ApiError::Internal("bake sidecar 返回 knowledge.accepted=true 但缺少 payload".to_string()))?;
-        let payload: BakeKnowledgeArtifactPayload = serde_json::from_value(payload)
-            .map_err(|err| ApiError::Internal(format!("解析 bake knowledge payload 失败: {err}")))?;
+        let payload = extraction.payload.clone().ok_or_else(|| {
+            ApiError::Internal(
+                "bake sidecar 返回 knowledge.accepted=true 但缺少 payload".to_string(),
+            )
+        })?;
+        let payload: BakeKnowledgeArtifactPayload =
+            serde_json::from_value(payload).map_err(|err| {
+                ApiError::Internal(format!("解析 bake knowledge payload 失败: {err}"))
+            })?;
         if let Some(memory_id) = memory_id {
             self.update_memory_match_metadata(
                 memory_id,
@@ -1074,14 +1226,21 @@ impl BakeService {
                 payload.match_level.as_deref(),
             )?;
         }
-        let review_status = normalize_review_status(payload.review_status.as_deref(), true);
-        let record = build_bake_knowledge_entry(candidate, &payload, &review_status, trigger_reason)?;
-        self.storage.insert_knowledge_entry(&record)?;
+        let review_status = resolve_review_status(
+            payload.review_status.as_deref(),
+            payload.match_score,
+            payload.match_level.as_deref(),
+        );
+        let record =
+            build_bake_knowledge_entry(candidate, &payload, &review_status, trigger_reason)?;
+        self.storage.insert_bake_knowledge(&record)?;
         existing_sources.insert(candidate.knowledge.id);
-        Ok(CandidatePersistResult::created_knowledge(review_status == "auto_created"))
+        Ok(CandidatePersistResult::created_knowledge(
+            review_status == "auto_created",
+        ))
     }
 
-    fn persist_template_artifact(
+    fn persist_design_artifact(
         &self,
         memory_id: Option<i64>,
         candidate: &BakeMemorySourceRecord,
@@ -1095,22 +1254,32 @@ impl BakeService {
             return Ok(CandidatePersistResult::discarded());
         }
 
-        let payload = extraction.payload.clone().ok_or_else(|| ApiError::Internal("bake sidecar 返回 template.accepted=true 但缺少 payload".to_string()))?;
-        let payload: BakeTemplateArtifactPayload = serde_json::from_value(payload)
-            .map_err(|err| ApiError::Internal(format!("解析 bake template payload 失败: {err}")))?;
+        let payload = extraction.payload.clone().ok_or_else(|| {
+            ApiError::Internal(
+                "bake sidecar 返回 template.accepted=true 但缺少 payload".to_string(),
+            )
+        })?;
+        let payload: BakeDesignArtifactPayload = serde_json::from_value(payload)
+            .map_err(|err| ApiError::Internal(format!("解析 bake design payload 失败: {err}")))?;
         if let Some(memory_id) = memory_id {
             self.update_memory_match_metadata(
                 memory_id,
-                "template",
+                "design",
                 payload.match_score,
                 payload.match_level.as_deref(),
             )?;
         }
-        let review_status = normalize_review_status(payload.review_status.as_deref(), true);
-        let template = build_bake_template(candidate, &payload, &review_status)?;
-        self.storage.insert_bake_template(&template)?;
+        let review_status = resolve_review_status(
+            payload.review_status.as_deref(),
+            payload.match_score,
+            payload.match_level.as_deref(),
+        );
+        let design = build_bake_design(candidate, &payload, &review_status)?;
+        self.storage.insert_bake_article(&design)?;
         existing_sources.insert(candidate.knowledge.id);
-        Ok(CandidatePersistResult::created_template(review_status == "auto_created"))
+        Ok(CandidatePersistResult::created_design(
+            review_status == "auto_created",
+        ))
     }
 
     fn persist_sop_artifact(
@@ -1128,7 +1297,9 @@ impl BakeService {
             return Ok(CandidatePersistResult::discarded());
         }
 
-        let payload = extraction.payload.clone().ok_or_else(|| ApiError::Internal("bake sidecar 返回 sop.accepted=true 但缺少 payload".to_string()))?;
+        let payload = extraction.payload.clone().ok_or_else(|| {
+            ApiError::Internal("bake sidecar 返回 sop.accepted=true 但缺少 payload".to_string())
+        })?;
         let payload: BakeSopArtifactPayload = serde_json::from_value(payload)
             .map_err(|err| ApiError::Internal(format!("解析 bake sop payload 失败: {err}")))?;
         if let Some(memory_id) = memory_id {
@@ -1139,11 +1310,17 @@ impl BakeService {
                 payload.match_level.as_deref(),
             )?;
         }
-        let review_status = normalize_review_status(payload.review_status.as_deref(), true);
+        let review_status = resolve_review_status(
+            payload.review_status.as_deref(),
+            payload.match_score,
+            payload.match_level.as_deref(),
+        );
         let sop = build_bake_sop_entry(candidate, &payload, &review_status, trigger_reason)?;
-        self.storage.insert_knowledge_entry(&sop)?;
+        self.storage.insert_bake_sop(&sop)?;
         existing_sources.insert(candidate.knowledge.id);
-        Ok(CandidatePersistResult::created_sop(review_status == "auto_created"))
+        Ok(CandidatePersistResult::created_sop(
+            review_status == "auto_created",
+        ))
     }
     fn update_memory_match_metadata(
         &self,
@@ -1152,7 +1329,8 @@ impl BakeService {
         match_score: Option<f64>,
         match_level: Option<&str>,
     ) -> Result<(), ApiError> {
-        let entry = self.storage
+        let entry = self
+            .storage
             .get_knowledge_entry(memory_id)?
             .ok_or_else(|| ApiError::NotFound(format!("memory {memory_id} not found")))?;
         let details = parse_details(entry.details.as_deref())
@@ -1160,7 +1338,10 @@ impl BakeService {
             .cloned()
             .unwrap_or_default();
         let mut next_details = serde_json::Map::from_iter(details);
-        next_details.insert(format!("{artifact_kind}_match_score"), match_score.map_or(Value::Null, Value::from));
+        next_details.insert(
+            format!("{artifact_kind}_match_score"),
+            match_score.map_or(Value::Null, Value::from),
+        );
         next_details.insert(
             format!("{artifact_kind}_match_level"),
             match_level.map_or(Value::Null, |value| Value::String(value.to_string())),
@@ -1175,24 +1356,28 @@ impl BakeService {
         Ok(())
     }
 
-
     pub fn get_overview(&self) -> Result<BakeOverviewPayload, ApiError> {
         let capture_count = self.storage.with_conn(|conn| {
             conn.query_row("SELECT COUNT(*) FROM captures", [], |row| row.get(0))
                 .map_err(StorageError::Sqlite)
         })?;
-        let memory_entries = self.storage.list_knowledge_by_category(CATEGORY_BAKE_ARTICLE)?;
-        let sop_entries = self.storage
+        let memory_entries = self
+            .storage
+            .list_knowledge_by_category(CATEGORY_BAKE_ARTICLE)?;
+        let sop_entries = self
+            .storage
             .list_knowledge_by_category(CATEGORY_BAKE_SOP)?
             .into_iter()
             .filter(is_current_bake_entry)
             .collect::<Vec<_>>();
-        let knowledge_entries = self.storage
+        let knowledge_entries = self
+            .storage
             .list_bake_knowledge_paginated(None, 5000, 0)?
             .into_iter()
             .filter(is_current_bake_entry)
             .collect::<Vec<_>>();
-        let templates = self.storage
+        let templates = self
+            .storage
             .list_bake_templates()?
             .into_iter()
             .filter(is_current_bake_template)
@@ -1200,21 +1385,36 @@ impl BakeService {
         let latest_run = self.storage.get_latest_bake_run()?;
         let memory_count = memory_entries.len() as i64;
 
-        let pending_candidates = memory_entries.iter().filter(|entry| extract_status(entry) == "candidate").count() as i64
-            + sop_entries.iter().filter(|entry| extract_status(entry) == "candidate").count() as i64
-            + knowledge_entries.iter().filter(|entry| extract_status(entry) == "candidate").count() as i64
-            + templates.iter().filter(|item| item.review_status == "candidate").count() as i64;
+        let pending_candidates = memory_entries
+            .iter()
+            .filter(|entry| extract_status(entry) == "candidate")
+            .count() as i64
+            + sop_entries
+                .iter()
+                .filter(|entry| extract_status(entry) == "candidate")
+                .count() as i64
+            + knowledge_entries
+                .iter()
+                .filter(|entry| extract_status(entry) == "candidate")
+                .count() as i64
+            + templates
+                .iter()
+                .filter(|item| item.review_status == "candidate")
+                .count() as i64;
 
-        let mut recent_activities: Vec<BakeActivityRecord> = memory_entries.iter()
+        let mut recent_activities: Vec<BakeActivityRecord> = memory_entries
+            .iter()
             .take(3)
             .map(|entry| BakeActivityRecord {
                 message: format!("情节记忆《{}》已进入烤面包队列", entry.summary),
                 ts: entry.updated_at_ms,
             })
             .collect();
-        recent_activities.extend(knowledge_entries.iter().take(2).map(|entry| BakeActivityRecord {
-            message: format!("知识《{}》已由 LLM 烤面包提炼", entry.summary),
-            ts: entry.updated_at_ms,
+        recent_activities.extend(knowledge_entries.iter().take(2).map(|entry| {
+            BakeActivityRecord {
+                message: format!("知识《{}》已由 LLM 烤面包提炼", entry.summary),
+                ts: entry.updated_at_ms,
+            }
         }));
         recent_activities.extend(templates.iter().take(2).map(|template| BakeActivityRecord {
             message: format!("模板《{}》状态已更新为 {}", template.name, template.status),
@@ -1234,15 +1434,35 @@ impl BakeService {
             knowledge_count: knowledge_entries.len() as i64,
             template_count: templates.len() as i64,
             pending_candidates,
-            auto_created_today: latest_run.as_ref().map(|run| run.auto_created_count).unwrap_or(0),
-            candidate_today: latest_run.as_ref().map(|run| run.candidate_count).unwrap_or(0),
-            discarded_today: latest_run.as_ref().map(|run| run.discarded_count).unwrap_or(0),
+            auto_created_today: latest_run
+                .as_ref()
+                .map(|run| run.auto_created_count)
+                .unwrap_or(0),
+            candidate_today: latest_run
+                .as_ref()
+                .map(|run| run.candidate_count)
+                .unwrap_or(0),
+            discarded_today: latest_run
+                .as_ref()
+                .map(|run| run.discarded_count)
+                .unwrap_or(0),
             last_bake_run_status: latest_run.as_ref().map(|run| run.status.clone()),
-            last_bake_run_at: latest_run.as_ref().map(|run| run.completed_at.unwrap_or(run.started_at)),
+            last_bake_run_at: latest_run
+                .as_ref()
+                .map(|run| run.completed_at.unwrap_or(run.started_at)),
             last_trigger_reason: latest_run.as_ref().map(|run| run.trigger_reason.clone()),
-            knowledge_auto_count: latest_run.as_ref().map(|run| run.knowledge_created_count).unwrap_or(0),
-            template_auto_count: latest_run.as_ref().map(|run| run.template_created_count).unwrap_or(0),
-            sop_auto_count: latest_run.as_ref().map(|run| run.sop_created_count).unwrap_or(0),
+            knowledge_auto_count: latest_run
+                .as_ref()
+                .map(|run| run.knowledge_created_count)
+                .unwrap_or(0),
+            template_auto_count: latest_run
+                .as_ref()
+                .map(|run| run.design_created_count)
+                .unwrap_or(0),
+            sop_auto_count: latest_run
+                .as_ref()
+                .map(|run| run.sop_created_count)
+                .unwrap_or(0),
             recent_activities,
         };
 
@@ -1261,12 +1481,17 @@ impl BakeService {
             knowledge_auto_count: overview.knowledge_auto_count,
             template_auto_count: overview.template_auto_count,
             sop_auto_count: overview.sop_auto_count,
-            recent_activities: overview.recent_activities.into_iter().map(|item| item.message).collect(),
+            recent_activities: overview
+                .recent_activities
+                .into_iter()
+                .map(|item| item.message)
+                .collect(),
         })
     }
 
     fn update_memory_status(&self, id: i64, status: &str) -> Result<BakeMemoryPayload, ApiError> {
-        let entry = self.storage
+        let entry = self
+            .storage
             .get_knowledge_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found")))?;
         let details = parse_details(entry.details.as_deref())
@@ -1282,7 +1507,8 @@ impl BakeService {
             Some(&Value::Object(next_details).to_string()),
             &entry.entities,
         )?;
-        let updated = self.storage
+        let updated = self
+            .storage
             .get_knowledge_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found after update")))?;
         Ok(map_memory_record(updated))
@@ -1295,7 +1521,7 @@ struct CandidatePersistResult {
     candidate_count: i64,
     discarded_count: i64,
     knowledge_created_count: i64,
-    template_created_count: i64,
+    design_created_count: i64,
     sop_created_count: i64,
 }
 
@@ -1316,11 +1542,11 @@ impl CandidatePersistResult {
         }
     }
 
-    fn created_template(auto_created: bool) -> Self {
+    fn created_design(auto_created: bool) -> Self {
         Self {
             auto_created_count: if auto_created { 1 } else { 0 },
             candidate_count: if auto_created { 0 } else { 1 },
-            template_created_count: 1,
+            design_created_count: 1,
             ..Self::default()
         }
     }
@@ -1339,12 +1565,14 @@ impl CandidatePersistResult {
         self.candidate_count += other.candidate_count;
         self.discarded_count += other.discarded_count;
         self.knowledge_created_count += other.knowledge_created_count;
-        self.template_created_count += other.template_created_count;
+        self.design_created_count += other.design_created_count;
         self.sop_created_count += other.sop_created_count;
     }
 }
 
-fn map_extract_candidate_payload(candidate: &BakeMemorySourceRecord) -> BakeExtractCandidatePayload {
+fn map_extract_candidate_payload(
+    candidate: &BakeMemorySourceRecord,
+) -> BakeExtractCandidatePayload {
     BakeExtractCandidatePayload {
         source_knowledge_id: candidate.knowledge.id,
         source_capture_id: candidate.knowledge.capture_id,
@@ -1375,17 +1603,29 @@ fn map_sidecar_request_error(err: reqwest::Error) -> ApiError {
     let msg = err.to_string();
     if err.is_timeout() || msg.contains("timed out") || msg.contains("timeout") {
         tracing::warn!("bake sidecar 响应超时: {}", err);
-        ApiError::Internal(format!(
-            "bake 提炼请求超时（>{} 秒），请稍后重试",
-            BAKE_SIDECAR_TIMEOUT_SECS
-        ))
+        ApiError::Upstream {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: "GATEWAY_TIMEOUT",
+            message: format!(
+                "bake 提炼请求超时（>{} 秒），请稍后重试",
+                BAKE_SIDECAR_TIMEOUT_SECS
+            ),
+        }
     } else {
         tracing::warn!("无法连接到 bake sidecar: {}", err);
-        ApiError::Internal(format!("bake 提炼服务不可用，请确认 AI Sidecar 已正常启动: {err}"))
+        ApiError::Upstream {
+            status: StatusCode::BAD_GATEWAY,
+            code: "BAD_GATEWAY",
+            message: format!("bake 提炼服务不可用，请确认 AI Sidecar 已正常启动: {err}"),
+        }
     }
 }
 
-fn map_sidecar_error(status: StatusCode, body_text: String, service_name: &str) -> BakeSidecarError {
+fn map_sidecar_error(
+    status: StatusCode,
+    body_text: String,
+    service_name: &str,
+) -> BakeSidecarError {
     let (mapped_status, code) = match status.as_u16() {
         400 | 422 => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
         502 => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
@@ -1408,17 +1648,41 @@ fn map_sidecar_error(status: StatusCode, body_text: String, service_name: &str) 
     }
 }
 
-fn normalize_review_status(value: Option<&str>, default_auto_created: bool) -> String {
-    match value.unwrap_or_default() {
-        "auto_created" => "auto_created".to_string(),
-        "candidate" => "candidate".to_string(),
-        "confirmed" => "confirmed".to_string(),
-        _ if default_auto_created => "auto_created".to_string(),
-        _ => "candidate".to_string(),
+fn resolve_review_status(
+    value: Option<&str>,
+    match_score: Option<f64>,
+    match_level: Option<&str>,
+) -> String {
+    let normalized = match value.unwrap_or_default() {
+        "auto_created" => "auto_created",
+        "candidate" => "candidate",
+        "confirmed" => "confirmed",
+        "ignored" => "ignored",
+        _ => "candidate",
+    };
+
+    if normalized == "auto_created" && !is_high_match_candidate(match_score, match_level) {
+        return "candidate".to_string();
     }
+
+    if normalized == "candidate" && is_high_match_candidate(match_score, match_level) {
+        return "auto_created".to_string();
+    }
+
+    normalized.to_string()
 }
 
-fn collect_template_source_knowledge_ids(records: &[BakeTemplateRecord]) -> std::collections::HashSet<i64> {
+fn is_high_match_candidate(match_score: Option<f64>, match_level: Option<&str>) -> bool {
+    let level_is_high = match_level
+        .map(|level| level.eq_ignore_ascii_case(MATCH_LEVEL_HIGH))
+        .unwrap_or(false);
+    let score_is_high = match_score.is_some_and(|score| score >= AUTO_ADOPT_MATCH_SCORE_THRESHOLD);
+    level_is_high && score_is_high
+}
+
+fn collect_template_source_knowledge_ids(
+    records: &[BakeTemplateRecord],
+) -> std::collections::HashSet<i64> {
     records
         .iter()
         .flat_map(|record| {
@@ -1429,7 +1693,9 @@ fn collect_template_source_knowledge_ids(records: &[BakeTemplateRecord]) -> std:
         .collect()
 }
 
-fn collect_current_template_source_knowledge_ids(records: &[BakeTemplateRecord]) -> std::collections::HashSet<i64> {
+fn collect_current_template_source_knowledge_ids(
+    records: &[BakeTemplateRecord],
+) -> std::collections::HashSet<i64> {
     records
         .iter()
         .filter(|record| is_current_bake_template(record))
@@ -1446,7 +1712,7 @@ fn build_bake_knowledge_entry(
     payload: &BakeKnowledgeArtifactPayload,
     review_status: &str,
     trigger_reason: &str,
-) -> Result<NewKnowledgeEntry, ApiError> {
+) -> Result<NewBakeKnowledge, ApiError> {
     let entities = if payload.entities.is_empty() {
         parse_json_vec_string(&source.knowledge.entities)
     } else {
@@ -1468,65 +1734,42 @@ fn build_bake_knowledge_entry(
         "status": review_status,
         "source_title": source.knowledge.summary.clone(),
     });
-    Ok(NewKnowledgeEntry {
-        capture_id: source.knowledge.capture_id,
+    Ok(NewBakeKnowledge {
+        timeline_id: source.knowledge.id,
+        title: payload
+            .overview
+            .clone()
+            .unwrap_or_else(|| payload.summary.clone()),
         summary: payload.summary.clone(),
-        overview: payload.overview.clone().or_else(|| source.knowledge.overview.clone()),
-        details: Some(details.to_string()),
+        content: Some(details.to_string()),
         entities: to_json_string(&entities)?,
-        category: CATEGORY_BAKE_KNOWLEDGE.to_string(),
-        importance: payload.importance.unwrap_or(source.knowledge.importance).max(1),
-        occurrence_count: payload.occurrence_count.or(source.knowledge.occurrence_count),
-        observed_at: payload.observed_at.or(source.knowledge.observed_at).or(Some(source.capture_ts)),
-        event_time_start: payload.event_time_start.or(source.knowledge.event_time_start),
-        event_time_end: payload.event_time_end.or(source.knowledge.event_time_end),
-        history_view: payload.history_view.unwrap_or(source.knowledge.history_view),
-        content_origin: payload.content_origin.clone().or_else(|| source.knowledge.content_origin.clone()),
-        activity_type: payload.activity_type.clone().or_else(|| source.knowledge.activity_type.clone()),
-        is_self_generated: false,
-        evidence_strength: payload.evidence_strength.clone().or_else(|| source.knowledge.evidence_strength.clone()),
-    })
+        importance: payload
+            .importance
+            .unwrap_or(source.knowledge.importance)
+            .max(1),
+            source_capture_ids: None,
+        })
 }
 
-fn build_bake_template(
+fn build_bake_design(
     source: &BakeMemorySourceRecord,
-    payload: &BakeTemplateArtifactPayload,
+    payload: &BakeDesignArtifactPayload,
     review_status: &str,
-) -> Result<NewBakeTemplate, ApiError> {
-    let tags = if payload.tags.is_empty() {
+) -> Result<NewBakeArticle, ApiError> {
+    let entities = if payload.entities.is_empty() {
         parse_json_vec_string(&source.knowledge.entities)
     } else {
-        payload.tags.clone()
+        payload.entities.clone()
     };
-    let applicable_tasks = if payload.applicable_tasks.is_empty() {
-        vec!["creation".to_string()]
-    } else {
-        payload.applicable_tasks.clone()
-    };
-    Ok(NewBakeTemplate {
-        name: payload.name.clone(),
-        category: payload.category.clone().unwrap_or_else(|| first_or_default(&tags, "精选文档")),
-        status: payload.status.clone().unwrap_or_else(|| if review_status == "auto_created" { "enabled".to_string() } else { "draft".to_string() }),
-        tags: to_json_string(&tags)?,
-        applicable_tasks: to_json_string(&applicable_tasks)?,
-        source_memory_ids: to_json_string(&vec![source.knowledge.id.to_string()])?,
-        source_capture_ids: to_json_string(&vec![source.knowledge.capture_id.to_string()])?,
-        source_episode_ids: to_json_string(&vec![source.knowledge.capture_id.to_string()])?,
-        linked_knowledge_ids: to_json_string(&payload.linked_knowledge_ids)?,
-        structure_sections: to_json_string(&payload.structure_sections)?,
-        style_phrases: to_json_string(&payload.style_phrases)?,
-        replacement_rules: to_json_string(&payload.replacement_rules)?,
-        prompt_hint: payload.prompt_hint.clone(),
-        diagram_code: payload.diagram_code.clone(),
-        image_assets: to_json_string(&payload.image_assets)?,
-        usage_count: 0,
-        match_score: payload.match_score,
-        match_level: payload.match_level.clone(),
-        creation_mode: "llm_bake".to_string(),
-        review_status: review_status.to_string(),
-        evidence_summary: payload.evidence_summary.clone(),
-        generation_version: Some(BAKE_GENERATION_VERSION.to_string()),
-        deleted_at: None,
+    let source_capture_ids = vec![source.knowledge.capture_id.to_string()];
+    Ok(NewBakeArticle {
+        timeline_id: source.knowledge.id,
+        title: payload.title.clone(),
+        summary: payload.summary.clone(),
+        content: Some(payload.content.clone()),
+        entities: to_json_string(&entities)?,
+        importance: source.knowledge.importance,
+        source_capture_ids: Some(to_json_string(&source_capture_ids)?),
     })
 }
 
@@ -1535,7 +1778,7 @@ fn build_bake_sop_entry(
     payload: &BakeSopArtifactPayload,
     review_status: &str,
     trigger_reason: &str,
-) -> Result<NewKnowledgeEntry, ApiError> {
+) -> Result<NewBakeSop, ApiError> {
     let trigger_keywords = if payload.trigger_keywords.is_empty() {
         parse_json_vec_string(&source.knowledge.entities)
     } else {
@@ -1566,24 +1809,18 @@ fn build_bake_sop_entry(
         "linked_knowledge_ids": linked_knowledge_ids,
         "status": review_status,
     });
-    Ok(NewKnowledgeEntry {
-        capture_id: source.knowledge.capture_id,
+    Ok(NewBakeSop {
+        timeline_id: source.knowledge.id,
+        title: payload
+            .overview
+            .clone()
+            .unwrap_or_else(|| payload.summary.clone()),
         summary: payload.summary.clone(),
-        overview: payload.overview.clone().or_else(|| source.knowledge.overview.clone()),
-        details: Some(details.to_string()),
+        content: Some(details.to_string()),
         entities: source.knowledge.entities.clone(),
-        category: CATEGORY_BAKE_SOP.to_string(),
         importance: source.knowledge.importance.max(3),
-        occurrence_count: source.knowledge.occurrence_count,
-        observed_at: source.knowledge.observed_at.or(Some(source.capture_ts)),
-        event_time_start: source.knowledge.event_time_start,
-        event_time_end: source.knowledge.event_time_end,
-        history_view: source.knowledge.history_view,
-        content_origin: source.knowledge.content_origin.clone(),
-        activity_type: source.knowledge.activity_type.clone(),
-        is_self_generated: false,
-        evidence_strength: source.knowledge.evidence_strength.clone(),
-    })
+            source_capture_ids: None,
+        })
 }
 
 fn map_bake_run_record(record: BakeRunRecord) -> BakeRunPayload {
@@ -1598,7 +1835,7 @@ fn map_bake_run_record(record: BakeRunRecord) -> BakeRunPayload {
         candidate_count: record.candidate_count,
         discarded_count: record.discarded_count,
         knowledge_created_count: record.knowledge_created_count,
-        template_created_count: record.template_created_count,
+        design_created_count: record.design_created_count,
         sop_created_count: record.sop_created_count,
         error_message: record.error_message,
         latency_ms: record.latency_ms,
@@ -1606,7 +1843,10 @@ fn map_bake_run_record(record: BakeRunRecord) -> BakeRunPayload {
 }
 
 fn format_bake_run_activity(run: &BakeRunRecord) -> String {
-    let summary = format!("自动 {}，候选 {}，丢弃 {}", run.auto_created_count, run.candidate_count, run.discarded_count);
+    let summary = format!(
+        "自动 {}，候选 {}，丢弃 {}",
+        run.auto_created_count, run.candidate_count, run.discarded_count
+    );
     match run.trigger_reason.as_str() {
         "knowledge_background" => format!("知识后台提炼后已自动执行分类烤面包（{}）", summary),
         "manual_debug" => format!("手动触发分类烤面包执行完成（{}）", summary),
@@ -1625,7 +1865,11 @@ fn map_capture_record(
     linked_knowledge: Option<&(i64, String)>,
 ) -> BakeCapturePayload {
     let best_text = record.best_text().map(ToString::to_string);
-    let summary = record.win_title.clone().or_else(|| best_text.as_ref().map(|text| text.chars().take(80).collect::<String>()));
+    let summary = record.win_title.clone().or_else(|| {
+        best_text
+            .as_ref()
+            .map(|text| text.chars().take(80).collect::<String>())
+    });
     let semantic_type_label = infer_semantic_type_label(&record);
     let raw_type_label = friendly_raw_type_label(&record.event_type, &record);
 
@@ -1655,7 +1899,7 @@ fn map_capture_record(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateOrUpdateTemplateRequest {
+pub struct CreateOrUpdateDesignRequest {
     pub name: String,
     pub category: String,
     pub status: String,
@@ -1670,7 +1914,7 @@ pub struct CreateOrUpdateTemplateRequest {
     #[serde(default)]
     pub source_episode_ids: Vec<String>,
     pub linked_knowledge_ids: Vec<String>,
-    pub structure_sections: Vec<TemplateSectionPayload>,
+    pub structure_sections: Vec<DesignSectionPayload>,
     pub style_phrases: Vec<String>,
     pub replacement_rules: Vec<ReplacementRulePayload>,
     pub prompt_hint: Option<String>,
@@ -1686,109 +1930,106 @@ pub struct CreateOrUpdateTemplateRequest {
     pub deleted_at: Option<i64>,
 }
 
-fn request_to_new_template(payload: CreateOrUpdateTemplateRequest) -> Result<NewBakeTemplate, ApiError> {
-    Ok(NewBakeTemplate {
-        name: payload.name,
-        category: payload.category,
-        status: payload.status,
-        tags: to_json_string(&payload.tags)?,
-        applicable_tasks: to_json_string(&payload.applicable_tasks)?,
-        source_memory_ids: to_json_string(&if payload.source_memory_ids.is_empty() {
-            payload.source_article_ids.clone()
-        } else {
-            payload.source_memory_ids.clone()
-        })?,
-        source_capture_ids: to_json_string(&payload.source_capture_ids)?,
-        source_episode_ids: to_json_string(&payload.source_episode_ids)?,
-        linked_knowledge_ids: to_json_string(&payload.linked_knowledge_ids)?,
-        structure_sections: to_json_string(&payload.structure_sections)?,
-        style_phrases: to_json_string(&payload.style_phrases)?,
-        replacement_rules: to_json_string(&payload.replacement_rules)?,
-        prompt_hint: payload.prompt_hint,
-        diagram_code: payload.diagram_code,
-        image_assets: to_json_string(&payload.image_assets)?,
-        usage_count: payload.usage_count.unwrap_or(0),
-        match_score: payload.match_score,
-        match_level: payload.match_level,
-        creation_mode: payload.creation_mode.unwrap_or_else(|| "manual".to_string()),
-        review_status: payload.review_status.unwrap_or_else(|| "draft".to_string()),
-        evidence_summary: payload.evidence_summary,
-        generation_version: payload.generation_version,
-        deleted_at: payload.deleted_at,
-    })
+// Placeholder functions for design CRUD - not yet implemented
+fn request_to_new_template(_payload: CreateOrUpdateDesignRequest) -> Result<NewBakeArticle, ApiError> {
+    Err(ApiError::Internal("Design CRUD not yet implemented".to_string()))
 }
 
-fn map_template_record(record: BakeTemplateRecord) -> BakeTemplatePayload {
-    let source_memory_ids = parse_json_vec_string(&record.source_memory_ids);
-    BakeTemplatePayload {
-        id: record.id.to_string(),
-        name: record.name,
-        category: record.category,
-        status: record.status,
-        tags: parse_json_vec_string(&record.tags),
-        applicable_tasks: parse_json_vec_string(&record.applicable_tasks),
-        source_article_ids: source_memory_ids.clone(),
-        source_memory_ids,
-        source_capture_ids: parse_json_vec_string(&record.source_capture_ids),
-        source_episode_ids: parse_json_vec_string(&record.source_episode_ids),
-        linked_knowledge_ids: parse_json_vec_string(&record.linked_knowledge_ids),
-        structure_sections: parse_json_value(&record.structure_sections),
-        style_phrases: parse_json_vec_string(&record.style_phrases),
-        replacement_rules: parse_json_value(&record.replacement_rules),
-        prompt_hint: record.prompt_hint,
-        diagram_code: record.diagram_code,
-        image_assets: parse_json_vec_string(&record.image_assets),
-        usage_count: record.usage_count,
-        match_score: record.match_score,
-        match_level: record.match_level,
-        creation_mode: record.creation_mode,
-        review_status: record.review_status,
-        evidence_summary: record.evidence_summary,
-        generation_version: record.generation_version,
-        deleted_at: record.deleted_at,
-        updated_at: format_ts_ms(record.updated_at),
-    }
+fn map_template_record(_record: BakeTemplateRecord) -> BakeDesignPayload {
+    unimplemented!("Design CRUD not yet implemented")
 }
 
 fn map_memory_record(record: KnowledgeEntryRecord) -> BakeMemoryPayload {
     let details = parse_details(record.details.as_deref());
-    let tags = details.get("tags")
+    let tags = details
+        .get("tags")
         .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
         .unwrap_or_else(|| parse_json_vec_string(&record.entities));
 
     BakeMemoryPayload {
         id: record.id.to_string(),
         title: record.summary,
-        url: details.get("url").and_then(Value::as_str).map(ToString::to_string),
-        source_capture_id: details.get("source_capture_id").and_then(Value::as_str).map(ToString::to_string).or_else(|| Some(record.capture_id.to_string())),
-        source_knowledge_id: details.get("source_knowledge_id").and_then(Value::as_i64).map(|value| value.to_string()),
+        url: details
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        source_capture_id: details
+            .get("source_capture_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| Some(record.capture_id.to_string())),
+        source_knowledge_id: details
+            .get("source_knowledge_id")
+            .and_then(Value::as_i64)
+            .map(|value| value.to_string()),
         summary: record.overview,
-        weight: details.get("weight").and_then(Value::as_i64).unwrap_or(record.importance * 20),
-        open_count: details.get("open_count").and_then(Value::as_i64).unwrap_or(0),
-        dwell_seconds: details.get("dwell_seconds").and_then(Value::as_i64).unwrap_or(0),
-        has_edit_action: details.get("has_edit_action").and_then(Value::as_bool).unwrap_or(false),
-        knowledge_ref_count: details.get("knowledge_ref_count").and_then(Value::as_i64).or(record.occurrence_count).unwrap_or(0),
-        status: details.get("status").and_then(Value::as_str).map(ToString::to_string)
-            .unwrap_or_else(|| if record.user_verified { "confirmed".to_string() } else { "candidate".to_string() }),
-        suggested_action: details.get("suggested_action").and_then(Value::as_str).map(ToString::to_string)
+        weight: details
+            .get("weight")
+            .and_then(Value::as_i64)
+            .unwrap_or(record.importance * 20),
+        open_count: details
+            .get("open_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        dwell_seconds: details
+            .get("dwell_seconds")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        has_edit_action: details
+            .get("has_edit_action")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        knowledge_ref_count: details
+            .get("knowledge_ref_count")
+            .and_then(Value::as_i64)
+            .or(record.occurrence_count)
+            .unwrap_or(0),
+        status: details
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                if record.user_verified {
+                    "confirmed".to_string()
+                } else {
+                    "candidate".to_string()
+                }
+            }),
+        suggested_action: details
+            .get("suggested_action")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
             .or_else(|| infer_suggested_action(&tags)),
         tags,
-        last_visited_at: details.get("last_visited_at").and_then(Value::as_str).map(ToString::to_string),
+        last_visited_at: details
+            .get("last_visited_at")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
         created_at: record.created_at,
         created_at_ms: record.created_at_ms,
         knowledge_match_score: details.get("knowledge_match_score").and_then(Value::as_f64),
-        knowledge_match_level: details.get("knowledge_match_level").and_then(Value::as_str).map(ToString::to_string),
+        knowledge_match_level: details
+            .get("knowledge_match_level")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
         template_match_score: details.get("template_match_score").and_then(Value::as_f64),
-        template_match_level: details.get("template_match_level").and_then(Value::as_str).map(ToString::to_string),
+        template_match_level: details
+            .get("template_match_level")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
         sop_match_score: details.get("sop_match_score").and_then(Value::as_f64),
-        sop_match_level: details.get("sop_match_level").and_then(Value::as_str).map(ToString::to_string),
+        sop_match_level: details
+            .get("sop_match_level")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
     }
 }
 
 fn map_bake_knowledge_record(record: KnowledgeEntryRecord) -> BakeKnowledgePayload {
     let details = parse_details(record.details.as_deref());
     let status = extract_status_from_details(&details, record.user_verified);
-    let review_status = details.get("review_status")
+    let review_status = details
+        .get("review_status")
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .unwrap_or_else(|| status.clone());
@@ -1806,36 +2047,194 @@ fn map_bake_knowledge_record(record: KnowledgeEntryRecord) -> BakeKnowledgePaylo
         status,
         review_status,
         match_score: details.get("match_score").and_then(Value::as_f64),
-        match_level: details.get("match_level").and_then(Value::as_str).map(ToString::to_string),
+        match_level: details
+            .get("match_level")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
         updated_at: record.updated_at,
         updated_at_ms: record.updated_at_ms,
     }
 }
 
-fn map_sop_record(record: KnowledgeEntryRecord) -> BakeSopPayload {
+fn map_sop_record_with_linked_summaries(
+    storage: &StorageManager,
+    record: KnowledgeEntryRecord,
+) -> BakeSopPayload {
     let details = parse_details(record.details.as_deref());
+    let linked_knowledge_ids = details
+        .get("linked_knowledge_ids")
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+        .unwrap_or_default();
+    let linked_knowledge_summaries = resolve_linked_knowledge_summaries(storage, &linked_knowledge_ids);
+
     BakeSopPayload {
         id: record.id.to_string(),
-        source_capture_id: details.get("source_capture_id").and_then(Value::as_str).unwrap_or_default().to_string(),
-        source_title: details.get("source_title").and_then(Value::as_str).map(ToString::to_string).or_else(|| Some(record.summary.clone())),
-        trigger_keywords: details.get("trigger_keywords")
+        source_capture_id: details
+            .get("source_capture_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        source_title: details
+            .get("source_title")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| Some(record.summary.clone())),
+        trigger_keywords: details
+            .get("trigger_keywords")
             .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
             .unwrap_or_else(|| parse_json_vec_string(&record.entities)),
-        confidence: details.get("confidence").and_then(Value::as_str).map(ToString::to_string)
+        confidence: details
+            .get("confidence")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
             .unwrap_or_else(|| infer_confidence(record.importance, record.occurrence_count)),
         extracted_problem: Some(record.summary),
-        steps: details.get("steps")
+        steps: details
+            .get("steps")
             .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
             .unwrap_or_default(),
-        linked_knowledge_ids: details.get("linked_knowledge_ids")
-            .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
-            .unwrap_or_default(),
-        status: details.get("status").and_then(Value::as_str).map(ToString::to_string)
-            .unwrap_or_else(|| if record.user_verified { "confirmed".to_string() } else { "candidate".to_string() }),
+        linked_knowledge_ids,
+        linked_knowledge_summaries,
+        status: details
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                if record.user_verified {
+                    "confirmed".to_string()
+                } else {
+                    "candidate".to_string()
+                }
+            }),
     }
 }
 
-fn collect_source_knowledge_ids(records: &[KnowledgeEntryRecord]) -> std::collections::HashSet<i64> {
+fn map_design_record_with_linked_summaries(
+    _storage: &StorageManager,
+    record: KnowledgeEntryRecord,
+) -> BakeDesignPayload {
+    let details = parse_details(record.details.as_deref());
+
+    BakeDesignPayload {
+        id: record.id.to_string(),
+        name: record.summary.clone(),
+        category: record.category,
+        status: details
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                if record.user_verified {
+                    "confirmed".to_string()
+                } else {
+                    "candidate".to_string()
+                }
+            }),
+        tags: parse_json_vec_string(&record.entities),
+        applicable_tasks: Vec::new(),
+        source_article_ids: Vec::new(),
+        source_memory_ids: Vec::new(),
+        source_capture_ids: details
+            .get("source_capture_ids")
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+            .unwrap_or_default(),
+        source_episode_ids: details
+            .get("source_episode_ids")
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+            .unwrap_or_default(),
+        linked_knowledge_ids: details
+            .get("linked_knowledge_ids")
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+            .unwrap_or_default(),
+        structure_sections: Vec::new(),
+        style_phrases: Vec::new(),
+        replacement_rules: Vec::new(),
+        prompt_hint: record.overview,
+        diagram_code: details
+            .get("diagram_code")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        image_assets: Vec::new(),
+        usage_count: 0,
+        match_score: details.get("match_score").and_then(Value::as_f64),
+        match_level: details
+            .get("match_level")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        creation_mode: details
+            .get("creation_mode")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "auto".to_string()),
+        review_status: details
+            .get("review_status")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "draft".to_string()),
+        evidence_summary: details
+            .get("evidence_summary")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        generation_version: details
+            .get("generation_version")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        deleted_at: None,
+        updated_at: record.created_at,
+    }
+}
+
+fn map_design_record(record: BakeDesignRecord) -> BakeDesignPayload {
+    BakeDesignPayload {
+        id: record.id.to_string(),
+        name: record.title,
+        category: record.design_type.unwrap_or_else(|| "general".to_string()),
+        status: record.status,
+        tags: parse_json_vec_string(&record.tags),
+        applicable_tasks: Vec::new(),
+        source_article_ids: Vec::new(),
+        source_memory_ids: Vec::new(),
+        source_capture_ids: parse_json_vec_string(&record.source_capture_ids),
+        source_episode_ids: parse_json_vec_string(&record.source_episode_ids),
+        linked_knowledge_ids: Vec::new(),
+        structure_sections: Vec::new(),
+        style_phrases: Vec::new(),
+        replacement_rules: Vec::new(),
+        prompt_hint: Some(record.summary),
+        diagram_code: record.diagram_code,
+        image_assets: Vec::new(),
+        usage_count: 0,
+        match_score: record.match_score,
+        match_level: record.match_level,
+        creation_mode: record.creation_mode,
+        review_status: record.review_status,
+        evidence_summary: record.evidence_summary,
+        generation_version: record.generation_version,
+        deleted_at: record.deleted_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn resolve_linked_knowledge_summaries(
+    storage: &StorageManager,
+    linked_knowledge_ids: &[String],
+) -> Vec<BakeLinkedKnowledgeSummaryPayload> {
+    linked_knowledge_ids
+        .iter()
+        .filter_map(|id| {
+            let parsed_id = id.parse::<i64>().ok()?;
+            let entry = storage.get_knowledge_entry(parsed_id).ok().flatten()?;
+            Some(BakeLinkedKnowledgeSummaryPayload {
+                id: id.clone(),
+                summary: entry.summary,
+            })
+        })
+        .collect()
+}
+
+fn collect_source_knowledge_ids(
+    records: &[KnowledgeEntryRecord],
+) -> std::collections::HashSet<i64> {
     records
         .iter()
         .filter_map(|record| {
@@ -1846,7 +2245,9 @@ fn collect_source_knowledge_ids(records: &[KnowledgeEntryRecord]) -> std::collec
         .collect()
 }
 
-fn collect_source_memory_ids(records: &[KnowledgeEntryRecord]) -> std::collections::HashMap<i64, i64> {
+fn collect_source_memory_ids(
+    records: &[KnowledgeEntryRecord],
+) -> std::collections::HashMap<i64, i64> {
     records
         .iter()
         .filter_map(|record| {
@@ -1858,7 +2259,9 @@ fn collect_source_memory_ids(records: &[KnowledgeEntryRecord]) -> std::collectio
         .collect()
 }
 
-fn collect_current_bake_source_knowledge_ids(records: &[KnowledgeEntryRecord]) -> std::collections::HashSet<i64> {
+fn collect_current_bake_source_knowledge_ids(
+    records: &[KnowledgeEntryRecord],
+) -> std::collections::HashSet<i64> {
     records
         .iter()
         .filter(|record| is_current_bake_entry(record))
@@ -1878,12 +2281,20 @@ fn is_high_value_candidate(record: &KnowledgeEntryRecord) -> bool {
         return true;
     }
 
-    let occurrences = record.occurrence_count.unwrap_or(0);
-    let strong_evidence = matches!(record.evidence_strength.as_deref(), Some("high") | Some("medium"));
-    let preferred_activity = matches!(record.activity_type.as_deref(), Some("coding") | Some("reading") | Some("reviewing_history") | Some("document_reference"));
-    let preferred_origin = matches!(record.content_origin.as_deref(), Some("historical_content") | Some("live_interaction"));
+    let strong_evidence = matches!(
+        record.evidence_strength.as_deref(),
+        Some("high") | Some("medium")
+    );
+    let preferred_activity = matches!(
+        record.activity_type.as_deref(),
+        Some("coding") | Some("reading") | Some("reviewing_history") | Some("document_reference")
+    );
+    let preferred_origin = matches!(
+        record.content_origin.as_deref(),
+        Some("historical_content") | Some("live_interaction")
+    );
 
-    occurrences >= 2 && strong_evidence && (record.history_view || preferred_activity || preferred_origin)
+    strong_evidence && (record.history_view || preferred_activity || preferred_origin)
 }
 
 fn score_candidate(record: &KnowledgeEntryRecord) -> i64 {
@@ -1900,13 +2311,19 @@ fn score_candidate(record: &KnowledgeEntryRecord) -> i64 {
     } else if matches!(record.evidence_strength.as_deref(), Some("medium")) {
         score += 5;
     }
-    if matches!(record.activity_type.as_deref(), Some("coding") | Some("reading") | Some("reviewing_history") | Some("document_reference")) {
+    if matches!(
+        record.activity_type.as_deref(),
+        Some("coding") | Some("reading") | Some("reviewing_history") | Some("document_reference")
+    ) {
         score += 8;
     }
     score
 }
 
-fn build_bake_memory_from_source(source: &BakeMemorySourceRecord, score: i64) -> Result<NewKnowledgeEntry, ApiError> {
+fn build_bake_memory_from_source(
+    source: &BakeMemorySourceRecord,
+    score: i64,
+) -> Result<NewKnowledgeEntry, ApiError> {
     let fallback_tags = parse_json_vec_string(&source.knowledge.entities);
     let tags = if fallback_tags.is_empty() {
         infer_tags_from_capture(source)
@@ -1954,7 +2371,16 @@ fn build_bake_memory_from_source(source: &BakeMemorySourceRecord, score: i64) ->
         activity_type: source.knowledge.activity_type.clone(),
         is_self_generated: false,
         evidence_strength: source.knowledge.evidence_strength.clone(),
-    })
+            capture_ids: None,
+            start_time: None,
+            end_time: None,
+            duration_minutes: None,
+            frag_app_name: None,
+            frag_win_title: None,
+            time_range_start: None,
+            time_range_end: None,
+            key_timestamps: None,
+        })
 }
 
 fn infer_tags_from_capture(source: &BakeMemorySourceRecord) -> Vec<String> {
@@ -1987,7 +2413,8 @@ fn is_current_bake_entry(record: &KnowledgeEntryRecord) -> bool {
 
 fn is_legacy_bake_entry_details(details: &Value) -> bool {
     details.get("creation_mode").and_then(Value::as_str) == Some("auto")
-        && details.get("generation_version").and_then(Value::as_str) == Some(BAKE_GENERATION_VERSION)
+        && details.get("generation_version").and_then(Value::as_str)
+            == Some(BAKE_GENERATION_VERSION)
 }
 
 fn is_current_bake_template(record: &BakeTemplateRecord) -> bool {
@@ -2003,7 +2430,9 @@ fn matches_template_bucket(record: &BakeTemplateRecord, bucket: Option<BakeBucke
     match bucket {
         None => record.review_status != "ignored",
         Some(BakeBucket::Pending) => record.review_status == "candidate",
-        Some(BakeBucket::Extracted) => record.review_status != "candidate" && record.review_status != "ignored",
+        Some(BakeBucket::Extracted) => {
+            record.review_status != "candidate" && record.review_status != "ignored"
+        }
     }
 }
 
@@ -2021,36 +2450,66 @@ fn extract_status_from_details(details: &Value, user_verified: bool) -> String {
         .get("status")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .unwrap_or_else(|| if user_verified { "confirmed".to_string() } else { "candidate".to_string() })
+        .unwrap_or_else(|| {
+            if user_verified {
+                "confirmed".to_string()
+            } else {
+                "candidate".to_string()
+            }
+        })
 }
 
 fn infer_semantic_type_label(record: &CaptureRecord) -> String {
-    if record.input_text.as_deref().is_some_and(has_meaningful_text) {
+    if record
+        .input_text
+        .as_deref()
+        .is_some_and(has_meaningful_text)
+    {
         return "输入片段".to_string();
     }
-    if record.audio_text.as_deref().is_some_and(has_meaningful_text) {
+    if record
+        .audio_text
+        .as_deref()
+        .is_some_and(has_meaningful_text)
+    {
         return "语音片段".to_string();
     }
-    if record.screenshot_path.is_some() || record.ocr_text.as_deref().is_some_and(has_meaningful_text) {
+    if record.screenshot_path.is_some()
+        || record.ocr_text.as_deref().is_some_and(has_meaningful_text)
+    {
         return "截图片段".to_string();
     }
-    if record.ax_text.as_deref().is_some_and(has_meaningful_text) || record.ax_focused_role.is_some() {
+    if record.ax_text.as_deref().is_some_and(has_meaningful_text)
+        || record.ax_focused_role.is_some()
+    {
         return "界面片段".to_string();
     }
     friendly_event_type_label(&record.event_type).to_string()
 }
 
 fn friendly_raw_type_label(event_type: &str, record: &CaptureRecord) -> String {
-    if record.input_text.as_deref().is_some_and(has_meaningful_text) {
+    if record
+        .input_text
+        .as_deref()
+        .is_some_and(has_meaningful_text)
+    {
         return "原始模态：输入".to_string();
     }
-    if record.audio_text.as_deref().is_some_and(has_meaningful_text) {
+    if record
+        .audio_text
+        .as_deref()
+        .is_some_and(has_meaningful_text)
+    {
         return "原始模态：音频".to_string();
     }
-    if record.ocr_text.as_deref().is_some_and(has_meaningful_text) || record.screenshot_path.is_some() {
+    if record.ocr_text.as_deref().is_some_and(has_meaningful_text)
+        || record.screenshot_path.is_some()
+    {
         return "原始模态：OCR / 截图".to_string();
     }
-    if record.ax_text.as_deref().is_some_and(has_meaningful_text) || record.ax_focused_role.is_some() {
+    if record.ax_text.as_deref().is_some_and(has_meaningful_text)
+        || record.ax_focused_role.is_some()
+    {
         return "原始模态：AX / UI".to_string();
     }
     format!("原始事件：{}", friendly_event_type_label(event_type))
@@ -2072,6 +2531,22 @@ fn has_meaningful_text(value: &str) -> bool {
     !value.trim().is_empty()
 }
 
+fn deserialize_string_vec_mixed<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Option::<Vec<Value>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(values
+        .into_iter()
+        .filter_map(|value| match value {
+            Value::String(item) => Some(item),
+            Value::Number(item) => Some(item.to_string()),
+            Value::Bool(item) => Some(item.to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
 fn parse_json_vec_string(value: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
 }
@@ -2084,14 +2559,21 @@ where
 }
 
 fn to_json_string<T: Serialize>(value: &T) -> Result<String, ApiError> {
-    serde_json::to_string(value).map_err(|err| ApiError::Internal(format!("序列化 bake 数据失败: {err}")))
+    serde_json::to_string(value)
+        .map_err(|err| ApiError::Internal(format!("序列化 bake 数据失败: {err}")))
 }
 
 fn infer_suggested_action(tags: &[String]) -> Option<String> {
-    if tags.iter().any(|tag| tag.contains("SOP") || tag.contains("流程")) {
+    if tags
+        .iter()
+        .any(|tag| tag.contains("SOP") || tag.contains("流程"))
+    {
         Some("sop".to_string())
-    } else if tags.iter().any(|tag| tag.contains("方案") || tag.contains("模板")) {
-        Some("template".to_string())
+    } else if tags
+        .iter()
+        .any(|tag| tag.contains("方案") || tag.contains("设计") || tag.contains("架构"))
+    {
+        Some("design".to_string())
     } else {
         Some("knowledge".to_string())
     }
@@ -2115,20 +2597,37 @@ fn extract_status(entry: &KnowledgeEntryRecord) -> String {
 
 fn format_ts_ms(ts: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| now_ms().to_string())
 }
 
 fn first_or_default(values: &[String], default: &str) -> String {
-    values.first().cloned().unwrap_or_else(|| default.to_string())
+    values
+        .first()
+        .cloned()
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn default_style_config() -> BakeStyleConfig {
     BakeStyleConfig {
-        preferred_phrases: vec!["整体看".to_string(), "这里建议".to_string(), "当前主要问题是".to_string()],
+        preferred_phrases: vec![
+            "整体看".to_string(),
+            "这里建议".to_string(),
+            "当前主要问题是".to_string(),
+        ],
         replacement_rules: vec![
-            ReplacementRulePayload { from: "综上所述".to_string(), to: "整体看".to_string() },
-            ReplacementRulePayload { from: "进一步优化".to_string(), to: "继续改进".to_string() },
+            ReplacementRulePayload {
+                from: "综上所述".to_string(),
+                to: "整体看".to_string(),
+            },
+            ReplacementRulePayload {
+                from: "进一步优化".to_string(),
+                to: "继续改进".to_string(),
+            },
         ],
         style_samples: vec![
             "整体看，这次改动优先解决主链路稳定性问题。".to_string(),
@@ -2150,40 +2649,53 @@ mod tests {
     }
 
     fn seed_capture(service: &BakeService, ts: i64, app_name: &str, title: &str) -> i64 {
-        service.storage.insert_capture(&NewCapture {
-            ts,
-            app_name: Some(app_name.to_string()),
-            app_bundle_id: Some(format!("com.example.{app_name}")),
-            win_title: Some(title.to_string()),
-            event_type: EventType::Manual,
-            ax_text: Some("原文内容".to_string()),
-            ax_focused_role: None,
-            ax_focused_id: None,
-            screenshot_path: None,
-            input_text: None,
-            is_sensitive: false,
-        }).expect("插入 capture 失败")
+        service
+            .storage
+            .insert_capture(&NewCapture {
+                ts,
+                app_name: Some(app_name.to_string()),
+                app_bundle_id: Some(format!("com.example.{app_name}")),
+                win_title: Some(title.to_string()),
+                event_type: EventType::Manual,
+                ax_text: Some("原文内容".to_string()),
+                ax_focused_role: None,
+                ax_focused_id: None,
+                ocr_text: None,
+                screenshot_path: None,
+                input_text: None,
+                is_sensitive: false,
+            })
+            .expect("插入 capture 失败")
     }
 
-    fn seed_knowledge(service: &BakeService, category: &str, capture_id: i64, importance: i64, occurrence_count: i64) -> i64 {
-        service.storage.insert_knowledge_entry(&NewKnowledgeEntry {
-            capture_id,
-            summary: format!("{category}-summary-{capture_id}"),
-            overview: Some("知识摘要".to_string()),
-            details: Some("{}".to_string()),
-            entities: r#"["模板","流程"]"#.to_string(),
-            category: category.to_string(),
-            importance,
-            occurrence_count: Some(occurrence_count),
-            observed_at: Some(1_710_000_000_000),
-            event_time_start: None,
-            event_time_end: None,
-            history_view: true,
-            content_origin: Some("historical_content".to_string()),
-            activity_type: Some("reading".to_string()),
-            is_self_generated: false,
-            evidence_strength: Some("high".to_string()),
-        }).expect("插入 knowledge 失败")
+    fn seed_knowledge(
+        service: &BakeService,
+        category: &str,
+        capture_id: i64,
+        importance: i64,
+        occurrence_count: i64,
+    ) -> i64 {
+        service
+            .storage
+            .insert_knowledge_entry(&NewKnowledgeEntry {
+                capture_id,
+                summary: format!("{category}-summary-{capture_id}"),
+                overview: Some("知识摘要".to_string()),
+                details: Some("{}".to_string()),
+                entities: r#"["模板","流程"]"#.to_string(),
+                category: category.to_string(),
+                importance,
+                occurrence_count: Some(occurrence_count),
+                observed_at: Some(1_710_000_000_000),
+                event_time_start: None,
+                event_time_end: None,
+                history_view: true,
+                content_origin: Some("historical_content".to_string()),
+                activity_type: Some("reading".to_string()),
+                is_self_generated: false,
+                evidence_strength: Some("high".to_string()),
+            })
+            .expect("插入 knowledge 失败")
     }
 
     #[test]
@@ -2204,13 +2716,37 @@ mod tests {
 
     #[test]
     fn test_infer_suggested_action() {
-        assert_eq!(infer_suggested_action(&["SOP".to_string()]), Some("sop".to_string()));
-        assert_eq!(infer_suggested_action(&["技术方案".to_string()]), Some("template".to_string()));
+        assert_eq!(
+            infer_suggested_action(&["SOP".to_string()]),
+            Some("sop".to_string())
+        );
+        assert_eq!(
+            infer_suggested_action(&["技术方案".to_string()]),
+            Some("design".to_string())
+        );
     }
 
     #[test]
-    fn test_parse_json_vec_string() {
-        let values = parse_json_vec_string(r#"["a","b"]"#);
-        assert_eq!(values, vec!["a", "b"]);
+    fn test_resolve_review_status_requires_high_level_and_threshold_score() {
+        assert_eq!(
+            resolve_review_status(Some("candidate"), Some(0.91), Some("high")),
+            "auto_created"
+        );
+        assert_eq!(
+            resolve_review_status(Some("candidate"), Some(0.91), Some("medium")),
+            "candidate"
+        );
+        assert_eq!(
+            resolve_review_status(Some("candidate"), Some(0.60), Some("high")),
+            "candidate"
+        );
+        assert_eq!(
+            resolve_review_status(Some("candidate"), Some(0.72), Some("high")),
+            "auto_created"
+        );
+        assert_eq!(
+            resolve_review_status(Some("auto_created"), Some(0.95), Some("low")),
+            "candidate"
+        );
     }
 }

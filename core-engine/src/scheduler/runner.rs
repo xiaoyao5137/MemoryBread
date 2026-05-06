@@ -2,23 +2,23 @@
 //!
 //! 每 30 秒轮询一次数据库，找出到期任务，通过 HTTP 调用 Python TaskExecutor。
 
-use std::sync::Arc;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use chrono::Utc;
 use cron::Schedule;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
-use crate::storage::StorageManager;
 use super::repo::TaskRepo;
+use crate::storage::StorageManager;
 
 const POLL_INTERVAL_SECS: u64 = 30;
 const PYTHON_EXECUTOR_URL: &str = "http://127.0.0.1:7071/tasks/execute";
 
 pub struct Scheduler {
     storage: StorageManager,
-    client:  reqwest::Client,
+    client: reqwest::Client,
 }
 
 impl Scheduler {

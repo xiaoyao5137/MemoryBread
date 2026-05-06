@@ -1,4 +1,4 @@
-import { useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useAppStore }  from '../store/useAppStore'
 import type {
   ArticleTemplate,
@@ -8,7 +8,7 @@ import type {
   CaptureRecord,
   DebugLogContent,
   DebugLogFile,
-  EpisodicMemoryItem,
+  TimelineItem,
   PaginatedBakeResponse,
   PreferenceRecord,
   RagQueryResponse,
@@ -16,6 +16,44 @@ import type {
   SopCandidate,
   WritingStyleConfig,
 } from '../types'
+
+export interface ModelStatus {
+  llm: boolean
+  embedding: boolean
+  ollama: boolean
+}
+
+export function useModelStatus() {
+  const [status, setStatus] = useState<ModelStatus>({ llm: false, embedding: false, ollama: false })
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const resp = await fetch('http://localhost:7071/api/models')
+        if (!resp.ok) {
+          setStatus({ llm: false, embedding: false, ollama: false })
+          return
+        }
+        const data = await resp.json()
+        const models = data.models || []
+        const llm = models.some((m: any) => m.category === 'llm' && (m.status === 'active' || m.is_active))
+        const embedding = models.some((m: any) => m.category === 'embedding' && (m.status === 'active' || m.is_active))
+        const ollama = models.some((m: any) => m.id === 'ollama' && (m.status === 'active' || m.is_active))
+        setStatus({ llm, embedding, ollama })
+      } catch {
+        setStatus({ llm: false, embedding: false, ollama: false })
+      } finally {
+        setLoading(false)
+      }
+    }
+    check()
+    const interval = setInterval(check, 10000)
+    return () => clearInterval(interval)
+  }, [])
+
+  return { status, loading, ready: status.llm && status.embedding && status.ollama }
+}
 
 export function useHealthCheck() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
@@ -72,8 +110,24 @@ export function useRagQuery() {
         body:    JSON.stringify({ query, top_k: topK }),
       })
       if (!resp.ok) {
-        const err = await resp.text()
-        throw new Error(`query failed: ${resp.status} ${err}`)
+        let errMsg = `query failed: ${resp.status}`
+        try {
+          const errJson = await resp.json()
+          if (errJson.error === 'MODEL_NOT_READY') {
+            errMsg = '向量模型或推理模型尚未就绪，请前往「模型」界面检查模型状态'
+          } else if (errJson.error || errJson.message) {
+            errMsg = errJson.message || errJson.error
+          }
+        } catch {
+          const errText = await resp.text()
+          if (errText) errMsg += ` ${errText}`
+        }
+        if (resp.status === 503 || resp.status === 504) {
+          if (!errMsg.includes('模型')) {
+            errMsg = 'AI 正在处理其他任务，请稍候 1-2 分钟再试'
+          }
+        }
+        throw new Error(errMsg)
       }
       const data: RagQueryResponse = await resp.json()
       setResult(data.answer, data.contexts ?? [])
@@ -199,7 +253,7 @@ export interface BakeCaptureListQueryParams extends BakeListQueryParams {
 export function useFetchBakeMemories() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
-  return useCallback(async (params: BakeListQueryParams = {}): Promise<PaginatedBakeResponse<EpisodicMemoryItem>> => {
+  return useCallback(async (params: BakeListQueryParams = {}): Promise<PaginatedBakeResponse<TimelineItem>> => {
     const buildUrl = (path: string) => {
       const url = new URL(`${apiBaseUrl}${path}`)
       if (params.q) url.searchParams.set('q', params.q)
@@ -244,6 +298,16 @@ export function useFetchBakeKnowledge() {
       limit: data.limit ?? params.limit ?? 20,
       offset: data.offset ?? params.offset ?? 0,
     }
+  }, [apiBaseUrl])
+}
+
+export function useAdoptBakeKnowledge() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (id: string): Promise<BakeKnowledgeItem> => {
+    const resp = await fetch(`${apiBaseUrl}/api/bake/knowledge/${encodeURIComponent(id)}/adopt`, { method: 'POST' })
+    if (!resp.ok) throw new Error(`adopt bake knowledge failed: ${resp.status}`)
+    return mapBakeKnowledge(await resp.json())
   }, [apiBaseUrl])
 }
 
@@ -303,7 +367,7 @@ export function useFetchBakeCaptureDetail() {
 export function useInitializeBakeMemories() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
-  return useCallback(async (limit = 20): Promise<{ created_count: number; skipped_count: number; memories: EpisodicMemoryItem[] }> => {
+  return useCallback(async (limit = 20): Promise<{ created_count: number; skipped_count: number; memories: TimelineItem[] }> => {
     const resp = await fetch(`${apiBaseUrl}/api/bake/memories/init`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -322,7 +386,7 @@ export function useInitializeBakeMemories() {
 export function useIgnoreBakeMemory() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
-  return useCallback(async (id: string): Promise<EpisodicMemoryItem> => {
+  return useCallback(async (id: string): Promise<TimelineItem> => {
     const resp = await fetch(`${apiBaseUrl}/api/bake/memories/${encodeURIComponent(id)}/ignore`, { method: 'POST' })
     if (!resp.ok) throw new Error(`ignore bake memory failed: ${resp.status}`)
     return mapBakeMemory(await resp.json())
@@ -407,6 +471,16 @@ export function useToggleBakeTemplateStatus() {
   return useCallback(async (id: string): Promise<ArticleTemplate> => {
     const resp = await fetch(`${apiBaseUrl}/api/bake/templates/${encodeURIComponent(id)}/toggle-status`, { method: 'POST' })
     if (!resp.ok) throw new Error(`toggle bake template failed: ${resp.status}`)
+    return mapBakeTemplate(await resp.json())
+  }, [apiBaseUrl])
+}
+
+export function useAdoptBakeTemplate() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (id: string): Promise<ArticleTemplate> => {
+    const resp = await fetch(`${apiBaseUrl}/api/bake/templates/${encodeURIComponent(id)}/adopt`, { method: 'POST' })
+    if (!resp.ok) throw new Error(`adopt bake template failed: ${resp.status}`)
     return mapBakeTemplate(await resp.json())
   }, [apiBaseUrl])
 }
@@ -515,7 +589,7 @@ export function useUpdateBakeStyleConfig() {
   }, [apiBaseUrl])
 }
 
-function mapBakeMemory(item: any): EpisodicMemoryItem {
+function mapBakeMemory(item: any): TimelineItem {
   return {
     id: String(item.id),
     title: item.title,
@@ -647,6 +721,7 @@ function mapBakeSop(item: any): SopCandidate {
     extractedProblem: item.extracted_problem,
     steps: item.steps ?? [],
     linkedKnowledgeIds: item.linked_knowledge_ids ?? [],
+    linkedKnowledgeSummaries: item.linked_knowledge_summaries ?? [],
     status: item.status,
   }
 }

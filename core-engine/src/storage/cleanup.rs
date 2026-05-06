@@ -32,7 +32,7 @@ impl StorageManager {
     pub fn run_screenshot_purge(
         &self,
         older_than_ms: i64,
-        captures_dir:  &Path,
+        captures_dir: &Path,
     ) -> Result<(usize, u64), StorageError> {
         // 1. 查询待清理记录
         let rows = self.with_conn(|conn| {
@@ -49,7 +49,7 @@ impl StorageManager {
         })?;
 
         let mut deleted_count = 0usize;
-        let mut freed_bytes   = 0u64;
+        let mut freed_bytes = 0u64;
 
         for (id, rel_path) in &rows {
             let full_path = captures_dir.join(rel_path);
@@ -108,10 +108,7 @@ impl StorageManager {
     /// 返回删除的行数。
     pub fn run_old_captures_cleanup(&self, older_than_ms: i64) -> Result<usize, StorageError> {
         let affected = self.with_conn(|conn| {
-            let n = conn.execute(
-                "DELETE FROM captures WHERE ts < ?1",
-                params![older_than_ms],
-            )?;
+            let n = conn.execute("DELETE FROM captures WHERE ts < ?1", params![older_than_ms])?;
             Ok(n)
         })?;
 
@@ -158,10 +155,7 @@ impl StorageManager {
     }
 
     /// 查询清理历史记录，按 ts 倒序。
-    pub fn list_cleanup_logs(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<CleanupLogRecord>, StorageError> {
+    pub fn list_cleanup_logs(&self, limit: usize) -> Result<Vec<CleanupLogRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, ts, cleanup_type, affected_count, freed_bytes, detail
@@ -169,15 +163,16 @@ impl StorageManager {
             )?;
             let rows = stmt.query_map(params![limit as i64], |row| {
                 Ok(CleanupLogRecord {
-                    id:             row.get(0)?,
-                    ts:             row.get(1)?,
-                    cleanup_type:   row.get(2)?,
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    cleanup_type: row.get(2)?,
                     affected_count: row.get(3)?,
-                    freed_bytes:    row.get(4)?,
-                    detail:         row.get(5)?,
+                    freed_bytes: row.get(4)?,
+                    detail: row.get(5)?,
                 })
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 }
@@ -189,12 +184,12 @@ impl StorageManager {
 /// data_cleanup_log 表的读取模型
 #[derive(Debug, Clone)]
 pub struct CleanupLogRecord {
-    pub id:             i64,
-    pub ts:             i64,
-    pub cleanup_type:   String,
+    pub id: i64,
+    pub ts: i64,
+    pub cleanup_type: String,
     pub affected_count: i64,
-    pub freed_bytes:    i64,
-    pub detail:         Option<String>,
+    pub freed_bytes: i64,
+    pub detail: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -266,16 +261,14 @@ mod tests {
         let cutoff = current_ts_ms() - 90 * 24 * 3600 * 1000;
         let (deleted, freed) = mgr.run_screenshot_purge(cutoff, dir.path()).unwrap();
         assert_eq!(deleted, 1); // 文件不存在，但仍计为"已清理"
-        assert_eq!(freed, 0);   // 没有实际文件，释放 0 字节
+        assert_eq!(freed, 0); // 没有实际文件，释放 0 字节
 
         // 验证数据库路径已清除
         let row: Option<String> = mgr
             .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT screenshot_path FROM captures LIMIT 1",
-                    [],
-                    |r| r.get(0),
-                )
+                conn.query_row("SELECT screenshot_path FROM captures LIMIT 1", [], |r| {
+                    r.get(0)
+                })
                 .map_err(StorageError::Sqlite)
             })
             .unwrap();
@@ -296,17 +289,18 @@ mod tests {
     fn test_insert_and_cleanup_uses_capture_helper() {
         let mgr = make_mgr();
         let cap = NewCapture {
-            ts:              1_700_000_000_000,
-            app_name:        Some("TestApp".into()),
-            app_bundle_id:   None,
-            win_title:       None,
-            event_type:      EventType::Auto,
-            ax_text:         Some("test".into()),
+            ts: 1_700_000_000_000,
+            app_name: Some("TestApp".into()),
+            app_bundle_id: None,
+            win_title: None,
+            event_type: EventType::Auto,
+            ax_text: Some("test".into()),
             ax_focused_role: None,
-            ax_focused_id:   None,
+            ax_focused_id: None,
+            ocr_text: None,
             screenshot_path: None,
-            input_text:      None,
-            is_sensitive:    false,
+            input_text: None,
+            is_sensitive: false,
         };
         mgr.insert_capture(&cap).unwrap();
 
