@@ -43,6 +43,7 @@ pub struct KnowledgeEntry {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub capture_ids: Option<Vec<i64>>,
+    #[serde(rename = "keyTimestamps")]
     pub key_timestamps: Option<serde_json::Value>,
 }
 

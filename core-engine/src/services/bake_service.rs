@@ -201,6 +201,8 @@ pub struct BakeMemoryPayload {
     pub sop_match_score: Option<f64>,
     pub sop_match_level: Option<String>,
     pub capture_ids: Vec<i64>,
+    #[serde(rename = "keyTimestamps")]
+    pub key_timestamps: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2061,6 +2063,9 @@ fn map_memory_record(record: KnowledgeEntryRecord) -> BakeMemoryPayload {
             .and_then(Value::as_str)
             .map(ToString::to_string),
         capture_ids,
+        key_timestamps: record.key_timestamps
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok()),
     }
 }
 

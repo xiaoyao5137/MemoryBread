@@ -1558,6 +1558,13 @@ class KnowledgeExtractorV2:
                 result['duration_minutes'] = 0
                 result['frag_app_name'] = captures[0].get('app_name')
                 result['frag_win_title'] = captures[0].get('window_title')
+                # 为单个 capture 也生成 key_timestamps
+                result['key_timestamps'] = json.dumps([{
+                    'capture_ids': [captures[0]['id']],
+                    'start_ts': captures[0]['ts'],
+                    'end_ts': captures[0]['ts'],
+                    'summary': result.get('summary', '')
+                }])
             return result
 
         try:
@@ -1667,6 +1674,9 @@ class KnowledgeExtractorV2:
 
             summary = _overview_to_summary(overview)
 
+            # 生成语义分段
+            segments = self._generate_segments(captures)
+
             knowledge = {
                 'capture_ids': json.dumps([c['id'] for c in captures]),
                 'summary': summary,
@@ -1679,6 +1689,7 @@ class KnowledgeExtractorV2:
                 'start_time': start_time,
                 'end_time': end_time,
                 'duration_minutes': duration_minutes,
+                'key_timestamps': json.dumps(segments),
                 'frag_app_name': frag_app_name,
                 'frag_win_title': frag_win_title,
                 'observed_at': end_time,
@@ -1706,3 +1717,59 @@ class KnowledgeExtractorV2:
         except Exception as e:
             logger.error(f"合并提炼失败: {e}")
             return None
+
+    def _generate_segments(self, captures: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """生成语义分段，使用AI提炼每个分段的总结"""
+        try:
+            segments_map = {}
+            for cap in captures:
+                key = f"{cap.get('app_name')}|{cap.get('window_title', '')}"
+                if key not in segments_map:
+                    segments_map[key] = {
+                        'capture_ids': [],
+                        'start_ts': cap['ts'],
+                        'end_ts': cap['ts'],
+                        'app_name': cap.get('app_name', ''),
+                        'window_title': cap.get('window_title', ''),
+                        'texts': []
+                    }
+                seg = segments_map[key]
+                seg['capture_ids'].append(cap['id'])
+                seg['end_ts'] = cap['ts']
+                text = (cap.get('ocr_text') or cap.get('ax_text') or '').strip()
+                if text:
+                    seg['texts'].append(text)
+
+            logger.info(f"生成语义分段: {len(captures)} captures → {len(segments_map)} segments")
+            segments = []
+            for idx, seg in enumerate(segments_map.values()):
+                merged_text = '\n\n'.join(seg['texts'])
+                if merged_text:
+                    segment_capture = {
+                        'id': seg['capture_ids'][0],
+                        'app_name': seg['app_name'],
+                        'window_title': seg['window_title'],
+                        'timestamp': datetime.fromtimestamp(seg['end_ts'] / 1000).isoformat(),
+                        'ocr_text': merged_text[:2000],  # 限制长度避免过长
+                    }
+                    logger.info(f"分段 {idx+1}/{len(segments_map)}: 调用 AI 提炼 ({len(seg['capture_ids'])} captures)")
+                    extracted = self.extract_sync(segment_capture)
+                    summary = extracted.get('summary', '') if extracted else ''
+                    logger.info(f"分段 {idx+1} AI 总结: {summary[:80]}...")
+                else:
+                    summary = ''
+
+                if not summary:
+                    summary = f"{seg['app_name']}活动"
+
+                segments.append({
+                    'capture_ids': seg['capture_ids'],
+                    'start_ts': seg['start_ts'],
+                    'end_ts': seg['end_ts'],
+                    'summary': summary
+                })
+            logger.info(f"语义分段生成完成: {len(segments)} segments")
+            return segments
+        except Exception as e:
+            logger.error(f"生成语义分段失败: {e}", exc_info=True)
+            return []

@@ -617,6 +617,7 @@ function mapBakeMemory(item: any): TimelineItem {
     sopMatchScore: item.sop_match_score ?? undefined,
     sopMatchLevel: item.sop_match_level ?? undefined,
     captureIds: item.capture_ids ?? [],
+    keyTimestamps: item.keyTimestamps ?? undefined,
   }
 }
 
