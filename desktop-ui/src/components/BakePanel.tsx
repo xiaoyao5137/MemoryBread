@@ -159,7 +159,6 @@ const BakePanel: React.FC = () => {
   const [overview, setOverview] = useState<BakeOverview>(defaultOverview)
   const [memories, setMemories] = useState<TimelineItem[]>([])
   const [memoryTotal, setMemoryTotal] = useState(0)
-  const [knowledgeBucket, setKnowledgeBucket] = useState<BakeBucket>('extracted')
   const [knowledgeItems, setKnowledgeItems] = useState<BakeKnowledgeItem[]>([])
   const [knowledgeTotal, setKnowledgeTotal] = useState(0)
   const [templateBucket, setTemplateBucket] = useState<BakeBucket>('extracted')
@@ -210,7 +209,6 @@ const BakePanel: React.FC = () => {
     if (bakeTab !== 'knowledge') return
     void fetchKnowledge({
       q: bakeKnowledgeQuery.trim() || undefined,
-      bucket: knowledgeBucket,
       limit: bakeKnowledgeLimit,
       offset: bakeKnowledgeOffset,
     }).then((data) => {
@@ -219,7 +217,7 @@ const BakePanel: React.FC = () => {
     }).catch((error) => {
       setStatusMessage(error instanceof Error ? error.message : '知识加载失败')
     })
-  }, [bakeKnowledgeLimit, bakeKnowledgeOffset, bakeKnowledgeQuery, bakeTab, fetchKnowledge, knowledgeBucket])
+  }, [bakeKnowledgeLimit, bakeKnowledgeOffset, bakeKnowledgeQuery, bakeTab, fetchKnowledge])
 
   useEffect(() => {
     if (bakeTab !== 'templates') return
@@ -291,10 +289,9 @@ const BakePanel: React.FC = () => {
     setMemories(data.items)
   }
 
-  const refreshKnowledge = async (offset = bakeKnowledgeOffset, bucket = knowledgeBucket) => {
+  const refreshKnowledge = async (offset = bakeKnowledgeOffset) => {
     const data = await fetchKnowledge({
       q: bakeKnowledgeQuery.trim() || undefined,
-      bucket,
       limit: bakeKnowledgeLimit,
       offset,
     })
@@ -337,12 +334,6 @@ const BakePanel: React.FC = () => {
       bakeKnowledgeQuery: '',
       bakeKnowledgeOffset: 0,
     })
-  }
-
-  const handleKnowledgeBucketChange = (bucket: BakeBucket) => {
-    setKnowledgeBucket(bucket)
-    setSelectedKnowledgeId(null)
-    setBakeKnowledgeOffset(0)
   }
 
   const handleTemplateBucketChange = (bucket: BakeBucket) => {
@@ -586,7 +577,6 @@ const BakePanel: React.FC = () => {
 
   const handleViewLinkedKnowledge = (knowledgeId: string) => {
     setBakeTab('knowledge')
-    setKnowledgeBucket('extracted')
     setBakeKnowledgeQuery('')
     setBakeKnowledgeOffset(0)
     setSelectedKnowledgeId(knowledgeId)
@@ -617,20 +607,16 @@ const BakePanel: React.FC = () => {
   const handleAdoptKnowledge = async (id: string) => {
     try {
       const adopted = await adoptKnowledge(id)
-      if (knowledgeBucket === 'pending') {
-        const nextOffset = getFallbackOffsetAfterRemoval(knowledgeItems.length, bakeKnowledgeOffset, bakeKnowledgeLimit)
-        if (selectedKnowledgeId === id || resolvedKnowledgeId === id) {
-          setSelectedKnowledgeId(null)
-        }
-        if (nextOffset !== bakeKnowledgeOffset) {
-          setBakeKnowledgeOffset(nextOffset)
-        } else {
-          await refreshKnowledge(nextOffset, knowledgeBucket)
-        }
-      } else {
-        setKnowledgeItems(prev => prev.map(item => item.id === id ? adopted : item))
+      const nextOffset = getFallbackOffsetAfterRemoval(knowledgeItems.length, bakeKnowledgeOffset, bakeKnowledgeLimit)
+      if (selectedKnowledgeId === id || resolvedKnowledgeId === id) {
+        setSelectedKnowledgeId(null)
       }
-      setStatusMessage('已采纳待提炼知识')
+      if (nextOffset !== bakeKnowledgeOffset) {
+        setBakeKnowledgeOffset(nextOffset)
+      } else {
+        await refreshKnowledge(nextOffset)
+      }
+      setStatusMessage('已采纳知识')
       await refreshOverview()
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : '采纳知识失败')
@@ -647,9 +633,9 @@ const BakePanel: React.FC = () => {
       if (nextOffset !== bakeKnowledgeOffset) {
         setBakeKnowledgeOffset(nextOffset)
       } else {
-        await refreshKnowledge(nextOffset, knowledgeBucket)
+        await refreshKnowledge(nextOffset)
       }
-      setStatusMessage('已忽略待提炼知识')
+      setStatusMessage('已忽略知识')
       await refreshOverview()
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : '忽略知识失败')
@@ -666,7 +652,7 @@ const BakePanel: React.FC = () => {
       if (nextOffset !== bakeKnowledgeOffset) {
         setBakeKnowledgeOffset(nextOffset)
       } else {
-        await refreshKnowledge(nextOffset, knowledgeBucket)
+        await refreshKnowledge(nextOffset)
       }
       setStatusMessage('已删除知识条目')
       await refreshOverview()
@@ -792,7 +778,6 @@ const BakePanel: React.FC = () => {
         )}
         {bakeTab === 'knowledge' && (
           <BakeKnowledgeTab
-            bucket={knowledgeBucket}
             items={knowledgeItems}
             total={knowledgeTotal}
             offset={bakeKnowledgeOffset}
@@ -801,14 +786,11 @@ const BakePanel: React.FC = () => {
             draftQuery={draftKnowledgeQuery}
             selectedKnowledgeId={resolvedKnowledgeId}
             onSelectKnowledge={setSelectedKnowledgeId}
-            onBucketChange={handleKnowledgeBucketChange}
             onPageChange={setBakeKnowledgeOffset}
             onLimitChange={setBakeKnowledgeLimit}
             onDraftQueryChange={setDraftKnowledgeQuery}
             onSearch={handleSearchKnowledge}
             onClearFilters={handleClearKnowledgeFilters}
-            onIgnoreKnowledge={handleIgnoreKnowledge}
-            onAdoptKnowledge={handleAdoptKnowledge}
             onDeleteKnowledge={handleDeleteKnowledge}
             onOpenCapture={(captureId?: string) => {
               if (!captureId) {

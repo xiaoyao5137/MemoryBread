@@ -2,18 +2,6 @@ import React, { useMemo, useState } from 'react'
 import type { BakeBucket, BakeKnowledgeItem } from '../../types'
 import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './BakeShared'
 
-const bucketMeta: Record<BakeBucket, { title: string; subtitle: string; empty: string }> = {
-  extracted: {
-    title: '已提炼',
-    subtitle: '浏览已经入库的知识条目',
-    empty: '当前还没有已提炼知识。',
-  },
-  pending: {
-    title: '待提炼',
-    subtitle: '处理中贴合度候选，可选择采纳或忽略',
-    empty: '当前还没有待提炼知识候选。',
-  },
-}
 
 const formatReviewStatus = (status?: string) => {
   if (!status) return '状态未知'
@@ -30,7 +18,6 @@ const formatMatchScore = (score?: number) => (
 )
 
 const BakeKnowledgeTab: React.FC<{
-  bucket: BakeBucket
   items: BakeKnowledgeItem[]
   total: number
   limit: number
@@ -39,18 +26,14 @@ const BakeKnowledgeTab: React.FC<{
   draftQuery: string
   selectedKnowledgeId: string | null
   onSelectKnowledge: (id: string | null) => void
-  onBucketChange: (bucket: BakeBucket) => void
   onPageChange: (offset: number) => void
   onLimitChange: (limit: number) => void
   onDraftQueryChange: (query: string) => void
   onSearch: () => void
   onClearFilters: () => void
-  onIgnoreKnowledge: (id: string) => void
-  onAdoptKnowledge: (id: string) => void
   onDeleteKnowledge: (id: string) => void
   onOpenCapture: (captureId?: string) => void
 }> = ({
-  bucket,
   items,
   total,
   limit,
@@ -59,14 +42,11 @@ const BakeKnowledgeTab: React.FC<{
   draftQuery,
   selectedKnowledgeId,
   onSelectKnowledge,
-  onBucketChange,
   onPageChange,
   onLimitChange,
   onDraftQueryChange,
   onSearch,
   onClearFilters,
-  onIgnoreKnowledge,
-  onAdoptKnowledge,
   onDeleteKnowledge,
   onOpenCapture,
 }) => {
@@ -77,9 +57,8 @@ const BakeKnowledgeTab: React.FC<{
   const filterPills = useMemo(() => {
     const pills: string[] = []
     if (query.trim()) pills.push(`关键词：${query.trim()}`)
-    pills.push(`分组：${bucketMeta[bucket].title}`)
     return pills
-  }, [bucket, query])
+  }, [query])
 
   return (
     <>
@@ -90,13 +69,6 @@ const BakeKnowledgeTab: React.FC<{
         />
         <div className="bake-list-toolbar">
           <div className="bake-list-toolbar__filters">
-            <label className="bake-form-field bake-filter-field">
-              <span className="bake-filter-label">分组</span>
-              <div className="bake-segmented-actions">
-                <BakeButton compact active={bucket === 'extracted'} onClick={() => onBucketChange('extracted')}>已提炼</BakeButton>
-                <BakeButton compact active={bucket === 'pending'} onClick={() => onBucketChange('pending')}>待提炼</BakeButton>
-              </div>
-            </label>
             <label className="bake-form-field bake-filter-field bake-filter-field--search">
               <span className="bake-filter-label">关键词</span>
               <input
@@ -123,7 +95,7 @@ const BakeKnowledgeTab: React.FC<{
         <BakeCard className="bake-knowledge-list-card">
         <div className="bake-list bake-knowledge-list">
           {items.length === 0 ? (
-            <div className="bake-muted">{query.trim() ? '当前筛选条件下没有可展示的知识条目。' : bucketMeta[bucket].empty}</div>
+            <div className="bake-muted">{query.trim() ? '当前筛选条件下没有可展示的知识条目。' : '当前还没有知识条目。'}</div>
           ) : items.map(item => {
             return (
               <button
@@ -250,12 +222,7 @@ const BakeKnowledgeTab: React.FC<{
             </div>
             <div className="bake-actions--primary">
               <BakeButton onClick={() => onOpenCapture(selected.captureId)}>来源采集记录</BakeButton>
-              {bucket === 'pending' && (
-                <BakeButton primary onClick={() => onAdoptKnowledge(selected.id)}>采纳为知识</BakeButton>
-              )}
-              {bucket === 'pending'
-                ? <BakeButton onClick={() => onIgnoreKnowledge(selected.id)}>忽略候选</BakeButton>
-                : <BakeButton onClick={() => onDeleteKnowledge(selected.id)}>删除知识</BakeButton>}
+              <BakeButton onClick={() => onDeleteKnowledge(selected.id)}>删除知识</BakeButton>
             </div>
           </div>
         ) : (
