@@ -1,0 +1,97 @@
+--- a/core-engine/src/capture/ax.rs
++++ b/core-engine/src/capture/ax.rs
+@@ -5,10 +5,17 @@
+ //!
+ //! 其他平台：返回 None，由调用方降级到 OCR。
+
++use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::OnceLock;
++
+ const EXTRACTED_TEXT_MAX_CHARS: usize = 5_000;
+ const GENERIC_FOCUS_MIN_CHARS: usize = 24;
+ const GENERIC_WINDOW_MIN_CHARS: usize = 48;
+ const GENERIC_STATIC_ITEM_LIMIT: usize = 80;
+ const GENERIC_ALL_UI_ITEM_LIMIT: usize = 140;
++
++static TIMEOUT_COUNTER: AtomicU32 = AtomicU32::new(0);
++static LAST_RESET_TIME: OnceLock<std::sync::Mutex<std::time::Instant>> = OnceLock::new();
++const MAX_CONSECUTIVE_TIMEOUTS: u32 = 5;
++const CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 30;
+
+ /// 从 Accessibility Tree 抓取到的前台应用信息
+@@ -208,12 +215,38 @@ pub fn get_frontmost_info() -> Option<AXInfo> {
+     }
+ }
+
+-/// 异步获取当前前台应用的 AX 信息（带超时保护）。
++/// 异步获取当前前台应用的 AX 信息（带超时保护 + 熔断机制）。
+ ///
+ /// 使用 spawn_blocking 避免阻塞 tokio 运行时，基础上下文与文本提取分阶段超时。
+ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
+     #[cfg(all(target_os = "macos", not(test)))]
+     {
+-        use std::time::Duration;
++        use std::time::{Duration, Instant};
+         use tracing::{debug, warn};
++
++        // 熔断检查：如果连续超时次数过多，进入冷却期
++        let timeout_count = TIMEOUT_COUNTER.load(Ordering::Relaxed);
++        if timeout_count >= MAX_CONSECUTIVE_TIMEOUTS {
++            let last_reset = LAST_RESET_TIME.get_or_init(|| std::sync::Mutex::new(Instant::now()));
++            let mut guard = last_reset.lock().unwrap();
++
++            if guard.elapsed().as_secs() < CIRCUIT_BREAKER_COOLDOWN_SECS {
++                warn!(
++                    timeout_count,
++                    cooldown_remaining = CIRCUIT_BREAKER_COOLDOWN_SECS - guard.elapsed().as_secs(),
++                    "AX 调用熔断中，跳过本次采集"
++                );
++                return None;
++            } else {
++                // 冷却期结束，重置计数器
++                TIMEOUT_COUNTER.store(0, Ordering::Relaxed);
++                *guard = Instant::now();
++                debug!("AX 熔断器已重置");
++            }
++        }
+
+         let basic_task = tokio::task::spawn_blocking(macos_impl::get_frontmost_basic_info_macos);
+@@ -225,6 +258,8 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
+                     win_title = ?info.win_title,
+                     "AX 基础上下文获取成功"
+                 );
++                // 成功则重置超时计数器
++                TIMEOUT_COUNTER.store(0, Ordering::Relaxed);
+                 info
+             }
+             Ok(Ok(None)) => {
+                 warn!("AX 基础上下文获取失败");
++                TIMEOUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+                 return None;
+             }
+             Ok(Err(e)) => {
+                 warn!("AX 基础上下文任务失败: {}", e);
++                TIMEOUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+                 return None;
+             }
+             Err(_) => {
+                 warn!("AX 基础上下文获取超时（4000ms）");
++                TIMEOUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+                 return None;
+             }
+         };
+@@ -265,11 +302,13 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
+             }
+             Ok(Err(e)) => {
+                 warn!("AX 文本提取任务失败: {}", e);
++                TIMEOUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+             }
+             Err(_) => {
+                 warn!(
+                     app = ?info.app_name,
+                     extractor = fallback.map(|e| e.as_str()).unwrap_or("generic"),
+                     "AX 文本提取超时（1200ms）"
+                 );
++                TIMEOUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+             }
+         }

@@ -8,6 +8,7 @@ OcrWorker — IPC OCR 任务处理器
 - 所有异常在此处被捕获并转换为错误响应，不向上抛出
 - 记录处理时间（latency_ms）用于性能监控
 - 支持注入自定义 OcrEngine（测试用）
+- 集成隐私过滤器，自动抹除敏感内容
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import time
 from memory_bread_ipc import IpcRequest, IpcResponse, OcrResult
 
 from .engine import OcrEngine
+from .privacy_filter import PrivacyFilter
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +34,9 @@ class OcrWorker:
     避免阻塞 asyncio 事件循环。
     """
 
-    def __init__(self, engine: OcrEngine | None = None) -> None:
+    def __init__(self, engine: OcrEngine | None = None, enable_privacy_filter: bool = True) -> None:
         self._engine = engine or OcrEngine.create_default()
+        self._privacy_filter = PrivacyFilter() if enable_privacy_filter else None
 
     async def handle(self, req: IpcRequest) -> IpcResponse:
         """
@@ -52,6 +55,17 @@ class OcrWorker:
                 None, self._engine.process, task.screenshot_path
             )
 
+            # 隐私过滤
+            text = output.text
+            if self._privacy_filter and text:
+                filter_result = self._privacy_filter.detect_and_redact(text, output.boxes)
+                if filter_result.is_sensitive:
+                    text = filter_result.sanitized_text
+                    logger.info(
+                        "OCR 敏感内容已过滤 capture_id=%d | 类型=%s",
+                        task.capture_id, filter_result.detected_types
+                    )
+
             latency_ms = int((time.monotonic() - t0) * 1000)
             logger.info(
                 "OCR 完成 capture_id=%d | %d行 | 置信度=%.3f | %dms",
@@ -59,7 +73,7 @@ class OcrWorker:
             )
 
             result = OcrResult(
-                text=output.text,
+                text=text,
                 confidence=round(output.confidence, 4),
                 language=output.language,
             )

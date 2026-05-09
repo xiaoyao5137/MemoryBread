@@ -7,6 +7,7 @@ pub mod bake_template;
 pub mod capture;
 pub mod knowledge;
 pub mod preferences;
+pub mod privacy;
 pub mod rag_session;
 pub mod style_sample;
 pub mod vector_index;

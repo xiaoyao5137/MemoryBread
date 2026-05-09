@@ -7,11 +7,13 @@
 //! - 写入 SQLite + 发送给 AI Sidecar（OCR/Embed）
 
 pub mod ax;
+pub mod blacklist;
 pub mod engine;
 pub mod filter;
 pub mod listener;
 pub mod screenshot;
 
+pub use blacklist::BlacklistChecker;
 pub use engine::{CaptureConfig, CaptureEngine, CaptureEvent};
 pub use filter::PrivacyFilter;
 pub use listener::{start_listener, ListenerConfig};

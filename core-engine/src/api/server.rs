@@ -24,6 +24,7 @@ use super::{
             update_bake_style_config, update_bake_template,
         },
         captures::list_captures,
+        creation::generate_document,
         debug::{
             clear_extraction_queue, debug_log_content, debug_log_files, system_stats, vector_status,
         },
@@ -32,6 +33,10 @@ use super::{
         monitor::{monitor_overview, monitor_system},
         pii::pii_scrub,
         preferences::{list_preferences, run_screenshot_cleanup_now, update_preference},
+        privacy::{
+            add_blacklist, delete_blacklist, list_blacklist, list_filters, update_blacklist_enabled,
+            update_filter_config, update_filter_enabled,
+        },
         query::rag_query,
         tasks::{
             create_task, delete_task, get_task, list_executions, list_tasks, trigger_task,
@@ -63,6 +68,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/preferences/:key", put(update_preference))
         .route("/pii/scrub", post(pii_scrub))
+        .route("/api/creation/generate", post(generate_document))
         .route("/api/vector/status", get(vector_status))
         .route("/api/stats", get(system_stats))
         .route("/api/debug/log-files", get(debug_log_files))
@@ -89,6 +95,26 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // 监控
         .route("/api/monitor/overview", get(monitor_overview))
         .route("/api/monitor/system", get(monitor_system))
+        // 隐私设置
+        .route("/api/privacy/blacklist", get(list_blacklist).post(add_blacklist))
+        .route(
+            "/api/privacy/blacklist/:id/enabled",
+            axum::routing::patch(update_blacklist_enabled),
+        )
+        .route(
+            "/api/privacy/blacklist/:id",
+            axum::routing::delete(delete_blacklist),
+        )
+        .route("/api/privacy/filters", get(list_filters))
+        .route(
+            "/api/privacy/filters/:filter_type/enabled",
+            axum::routing::patch(update_filter_enabled),
+        )
+        .route(
+            "/api/privacy/filters/:filter_type/config",
+            axum::routing::patch(update_filter_config),
+        )
+        // 烤面包
         .route("/api/bake/overview", get(get_bake_overview))
         .route("/api/bake/run", post(run_bake_pipeline))
         .route(

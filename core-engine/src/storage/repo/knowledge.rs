@@ -12,6 +12,52 @@ use crate::storage::{
 };
 
 impl StorageManager {
+    pub fn get_design_templates(&self, limit: Option<usize>) -> Result<Vec<crate::storage::models_bake::BakeTemplateRecord>, StorageError> {
+        self.with_conn(|conn| {
+            let lim = limit.unwrap_or(10);
+            let mut stmt = conn.prepare(
+                "SELECT id, title, summary, content, design_type, status, tags,
+                        source_capture_ids, source_episode_ids, match_score, match_level,
+                        creation_mode, review_status, created_at, updated_at
+                 FROM bake_designs
+                 WHERE deleted_at IS NULL AND status = 'active'
+                 ORDER BY match_score DESC
+                 LIMIT ?1"
+            )?;
+            let rows = stmt.query_map([lim], |row| {
+                Ok(crate::storage::models_bake::BakeTemplateRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    category: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    status: row.get(5)?,
+                    tags: row.get(6)?,
+                    applicable_tasks: "[]".to_string(),
+                    source_memory_ids: "[]".to_string(),
+                    source_capture_ids: row.get(7)?,
+                    source_episode_ids: row.get(8)?,
+                    linked_knowledge_ids: "[]".to_string(),
+                    structure_sections: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    style_phrases: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    replacement_rules: "[]".to_string(),
+                    prompt_hint: Some("".to_string()),
+                    diagram_code: None,
+                    image_assets: "[]".to_string(),
+                    usage_count: 0,
+                    match_score: row.get(9)?,
+                    match_level: row.get::<_, Option<String>>(10)?,
+                    creation_mode: row.get(11)?,
+                    review_status: row.get(12)?,
+                    evidence_summary: None,
+                    generation_version: None,
+                    deleted_at: None,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
     pub fn insert_knowledge_entry(&self, entry: &NewKnowledgeEntry) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
             match entry.category.as_str() {

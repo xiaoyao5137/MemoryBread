@@ -90,7 +90,7 @@ export interface ActionResult {
   action_id:   string
 }
 
-export type WindowMode = 'buddy' | 'rag' | 'knowledge' | 'models' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake'
+export type WindowMode = 'buddy' | 'rag' | 'creation' | 'knowledge' | 'models' | 'privacy' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake'
 
 export type BakeTab = 'overview' | 'templates' | 'memories' | 'knowledge' | 'sop' | 'style'
 
@@ -469,3 +469,29 @@ export interface SystemResources {
     } | null
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 隐私保护模块
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface AppBlacklistRecord {
+  id: number
+  bundle_id: string
+  app_name: string
+  enabled: boolean
+  reason: string | null
+  created_at: string
+  updated_at: string
+  week_blocked?: number
+}
+
+export interface PrivacyFilterRecord {
+  id: number
+  filter_type: "chat" | "pii" | "policy"
+  filter_name: string
+  enabled: boolean
+  config_json: string | null
+  updated_at: string
+  week_blocked?: number
+}
+

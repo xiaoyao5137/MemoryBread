@@ -24,6 +24,7 @@ use crate::storage::{
 
 use super::{
     ax::{get_frontmost_info_async, AXInfo},
+    blacklist::BlacklistChecker,
     filter::PrivacyFilter,
     screenshot::{capture_and_save, hamming_distance},
     CaptureError,
@@ -185,6 +186,7 @@ pub struct CaptureEngine {
     storage: StorageManager,
     config: CaptureConfig,
     filter: PrivacyFilter,
+    blacklist: BlacklistChecker,
     ipc_client: Option<IpcClient>,
     last_context: Mutex<Option<CachedContext>>,
     recent_periodic_frames: Mutex<HashMap<PeriodicSceneKey, VecDeque<RecentFrameFingerprint>>>,
@@ -200,10 +202,13 @@ impl CaptureEngine {
             warn!("启动时未检测到 AI Sidecar socket，稍后可自动恢复 OCR 连接");
         }
 
+        let blacklist = BlacklistChecker::new(storage.clone());
+
         Self {
             storage,
             config,
             filter: PrivacyFilter::new(),
+            blacklist,
             ipc_client: Some(ipc_client),
             last_context: Mutex::new(None),
             recent_periodic_frames: Mutex::new(HashMap::new()),
@@ -223,10 +228,13 @@ impl CaptureEngine {
             warn!("启动时未检测到 AI Sidecar socket，稍后可自动恢复 OCR 连接");
         }
 
+        let blacklist = BlacklistChecker::new(storage.clone());
+
         Self {
             storage,
             config,
             filter,
+            blacklist,
             ipc_client: Some(ipc_client),
             last_context: Mutex::new(None),
             recent_periodic_frames: Mutex::new(HashMap::new()),
@@ -270,7 +278,27 @@ impl CaptureEngine {
             "AX 与上下文合并完成"
         );
 
-        // 3. 隐私过滤
+        // 3. 应用黑名单检测（优先级最高，快速跳过）
+        if let Some(bundle_id) = &merged.app_bundle_id {
+            if self.blacklist.is_blacklisted(bundle_id) {
+                info!(
+                    app = ?merged.app_name,
+                    bundle_id = %bundle_id,
+                    "应用在黑名单中，跳过采集"
+                );
+                // 记录拦截统计
+                let storage = self.storage.clone();
+                let bundle_id = bundle_id.clone();
+                tokio::spawn(async move {
+                    let _ = storage.with_conn(|conn| {
+                        crate::storage::repo::privacy::increment_block_stat(conn, "blacklist", &bundle_id)
+                    });
+                });
+                return Ok(None);
+            }
+        }
+
+        // 4. 隐私过滤
         let is_sensitive = self.filter.is_sensitive(
             merged.app_name.as_deref(),
             merged.app_bundle_id.as_deref(),

@@ -145,7 +145,16 @@ fn capture_real(
     use std::time::{SystemTime, UNIX_EPOCH};
     use xcap::Monitor;
 
-    let monitors = Monitor::all().map_err(|e| CaptureError::ScreenshotFailed(e.to_string()))?;
+    // 获取显示器列表（可能触发显卡驱动调用）
+    let monitors = match Monitor::all() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("获取显示器列表失败（可能是显卡驱动问题）: {}", e);
+            // 等待 1 秒让驱动恢复
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            return Err(CaptureError::ScreenshotFailed(e.to_string()));
+        }
+    };
 
     if monitors.is_empty() {
         return Ok(None);
@@ -160,11 +169,24 @@ fn capture_real(
     let mut combined_image: Option<DynamicImage> = None;
 
     for (i, monitor) in monitors.iter().enumerate() {
+        // 添加重试机制，避免临时性显卡驱动错误
         let rgba_image = match monitor.capture_image() {
             Ok(img) => img,
             Err(e) => {
-                tracing::warn!("显示器 {} 截图失败: {}", i, e);
-                continue;
+                tracing::warn!("显示器 {} 截图失败: {}，尝试重试", i, e);
+
+                // 等待 100ms 后重试一次
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                match monitor.capture_image() {
+                    Ok(img) => {
+                        tracing::info!("显示器 {} 重试成功", i);
+                        img
+                    }
+                    Err(e2) => {
+                        tracing::error!("显示器 {} 重试仍失败: {}", i, e2);
+                        continue;
+                    }
+                }
             }
         };
 

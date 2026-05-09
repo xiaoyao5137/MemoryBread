@@ -3,11 +3,13 @@
 pub mod action;
 pub mod bake;
 pub mod captures;
+pub mod creation;
 pub mod debug;
 pub mod health;
 pub mod knowledge;
 pub mod monitor;
 pub mod pii;
 pub mod preferences;
+pub mod privacy;
 pub mod query;
 pub mod tasks;

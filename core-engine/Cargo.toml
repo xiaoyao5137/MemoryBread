@@ -49,7 +49,11 @@ tower      = { version = "0.4", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
 
 # HTTP 客户端
-reqwest    = { version = "0.11", features = ["json"] }
+reqwest    = { version = "0.11", features = ["json", "stream"] }
+
+# 异步流
+async-stream = "0.3"
+futures = "0.3"
 
 # 键鼠自动化
 enigo      = "0.2"

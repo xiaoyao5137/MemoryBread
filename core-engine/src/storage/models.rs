@@ -271,3 +271,59 @@ pub struct NewRagSession {
     pub llm_response: Option<String>,
     pub latency_ms: Option<i64>,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// app_blacklist 表
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppBlacklistRecord {
+    pub id: i64,
+    pub bundle_id: String,
+    pub app_name: String,
+    pub enabled: bool,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAppBlacklist {
+    pub bundle_id: String,
+    pub app_name: String,
+    pub enabled: bool,
+    pub reason: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// privacy_filters 表
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyFilterRecord {
+    pub id: i64,
+    pub filter_type: String,
+    pub filter_name: String,
+    pub enabled: bool,
+    pub config_json: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPrivacyFilter {
+    pub filter_type: String,
+    pub filter_name: String,
+    pub enabled: bool,
+    pub config_json: Option<String>,
+}
+
+/// 隐私拦截统计记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyBlockStat {
+    pub id: i64,
+    pub stat_type: String,
+    pub target_id: String,
+    pub block_count: i64,
+    pub week_start: String,
+    pub updated_at: String,
+}

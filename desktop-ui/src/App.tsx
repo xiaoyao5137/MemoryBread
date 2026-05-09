@@ -2,8 +2,10 @@ import React, { useEffect } from 'react'
 import { useAppStore }        from './store/useAppStore'
 import FloatingBuddy          from './components/FloatingBuddy'
 import RagPanel               from './components/RagPanel.v2'
+import CreationPanel          from './components/CreationPanel'
 import RepositoryPanel        from './components/RepositoryPanel'
 import ModelManager           from './components/ModelManager'
+import PrivacyPanel           from './components/PrivacyPanel'
 import ActionConfirm          from './components/ActionConfirm'
 import Settings               from './components/Settings'
 import DebugPanel             from './components/DebugPanel'
@@ -49,8 +51,10 @@ const App: React.FC = () => {
 
       <main className="app-content">
         {windowMode === 'rag'       && <RagPanel />}
+        {windowMode === 'creation'  && <CreationPanel />}
         {windowMode === 'knowledge' && <RepositoryPanel />}
         {windowMode === 'models'    && <ModelManager />}
+        {windowMode === 'privacy'   && <PrivacyPanel />}
         {windowMode === 'settings'  && <Settings />}
         {windowMode === 'debug'     && <DebugPanel />}
         {windowMode === 'tasks'     && <ScheduledTasksPanel />}
