@@ -65,3 +65,6 @@ temp/
 
 # Node
 node_modules/
+
+# Claude Code worktrees
+.claude/worktrees/
