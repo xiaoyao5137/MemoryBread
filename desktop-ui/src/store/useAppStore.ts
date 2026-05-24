@@ -13,6 +13,57 @@ interface CaptureBackTarget {
   repositoryCaptureSourceCaptureId?: string | null
 }
 
+export interface CreationReferenceItem {
+  id: number
+  title: string
+  doc_type: string
+  final_weight: number
+  relevance_score: number
+  quality_score: number
+  completeness_score: number
+  usage_score: number
+  format_score: number
+  freshness_score: number
+  usage_count: number
+  reason: string
+  summary?: string
+}
+
+export interface CreationReferencePreview {
+  requirement: {
+    topic: string
+    doc_type: string
+    audience: string
+    style: string
+    keywords: string[]
+  }
+  references: CreationReferenceItem[]
+}
+
+export interface CreationDraft {
+  prompt: string
+  docType: string
+  audience: string
+  generatedContent: string
+  inheritFormat: boolean
+  enableRag: boolean
+  enableWebSearch: boolean
+  enableImageGeneration: boolean
+  contentWeight: number
+  qualityWeight: number
+  completenessWeight: number
+  usageWeight: number
+  formatWeight: number
+  freshnessWeight: number
+  referencePreview: CreationReferencePreview | null
+}
+
+export interface CreationBackTarget {
+  windowMode: WindowMode
+  bakeTab?: BakeTab
+  selectedTemplateId?: string | null
+}
+
 export interface AppState {
   // ── 窗口模式 ────────────────────────────────────────────────────────────────
   windowMode: WindowMode
@@ -44,6 +95,8 @@ export interface AppState {
   repositoryCaptureLimit: number
   repositoryCaptureSourceCaptureId: string | null
   captureBackTarget: CaptureBackTarget | null
+  creationDraft: CreationDraft
+  creationBackTarget: CreationBackTarget | null
 
   // ── RAG Panel ───────────────────────────────────────────────────────────────
   ragQuery:     string
@@ -95,6 +148,10 @@ export interface AppState {
   setRepositoryCaptureSourceCaptureId: (id: string | null) => void
   setCaptureBackTarget: (target: CaptureBackTarget | null) => void
   clearCaptureBackTarget: () => void
+  setCreationDraft: (patch: Partial<CreationDraft>) => void
+  resetCreationDraft: () => void
+  setCreationBackTarget: (target: CreationBackTarget | null) => void
+  clearCreationBackTarget: () => void
   setRagQuery:           (q: string) => void
   setRagResult:          (answer: string, contexts: RagContext[]) => void
   setRagLoading:         (loading: boolean) => void
@@ -115,6 +172,24 @@ const SKIP_KEY  = 'memory-bread_setup_skipped'
 const safeLocalStorage = typeof window !== 'undefined' && typeof window.localStorage?.getItem === 'function'
   ? window.localStorage
   : null
+
+const initialCreationDraft: CreationDraft = {
+  prompt: '',
+  docType: '',
+  audience: '',
+  generatedContent: '',
+  inheritFormat: true,
+  enableRag: true,
+  enableWebSearch: false,
+  enableImageGeneration: false,
+  contentWeight: 45,
+  qualityWeight: 15,
+  completenessWeight: 15,
+  usageWeight: 10,
+  formatWeight: 10,
+  freshnessWeight: 5,
+  referencePreview: null,
+}
 
 const initialState = {
   windowMode:          'rag' as WindowMode,
@@ -146,6 +221,8 @@ const initialState = {
   repositoryCaptureLimit: 20,
   repositoryCaptureSourceCaptureId: null,
   captureBackTarget: null,
+  creationDraft: initialCreationDraft,
+  creationBackTarget: null,
   ragQuery:            '',
   ragAnswer:           '',
   ragContexts:         [] as RagContext[],
@@ -221,6 +298,16 @@ export const useAppStore = create<AppState>((set) => ({
   setCaptureBackTarget: (target) => set({ captureBackTarget: target }),
 
   clearCaptureBackTarget: () => set({ captureBackTarget: null }),
+
+  setCreationDraft: (patch) => set((state) => ({
+    creationDraft: { ...state.creationDraft, ...patch },
+  })),
+
+  resetCreationDraft: () => set({ creationDraft: initialCreationDraft }),
+
+  setCreationBackTarget: (target) => set({ creationBackTarget: target }),
+
+  clearCreationBackTarget: () => set({ creationBackTarget: null }),
 
   setRagQuery:   (q) => set({ ragQuery: q }),
 

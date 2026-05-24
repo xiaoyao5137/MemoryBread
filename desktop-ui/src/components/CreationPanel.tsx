@@ -1,17 +1,138 @@
-import React, { useState, useRef, useEffect } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
+import { Copy, ExternalLink, FileText, Image, Loader2, Search, Sparkles } from 'lucide-react'
+import { useAppStore } from '../store/useAppStore'
+import type { CreationReferenceItem, CreationReferencePreview } from '../store/useAppStore'
 
 interface CreationPanelProps {
   className?: string
 }
 
+type ReferenceItem = CreationReferenceItem
+type ReferencePreview = CreationReferencePreview
+
+const defaultPrompt = '请生成一份“数据治理平台建设方案”，参考历史项目方案、知识库和操作手册，风格正式，包含总体架构、功能设计、实施计划和后续核验清单。'
+
 const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
-  const [prompt, setPrompt] = useState('')
-  const [generatedContent, setGeneratedContent] = useState('')
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+  const draft = useAppStore((s) => s.creationDraft)
+  const setCreationDraft = useAppStore((s) => s.setCreationDraft)
+  const setWindowMode = useAppStore((s) => s.setWindowMode)
+  const setBakeTab = useAppStore((s) => s.setBakeTab)
+  const setSelectedTemplateId = useAppStore((s) => s.setSelectedTemplateId)
+  const setCreationBackTarget = useAppStore((s) => s.setCreationBackTarget)
+
+  const {
+    prompt,
+    docType,
+    audience,
+    generatedContent,
+    inheritFormat,
+    enableRag,
+    enableWebSearch,
+    enableImageGeneration,
+    contentWeight,
+    qualityWeight,
+    completenessWeight,
+    usageWeight,
+    formatWeight,
+    freshnessWeight,
+    referencePreview,
+  } = draft
+
+  const setPrompt = (v: string) => setCreationDraft({ prompt: v })
+  const setDocType = (v: string) => setCreationDraft({ docType: v })
+  const setAudience = (v: string) => setCreationDraft({ audience: v })
+  const setGeneratedContent = (updater: string | ((prev: string) => string)) => {
+    if (typeof updater === 'function') {
+      setCreationDraft({ generatedContent: updater(useAppStore.getState().creationDraft.generatedContent) })
+    } else {
+      setCreationDraft({ generatedContent: updater })
+    }
+  }
+  const setInheritFormat = (v: boolean) => setCreationDraft({ inheritFormat: v })
+  const setEnableRag = (v: boolean) => setCreationDraft({ enableRag: v })
+  const setEnableWebSearch = (v: boolean) => setCreationDraft({ enableWebSearch: v })
+  const setEnableImageGeneration = (v: boolean) => setCreationDraft({ enableImageGeneration: v })
+  const setContentWeight = (v: number) => setCreationDraft({ contentWeight: v })
+  const setQualityWeight = (v: number) => setCreationDraft({ qualityWeight: v })
+  const setCompletenessWeight = (v: number) => setCreationDraft({ completenessWeight: v })
+  const setUsageWeight = (v: number) => setCreationDraft({ usageWeight: v })
+  const setFormatWeight = (v: number) => setCreationDraft({ formatWeight: v })
+  const setFreshnessWeight = (v: number) => setCreationDraft({ freshnessWeight: v })
+  const setReferencePreview = (v: ReferencePreview | null) => setCreationDraft({ referencePreview: v })
+
   const [isGenerating, setIsGenerating] = useState(false)
+  const [isPreviewing, setIsPreviewing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copySuccess, setCopySuccess] = useState(false)
   const contentRef = useRef<HTMLDivElement>(null)
+
+  const handleOpenReferenceSource = (item: ReferenceItem) => {
+    setCreationBackTarget({
+      windowMode: 'creation',
+      bakeTab: 'templates',
+      selectedTemplateId: String(item.id),
+    })
+    setBakeTab('templates')
+    setSelectedTemplateId(String(item.id))
+    setWindowMode('bake')
+  }
+
+  const buildPayload = () => ({
+    user_prompt: prompt,
+    design_ids: [],
+    timeline_ids: [],
+    capture_ids: [],
+    doc_type: docType,
+    audience,
+    output_format: 'markdown',
+    inherit_format: inheritFormat,
+    enable_rag: enableRag,
+    enable_web_search: enableWebSearch,
+    enable_image_generation: enableImageGeneration,
+    content_weight: contentWeight / 100,
+    quality_weight: qualityWeight / 100,
+    completeness_weight: completenessWeight / 100,
+    usage_weight: usageWeight / 100,
+    format_weight: formatWeight / 100,
+    freshness_weight: freshnessWeight / 100,
+    max_references: 6,
+  })
+
+  const postReferencePreview = async () => {
+    const payload = buildPayload()
+    const response = await fetch(`${apiBaseUrl}/api/creation/references`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+
+    if (response.ok) return response
+    if (response.status !== 404) return response
+
+    return fetch('http://127.0.0.1:8001/creation/references', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  }
+
+  const handlePreviewReferences = async () => {
+    if (!prompt.trim()) return
+    setIsPreviewing(true)
+    setError(null)
+    try {
+      const response = await postReferencePreview()
+      if (!response.ok) throw new Error(`参考资料预览失败: ${response.status}`)
+      const data = await response.json()
+      setReferencePreview(data)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '参考资料预览失败')
+    } finally {
+      setIsPreviewing(false)
+    }
+  }
 
   const handleGenerate = async () => {
     if (!prompt.trim()) return
@@ -21,27 +142,28 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     setGeneratedContent('')
 
     try {
-      const response = await fetch('http://localhost:7070/api/creation/generate', {
+      if (enableRag) {
+        try {
+          const refResponse = await postReferencePreview()
+          if (refResponse.ok) {
+            setReferencePreview(await refResponse.json())
+          }
+        } catch (refErr) {
+          console.warn('参考资料同步加载失败,继续生成:', refErr)
+        }
+      }
+
+      const response = await fetch(`${apiBaseUrl}/api/creation/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          user_prompt: prompt,
-          design_ids: [],
-          timeline_ids: [],
-          capture_ids: []
-        })
+        body: JSON.stringify(buildPayload()),
       })
 
-      if (!response.ok) {
-        throw new Error(`生成失败: ${response.statusText}`)
-      }
+      if (!response.ok) throw new Error(`生成失败: ${response.statusText}`)
 
       const reader = response.body?.getReader()
       const decoder = new TextDecoder()
-
-      if (!reader) {
-        throw new Error('无法读取响应流')
-      }
+      if (!reader) throw new Error('无法读取响应流')
 
       let buffer = ''
       while (true) {
@@ -53,19 +175,13 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         buffer = lines.pop() || ''
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const jsonStr = line.slice(6)
-            try {
-              const content = JSON.parse(jsonStr)
-              console.log('SSE行:', JSON.stringify(line.substring(0, 50)), '提取内容:', JSON.stringify(content))
-              setGeneratedContent(prev => {
-                const newContent = prev + content
-                console.log('拼接内容:', JSON.stringify(newContent.slice(-50)))
-                return newContent
-              })
-            } catch (e) {
-              console.error('JSON解析失败:', jsonStr)
-            }
+          if (!line.startsWith('data: ')) continue
+          const jsonStr = line.slice(6)
+          try {
+            const content = JSON.parse(jsonStr)
+            setGeneratedContent(prev => prev + content)
+          } catch {
+            setGeneratedContent(prev => prev + jsonStr)
           }
         }
       }
@@ -77,138 +193,231 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   }
 
   const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(generatedContent)
-      setCopySuccess(true)
-      setTimeout(() => setCopySuccess(false), 2000)
-    } catch (err) {
-      console.error('复制失败:', err)
-    }
+    await navigator.clipboard.writeText(generatedContent)
+    setCopySuccess(true)
+    setTimeout(() => setCopySuccess(false), 2000)
   }
 
   useEffect(() => {
-    if (contentRef.current) {
-      contentRef.current.scrollTop = contentRef.current.scrollHeight
-    }
+    if (contentRef.current) contentRef.current.scrollTop = contentRef.current.scrollHeight
   }, [generatedContent])
 
+  const totalWeight = contentWeight + qualityWeight + completenessWeight + usageWeight + formatWeight + freshnessWeight
+
   return (
-    <div style={{ padding: '24px', height: '100vh', display: 'flex', flexDirection: 'column', backgroundColor: '#fff' }}>
-      <div style={{ marginBottom: '24px' }}>
-        <h2 style={{ fontSize: '24px', fontWeight: 'bold', marginBottom: '8px' }}>
-          ✨ 创作
-        </h2>
-        <p style={{ color: '#666', fontSize: '14px' }}>
-          输入创作指令，基于设计模板和采集内容生成文档
-        </p>
-      </div>
-
-      <div style={{ marginBottom: '16px' }}>
-        <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          placeholder="例如：帮我写一份关于本周工作总结的文档..."
-          style={{
-            width: '100%',
-            minHeight: '120px',
-            padding: '12px',
-            border: '1px solid #ddd',
-            borderRadius: '8px',
-            fontSize: '14px',
-            resize: 'vertical',
-            fontFamily: 'inherit'
-          }}
-          disabled={isGenerating}
-        />
-      </div>
-
-      <div style={{ marginBottom: '16px' }}>
-        <button
-          onClick={handleGenerate}
-          disabled={!prompt.trim() || isGenerating}
-          style={{
-            padding: '10px 20px',
-            backgroundColor: isGenerating ? '#ccc' : '#007bff',
-            color: 'white',
-            border: 'none',
-            borderRadius: '6px',
-            cursor: isGenerating ? 'not-allowed' : 'pointer',
-            fontSize: '14px',
-            fontWeight: '500'
-          }}
-        >
-          {isGenerating ? '生成中...' : '开始创作'}
-        </button>
-      </div>
-
-      {error && (
-        <div style={{
-          padding: '12px',
-          backgroundColor: '#fee',
-          border: '1px solid #fcc',
-          borderRadius: '6px',
-          color: '#c33',
-          fontSize: '14px',
-          marginBottom: '16px'
-        }}>
-          {error}
+    <div className={className} style={{ height: '100vh', display: 'grid', gridTemplateColumns: '320px minmax(0, 1fr) 360px', background: '#f6f7f9', color: '#172033' }}>
+      <aside style={{ borderRight: '1px solid #e1e5ea', background: '#fff', overflowY: 'auto' }}>
+        <div style={{ padding: '22px 20px', borderBottom: '1px solid #e1e5ea' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <Sparkles size={22} color="#0f766e" />
+            <h2 style={{ fontSize: 21, fontWeight: 700, margin: 0 }}>智能创作</h2>
+          </div>
+          <p style={{ margin: '8px 0 0', color: '#667085', fontSize: 13, lineHeight: 1.5 }}>
+            基于历史文档、知识和操作手册生成新内容。
+          </p>
         </div>
-      )}
 
-      {generatedContent && (
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', border: '1px solid #ddd', borderRadius: '8px', overflow: 'hidden' }}>
-          <div style={{
-            padding: '12px 16px',
-            backgroundColor: '#f8f9fa',
-            borderBottom: '1px solid #ddd',
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center'
-          }}>
-            <span style={{ fontSize: '14px', fontWeight: '500' }}>生成的文档</span>
-            {generatedContent && (
-              <button
-                onClick={handleCopy}
-                style={{
-                  padding: '6px 12px',
-                  backgroundColor: copySuccess ? '#28a745' : 'white',
-                  color: copySuccess ? 'white' : '#333',
-                  border: '1px solid #ddd',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  fontSize: '13px'
-                }}
-              >
-                {copySuccess ? '✓ 已复制' : '📋 复制'}
+        <div style={{ padding: 20, display: 'grid', gap: 16 }}>
+          <label style={{ display: 'grid', gap: 7, fontSize: 13, color: '#475467' }}>
+            文档类型
+            <input value={docType} onChange={(e) => setDocType(e.target.value)} placeholder="建设方案 / 操作手册 / 汇报材料" style={inputStyle} />
+          </label>
+          <label style={{ display: 'grid', gap: 7, fontSize: 13, color: '#475467' }}>
+            目标读者
+            <input value={audience} onChange={(e) => setAudience(e.target.value)} placeholder="客户 / 管理人员 / 研发团队" style={inputStyle} />
+          </label>
+
+          <Toggle label="启用 RAG 参考" checked={enableRag} onChange={setEnableRag} />
+          <Toggle label="继承历史格式" checked={inheritFormat} onChange={setInheritFormat} />
+          <Toggle label="互联网检索补充" checked={enableWebSearch} onChange={setEnableWebSearch} icon={<Search size={16} />} />
+          <Toggle label="图片/图示生成建议" checked={enableImageGeneration} onChange={setEnableImageGeneration} icon={<Image size={16} />} />
+
+          <div style={{ height: 1, background: '#edf0f3' }} />
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, color: '#475467', marginBottom: 10 }}>
+              <span>权重配置</span>
+              <span style={{ color: totalWeight === 100 ? '#0f766e' : '#b54708' }}>{totalWeight}%</span>
+            </div>
+            <WeightSlider label="内容相关度" value={contentWeight} onChange={setContentWeight} />
+            <WeightSlider label="文档质量" value={qualityWeight} onChange={setQualityWeight} />
+            <WeightSlider label="完整性" value={completenessWeight} onChange={setCompletenessWeight} />
+            <WeightSlider label="打开/引用热度" value={usageWeight} onChange={setUsageWeight} />
+            <WeightSlider label="格式匹配" value={formatWeight} onChange={setFormatWeight} />
+            <WeightSlider label="时效性" value={freshnessWeight} onChange={setFreshnessWeight} />
+          </div>
+        </div>
+      </aside>
+
+      <main style={{ minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <section style={{ padding: 22, borderBottom: '1px solid #e1e5ea', background: '#fff' }}>
+          <textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder={defaultPrompt}
+            style={{ ...inputStyle, minHeight: 118, resize: 'vertical', lineHeight: 1.6 }}
+            disabled={isGenerating}
+          />
+          <div style={{ marginTop: 14, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button onClick={handlePreviewReferences} disabled={!prompt.trim() || isPreviewing || isGenerating} style={secondaryButtonStyle}>
+              {isPreviewing ? <Loader2 size={16} className="spin" /> : <FileText size={16} />}
+              预览参考
+            </button>
+            <button onClick={handleGenerate} disabled={!prompt.trim() || isGenerating} style={primaryButtonStyle}>
+              {isGenerating ? <Loader2 size={16} className="spin" /> : <Sparkles size={16} />}
+              {isGenerating ? '生成中' : '开始创作'}
+            </button>
+          </div>
+          {error && <div style={{ marginTop: 12, color: '#b42318', fontSize: 13 }}>{error}</div>}
+        </section>
+
+        <section style={{ flex: 1, minHeight: 0, overflow: 'hidden', padding: 22 }}>
+          <div style={{ height: '100%', border: '1px solid #e1e5ea', borderRadius: 8, background: '#fff', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            <div style={{ height: 48, padding: '0 16px', borderBottom: '1px solid #e1e5ea', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span style={{ fontSize: 14, fontWeight: 650 }}>创作文档</span>
+              <button onClick={handleCopy} disabled={!generatedContent} style={compactButtonStyle}>
+                <Copy size={15} />
+                {copySuccess ? '已复制' : '复制'}
               </button>
-            )}
+            </div>
+            <div ref={contentRef} style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
+              {generatedContent ? (
+                <ReactMarkdown components={markdownComponents}>{generatedContent}</ReactMarkdown>
+              ) : (
+                <div style={{ height: '100%', display: 'grid', placeItems: 'center', color: '#98a2b3', fontSize: 14 }}>
+                  输入创作需求后，可以先预览参考资料，也可以直接开始生成。
+                </div>
+              )}
+            </div>
           </div>
-          <div
-            ref={contentRef}
-            style={{
-              flex: 1,
-              padding: '16px',
-              overflowY: 'auto',
-              backgroundColor: 'white'
-            }}
-          >
-            {console.log('最终渲染内容:', JSON.stringify(generatedContent.substring(0, 200)))}
-            <ReactMarkdown
-              components={{
-                h1: ({node, ...props}) => <h1 style={{fontSize: '2em', fontWeight: 'bold', marginTop: '0.67em', marginBottom: '0.67em'}} {...props} />,
-                h2: ({node, ...props}) => <h2 style={{fontSize: '1.5em', fontWeight: 'bold', marginTop: '0.83em', marginBottom: '0.83em'}} {...props} />,
-                h3: ({node, ...props}) => <h3 style={{fontSize: '1.17em', fontWeight: 'bold', marginTop: '1em', marginBottom: '1em'}} {...props} />,
-                h4: ({node, ...props}) => <h4 style={{fontSize: '1em', fontWeight: 'bold', marginTop: '1.33em', marginBottom: '1.33em'}} {...props} />,
-                p: ({node, ...props}) => <p style={{marginTop: '1em', marginBottom: '1em'}} {...props} />,
-              }}
-            >
-              {generatedContent}
-            </ReactMarkdown>
-          </div>
+        </section>
+      </main>
+
+      <aside style={{ borderLeft: '1px solid #e1e5ea', background: '#fff', overflowY: 'auto' }}>
+        <div style={{ padding: '22px 20px', borderBottom: '1px solid #e1e5ea' }}>
+          <h3 style={{ fontSize: 16, margin: 0 }}>参考资料</h3>
+          <p style={{ margin: '7px 0 0', color: '#667085', fontSize: 13 }}>按综合权重排序，用于内容、格式和风格参考。</p>
         </div>
-      )}
+        <div style={{ padding: 16, display: 'grid', gap: 12 }}>
+          {referencePreview?.requirement && (
+            <div style={{ paddingBottom: 12, borderBottom: '1px solid #edf0f3', fontSize: 13, color: '#475467', lineHeight: 1.7 }}>
+              <div>主题：{referencePreview.requirement.topic}</div>
+              <div>类型：{referencePreview.requirement.doc_type}</div>
+              <div>风格：{referencePreview.requirement.style}</div>
+            </div>
+          )}
+          {referencePreview?.references?.length ? referencePreview.references.map((item) => (
+            <ReferenceRow key={item.id} item={item} onOpenSource={handleOpenReferenceSource} />
+          )) : (
+            <div style={{ color: '#98a2b3', fontSize: 13, lineHeight: 1.6 }}>
+              暂无参考资料预览。点击“预览参考”后，这里会显示高权重历史文档和推荐原因。
+            </div>
+          )}
+        </div>
+      </aside>
     </div>
   )
+}
+
+const Toggle = ({ label, checked, onChange, icon }: { label: string; checked: boolean; onChange: (value: boolean) => void; icon?: React.ReactNode }) => (
+  <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, fontSize: 14, color: '#344054' }}>
+    <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>{icon}{label}</span>
+    <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+  </label>
+)
+
+const WeightSlider = ({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) => (
+  <label style={{ display: 'grid', gap: 6, marginBottom: 11, fontSize: 12, color: '#667085' }}>
+    <span style={{ display: 'flex', justifyContent: 'space-between' }}>
+      <span>{label}</span>
+      <span>{value}%</span>
+    </span>
+    <input type="range" min={0} max={70} value={value} onChange={(e) => onChange(Number(e.target.value))} />
+  </label>
+)
+
+const ReferenceRow = ({ item, onOpenSource }: { item: ReferenceItem; onOpenSource: (item: ReferenceItem) => void }) => (
+  <div style={{ border: '1px solid #e1e5ea', borderRadius: 8, padding: 12 }}>
+    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start' }}>
+      <div style={{ fontSize: 14, fontWeight: 650, lineHeight: 1.35 }}>{item.title}</div>
+      <div style={{ fontSize: 13, color: '#0f766e', fontWeight: 700 }}>{Math.round(item.final_weight * 100)}</div>
+    </div>
+    <div style={{ marginTop: 6, fontSize: 12, color: '#667085' }}>{item.doc_type || '未分类'} · 打开/引用 {item.usage_count}</div>
+    <div style={{ marginTop: 8, fontSize: 12, color: '#475467', lineHeight: 1.55 }}>{item.reason}</div>
+    <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6, fontSize: 11, color: '#667085' }}>
+      <span>相关 {Math.round(item.relevance_score * 100)}</span>
+      <span>完整 {Math.round(item.completeness_score * 100)}</span>
+      <span>格式 {Math.round(item.format_score * 100)}</span>
+    </div>
+    <button
+      type="button"
+      onClick={() => onOpenSource(item)}
+      style={{
+        marginTop: 10,
+        padding: '6px 10px',
+        border: '1px solid #d0d5dd',
+        borderRadius: 6,
+        background: '#fff',
+        color: '#0f766e',
+        fontSize: 12,
+        fontWeight: 600,
+        cursor: 'pointer',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+      }}
+    >
+      <ExternalLink size={13} />
+      资料来源
+    </button>
+  </div>
+)
+
+const inputStyle: React.CSSProperties = {
+  width: '100%',
+  padding: '10px 12px',
+  border: '1px solid #d0d5dd',
+  borderRadius: 8,
+  fontSize: 14,
+  fontFamily: 'inherit',
+  outline: 'none',
+  background: '#fff',
+}
+
+const primaryButtonStyle: React.CSSProperties = {
+  height: 38,
+  padding: '0 15px',
+  border: '1px solid #0f766e',
+  borderRadius: 8,
+  background: '#0f766e',
+  color: '#fff',
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 8,
+  cursor: 'pointer',
+  fontWeight: 650,
+}
+
+const secondaryButtonStyle: React.CSSProperties = {
+  ...primaryButtonStyle,
+  background: '#fff',
+  color: '#344054',
+  border: '1px solid #d0d5dd',
+}
+
+const compactButtonStyle: React.CSSProperties = {
+  ...secondaryButtonStyle,
+  height: 32,
+  padding: '0 10px',
+  fontSize: 13,
+}
+
+const markdownComponents = {
+  h1: ({ node, ...props }: any) => <h1 style={{ fontSize: 26, lineHeight: 1.25, margin: '0 0 18px' }} {...props} />,
+  h2: ({ node, ...props }: any) => <h2 style={{ fontSize: 20, lineHeight: 1.35, margin: '24px 0 12px' }} {...props} />,
+  h3: ({ node, ...props }: any) => <h3 style={{ fontSize: 16, lineHeight: 1.45, margin: '18px 0 9px' }} {...props} />,
+  p: ({ node, ...props }: any) => <p style={{ margin: '9px 0', lineHeight: 1.75 }} {...props} />,
+  li: ({ node, ...props }: any) => <li style={{ margin: '6px 0', lineHeight: 1.65 }} {...props} />,
+  code: ({ node, ...props }: any) => <code style={{ background: '#f2f4f7', padding: '2px 5px', borderRadius: 4 }} {...props} />,
 }
 
 export default CreationPanel

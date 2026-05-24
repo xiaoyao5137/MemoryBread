@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { ArrowLeft } from 'lucide-react'
 import {
   useAdoptBakeKnowledge,
   useAdoptBakeSop,
@@ -40,14 +41,14 @@ const getFallbackOffsetAfterRemoval = (currentCount: number, offset: number, lim
 
 const createDraftTemplate = (): ArticleTemplate => ({
   id: `template-draft-${Date.now()}`,
-  name: '新模板',
-  category: '未分类',
+  title: '新模板',
+  docType: 'article',
   status: 'draft',
   tags: [],
   applicableTasks: ['creation'],
   sourceMemoryIds: [],
   linkedKnowledgeIds: [],
-  structureSections: [],
+  sections: [],
   stylePhrases: [],
   replacementRules: [],
   promptHint: '',
@@ -100,6 +101,8 @@ const BakePanel: React.FC = () => {
     setBakeSopQuery,
     setBakeSopLimit,
     setRepositoryCaptureSourceCaptureId,
+    creationBackTarget,
+    clearCreationBackTarget,
   } = useAppStore()
 
   const { status: modelStatus, ready: modelsReady, loading: modelStatusLoading } = useModelStatus()
@@ -264,7 +267,7 @@ const BakePanel: React.FC = () => {
       setBakeTab('templates')
       setBakeTemplateOffset(0)
       setSelectedTemplateId(created.id)
-      setStatusMessage(`已新建模板「${created.name}」`)
+      setStatusMessage(`已新建模板「${created.title}」`)
       await refreshOverview()
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : '新建模板失败')
@@ -311,7 +314,7 @@ const BakePanel: React.FC = () => {
     try {
       const updated = await updateTemplate(updater(target))
       setTemplates(prev => prev.map(item => item.id === templateId ? updated : item))
-      setStatusMessage(`已更新模板「${updated.name}」`)
+      setStatusMessage(`已更新模板「${updated.title}」`)
       await refreshOverview()
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : '更新模板失败')
@@ -352,7 +355,7 @@ const BakePanel: React.FC = () => {
     try {
       const adopted = await adoptTemplate(templateId)
       setTemplates(prev => prev.map(item => item.id === templateId ? adopted : item))
-      setStatusMessage(`已采纳模板「${adopted.name}」`)
+      setStatusMessage(`已采纳模板「${adopted.title}」`)
       await refreshOverview()
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : '采纳模板失败')
@@ -492,6 +495,44 @@ const BakePanel: React.FC = () => {
 
   return (
     <div className="bake-panel">
+      {creationBackTarget && (
+        <div style={{
+          padding: '10px 16px',
+          background: '#f0fdfa',
+          borderBottom: '1px solid #99f6e4',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+        }}>
+          <span style={{ fontSize: 13, color: '#0f766e' }}>
+            从智能创作的参考资料跳转而来
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              const target = creationBackTarget
+              clearCreationBackTarget()
+              setWindowMode(target.windowMode)
+            }}
+            style={{
+              padding: '6px 12px',
+              border: '1px solid #0f766e',
+              borderRadius: 6,
+              background: '#fff',
+              color: '#0f766e',
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+            }}
+          >
+            <ArrowLeft size={14} />
+            返回创作
+          </button>
+        </div>
+      )}
       <BakeHeader />
       {statusMessage && <div className="bake-inline-message">{statusMessage}</div>}
 

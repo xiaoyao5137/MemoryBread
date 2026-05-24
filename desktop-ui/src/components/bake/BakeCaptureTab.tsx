@@ -39,7 +39,7 @@ const BakeCaptureTab: React.FC<{
   onSearch: () => void
   onClearFilters: () => void
   onClearScope: () => void
-  onViewLinkedKnowledge: (knowledgeId?: string | null) => void
+  onViewLinkedTimeline: (timelineId?: string | null) => void
   canGoBack: boolean
   onGoBack: () => void
 }> = ({
@@ -65,7 +65,7 @@ const BakeCaptureTab: React.FC<{
   onSearch,
   onClearFilters,
   onClearScope,
-  onViewLinkedKnowledge,
+  onViewLinkedTimeline,
   canGoBack,
   onGoBack,
 }) => {
@@ -291,11 +291,6 @@ const BakeCaptureTab: React.FC<{
             </div>
 
             <div>
-              <div className="bake-kv__title">摘要</div>
-              <div className="bake-capture-detail__text">{selected.bestText || selected.summary || '暂无摘要'}</div>
-            </div>
-
-            <div>
               <div className="bake-kv__title">AX 文本</div>
               <div className="bake-capture-detail__text">{selected.axText || '暂无 AX 文本'}</div>
             </div>
@@ -310,9 +305,32 @@ const BakeCaptureTab: React.FC<{
               <div className="bake-capture-detail__text">{selected.inputText || selected.audioText || '暂无输入或音频文本'}</div>
             </div>
 
+            {(selected.url || selected.webpageTitle) && (
+              <div>
+                <div className="bake-kv__title">网址</div>
+                <div className="bake-capture-detail__text">
+                  {selected.webpageTitle && (
+                    <div style={{ marginBottom: 4 }}>{selected.webpageTitle}</div>
+                  )}
+                  {selected.url && (
+                    <a
+                      href={selected.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: '#2563EB', textDecoration: 'underline', wordBreak: 'break-all' }}
+                    >
+                      {selected.url}
+                    </a>
+                  )}
+                </div>
+              </div>
+            )}
+
             <div className="bake-actions">
-              <BakeButton onClick={() => onViewLinkedKnowledge(selected.linkedKnowledgeId)}>
-                {selected.linkedKnowledgeId ? '查看关联知识' : '暂无关联知识'}
+              <BakeButton onClick={() => onViewLinkedTimeline(selected.linkedTimelineId)}>
+                {selected.linkedTimelineId
+                  ? `查看所属时间线${selected.linkedTimelineSummary ? ` · ${selected.linkedTimelineSummary.slice(0, 24)}` : ''}`
+                  : '尚未归入时间线'}
               </BakeButton>
             </div>
           </div>

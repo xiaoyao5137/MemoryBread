@@ -176,12 +176,15 @@ export interface BakeCaptureItem {
   inputText?: string | null
   audioText?: string | null
   screenshotPath?: string | null
+  screenshotSource?: string | null
+  url?: string | null
+  webpageTitle?: string | null
   isSensitive: boolean
   piiScrubbed: boolean
   bestText?: string | null
   summary?: string | null
-  linkedKnowledgeId?: string | null
-  linkedKnowledgeSummary?: string | null
+  linkedTimelineId?: string | null
+  linkedTimelineSummary?: string | null
 }
 
 export interface PaginatedBakeResponse<T> {
@@ -204,20 +207,21 @@ export interface ReplacementRule {
 
 export interface ArticleTemplate {
   id: string
-  name: string
-  category: string
+  title: string
+  docType: string
   status: 'draft' | 'auto_generated' | 'pending_review' | 'enabled' | 'disabled'
   tags: string[]
   applicableTasks: Array<'qa' | 'creation' | 'work_tip'>
   sourceMemoryIds: string[]
   linkedKnowledgeIds: string[]
-  structureSections: TemplateSection[]
+  sections: TemplateSection[]
   stylePhrases: string[]
   replacementRules: ReplacementRule[]
+  summary?: string
+  fullContent?: string
   diagramCode?: string
   imageAssets?: string[]
   promptHint?: string
-  detailedContent?: string
   usageCount: number
   reviewStatus: string
   matchScore?: number
@@ -286,6 +290,9 @@ export interface MonitorOverview {
     pending_extraction_count: number
     by_time: { ts: number; count: number }[]
     recent: { id: number; ts: number; summary: string; category: string; importance: number; app_name: string; win_title: string }[]
+    extracting: { id: number; ts: number; app_name: string; win_title: string }[]
+    last_extraction_at_ms: number | null
+    extractor_status: 'running' | 'waiting' | 'idle' | 'stalled'
   }
   rag_sessions: {
     today_count:    number

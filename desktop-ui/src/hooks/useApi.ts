@@ -421,14 +421,14 @@ export function useFetchBakeTemplates() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
   return useCallback(async (params: BakeListQueryParams = {}): Promise<PaginatedBakeResponse<ArticleTemplate>> => {
-    const url = new URL(`${apiBaseUrl}/api/bake/designs`)
+    const url = new URL(`${apiBaseUrl}/api/bake/documents`)
     if (params.q) url.searchParams.set('q', params.q)
     if (params.bucket) url.searchParams.set('bucket', params.bucket)
     if (params.limit != null) url.searchParams.set('limit', String(params.limit))
     if (params.offset != null) url.searchParams.set('offset', String(params.offset))
 
     const resp = await fetch(url.toString())
-    if (!resp.ok) throw new Error(`bake designs fetch failed: ${resp.status}`)
+    if (!resp.ok) throw new Error(`bake documents fetch failed: ${resp.status}`)
     const data = await resp.json()
     return {
       items: (data.items ?? data.templates ?? []).map(mapBakeTemplate),
@@ -443,12 +443,12 @@ export function useCreateBakeTemplate() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
   return useCallback(async (template: ArticleTemplate): Promise<ArticleTemplate> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/designs`, {
+    const resp = await fetch(`${apiBaseUrl}/api/bake/documents`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(serializeBakeTemplate(template)),
     })
-    if (!resp.ok) throw new Error(`create bake design failed: ${resp.status}`)
+    if (!resp.ok) throw new Error(`create bake document failed: ${resp.status}`)
     return mapBakeTemplate(await resp.json())
   }, [apiBaseUrl])
 }
@@ -457,12 +457,12 @@ export function useUpdateBakeTemplate() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
   return useCallback(async (template: ArticleTemplate): Promise<ArticleTemplate> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/designs/${encodeURIComponent(template.id)}`, {
+    const resp = await fetch(`${apiBaseUrl}/api/bake/documents/${encodeURIComponent(template.id)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(serializeBakeTemplate(template)),
     })
-    if (!resp.ok) throw new Error(`update bake design failed: ${resp.status}`)
+    if (!resp.ok) throw new Error(`update bake document failed: ${resp.status}`)
     return mapBakeTemplate(await resp.json())
   }, [apiBaseUrl])
 }
@@ -471,8 +471,8 @@ export function useToggleBakeTemplateStatus() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
   return useCallback(async (id: string): Promise<ArticleTemplate> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/designs/${encodeURIComponent(id)}/toggle-status`, { method: 'POST' })
-    if (!resp.ok) throw new Error(`toggle bake design failed: ${resp.status}`)
+    const resp = await fetch(`${apiBaseUrl}/api/bake/documents/${encodeURIComponent(id)}/toggle-status`, { method: 'POST' })
+    if (!resp.ok) throw new Error(`toggle bake document failed: ${resp.status}`)
     return mapBakeTemplate(await resp.json())
   }, [apiBaseUrl])
 }
@@ -481,8 +481,8 @@ export function useAdoptBakeTemplate() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
   return useCallback(async (id: string): Promise<ArticleTemplate> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/designs/${encodeURIComponent(id)}/adopt`, { method: 'POST' })
-    if (!resp.ok) throw new Error(`adopt bake design failed: ${resp.status}`)
+    const resp = await fetch(`${apiBaseUrl}/api/bake/documents/${encodeURIComponent(id)}/adopt`, { method: 'POST' })
+    if (!resp.ok) throw new Error(`adopt bake document failed: ${resp.status}`)
     return mapBakeTemplate(await resp.json())
   }, [apiBaseUrl])
 }
@@ -491,8 +491,8 @@ export function useDeleteBakeTemplate() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
   return useCallback(async (id: string): Promise<void> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/designs/${encodeURIComponent(id)}`, { method: 'DELETE' })
-    if (!resp.ok) throw new Error(`delete bake design failed: ${resp.status}`)
+    const resp = await fetch(`${apiBaseUrl}/api/bake/documents/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (!resp.ok) throw new Error(`delete bake document failed: ${resp.status}`)
   }, [apiBaseUrl])
 }
 
@@ -660,30 +660,34 @@ function mapBakeCapture(item: any): BakeCaptureItem {
     inputText: item.input_text,
     audioText: item.audio_text,
     screenshotPath: item.screenshot_path,
+    screenshotSource: item.screenshot_source,
+    url: item.url,
+    webpageTitle: item.webpage_title,
     isSensitive: item.is_sensitive ?? false,
     piiScrubbed: item.pii_scrubbed ?? false,
     bestText: item.best_text,
     summary: item.summary,
-    linkedKnowledgeId: item.linked_knowledge_id,
-    linkedKnowledgeSummary: item.linked_knowledge_summary,
+    linkedTimelineId: item.linked_timeline_id,
+    linkedTimelineSummary: item.linked_timeline_summary,
   }
 }
 
 function mapBakeTemplate(item: any): ArticleTemplate {
   return {
     id: String(item.id),
-    name: item.name,
-    category: item.category,
+    title: item.title,
+    docType: item.doc_type,
     status: item.status,
     tags: item.tags ?? [],
     applicableTasks: item.applicable_tasks ?? [],
     sourceMemoryIds: item.source_memory_ids ?? [],
     linkedKnowledgeIds: item.linked_knowledge_ids ?? [],
-    structureSections: item.structure_sections ?? [],
+    sections: item.sections ?? [],
     stylePhrases: item.style_phrases ?? [],
     replacementRules: item.replacement_rules ?? [],
+    summary: item.summary,
+    fullContent: item.full_content,
     promptHint: item.prompt_hint,
-    detailedContent: item.detailed_content,
     diagramCode: item.diagram_code,
     imageAssets: item.image_assets ?? [],
     usageCount: item.usage_count ?? 0,
@@ -696,18 +700,19 @@ function mapBakeTemplate(item: any): ArticleTemplate {
 
 function serializeBakeTemplate(template: ArticleTemplate) {
   return {
-    name: template.name,
-    category: template.category,
+    title: template.title,
+    doc_type: template.docType,
     status: template.status,
     tags: template.tags,
     applicable_tasks: template.applicableTasks,
     source_memory_ids: template.sourceMemoryIds,
     linked_knowledge_ids: template.linkedKnowledgeIds,
-    structure_sections: template.structureSections,
+    sections: template.sections,
     style_phrases: template.stylePhrases,
     replacement_rules: template.replacementRules,
+    summary: template.summary ?? null,
+    full_content: template.fullContent ?? null,
     prompt_hint: template.promptHint,
-    detailed_content: template.detailedContent,
     diagram_code: template.diagramCode,
     image_assets: template.imageAssets ?? [],
     usage_count: template.usageCount,

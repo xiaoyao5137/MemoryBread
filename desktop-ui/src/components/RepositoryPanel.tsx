@@ -260,6 +260,17 @@ const RepositoryPanel: React.FC = () => {
     setStatusMessage('已切换到已提炼知识页；来源 knowledge 不在这里展示')
   }
 
+  const handleViewLinkedTimeline = (timelineId?: string | null) => {
+    if (!timelineId) {
+      setStatusMessage('该采集尚未归入任何时间线')
+      return
+    }
+    setWindowMode('knowledge')
+    setRepositoryTab('memory')
+    setSelectedMemoryId(timelineId)
+    setStatusMessage('已切换到所属时间线')
+  }
+
   const handleCaptureGoBack = () => {
     if (!captureBackTarget) {
       setStatusMessage('当前没有可返回的上一步页面')
@@ -620,7 +631,7 @@ const RepositoryPanel: React.FC = () => {
             onSearch={handleSearchCaptures}
             onClearFilters={handleClearCaptureFilters}
             onClearScope={() => setRepositoryCaptureSourceCaptureId(null)}
-            onViewLinkedKnowledge={handleViewLinkedKnowledge}
+            onViewLinkedTimeline={handleViewLinkedTimeline}
             canGoBack={Boolean(captureBackTarget)}
             onGoBack={handleCaptureGoBack}
           />

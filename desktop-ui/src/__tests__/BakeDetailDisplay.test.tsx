@@ -8,14 +8,14 @@ const noop = vi.fn()
 
 const template: ArticleTemplate = {
   id: 'tpl-1',
-  name: '周报模板',
-  category: 'weekly_report',
+  title: '周报模板',
+  docType: 'weekly_report',
   status: 'enabled',
   tags: ['周报'],
   applicableTasks: ['creation'],
   sourceMemoryIds: ['m-1'],
   linkedKnowledgeIds: ['k-1'],
-  structureSections: [
+  sections: [
     { title: '背景', keywords: ['背景'] },
     { title: '进展', keywords: ['进展'] },
   ],

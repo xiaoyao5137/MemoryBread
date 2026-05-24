@@ -34,6 +34,9 @@ const EMPTY_OVERVIEW: MonitorOverview = {
     pending_extraction_count: 0,
     by_time: [],
     recent: [],
+    extracting: [],
+    last_extraction_at_ms: null,
+    extractor_status: 'idle',
   },
   rag_sessions: {
     today_count: 0,
@@ -385,10 +388,87 @@ const StatCard: React.FC<{
     border: `1px solid ${color}20`, flex: 1, minWidth: 0,
   }}>
     <div style={{ fontSize: 11, color: '#6E6E73', marginBottom: 4 }}>{label}</div>
-    <div style={{ fontSize: 20, fontWeight: 700, color, lineHeight: 1 }}>{value}</div>
+    <div style={fontSize_20_weight_700(color)}>{value}</div>
     {sub && <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 3 }}>{sub}</div>}
   </div>
 )
+
+function fontSize_20_weight_700(color: string): React.CSSProperties {
+  return { fontSize: 20, fontWeight: 700, color, lineHeight: 1 }
+}
+
+type ExtractorStatus = 'running' | 'waiting' | 'idle' | 'stalled'
+
+const EXTRACTOR_STATUS_META: Record<ExtractorStatus, { label: string; color: string; dot: string }> = {
+  running: { label: '运行中', color: '#34C759', dot: '#34C759' },
+  waiting: { label: '等待片段成熟', color: '#FF9500', dot: '#FF9500' },
+  idle:    { label: '空闲', color: '#8E8E93', dot: '#8E8E93' },
+  stalled: { label: '提炼器无响应', color: '#FF3B30', dot: '#FF3B30' },
+}
+
+function fmtRelativeTs(ms: number | null | undefined): string {
+  if (!ms) return '尚无记录'
+  const diff = Date.now() - ms
+  if (diff < 0) return '刚刚'
+  const s = Math.floor(diff / 1000)
+  if (s < 60) return `${s} 秒前`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} 分钟前`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h} 小时前`
+  return `${Math.floor(h / 24)} 天前`
+}
+
+const ExtractionQueueCard: React.FC<{
+  pending: number
+  status: ExtractorStatus
+  extractingCount: number
+  lastExtractionAtMs: number | null | undefined
+}> = ({ pending, status, extractingCount, lastExtractionAtMs }) => {
+  const meta = EXTRACTOR_STATUS_META[status] ?? EXTRACTOR_STATUS_META.idle
+  // 主色：等待队列卡片仍以橙色为基底（呼应原设计），但用状态点指示真实健康度
+  const baseColor = pending > 0 ? '#FF9500' : '#8E8E93'
+
+  let sub: string
+  if (status === 'running') {
+    sub = extractingCount > 0
+      ? `正在提炼 ${extractingCount} 条 · 上次 ${fmtRelativeTs(lastExtractionAtMs)}`
+      : `刚刚完成 · 上次 ${fmtRelativeTs(lastExtractionAtMs)}`
+  } else if (status === 'waiting') {
+    sub = '等待片段积累足够（≥3 条且静默 ≥10 分钟）后批量提炼'
+  } else if (status === 'stalled') {
+    sub = '后台提炼器未启动，请检查 sidecar 服务'
+  } else {
+    sub = pending > 0 ? `${pending} 条待评估` : '当前无待提炼内容'
+  }
+
+  return (
+    <div
+      title="数字代表已采集但尚未被合并到任何 knowledge 的 captures。系统按片段（≥3 条 + 静默 10 分钟）批量提炼，因此该数字会持续累计、阶段性下降，并不代表卡死。"
+      style={{
+        background: `${baseColor}10`, borderRadius: 10, padding: '10px 12px',
+        border: `1px solid ${baseColor}20`, flex: 1, minWidth: 0,
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, marginBottom: 4 }}>
+        <span style={{ fontSize: 11, color: '#6E6E73' }}>提炼等待队列</span>
+        <span style={{
+          display: 'inline-flex', alignItems: 'center', gap: 4,
+          fontSize: 10, padding: '1px 6px', borderRadius: 4,
+          background: `${meta.color}18`, color: meta.color, fontWeight: 600,
+        }}>
+          <span style={{
+            width: 6, height: 6, borderRadius: '50%', background: meta.dot,
+            animation: status === 'running' ? 'pulse 1.4s ease-in-out infinite' : undefined,
+          }} />
+          {meta.label}
+        </span>
+      </div>
+      <div style={fontSize_20_weight_700(baseColor)}>{fmt(pending)}</div>
+      <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 3, lineHeight: 1.35 }}>{sub}</div>
+    </div>
+  )
+}
 
 const RuntimeBreakdownCard: React.FC<{
   items: SystemResources['model_runtime_breakdown']
@@ -459,6 +539,7 @@ const OverviewContent: React.FC<{ data: MonitorOverview; range: OverviewRange }>
     ...(data?.knowledge_flow ?? {}),
     by_time: data?.knowledge_flow?.by_time ?? [],
     recent: data?.knowledge_flow?.recent ?? [],
+    extracting: data?.knowledge_flow?.extracting ?? [],
   }
   const task_executions = {
     ...EMPTY_OVERVIEW.task_executions,
@@ -476,8 +557,12 @@ const OverviewContent: React.FC<{ data: MonitorOverview; range: OverviewRange }>
           sub={`数据库 ${fmtBytes(data?.db_size_bytes ?? 0)}`} color="#32ADE6" />
         <StatCard label="知识提炼" value={fmt(knowledge_flow.period_count)}
           sub={`今日 ${fmt(knowledge_flow.today_count)}`} color="#BF5AF2" />
-        <StatCard label="提炼等待队列" value={fmt(knowledge_flow.pending_extraction_count)}
-          sub="待提炼 captures" color="#FF9500" />
+        <ExtractionQueueCard
+          pending={knowledge_flow.pending_extraction_count}
+          status={knowledge_flow.extractor_status}
+          extractingCount={knowledge_flow.extracting.length}
+          lastExtractionAtMs={knowledge_flow.last_extraction_at_ms}
+        />
         <StatCard label="向量化率" value={`${(capture_flow.vectorization_rate * 100).toFixed(0)}%`}
           sub={`已入索引 ${fmt(capture_flow.vectorized_count)}/${fmt(capture_flow.eligible_count)}`} color="#5E5CE6" />
         <StatCard label="知识化率" value={`${(capture_flow.knowledge_generation_rate * 100).toFixed(0)}%`}
@@ -647,8 +732,49 @@ const OverviewContent: React.FC<{ data: MonitorOverview; range: OverviewRange }>
       </div>
 
       <div style={cardStyle}>
-        <div style={sectionTitle}>最近知识提炼记录</div>
-        {knowledge_flow.recent.length === 0
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+          <span style={sectionTitle as any}>最近知识提炼记录</span>
+          {knowledge_flow.extracting.length > 0 && (
+            <span style={{
+              display: 'inline-flex', alignItems: 'center', gap: 4,
+              fontSize: 11, padding: '1px 6px', borderRadius: 4,
+              background: 'rgba(52,199,89,0.12)', color: '#34C759', fontWeight: 600,
+            }}>
+              <span style={{
+                width: 6, height: 6, borderRadius: '50%', background: '#34C759',
+                animation: 'pulse 1.4s ease-in-out infinite',
+              }} />
+              提炼中 {knowledge_flow.extracting.length}
+            </span>
+          )}
+        </div>
+        {knowledge_flow.extracting.map((c, i) => (
+          <div
+            key={`extracting-${c.id}`}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 8, padding: '7px 0',
+              borderBottom: (i < knowledge_flow.extracting.length - 1 || knowledge_flow.recent.length > 0)
+                ? '1px solid rgba(0,0,0,0.05)' : 'none',
+              background: 'rgba(52,199,89,0.06)',
+              marginLeft: -12, marginRight: -12, paddingLeft: 12, paddingRight: 12,
+            }}
+          >
+            <span style={{
+              width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
+              background: '#34C759', animation: 'pulse 1.4s ease-in-out infinite',
+            }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {c.win_title || c.app_name || `capture #${c.id}`}
+              </div>
+              <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 2 }}>{fmtTs(c.ts)}</div>
+            </div>
+            <span style={{ fontSize: 11, padding: '1px 6px', borderRadius: 4, background: 'rgba(52,199,89,0.12)', color: '#34C759', fontWeight: 600 }}>
+              提炼中
+            </span>
+          </div>
+        ))}
+        {knowledge_flow.recent.length === 0 && knowledge_flow.extracting.length === 0
           ? <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无知识记录</div>
           : knowledge_flow.recent.map((item, i) => (
             <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 0',
@@ -1244,6 +1370,14 @@ const MonitorPanel: React.FC = () => {
     }, 30000)
     return () => window.clearInterval(timer)
   }, [tab, base, sysRange, isVisible])
+
+  useEffect(() => {
+    if (tab !== 'overview' || !isVisible) return
+    const timer = window.setInterval(() => {
+      load()
+    }, 15000)
+    return () => window.clearInterval(timer)
+  }, [tab, base, range, isVisible])
 
   useEffect(() => () => {
     systemAbortRef.current?.abort()

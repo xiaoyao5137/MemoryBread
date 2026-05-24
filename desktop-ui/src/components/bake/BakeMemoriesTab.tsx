@@ -197,9 +197,9 @@ const BakeMemoriesTab: React.FC<{
                   <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>将当前时间线加工为稳定、可复用的内容资产，三种提炼方式同级处理。</div>
                 </div>
                 <div className="bake-actions bake-actions--primary bake-memory-detail__action-copy">
-                  <BakeButton onClick={() => onPromoteToTemplate(selected.id)}>设计</BakeButton>
-                  <BakeButton onClick={() => onPromoteToSop(selected.id)}>操作手册</BakeButton>
+                  <BakeButton onClick={() => onPromoteToTemplate(selected.id)}>文档</BakeButton>
                   <BakeButton onClick={() => onPromoteToKnowledge(selected.id)}>知识</BakeButton>
+                  <BakeButton onClick={() => onPromoteToSop(selected.id)}>操作手册</BakeButton>
                 </div>
               </div>
 

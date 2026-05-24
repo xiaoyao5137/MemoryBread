@@ -4,8 +4,8 @@ import { BakeButton } from './BakeShared'
 
 const tabs: Array<{ key: BakeTab; label: string }> = [
   { key: 'overview', label: '总览' },
+  { key: 'templates', label: '文档' },
   { key: 'knowledge', label: '知识' },
-  { key: 'templates', label: '设计' },
   { key: 'sop', label: '操作手册' },
 ]
 

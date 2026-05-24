@@ -63,10 +63,10 @@ const BakeTemplatesTab: React.FC<{
   const totalPages = Math.max(1, Math.ceil(total / limit))
 
   const editingValues = useMemo(() => ({
-    name: selected?.name || '',
-    category: selected?.category || '',
+    name: selected?.title || '',
+    category: selected?.docType || '',
     promptHint: selected?.promptHint || '',
-    structureSections: selected?.structureSections.map(section => section.title).join('\n') || '',
+    structureSections: selected?.sections.map(section => section.title).join('\n') || '',
     stylePhrases: selected?.stylePhrases.join('\n') || '',
     replacementRules: selected?.replacementRules.map(item => `${item.from} => ${item.to}`).join('\n') || '',
   }), [selected])
@@ -92,10 +92,10 @@ const BakeTemplatesTab: React.FC<{
     if (!selected) return
     onUpdateTemplate(selected.id, template => ({
       ...template,
-      name: draftName.trim() || template.name,
-      category: draftCategory.trim() || template.category,
+      title: draftName.trim() || template.title,
+      docType: draftCategory.trim() || template.docType,
       promptHint: draftPromptHint.trim(),
-      structureSections: draftStructureSections
+      sections: draftStructureSections
         .split('\n')
         .map(item => item.trim())
         .filter(Boolean)
@@ -121,7 +121,7 @@ const BakeTemplatesTab: React.FC<{
     <>
       <BakeCard>
         <BakeSectionHeader
-          title="设计"
+          title="文档"
           subtitle="管理可复用的文档模板"
           right={<BakeButton primary onClick={onCreateTemplate}>新建模板</BakeButton>}
         />
@@ -146,7 +146,7 @@ const BakeTemplatesTab: React.FC<{
         <BakeCard className="bake-knowledge-list-card">
         <div className="bake-list bake-knowledge-list">
           {templates.length === 0 ? (
-            <div className="bake-muted">{query.trim() ? '当前筛选条件下没有设计。' : '当前还没有设计。'}</div>
+            <div className="bake-muted">{query.trim() ? '当前筛选条件下没有文档。' : '当前还没有文档。'}</div>
           ) : templates.map(item => {
             const active = item.id === selected?.id
             return (
@@ -158,8 +158,8 @@ const BakeTemplatesTab: React.FC<{
               >
                 <div className="bake-inline-meta">
                   <div style={{ minWidth: 0 }}>
-                    <div className="bake-list-item__title bake-line-clamp-2">{item.name}</div>
-                    <div className="bake-muted bake-line-clamp-1">{item.category} · 使用 {item.usageCount} 次</div>
+                    <div className="bake-list-item__title bake-line-clamp-2">{item.title}</div>
+                    <div className="bake-muted bake-line-clamp-1">{item.docType} · 使用 {item.usageCount} 次</div>
                   </div>
                   <BakePill text={formatTemplateStatus(item.status)} />
                 </div>
@@ -216,8 +216,8 @@ const BakeTemplatesTab: React.FC<{
           <div className="bake-kv bake-knowledge-detail">
             <div className="bake-inline-meta">
               <div>
-                <div className="bake-title" style={{ fontSize: 18 }}>{selected.name}</div>
-                <div className="bake-muted" style={{ marginTop: 4 }}>{selected.category} · 最近更新 {selected.updatedAt || '—'}</div>
+                <div className="bake-title" style={{ fontSize: 18 }}>{selected.title}</div>
+                <div className="bake-muted" style={{ marginTop: 4 }}>{selected.docType} · 最近更新 {selected.updatedAt || '—'}</div>
               </div>
               <div className="bake-inline-pills">
                 <BakePill text={formatTemplateStatus(selected.status)} />
@@ -268,7 +268,7 @@ const BakeTemplatesTab: React.FC<{
                 <div className="bake-knowledge-detail__section">
                   <div className="bake-kv__title">结构骨架（决定输出结构）</div>
                   <div className="bake-list">
-                    {selected.structureSections.length > 0 ? selected.structureSections.map(section => (
+                    {selected.sections.length > 0 ? selected.sections.map(section => (
                       <div key={section.title} className="bake-list-item">
                         <div className="bake-list-item__title">{section.title}</div>
                         <div className="bake-muted">关键词：{section.keywords.join(' / ') || '未设置'}</div>
@@ -288,7 +288,7 @@ const BakeTemplatesTab: React.FC<{
 
                 <div className="bake-knowledge-detail__section">
                   <div className="bake-kv__title">详细描述</div>
-                  <BakeMarkdown content={selected.detailedContent} />
+                  <BakeMarkdown content={selected.fullContent} />
                 </div>
               </>
             )}
