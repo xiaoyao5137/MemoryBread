@@ -197,6 +197,20 @@ pub struct KnowledgeFlow {
     pub pending_extraction_count: i64,
     pub by_time: Vec<KnowledgeTimePoint>,
     pub recent: Vec<KnowledgeItem>,
+    /// 当前正在被提炼的 captures（来自 sidecar 实时状态）
+    pub extracting: Vec<ExtractingCapture>,
+    /// 最近一次成功提炼的时间戳（毫秒）；从未提炼则为 None
+    pub last_extraction_at_ms: Option<i64>,
+    /// 提炼器状态：running / waiting / idle / stalled
+    pub extractor_status: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ExtractingCapture {
+    pub id: i64,
+    pub ts: i64,
+    pub app_name: String,
+    pub win_title: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -265,7 +279,7 @@ pub async fn monitor_overview(
     let knowledge_bucket_ms = knowledge_bucket_ms(&params.range);
     let fallback_noise_pattern = format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX);
 
-    let overview = state.storage.with_conn_async(move |conn| {
+    let mut overview = state.storage.with_conn_async(move |conn| {
         let db_size_bytes = conn.query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0)).unwrap_or(0)
             * conn.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0)).unwrap_or(0);
         let capture_total_count: i64 = conn.query_row(
@@ -580,6 +594,9 @@ pub async fn monitor_overview(
                 pending_extraction_count,
                 by_time: knowledge_by_time,
                 recent: knowledge_recent,
+                extracting: Vec::new(),
+                last_extraction_at_ms: None,
+                extractor_status: "stalled".to_string(),
             },
             rag_sessions: RagSessionStats {
                 today_count: rag_today_count,
@@ -597,7 +614,138 @@ pub async fn monitor_overview(
         })
     }).await?;
 
+    enrich_extractor_status(&mut overview.knowledge_flow, now_ms).await;
+
     Ok(Json(overview))
+}
+
+/// 直接读取 sidecar 写入的 ~/.memory-bread/state/extraction_status.json，
+/// 并据此推导 extractor_status 文案。
+///
+/// 选择文件而不是 HTTP：sidecar Flask 与 OCR/Paddle 在同一进程，
+/// 重负载时 GIL/socket 抢占会让 HTTP 探测假死，造成误报 stalled。
+/// 文件路径走 OS page cache，几乎零延迟，且 sidecar 即使卡住，
+/// 我们仍能拿到它最后一次落盘的真实状态。
+async fn enrich_extractor_status(flow: &mut KnowledgeFlow, now_ms: i64) {
+    const RECENT_ACTIVITY_WINDOW_MS: i64 = 5 * 60 * 1000;
+    // 文件超过 15 分钟没更新才认为 sidecar 真的死了：
+    // BackgroundProcessor 每次扫描（30s 间隔）会通过 mark/unmark 触发写入，
+    // 即使分组未成熟也会因为下一轮发现 pending 而再次触达此处。
+    const STATUS_FILE_STALENESS_MS: i64 = 15 * 60 * 1000;
+
+    let path = match std::env::var_os("HOME") {
+        Some(home) => std::path::PathBuf::from(home)
+            .join(".memory-bread")
+            .join("state")
+            .join("extraction_status.json"),
+        None => {
+            flow.extractor_status = "stalled".to_string();
+            return;
+        }
+    };
+
+    #[derive(Deserialize)]
+    struct SidecarExtracting {
+        id: i64,
+        ts: i64,
+        #[serde(default)]
+        app_name: String,
+        #[serde(default)]
+        win_title: String,
+    }
+
+    #[derive(Deserialize)]
+    struct SidecarStatus {
+        #[serde(default)]
+        running: bool,
+        #[serde(default)]
+        extracting_captures: Vec<SidecarExtracting>,
+        #[serde(default)]
+        last_extraction_at_ms: Option<i64>,
+        #[serde(default)]
+        updated_at_ms: Option<i64>,
+    }
+
+    let read_path = path.clone();
+    let read_result = tokio::task::spawn_blocking(move || std::fs::read(&read_path)).await;
+
+    let bytes = match read_result {
+        Ok(Ok(b)) => b,
+        _ => {
+            // 文件不存在或读失败：sidecar 后台处理器从未启动过
+            flow.extractor_status = if flow.pending_extraction_count > 0 {
+                "stalled".to_string()
+            } else {
+                "idle".to_string()
+            };
+            return;
+        }
+    };
+
+    let body: SidecarStatus = match serde_json::from_slice(&bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            flow.extractor_status = "stalled".to_string();
+            return;
+        }
+    };
+
+    flow.extracting = body
+        .extracting_captures
+        .into_iter()
+        .map(|c| ExtractingCapture {
+            id: c.id,
+            ts: c.ts,
+            app_name: c.app_name,
+            win_title: c.win_title,
+        })
+        .collect();
+    flow.last_extraction_at_ms = body.last_extraction_at_ms;
+
+    // 状态判定优先级：
+    //   1. 当前有 group 在提炼 → running
+    //   2. running=false（sidecar 标识自己未启动）→ stalled
+    //   3. 最近 5min 内有成功提炼 → running
+    //   4. 文件超过 15min 没更新且 pending>0 → stalled
+    //   5. pending=0 → idle
+    //   6. 其他 → waiting（在线但片段未成熟）
+    flow.extractor_status = if !flow.extracting.is_empty() {
+        "running".to_string()
+    } else if !body.running {
+        "stalled".to_string()
+    } else if let Some(last_ms) = flow.last_extraction_at_ms {
+        if now_ms.saturating_sub(last_ms) <= RECENT_ACTIVITY_WINDOW_MS {
+            "running".to_string()
+        } else if let Some(updated_ms) = body.updated_at_ms {
+            if now_ms.saturating_sub(updated_ms) > STATUS_FILE_STALENESS_MS
+                && flow.pending_extraction_count > 0
+            {
+                "stalled".to_string()
+            } else if flow.pending_extraction_count > 0 {
+                "waiting".to_string()
+            } else {
+                "idle".to_string()
+            }
+        } else if flow.pending_extraction_count > 0 {
+            "waiting".to_string()
+        } else {
+            "idle".to_string()
+        }
+    } else if let Some(updated_ms) = body.updated_at_ms {
+        if now_ms.saturating_sub(updated_ms) > STATUS_FILE_STALENESS_MS
+            && flow.pending_extraction_count > 0
+        {
+            "stalled".to_string()
+        } else if flow.pending_extraction_count > 0 {
+            "waiting".to_string()
+        } else {
+            "idle".to_string()
+        }
+    } else if flow.pending_extraction_count > 0 {
+        "waiting".to_string()
+    } else {
+        "idle".to_string()
+    };
 }
 
 // ── 系统资源响应结构 ──────────────────────────────────────────────────────────

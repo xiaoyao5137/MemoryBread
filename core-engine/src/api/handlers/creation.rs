@@ -20,6 +20,34 @@ pub struct GenerateRequest {
     pub timeline_ids: Vec<i64>,
     #[serde(default)]
     pub capture_ids: Vec<i64>,
+    #[serde(default)]
+    pub doc_type: String,
+    #[serde(default)]
+    pub audience: String,
+    #[serde(default = "default_output_format")]
+    pub output_format: String,
+    #[serde(default = "default_true")]
+    pub inherit_format: bool,
+    #[serde(default = "default_true")]
+    pub enable_rag: bool,
+    #[serde(default)]
+    pub enable_web_search: bool,
+    #[serde(default)]
+    pub enable_image_generation: bool,
+    #[serde(default = "default_content_weight")]
+    pub content_weight: f64,
+    #[serde(default = "default_quality_weight")]
+    pub quality_weight: f64,
+    #[serde(default = "default_completeness_weight")]
+    pub completeness_weight: f64,
+    #[serde(default = "default_usage_weight")]
+    pub usage_weight: f64,
+    #[serde(default = "default_format_weight")]
+    pub format_weight: f64,
+    #[serde(default = "default_freshness_weight")]
+    pub freshness_weight: f64,
+    #[serde(default = "default_max_references")]
+    pub max_references: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -28,6 +56,36 @@ struct CreationPayload {
     design_templates: Vec<serde_json::Value>,
     timeline_context: Option<String>,
     capture_context: Option<String>,
+    doc_type: String,
+    audience: String,
+    output_format: String,
+    inherit_format: bool,
+    enable_rag: bool,
+    enable_web_search: bool,
+    enable_image_generation: bool,
+    content_weight: f64,
+    quality_weight: f64,
+    completeness_weight: f64,
+    usage_weight: f64,
+    format_weight: f64,
+    freshness_weight: f64,
+    max_references: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReferencePayload {
+    user_prompt: String,
+    doc_type: String,
+    audience: String,
+    inherit_format: bool,
+    enable_rag: bool,
+    content_weight: f64,
+    quality_weight: f64,
+    completeness_weight: f64,
+    usage_weight: f64,
+    format_weight: f64,
+    freshness_weight: f64,
+    max_references: i64,
 }
 
 pub async fn generate_document(
@@ -36,12 +94,12 @@ pub async fn generate_document(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     info!("创作请求: prompt={}", req.user_prompt);
 
-    // 1. 查询设计模板
+    // 1. 查询文档模板
     let templates = state
         .storage
-        .get_design_templates(Some(5))
-        .map_err(|e| {
-            error!("查询设计模板失败: {}", e);
+        .get_document_templates(Some(5))
+        .map_err(|e: crate::storage::error::StorageError| {
+            error!("查询文档模板失败: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
@@ -49,8 +107,9 @@ pub async fn generate_document(
         .into_iter()
         .map(|t| {
             serde_json::json!({
-                "name": t.name,
-                "structure_sections": t.structure_sections,
+                "title": t.title,
+                "doc_type": t.doc_type,
+                "sections_json": t.sections_json,
                 "style_phrases": t.style_phrases,
             })
         })
@@ -76,6 +135,20 @@ pub async fn generate_document(
         design_templates,
         timeline_context,
         capture_context,
+        doc_type: req.doc_type,
+        audience: req.audience,
+        output_format: req.output_format,
+        inherit_format: req.inherit_format,
+        enable_rag: req.enable_rag,
+        enable_web_search: req.enable_web_search,
+        enable_image_generation: req.enable_image_generation,
+        content_weight: req.content_weight,
+        quality_weight: req.quality_weight,
+        completeness_weight: req.completeness_weight,
+        usage_weight: req.usage_weight,
+        format_weight: req.format_weight,
+        freshness_weight: req.freshness_weight,
+        max_references: req.max_references,
     };
 
     let client = reqwest::Client::new();
@@ -132,4 +205,84 @@ pub async fn generate_document(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+pub async fn preview_references(
+    Json(req): Json<GenerateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let payload = ReferencePayload {
+        user_prompt: req.user_prompt,
+        doc_type: req.doc_type,
+        audience: req.audience,
+        inherit_format: req.inherit_format,
+        enable_rag: req.enable_rag,
+        content_weight: req.content_weight,
+        quality_weight: req.quality_weight,
+        completeness_weight: req.completeness_weight,
+        usage_weight: req.usage_weight,
+        format_weight: req.format_weight,
+        freshness_weight: req.freshness_weight,
+        max_references: req.max_references,
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("http://localhost:8001/creation/references")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("调用 ai-sidecar 参考资料预览失败: {}", e);
+            (StatusCode::BAD_GATEWAY, format!("AI 服务不可用: {}", e))
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        error!("ai-sidecar 参考资料预览返回错误: {} - {}", status, body);
+        return Err((StatusCode::BAD_GATEWAY, format!("AI 服务错误: {}", body)));
+    }
+
+    let body = response.json::<serde_json::Value>().await.map_err(|e| {
+        error!("解析参考资料预览响应失败: {}", e);
+        (StatusCode::BAD_GATEWAY, format!("AI 服务响应格式错误: {}", e))
+    })?;
+
+    Ok(Json(body))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_output_format() -> String {
+    "markdown".to_string()
+}
+
+fn default_content_weight() -> f64 {
+    0.45
+}
+
+fn default_quality_weight() -> f64 {
+    0.15
+}
+
+fn default_completeness_weight() -> f64 {
+    0.15
+}
+
+fn default_usage_weight() -> f64 {
+    0.10
+}
+
+fn default_format_weight() -> f64 {
+    0.10
+}
+
+fn default_freshness_weight() -> f64 {
+    0.05
+}
+
+fn default_max_references() -> i64 {
+    6
 }

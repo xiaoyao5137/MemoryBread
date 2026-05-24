@@ -13,18 +13,18 @@ use super::{
     handlers::{
         action::execute_action,
         bake::{
-            adopt_bake_design, adopt_bake_knowledge, adopt_bake_sop, create_bake_design,
-            delete_bake_design, delete_bake_knowledge, delete_bake_sop,
+            adopt_bake_document, adopt_bake_knowledge, adopt_bake_sop, create_bake_document,
+            delete_bake_document, delete_bake_knowledge, delete_bake_sop,
             get_bake_capture, get_bake_capture_screenshot,
             get_bake_memory_preview, get_bake_overview, get_bake_style_config,
             ignore_bake_knowledge, ignore_bake_memory, ignore_bake_sop, initialize_bake_memories,
-            list_bake_captures, list_bake_designs, list_bake_knowledge, list_bake_memories,
-            list_bake_sops, promote_bake_memory_to_design, promote_bake_memory_to_sop,
-            run_bake_pipeline, toggle_bake_design_status, update_bake_design,
+            list_bake_captures, list_bake_documents, list_bake_knowledge, list_bake_memories,
+            list_bake_sops, promote_bake_memory_to_document, promote_bake_memory_to_sop,
+            run_bake_pipeline, toggle_bake_document_status, update_bake_document,
             update_bake_style_config,
         },
         captures::list_captures,
-        creation::generate_document,
+        creation::{generate_document, preview_references},
         debug::{
             clear_extraction_queue, debug_log_content, debug_log_files, system_stats, vector_status,
         },
@@ -70,6 +70,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/preferences/:key", put(update_preference))
         .route("/pii/scrub", post(pii_scrub))
         .route("/api/creation/generate", post(generate_document))
+        .route("/api/creation/references", post(preview_references))
         .route("/api/vector/status", get(vector_status))
         .route("/api/stats", get(system_stats))
         .route("/api/debug/log-files", get(debug_log_files))
@@ -130,15 +131,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/bake/sops/:id", axum::routing::delete(delete_bake_sop))
         .route("/api/bake/sops/:id/adopt", post(adopt_bake_sop))
         .route("/api/bake/sops/:id/ignore", post(ignore_bake_sop))
-        .route("/api/bake/designs", get(list_bake_designs).post(create_bake_design))
+        .route("/api/bake/documents", get(list_bake_documents).post(create_bake_document))
         .route(
-            "/api/bake/designs/:id",
-            put(update_bake_design).delete(delete_bake_design),
+            "/api/bake/documents/:id",
+            put(update_bake_document).delete(delete_bake_document),
         )
-        .route("/api/bake/designs/:id/adopt", post(adopt_bake_design))
+        .route("/api/bake/documents/:id/adopt", post(adopt_bake_document))
         .route(
-            "/api/bake/designs/:id/toggle-status",
-            post(toggle_bake_design_status),
+            "/api/bake/documents/:id/toggle-status",
+            post(toggle_bake_document_status),
         )
         .route("/api/bake/articles", get(list_bake_memories))
         .route("/api/bake/memories", get(list_bake_memories))
@@ -163,12 +164,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/bake/articles/:id/ignore", post(ignore_bake_memory))
         .route("/api/bake/memories/:id/ignore", post(ignore_bake_memory))
         .route(
-            "/api/bake/articles/:id/promote-design",
-            post(promote_bake_memory_to_design),
+            "/api/bake/articles/:id/promote-document",
+            post(promote_bake_memory_to_document),
         )
         .route(
-            "/api/bake/memories/:id/promote-design",
-            post(promote_bake_memory_to_design),
+            "/api/bake/memories/:id/promote-document",
+            post(promote_bake_memory_to_document),
         )
         .route(
             "/api/bake/articles/:id/promote-sop",

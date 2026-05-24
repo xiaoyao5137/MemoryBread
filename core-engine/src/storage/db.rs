@@ -104,6 +104,18 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "023_rename_bake_run_design_count",
         include_str!("migrations/023_rename_bake_run_design_count.sql"),
     ),
+    (
+        "024_create_bake_documents",
+        include_str!("migrations/024_create_bake_documents.sql"),
+    ),
+    (
+        "025_add_capture_web_source",
+        include_str!("migrations/025_add_capture_web_source.sql"),
+    ),
+    (
+        "026_add_capture_screenshot_source",
+        include_str!("migrations/026_add_capture_screenshot_source.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

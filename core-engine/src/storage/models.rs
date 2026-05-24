@@ -64,10 +64,13 @@ pub struct CaptureRecord {
     pub ax_focused_id: Option<String>,
     pub ocr_text: Option<String>,
     pub screenshot_path: Option<String>,
+    pub screenshot_source: Option<String>,
     pub input_text: Option<String>,
     pub audio_text: Option<String>,
     pub is_sensitive: bool,
     pub pii_scrubbed: bool,
+    pub url: Option<String>,
+    pub webpage_title: Option<String>,
 }
 
 impl CaptureRecord {
@@ -90,8 +93,11 @@ pub struct NewCapture {
     pub ax_focused_id: Option<String>,
     pub ocr_text: Option<String>,
     pub screenshot_path: Option<String>,
+    pub screenshot_source: Option<String>,
     pub input_text: Option<String>,
     pub is_sensitive: bool,
+    pub url: Option<String>,
+    pub webpage_title: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

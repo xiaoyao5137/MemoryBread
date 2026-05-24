@@ -1,7 +1,7 @@
 //! repo 子模块：每张表的 CRUD 操作集合
 
 pub mod action_log;
-pub mod bake_design;
+pub mod bake_document;
 pub mod bake_run;
 pub mod capture;
 pub mod knowledge;

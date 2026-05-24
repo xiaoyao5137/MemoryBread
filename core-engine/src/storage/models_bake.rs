@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::storage::db::current_ts_ms;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BakeDesignRecord {
+pub struct BakeDocumentRecord {
     pub id: i64,
-    pub name: String,
-    pub category: String,
+    pub title: String,
+    pub doc_type: String,
     pub status: String,
     pub tags: String,
     pub applicable_tasks: String,
@@ -14,13 +14,20 @@ pub struct BakeDesignRecord {
     pub source_capture_ids: String,
     pub source_episode_ids: String,
     pub linked_knowledge_ids: String,
-    pub structure_sections: String,
+    pub sections_json: String,
     pub style_phrases: String,
     pub replacement_rules: String,
+    pub summary: Option<String>,
+    pub full_content: Option<String>,
+    pub structured_content: String,
     pub prompt_hint: Option<String>,
-    pub detailed_content: Option<String>,
     pub diagram_code: Option<String>,
     pub image_assets: String,
+    pub source_app_name: Option<String>,
+    pub source_win_title: Option<String>,
+    pub source_url: Option<String>,
+    pub content_hash: Option<String>,
+    pub language: Option<String>,
     pub usage_count: i64,
     pub match_score: Option<f64>,
     pub match_level: Option<String>,
@@ -34,9 +41,9 @@ pub struct BakeDesignRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewBakeDesign {
-    pub name: String,
-    pub category: String,
+pub struct NewBakeDocument {
+    pub title: String,
+    pub doc_type: String,
     pub status: String,
     pub tags: String,
     pub applicable_tasks: String,
@@ -44,13 +51,20 @@ pub struct NewBakeDesign {
     pub source_capture_ids: String,
     pub source_episode_ids: String,
     pub linked_knowledge_ids: String,
-    pub structure_sections: String,
+    pub sections_json: String,
     pub style_phrases: String,
     pub replacement_rules: String,
+    pub summary: Option<String>,
+    pub full_content: Option<String>,
+    pub structured_content: String,
     pub prompt_hint: Option<String>,
-    pub detailed_content: Option<String>,
     pub diagram_code: Option<String>,
     pub image_assets: String,
+    pub source_app_name: Option<String>,
+    pub source_win_title: Option<String>,
+    pub source_url: Option<String>,
+    pub content_hash: Option<String>,
+    pub language: Option<String>,
     pub usage_count: i64,
     pub match_score: Option<f64>,
     pub match_level: Option<String>,
@@ -61,11 +75,11 @@ pub struct NewBakeDesign {
     pub deleted_at: Option<i64>,
 }
 
-impl NewBakeDesign {
-    pub fn with_defaults(name: String, category: String) -> Self {
+impl NewBakeDocument {
+    pub fn with_defaults(title: String, doc_type: String) -> Self {
         Self {
-            name,
-            category,
+            title,
+            doc_type,
             status: "draft".to_string(),
             tags: "[]".to_string(),
             applicable_tasks: "[]".to_string(),
@@ -73,13 +87,20 @@ impl NewBakeDesign {
             source_capture_ids: "[]".to_string(),
             source_episode_ids: "[]".to_string(),
             linked_knowledge_ids: "[]".to_string(),
-            structure_sections: "[]".to_string(),
+            sections_json: "[]".to_string(),
             style_phrases: "[]".to_string(),
             replacement_rules: "[]".to_string(),
+            summary: None,
+            full_content: None,
+            structured_content: "{}".to_string(),
             prompt_hint: None,
-            detailed_content: None,
             diagram_code: None,
             image_assets: "[]".to_string(),
+            source_app_name: None,
+            source_win_title: None,
+            source_url: None,
+            content_hash: None,
+            language: None,
             usage_count: 0,
             match_score: None,
             match_level: None,
@@ -246,6 +267,10 @@ pub struct BakeMemorySourceRecord {
     pub capture_ocr_text: Option<String>,
     pub capture_input_text: Option<String>,
     pub capture_audio_text: Option<String>,
+    pub capture_url: Option<String>,
+    pub capture_webpage_title: Option<String>,
+    pub url_aggregated_text: Option<String>,
+    pub url_aggregated_capture_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,7 +339,7 @@ pub struct BakeRunRecord {
     pub candidate_count: i64,
     pub discarded_count: i64,
     pub knowledge_created_count: i64,
-    pub design_created_count: i64,
+    pub document_created_count: i64,
     pub sop_created_count: i64,
     pub error_message: Option<String>,
     pub latency_ms: Option<i64>,

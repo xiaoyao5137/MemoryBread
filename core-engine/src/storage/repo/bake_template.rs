@@ -3,52 +3,52 @@ use rusqlite::{params, Connection};
 use crate::storage::{
     db::current_ts_ms,
     error::StorageError,
-    models_bake::{BakeDesignRecord, NewBakeDesign},
+    models_bake::{BakeTemplateRecord, NewBakeTemplate},
     StorageManager,
 };
 
 impl StorageManager {
-    pub fn insert_bake_design(&self, design: &NewBakeDesign) -> Result<i64, StorageError> {
-        self.with_conn(|conn| insert_bake_design_inner(conn, design))
+    pub fn insert_bake_template(&self, template: &NewBakeTemplate) -> Result<i64, StorageError> {
+        self.with_conn(|conn| insert_bake_template_inner(conn, template))
     }
 
-    pub fn get_bake_design(&self, id: i64) -> Result<Option<BakeDesignRecord>, StorageError> {
+    pub fn get_bake_template(&self, id: i64) -> Result<Option<BakeTemplateRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, category, status, tags, applicable_tasks, source_memory_ids,
+                "SELECT id, name, category, status, tags, applicable_tasks, source_article_ids,
                         source_capture_ids, source_episode_ids, linked_knowledge_ids,
                         structure_sections, style_phrases, replacement_rules,
-                        prompt_hint, detailed_content, diagram_code, image_assets, usage_count,
+                        prompt_hint, diagram_code, image_assets, usage_count,
                         match_score, match_level, creation_mode, review_status,
                         evidence_summary, generation_version, deleted_at,
                         created_at, updated_at
-                 FROM bake_designs WHERE id = ?1",
+                 FROM bake_templates WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
-                Ok(Some(row_to_bake_design(row)?))
+                Ok(Some(row_to_bake_template(row)?))
             } else {
                 Ok(None)
             }
         })
     }
 
-    pub fn list_bake_designs_paginated(
+    pub fn list_bake_templates_paginated(
         &self,
         query: Option<&str>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<BakeDesignRecord>, StorageError> {
+    ) -> Result<Vec<BakeTemplateRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut sql = String::from(
-                "SELECT id, name, category, status, tags, applicable_tasks, source_memory_ids,
+                "SELECT id, name, category, status, tags, applicable_tasks, source_article_ids,
                         source_capture_ids, source_episode_ids, linked_knowledge_ids,
                         structure_sections, style_phrases, replacement_rules,
-                        prompt_hint, detailed_content, diagram_code, image_assets, usage_count,
+                        prompt_hint, diagram_code, image_assets, usage_count,
                         match_score, match_level, creation_mode, review_status,
                         evidence_summary, generation_version, deleted_at,
                         created_at, updated_at
-                 FROM bake_designs WHERE deleted_at IS NULL",
+                 FROM bake_templates WHERE deleted_at IS NULL",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
             if let Some(q) = query {
@@ -68,17 +68,17 @@ impl StorageManager {
             let params: Vec<&dyn rusqlite::ToSql> =
                 bind_values.iter().map(|b| b.as_ref()).collect();
             let rows = stmt.query_map(params.as_slice(), |row| {
-                Ok(row_to_bake_design(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
+                Ok(row_to_bake_template(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(StorageError::Sqlite)
         })
     }
 
-    pub fn count_bake_designs_filtered(&self, query: Option<&str>) -> Result<i64, StorageError> {
+    pub fn count_bake_templates_filtered(&self, query: Option<&str>) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
             let mut sql =
-                String::from("SELECT COUNT(*) FROM bake_designs WHERE deleted_at IS NULL");
+                String::from("SELECT COUNT(*) FROM bake_templates WHERE deleted_at IS NULL");
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
             if let Some(q) = query {
                 sql.push_str(
@@ -98,71 +98,69 @@ impl StorageManager {
         })
     }
 
-    pub fn list_bake_designs(&self) -> Result<Vec<BakeDesignRecord>, StorageError> {
+    pub fn list_bake_templates(&self) -> Result<Vec<BakeTemplateRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, category, status, tags, applicable_tasks, source_memory_ids,
+                "SELECT id, name, category, status, tags, applicable_tasks, source_article_ids,
                         source_capture_ids, source_episode_ids, linked_knowledge_ids,
                         structure_sections, style_phrases, replacement_rules,
-                        prompt_hint, detailed_content, diagram_code, image_assets, usage_count,
+                        prompt_hint, diagram_code, image_assets, usage_count,
                         match_score, match_level, creation_mode, review_status,
                         evidence_summary, generation_version, deleted_at,
                         created_at, updated_at
-                 FROM bake_designs
+                 FROM bake_templates
                  WHERE deleted_at IS NULL
                  ORDER BY updated_at DESC, id DESC",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok(row_to_bake_design(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
+                Ok(row_to_bake_template(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(StorageError::Sqlite)
         })
     }
 
-    pub fn update_bake_design(
+    pub fn update_bake_template(
         &self,
         id: i64,
-        design: &NewBakeDesign,
+        template: &NewBakeTemplate,
     ) -> Result<bool, StorageError> {
         let updated_at = current_ts_ms();
         self.with_conn(|conn| {
             let affected = conn.execute(
-                "UPDATE bake_designs
+                "UPDATE bake_templates
                  SET name = ?1, category = ?2, status = ?3, tags = ?4, applicable_tasks = ?5,
-                     source_memory_ids = ?6, source_capture_ids = ?7, source_episode_ids = ?8,
+                     source_article_ids = ?6, source_capture_ids = ?7, source_episode_ids = ?8,
                      linked_knowledge_ids = ?9, structure_sections = ?10,
-                     style_phrases = ?11, replacement_rules = ?12, prompt_hint = ?13,
-                     detailed_content = ?14, diagram_code = ?15, image_assets = ?16,
-                     usage_count = ?17, match_score = ?18, match_level = ?19,
-                     creation_mode = ?20, review_status = ?21, evidence_summary = ?22,
-                     generation_version = ?23, deleted_at = ?24, updated_at = ?25
-                 WHERE id = ?26",
+                     style_phrases = ?11, replacement_rules = ?12, prompt_hint = ?13, diagram_code = ?14,
+                     image_assets = ?15, usage_count = ?16, match_score = ?17, match_level = ?18,
+                     creation_mode = ?19, review_status = ?20, evidence_summary = ?21,
+                     generation_version = ?22, deleted_at = ?23, updated_at = ?24
+                 WHERE id = ?25",
                 params![
-                    design.name,
-                    design.category,
-                    design.status,
-                    design.tags,
-                    design.applicable_tasks,
-                    design.source_memory_ids,
-                    design.source_capture_ids,
-                    design.source_episode_ids,
-                    design.linked_knowledge_ids,
-                    design.structure_sections,
-                    design.style_phrases,
-                    design.replacement_rules,
-                    design.prompt_hint,
-                    design.detailed_content,
-                    design.diagram_code,
-                    design.image_assets,
-                    design.usage_count,
-                    design.match_score,
-                    design.match_level,
-                    design.creation_mode,
-                    design.review_status,
-                    design.evidence_summary,
-                    design.generation_version,
-                    design.deleted_at,
+                    template.name,
+                    template.category,
+                    template.status,
+                    template.tags,
+                    template.applicable_tasks,
+                    template.source_memory_ids,
+                    template.source_capture_ids,
+                    template.source_episode_ids,
+                    template.linked_knowledge_ids,
+                    template.structure_sections,
+                    template.style_phrases,
+                    template.replacement_rules,
+                    template.prompt_hint,
+                    template.diagram_code,
+                    template.image_assets,
+                    template.usage_count,
+                    template.match_score,
+                    template.match_level,
+                    template.creation_mode,
+                    template.review_status,
+                    template.evidence_summary,
+                    template.generation_version,
+                    template.deleted_at,
                     updated_at,
                     id,
                 ],
@@ -171,16 +169,16 @@ impl StorageManager {
         })
     }
 
-    pub fn toggle_bake_design_status(
+    pub fn toggle_bake_template_status(
         &self,
         id: i64,
-    ) -> Result<Option<BakeDesignRecord>, StorageError> {
-        let maybe_design = self.get_bake_design(id)?;
-        let Some(design) = maybe_design else {
+    ) -> Result<Option<BakeTemplateRecord>, StorageError> {
+        let maybe_template = self.get_bake_template(id)?;
+        let Some(template) = maybe_template else {
             return Ok(None);
         };
 
-        let next_status = if design.status == "enabled" {
+        let next_status = if template.status == "enabled" {
             "disabled"
         } else {
             "enabled"
@@ -188,20 +186,20 @@ impl StorageManager {
         let updated_at = current_ts_ms();
         self.with_conn(|conn| {
             conn.execute(
-                "UPDATE bake_designs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE bake_templates SET status = ?1, updated_at = ?2 WHERE id = ?3",
                 params![next_status, updated_at, id],
             )?;
             Ok(())
         })?;
 
-        self.get_bake_design(id)
+        self.get_bake_template(id)
     }
 
-    pub fn soft_delete_bake_design(&self, id: i64) -> Result<bool, StorageError> {
+    pub fn soft_delete_bake_template(&self, id: i64) -> Result<bool, StorageError> {
         let deleted_at = current_ts_ms();
         self.with_conn(|conn| {
             let affected = conn.execute(
-                "UPDATE bake_designs SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                "UPDATE bake_templates SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
                 params![deleted_at, id],
             )?;
             Ok(affected > 0)
@@ -209,44 +207,43 @@ impl StorageManager {
     }
 }
 
-fn insert_bake_design_inner(
+fn insert_bake_template_inner(
     conn: &Connection,
-    design: &NewBakeDesign,
+    template: &NewBakeTemplate,
 ) -> Result<i64, StorageError> {
     let now = current_ts_ms();
     conn.execute(
-        "INSERT INTO bake_designs (
-            name, category, status, tags, applicable_tasks, source_memory_ids,
+        "INSERT INTO bake_templates (
+            name, category, status, tags, applicable_tasks, source_article_ids,
             source_capture_ids, source_episode_ids, linked_knowledge_ids,
-            structure_sections, style_phrases, replacement_rules, prompt_hint, detailed_content, diagram_code,
+            structure_sections, style_phrases, replacement_rules, prompt_hint, diagram_code,
             image_assets, usage_count, match_score, match_level, creation_mode, review_status,
             evidence_summary, generation_version, deleted_at, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
-            design.name,
-            design.category,
-            design.status,
-            design.tags,
-            design.applicable_tasks,
-            design.source_memory_ids,
-            design.source_capture_ids,
-            design.source_episode_ids,
-            design.linked_knowledge_ids,
-            design.structure_sections,
-            design.style_phrases,
-            design.replacement_rules,
-            design.prompt_hint,
-            design.detailed_content,
-            design.diagram_code,
-            design.image_assets,
-            design.usage_count,
-            design.match_score,
-            design.match_level,
-            design.creation_mode,
-            design.review_status,
-            design.evidence_summary,
-            design.generation_version,
-            design.deleted_at,
+            template.name,
+            template.category,
+            template.status,
+            template.tags,
+            template.applicable_tasks,
+            template.source_memory_ids,
+            template.source_capture_ids,
+            template.source_episode_ids,
+            template.linked_knowledge_ids,
+            template.structure_sections,
+            template.style_phrases,
+            template.replacement_rules,
+            template.prompt_hint,
+            template.diagram_code,
+            template.image_assets,
+            template.usage_count,
+            template.match_score,
+            template.match_level,
+            template.creation_mode,
+            template.review_status,
+            template.evidence_summary,
+            template.generation_version,
+            template.deleted_at,
             now,
             now,
         ],
@@ -254,8 +251,8 @@ fn insert_bake_design_inner(
     Ok(conn.last_insert_rowid())
 }
 
-fn row_to_bake_design(row: &rusqlite::Row<'_>) -> Result<BakeDesignRecord, StorageError> {
-    Ok(BakeDesignRecord {
+fn row_to_bake_template(row: &rusqlite::Row<'_>) -> Result<BakeTemplateRecord, StorageError> {
+    Ok(BakeTemplateRecord {
         id: row.get(0)?,
         name: row.get(1)?,
         category: row.get(2)?,
@@ -270,19 +267,18 @@ fn row_to_bake_design(row: &rusqlite::Row<'_>) -> Result<BakeDesignRecord, Stora
         style_phrases: row.get(11)?,
         replacement_rules: row.get(12)?,
         prompt_hint: row.get(13)?,
-        detailed_content: row.get(14)?,
-        diagram_code: row.get(15)?,
-        image_assets: row.get(16)?,
-        usage_count: row.get(17)?,
-        match_score: row.get(18)?,
-        match_level: row.get(19)?,
-        creation_mode: row.get(20)?,
-        review_status: row.get(21)?,
-        evidence_summary: row.get(22)?,
-        generation_version: row.get(23)?,
-        deleted_at: row.get(24)?,
-        created_at: row.get(25)?,
-        updated_at: row.get(26)?,
+        diagram_code: row.get(14)?,
+        image_assets: row.get(15)?,
+        usage_count: row.get(16)?,
+        match_score: row.get(17)?,
+        match_level: row.get(18)?,
+        creation_mode: row.get(19)?,
+        review_status: row.get(20)?,
+        evidence_summary: row.get(21)?,
+        generation_version: row.get(22)?,
+        deleted_at: row.get(23)?,
+        created_at: row.get(24)?,
+        updated_at: row.get(25)?,
     })
 }
 
@@ -294,8 +290,8 @@ mod tests {
         StorageManager::open_in_memory().expect("内存数据库初始化失败")
     }
 
-    fn sample_design() -> NewBakeDesign {
-        NewBakeDesign {
+    fn sample_template() -> NewBakeTemplate {
+        NewBakeTemplate {
             name: "技术方案结构版".to_string(),
             category: "技术方案".to_string(),
             status: "draft".to_string(),
@@ -309,7 +305,6 @@ mod tests {
             style_phrases: r#"[\"整体看\"]"#.to_string(),
             replacement_rules: r#"[{\"from\":\"综上\",\"to\":\"整体看\"}]"#.to_string(),
             prompt_hint: Some("优先输出结构化方案".to_string()),
-            detailed_content: Some("## 模板价值\n用于技术方案写作。".to_string()),
             diagram_code: None,
             image_assets: "[]".to_string(),
             usage_count: 0,
@@ -324,36 +319,36 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_and_get_bake_design() {
+    fn test_insert_and_get_bake_template() {
         let mgr = make_mgr();
-        let id = mgr.insert_bake_design(&sample_design()).unwrap();
-        let design = mgr.get_bake_design(id).unwrap().unwrap();
-        assert_eq!(design.name, "技术方案结构版");
-        assert_eq!(design.category, "技术方案");
-        assert_eq!(design.creation_mode, "auto");
-        assert_eq!(design.review_status, "auto_created");
+        let id = mgr.insert_bake_template(&sample_template()).unwrap();
+        let template = mgr.get_bake_template(id).unwrap().unwrap();
+        assert_eq!(template.name, "技术方案结构版");
+        assert_eq!(template.category, "技术方案");
+        assert_eq!(template.creation_mode, "auto");
+        assert_eq!(template.review_status, "auto_created");
     }
 
     #[test]
-    fn test_update_bake_design() {
+    fn test_update_bake_template() {
         let mgr = make_mgr();
-        let id = mgr.insert_bake_design(&sample_design()).unwrap();
-        let mut updated = sample_design();
+        let id = mgr.insert_bake_template(&sample_template()).unwrap();
+        let mut updated = sample_template();
         updated.name = "周报模板".to_string();
         updated.status = "enabled".to_string();
         updated.review_status = "accepted".to_string();
-        assert!(mgr.update_bake_design(id, &updated).unwrap());
-        let design = mgr.get_bake_design(id).unwrap().unwrap();
-        assert_eq!(design.name, "周报模板");
-        assert_eq!(design.status, "enabled");
-        assert_eq!(design.review_status, "accepted");
+        assert!(mgr.update_bake_template(id, &updated).unwrap());
+        let template = mgr.get_bake_template(id).unwrap().unwrap();
+        assert_eq!(template.name, "周报模板");
+        assert_eq!(template.status, "enabled");
+        assert_eq!(template.review_status, "accepted");
     }
 
     #[test]
-    fn test_toggle_bake_design_status() {
+    fn test_toggle_bake_template_status() {
         let mgr = make_mgr();
-        let id = mgr.insert_bake_design(&sample_design()).unwrap();
-        let toggled = mgr.toggle_bake_design_status(id).unwrap().unwrap();
+        let id = mgr.insert_bake_template(&sample_template()).unwrap();
+        let toggled = mgr.toggle_bake_template_status(id).unwrap().unwrap();
         assert_eq!(toggled.status, "enabled");
     }
 }

@@ -73,8 +73,9 @@ fn insert_capture_inner(conn: &Connection, c: &NewCapture) -> Result<i64, Storag
         "INSERT INTO captures
             (ts, app_name, app_bundle_id, win_title, event_type,
              ax_text, ax_focused_role, ax_focused_id,
-             ocr_text, screenshot_path, input_text, is_sensitive)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             ocr_text, screenshot_path, screenshot_source, input_text, is_sensitive,
+             url, webpage_title)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             c.ts,
             c.app_name,
@@ -86,8 +87,11 @@ fn insert_capture_inner(conn: &Connection, c: &NewCapture) -> Result<i64, Storag
             c.ax_focused_id,
             c.ocr_text,
             c.screenshot_path,
+            c.screenshot_source,
             c.input_text,
             c.is_sensitive as i64,
+            c.url,
+            c.webpage_title,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -145,7 +149,7 @@ impl StorageManager {
                 "SELECT id, ts, app_name, app_bundle_id, win_title, event_type,
                         ax_text, ax_focused_role, ax_focused_id,
                         ocr_text, screenshot_path, input_text, audio_text,
-                        is_sensitive, pii_scrubbed
+                        is_sensitive, pii_scrubbed, screenshot_source, url, webpage_title
                  FROM captures WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
@@ -168,7 +172,7 @@ impl StorageManager {
                 "SELECT id, ts, app_name, app_bundle_id, win_title, event_type,
                         ax_text, ax_focused_role, ax_focused_id,
                         ocr_text, screenshot_path, input_text, audio_text,
-                        is_sensitive, pii_scrubbed
+                        is_sensitive, pii_scrubbed, screenshot_source, url, webpage_title
                  FROM captures WHERE id IN ({}) ORDER BY ts",
                 placeholders
             );
@@ -192,7 +196,7 @@ impl StorageManager {
                 "SELECT c.id, c.ts, c.app_name, c.app_bundle_id, c.win_title, c.event_type,
                         c.ax_text, c.ax_focused_role, c.ax_focused_id,
                         c.ocr_text, c.screenshot_path, c.input_text, c.audio_text,
-                        c.is_sensitive, c.pii_scrubbed
+                        c.is_sensitive, c.pii_scrubbed, c.screenshot_source, c.url, c.webpage_title
                  FROM captures c",
             );
             let query_pattern = filter.query.as_ref().map(|value| format!("%{}%", value));
@@ -284,7 +288,7 @@ impl StorageManager {
                 "SELECT c.id, c.ts, c.app_name, c.app_bundle_id, c.win_title, c.event_type,
                         c.ax_text, c.ax_focused_role, c.ax_focused_id,
                         c.ocr_text, c.screenshot_path, c.input_text, c.audio_text,
-                        c.is_sensitive, c.pii_scrubbed
+                        c.is_sensitive, c.pii_scrubbed, c.screenshot_source, c.url, c.webpage_title
                  FROM captures c
                  JOIN captures_fts f ON f.rowid = c.id
                  WHERE captures_fts MATCH ?1
@@ -315,7 +319,10 @@ impl StorageManager {
         })
     }
 
-    /// 简单列举最近的 N 条采集记录（用于调试面板）。
+    /// 查询一批 capture 各自所属时间线的 (timeline_id, summary)。
+    ///
+    /// 走 captures.knowledge_id → timelines 直连，能正确覆盖被合并到时间线的从属
+    /// capture（leader/follower 都能查到归属）。
     pub fn list_capture_knowledge_links(
         &self,
         capture_ids: &[i64],
@@ -330,11 +337,10 @@ impl StorageManager {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT em.capture_id, bk.id, bk.summary
-                 FROM bake_knowledge bk
-                 JOIN timelines em ON em.id = bk.timeline_id
-                 WHERE em.capture_id IN ({})
-                 ORDER BY bk.updated_at DESC, bk.id DESC",
+                "SELECT c.id, t.id, t.summary
+                 FROM captures c
+                 JOIN timelines t ON t.id = c.knowledge_id
+                 WHERE c.id IN ({}) AND c.knowledge_id IS NOT NULL",
                 placeholders
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -352,8 +358,8 @@ impl StorageManager {
 
             let mut result = std::collections::HashMap::new();
             for row in rows {
-                let (capture_id, knowledge_id, summary) = row?;
-                result.entry(capture_id).or_insert((knowledge_id, summary));
+                let (capture_id, timeline_id, summary) = row?;
+                result.entry(capture_id).or_insert((timeline_id, summary));
             }
             Ok(result)
         })
@@ -394,7 +400,7 @@ impl StorageManager {
                 "SELECT c.id, c.ts, c.app_name, c.app_bundle_id, c.win_title, c.event_type,
                         c.ax_text, c.ax_focused_role, c.ax_focused_id,
                         c.ocr_text, c.screenshot_path, c.input_text, c.audio_text,
-                        c.is_sensitive, c.pii_scrubbed
+                        c.is_sensitive, c.pii_scrubbed, c.screenshot_source, c.url, c.webpage_title
                  FROM captures c
                  JOIN captures_fts f ON f.rowid = c.id
                  WHERE captures_fts MATCH ?1
@@ -432,6 +438,9 @@ fn row_to_capture(row: &rusqlite::Row<'_>) -> Result<CaptureRecord, StorageError
         audio_text: row.get(12)?,
         is_sensitive: row.get::<_, i64>(13)? != 0,
         pii_scrubbed: row.get::<_, i64>(14)? != 0,
+        screenshot_source: row.get(15)?,
+        url: row.get(16)?,
+        webpage_title: row.get(17)?,
     })
 }
 
@@ -460,6 +469,7 @@ mod tests {
             ax_focused_id: Some("input-1".into()),
             ocr_text: None,
             screenshot_path: Some("2026/03/04/test.jpg".into()),
+            screenshot_source: Some("window".into()),
             input_text: Some("你好".into()),
             is_sensitive: false,
         }

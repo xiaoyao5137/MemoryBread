@@ -35,6 +35,10 @@ pub struct AXInfo {
     pub app_bundle_id: Option<String>,
     /// 窗口标题
     pub win_title: Option<String>,
+    /// 如果前台是浏览器，当前页面 URL。
+    pub url: Option<String>,
+    /// 如果前台是浏览器，当前页面标题。
+    pub webpage_title: Option<String>,
     /// 当前焦点元素的 AX Role，如 "AXTextField"（用于密码框检测）
     pub focused_role: Option<String>,
     /// 当前焦点元素的标识符（用于执行器精确定位）
@@ -211,6 +215,21 @@ pub fn get_frontmost_info() -> Option<AXInfo> {
     #[cfg(any(not(target_os = "macos"), test))]
     {
         None
+    }
+}
+
+/// 检查 AX 调用是否处于熔断冷却期。
+///
+/// `true` 表示当前已连续超时 ≥ `MAX_CONSECUTIVE_TIMEOUTS` 次且仍在冷却窗口内。
+/// 该函数仅做只读检查，不修改任何状态，供外部门禁联动使用。
+pub fn is_circuit_breaker_tripped() -> bool {
+    if TIMEOUT_COUNTER.load(Ordering::Relaxed) < MAX_CONSECUTIVE_TIMEOUTS {
+        return false;
+    }
+    let last_reset = LAST_RESET_TIME.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+    match last_reset.lock() {
+        Ok(guard) => guard.elapsed().as_secs() < CIRCUIT_BREAKER_COOLDOWN_SECS,
+        Err(_) => false,
     }
 }
 
@@ -428,6 +447,12 @@ mod macos_impl {
         let app_name = info.app_name.clone();
         let app_bundle_id = info.app_bundle_id.clone();
         let win_title = info.win_title.clone();
+        if let Some((url, title)) =
+            get_browser_page_metadata(app_bundle_id.as_deref(), app_name.as_deref())
+        {
+            info.url = Some(url);
+            info.webpage_title = Some(title);
+        }
         info.extracted_text = extract_ax_text_for_context(
             app_name.as_deref(),
             app_bundle_id.as_deref(),
@@ -557,12 +582,104 @@ end tell"#,
             }
         };
 
+        let (url, webpage_title) =
+            get_browser_page_metadata(app_bundle_id.as_deref(), app_name.as_deref())
+                .map(|(url, title)| (Some(url), Some(title)))
+                .unwrap_or((None, None));
+
         Some(AXInfo {
             app_name,
             app_bundle_id,
             win_title,
+            url,
+            webpage_title,
             ..Default::default()
         })
+    }
+
+    fn get_browser_page_metadata(
+        bundle_id: Option<&str>,
+        app_name: Option<&str>,
+    ) -> Option<(String, String)> {
+        match fallback_extractor_for_context(bundle_id, app_name)? {
+            TextExtractor::Chrome => get_chrome_page_metadata(),
+            TextExtractor::Safari => get_safari_page_metadata(),
+            _ => None,
+        }
+    }
+
+    fn get_chrome_page_metadata() -> Option<(String, String)> {
+        let script = r#"
+            tell application "Google Chrome"
+                if (count of windows) > 0 then
+                    set front_win to front window
+                    if (count of tabs of front_win) > 0 then
+                        set active_tab to active tab of front_win
+                        return (URL of active_tab) & linefeed & (title of active_tab)
+                    end if
+                end if
+            end tell
+            return ""
+        "#;
+
+        run_browser_metadata_script(script, "chrome_page_metadata")
+    }
+
+    fn get_safari_page_metadata() -> Option<(String, String)> {
+        let script = r#"
+            tell application "Safari"
+                if (count of windows) > 0 then
+                    set front_win to front window
+                    if (count of tabs of front_win) > 0 then
+                        set active_tab to current tab of front_win
+                        return (URL of active_tab) & linefeed & (name of active_tab)
+                    end if
+                end if
+            end tell
+            return ""
+        "#;
+
+        run_browser_metadata_script(script, "safari_page_metadata")
+    }
+
+    fn run_browser_metadata_script(script: &str, stage: &str) -> Option<(String, String)> {
+        let started = Instant::now();
+        match run_osascript_with_timeout(script, stage, Duration::from_millis(600)) {
+            Ok(raw) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                match parse_page_metadata(&raw) {
+                    Some((url, title)) => {
+                        debug!(stage, elapsed_ms, url_len = url.len(), "浏览器 URL 提取成功");
+                        Some((url, title))
+                    }
+                    None => {
+                        warn!(
+                            stage,
+                            elapsed_ms,
+                            raw_len = raw.len(),
+                            raw_preview = %raw.chars().take(200).collect::<String>(),
+                            "浏览器 URL 解析失败：osascript 返回内容不符合预期"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                warn!(stage, elapsed_ms, error = %err, "浏览器 URL 提取失败");
+                None
+            }
+        }
+    }
+
+    fn parse_page_metadata(raw: &str) -> Option<(String, String)> {
+        let mut lines = raw.lines().map(str::trim).filter(|line| !line.is_empty());
+        let url = lines.next()?.to_string();
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return None;
+        }
+        let title = lines.next().unwrap_or("").trim().to_string();
+        Some((url, title))
     }
 
     pub fn extract_ax_text_for_context(

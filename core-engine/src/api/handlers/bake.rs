@@ -13,7 +13,7 @@ use crate::{
         BakeBucket, BakeCaptureFilter, BakeCapturePayload, BakeExtractResponse,
         BakeKnowledgePayload, BakeListFilter, BakeMemoryFilter, BakeMemoryPayload,
         BakeOverviewPayload, BakePagedResponse, BakeRunPayload, BakeService, BakeSopPayload,
-        BakeStyleConfig, BakeDesignPayload, CreateOrUpdateDesignRequest,
+        BakeStyleConfig, BakeDocumentPayload, CreateOrUpdateDocumentRequest,
         InitializeBakeMemoriesResponse,
     },
 };
@@ -63,8 +63,8 @@ pub struct BakeSopsResponse {
 }
 
 #[derive(serde::Serialize)]
-pub struct BakeDesignsResponse {
-    pub items: Vec<BakeDesignPayload>,
+pub struct BakeDocumentsResponse {
+    pub items: Vec<BakeDocumentPayload>,
     pub total: i64,
     pub limit: usize,
     pub offset: usize,
@@ -161,10 +161,10 @@ pub async fn delete_bake_sop(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn list_bake_designs(
+pub async fn list_bake_documents(
     State(state): State<Arc<AppState>>,
     Query(params): Query<BakePaginationQuery>,
-) -> Result<Json<BakeDesignsResponse>, ApiError> {
+) -> Result<Json<BakeDocumentsResponse>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let offset = params.offset.unwrap_or(0);
@@ -175,11 +175,11 @@ pub async fn list_bake_designs(
         limit,
         offset,
     };
-    let response: BakePagedResponse<BakeDesignPayload> =
-        tokio::task::spawn_blocking(move || service.list_designs_paginated(filter))
+    let response: BakePagedResponse<BakeDocumentPayload> =
+        tokio::task::spawn_blocking(move || service.list_documents_paginated(filter))
             .await
             .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(BakeDesignsResponse {
+    Ok(Json(BakeDocumentsResponse {
         items: response.items,
         total: response.total,
         limit: response.limit,
@@ -187,57 +187,57 @@ pub async fn list_bake_designs(
     }))
 }
 
-pub async fn create_bake_design(
+pub async fn create_bake_document(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateOrUpdateDesignRequest>,
-) -> Result<Json<BakeDesignPayload>, ApiError> {
+    Json(body): Json<CreateOrUpdateDocumentRequest>,
+) -> Result<Json<BakeDocumentPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let design = tokio::task::spawn_blocking(move || service.create_design(body))
+    let document = tokio::task::spawn_blocking(move || service.create_document(body))
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(design))
+    Ok(Json(document))
 }
 
-pub async fn update_bake_design(
+pub async fn update_bake_document(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-    Json(body): Json<CreateOrUpdateDesignRequest>,
-) -> Result<Json<BakeDesignPayload>, ApiError> {
+    Json(body): Json<CreateOrUpdateDocumentRequest>,
+) -> Result<Json<BakeDocumentPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let design = tokio::task::spawn_blocking(move || service.update_design(id, body))
+    let document = tokio::task::spawn_blocking(move || service.update_document(id, body))
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(design))
+    Ok(Json(document))
 }
 
-pub async fn toggle_bake_design_status(
+pub async fn toggle_bake_document_status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-) -> Result<Json<BakeDesignPayload>, ApiError> {
+) -> Result<Json<BakeDocumentPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let design = tokio::task::spawn_blocking(move || service.toggle_design_status(id))
+    let document = tokio::task::spawn_blocking(move || service.toggle_document_status(id))
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(design))
+    Ok(Json(document))
 }
 
-pub async fn adopt_bake_design(
+pub async fn adopt_bake_document(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-) -> Result<Json<BakeDesignPayload>, ApiError> {
+) -> Result<Json<BakeDocumentPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let candidate = tokio::task::spawn_blocking(move || service.adopt_design(id))
+    let candidate = tokio::task::spawn_blocking(move || service.adopt_document(id))
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
     Ok(Json(candidate))
 }
 
-pub async fn delete_bake_design(
+pub async fn delete_bake_document(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    tokio::task::spawn_blocking(move || service.delete_design(id))
+    tokio::task::spawn_blocking(move || service.delete_document(id))
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
     Ok(StatusCode::NO_CONTENT)
@@ -424,15 +424,15 @@ pub async fn ignore_bake_memory(
     Ok(Json(memory))
 }
 
-pub async fn promote_bake_memory_to_design(
+pub async fn promote_bake_memory_to_document(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-) -> Result<Json<BakeDesignPayload>, ApiError> {
+) -> Result<Json<BakeDocumentPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let design = tokio::task::spawn_blocking(move || service.promote_memory_to_design(id))
+    let document = tokio::task::spawn_blocking(move || service.promote_memory_to_document(id))
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(design))
+    Ok(Json(document))
 }
 
 pub async fn promote_bake_memory_to_sop(

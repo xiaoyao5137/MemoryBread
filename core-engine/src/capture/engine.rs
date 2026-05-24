@@ -323,6 +323,7 @@ impl CaptureEngine {
 
         // 4. 截图 / periodic 去重策略
         let mut screenshot_path = None;
+        let mut screenshot_source: Option<String> = None;
         let mut periodic_screenshot_dhash = None;
         if is_periodic_event {
             if has_ax_text {
@@ -344,9 +345,10 @@ impl CaptureEngine {
                     return Ok(None);
                 }
 
-                debug!(path = %result.relative_path, dhash = result.dhash, "periodic 截图已保存，等待 OCR 兜底");
+                debug!(path = %result.relative_path, dhash = result.dhash, source = %result.source.as_str(), "periodic 截图已保存，等待 OCR 兜底");
                 periodic_screenshot_dhash = Some(result.dhash);
                 screenshot_path = Some(result.relative_path);
+                screenshot_source = Some(result.source.as_str().to_string());
             } else {
                 debug!(event = ?event.to_event_type(), "跳过入库：periodic_ax_missing_without_screenshot_result");
                 return Ok(None);
@@ -354,8 +356,9 @@ impl CaptureEngine {
         } else if self.config.enable_screenshot {
             match capture_and_save(&self.config.captures_dir, self.config.screenshot_quality)? {
                 Some(result) => {
-                    debug!(path = %result.relative_path, "截图已保存");
+                    debug!(path = %result.relative_path, source = %result.source.as_str(), "截图已保存");
                     screenshot_path = Some(result.relative_path);
+                    screenshot_source = Some(result.source.as_str().to_string());
                 }
                 None => {}
             }
@@ -456,6 +459,7 @@ impl CaptureEngine {
             &merged,
             &event,
             screenshot_path.clone(),
+            screenshot_source.clone(),
             ocr_text_for_insert.clone(),
             false,
         )?;
@@ -595,6 +599,7 @@ impl CaptureEngine {
         ax: &AXInfo,
         event: &CaptureEvent,
         screenshot_path: Option<String>,
+        screenshot_source: Option<String>,
         ocr_text: Option<String>,
         is_sensitive: bool,
     ) -> Result<i64, CaptureError> {
@@ -627,12 +632,19 @@ impl CaptureEngine {
             },
             ocr_text: if is_sensitive { None } else { ocr_text },
             screenshot_path,
+            screenshot_source,
             input_text: if is_sensitive {
                 None
             } else {
                 event.input_text().map(str::to_string)
             },
             is_sensitive,
+            url: if is_sensitive { None } else { ax.url.clone() },
+            webpage_title: if is_sensitive {
+                None
+            } else {
+                ax.webpage_title.clone()
+            },
         };
         Ok(self.storage.insert_capture(&new_capture)?)
     }
@@ -898,6 +910,7 @@ mod tests {
                 },
                 None,
                 None,
+                None,
                 false,
             )
             .unwrap();
@@ -943,7 +956,7 @@ mod tests {
         };
 
         let id = engine
-            .save_capture(ts, &ax, &CaptureEvent::Periodic, None, None, false)
+            .save_capture(ts, &ax, &CaptureEvent::Periodic, None, None, None, false)
             .unwrap();
         let rec = engine.storage.get_capture(id).unwrap().unwrap();
         assert_eq!(rec.event_type, "auto");

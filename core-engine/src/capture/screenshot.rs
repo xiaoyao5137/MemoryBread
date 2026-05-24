@@ -86,11 +86,43 @@ pub struct ScreenshotResult {
     pub height: u32,
     /// JPEG 文件大小（字节）
     pub file_size: u64,
+    /// 截图来源：`window`（前台窗口截图）或 `fullscreen`（全屏回退）
+    pub source: ScreenshotSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenshotSource {
+    Window,
+    Fullscreen,
+}
+
+impl ScreenshotSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScreenshotSource::Window => "window",
+            ScreenshotSource::Fullscreen => "fullscreen",
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 公共 API
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// 采集主显示器截图并以 JPEG 格式存储（异步版本）。
+///
+/// 返回 `Ok(None)` 表示无可用显示器（无头服务器 / 测试环境）或熔断保护。
+pub async fn capture_and_save_async(
+    captures_dir: PathBuf,
+    quality: u8,
+) -> Result<Option<ScreenshotResult>, CaptureError> {
+    // 使用 spawn_blocking 避免阻塞 tokio runtime
+    tokio::task::spawn_blocking(move || {
+        capture_and_save(&captures_dir, quality)
+    })
+    .await
+    .map_err(|e| CaptureError::ScreenshotFailed(format!("截图任务 panic: {}", e)))?
+}
 
 /// 采集主显示器截图并以 JPEG 格式存储。
 ///
@@ -191,100 +223,162 @@ pub(crate) fn push_test_screenshot_from_image(image: &DynamicImage) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(not(test))]
+fn pick_active_monitor() -> Result<xcap::Monitor, CaptureError> {
+    use enigo::{Enigo, Mouse, Settings};
+    use xcap::Monitor;
+
+    // 1) 尝试拿鼠标全局坐标，再用 from_point 选出鼠标所在屏。
+    //    Enigo::new 在权限缺失等情况下可能返回 Err；我们都视为"取不到"，回落主屏。
+    let mouse_xy = Enigo::new(&Settings::default())
+        .ok()
+        .and_then(|e| e.location().ok());
+
+    if let Some((x, y)) = mouse_xy {
+        match Monitor::from_point(x, y) {
+            Ok(m) => {
+                tracing::debug!(x, y, "pick_active_monitor: 命中鼠标所在屏");
+                return Ok(m);
+            }
+            Err(e) => {
+                tracing::warn!(x, y, error = %e, "from_point 失败，回落主屏");
+            }
+        }
+    } else {
+        tracing::debug!("无法获取鼠标坐标，回落主屏");
+    }
+
+    // 2) 回落：找 is_primary 主屏；再退一步取第一块。
+    let monitors = Monitor::all().map_err(|e| {
+        tracing::error!("获取显示器列表失败（可能是显卡驱动问题）: {}", e);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        CaptureError::ScreenshotFailed(e.to_string())
+    })?;
+
+    if monitors.is_empty() {
+        return Err(CaptureError::ScreenshotFailed("无可用显示器".into()));
+    }
+
+    let primary = monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .cloned();
+
+    Ok(primary.unwrap_or_else(|| monitors.into_iter().next().unwrap()))
+}
+
+#[cfg(not(test))]
+fn capture_focused_window_image() -> Result<image::RgbaImage, String> {
+    use xcap::Window;
+
+    let windows = Window::all().map_err(|e| format!("Window::all 失败: {e}"))?;
+    if windows.is_empty() {
+        return Err("Window::all 返回空列表".into());
+    }
+
+    let mut focused: Option<Window> = None;
+    let mut focused_check_errors: Vec<String> = Vec::new();
+    for w in windows {
+        match w.is_focused() {
+            Ok(true) => {
+                focused = Some(w);
+                break;
+            }
+            Ok(false) => {}
+            Err(e) => focused_check_errors.push(format!("is_focused err: {e}")),
+        }
+    }
+
+    let win = focused.ok_or_else(|| {
+        if focused_check_errors.is_empty() {
+            "无 focused 窗口（可能处于 Mission Control / 桌面 / 菜单栏弹层）".to_string()
+        } else {
+            format!(
+                "无 focused 窗口；is_focused 调用错误 {} 次：{}",
+                focused_check_errors.len(),
+                focused_check_errors.join("; ")
+            )
+        }
+    })?;
+
+    let app_name = win.app_name().unwrap_or_default();
+    let win_title = win.title().unwrap_or_default();
+
+    if win.is_minimized().unwrap_or(false) {
+        return Err(format!(
+            "focused 窗口已最小化 app={app_name:?} title={win_title:?}"
+        ));
+    }
+
+    let width = win.width().unwrap_or(0);
+    let height = win.height().unwrap_or(0);
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "focused 窗口尺寸为 0 app={app_name:?} title={win_title:?} {width}x{height}"
+        ));
+    }
+
+    win.capture_image().map_err(|e| {
+        format!("Window::capture_image 失败 app={app_name:?} title={win_title:?}: {e}")
+    })
+}
+
+#[cfg(not(test))]
+fn capture_fullscreen_image() -> Result<image::RgbaImage, CaptureError> {
+    let monitor = pick_active_monitor()?;
+    monitor.capture_image().map_err(|e| {
+        tracing::warn!("活动屏截图失败: {}", e);
+        CaptureError::ScreenshotFailed(e.to_string())
+    })
+}
+
+#[cfg(not(test))]
 fn capture_real(
     captures_dir: &Path,
     quality: u8,
 ) -> Result<Option<ScreenshotResult>, CaptureError> {
     use image::codecs::jpeg::JpegEncoder;
-    use image::imageops;
     use std::fs;
     use std::io::BufWriter;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use xcap::Monitor;
 
-    // 获取显示器列表（可能触发显卡驱动调用）
-    let monitors = match Monitor::all() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("获取显示器列表失败（可能是显卡驱动问题）: {}", e);
-            // 等待 1 秒让驱动恢复
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            return Err(CaptureError::ScreenshotFailed(e.to_string()));
+    let (rgba_image, source) = match capture_focused_window_image() {
+        Ok(img) => (img, ScreenshotSource::Window),
+        Err(reason) => {
+            tracing::warn!(
+                fallback_reason = %reason,
+                "前台窗口截图失败，回退到全屏截图（OCR 可能扫到非目标窗口内容）"
+            );
+            match capture_fullscreen_image() {
+                Ok(img) => (img, ScreenshotSource::Fullscreen),
+                Err(e) => {
+                    record_screenshot_failure();
+                    return Err(e);
+                }
+            }
         }
     };
 
-    if monitors.is_empty() {
-        return Ok(None);
-    }
+    reset_screenshot_failure();
 
     let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
 
-    // 采集所有显示器并水平拼接
-    let mut combined_image: Option<DynamicImage> = None;
-    let mut all_failed = true;
-
-    for (i, monitor) in monitors.iter().enumerate() {
-        // 移除重试逻辑：失败时立即跳过，避免轰炸 WindowServer
-        let rgba_image = match monitor.capture_image() {
-            Ok(img) => {
-                all_failed = false;
-                img
-            }
-            Err(e) => {
-                tracing::warn!("显示器 {} 截图失败: {}，跳过该显示器", i, e);
-                continue;
-            }
-        };
-
-        let dynamic = DynamicImage::ImageRgba8(rgba_image);
-
-        combined_image = Some(match combined_image {
-            None => dynamic,
-            Some(existing) => {
-                // 水平拼接：将新图像放在右侧
-                let total_width = existing.width() + dynamic.width();
-                let total_height = existing.height().max(dynamic.height());
-
-                let mut combined = DynamicImage::new_rgba8(total_width, total_height);
-                imageops::overlay(&mut combined, &existing, 0, 0);
-                imageops::overlay(&mut combined, &dynamic, existing.width() as i64, 0);
-                combined
-            }
-        });
-    }
-
-    // 所有显示器都失败，触发熔断
-    if all_failed {
-        record_screenshot_failure();
-        return Ok(None);
-    }
-
-    let combined_image = match combined_image {
-        Some(img) => {
-            reset_screenshot_failure(); // 成功则重置计数器
-            img
-        }
-        None => return Ok(None),
-    };
-
-    let width = combined_image.width();
-    let height = combined_image.height();
+    let dynamic = DynamicImage::ImageRgba8(rgba_image);
+    let width = dynamic.width();
+    let height = dynamic.height();
 
     let relative_path = make_relative_path(ts_ms);
     let full_path = captures_dir.join(&relative_path);
 
-    // 确保父目录存在
     if let Some(parent) = full_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let dhash = compute_dhash64(&combined_image);
-    let rgb_image = combined_image.into_rgb8();
+    let dhash = compute_dhash64(&dynamic);
+    let rgb_image = dynamic.into_rgb8();
 
-    // 编码为 JPEG（指定质量）
     let file = fs::File::create(&full_path)?;
     let writer = BufWriter::new(file);
     let mut encoder = JpegEncoder::new_with_quality(writer, quality);
@@ -302,6 +396,7 @@ fn capture_real(
         width,
         height,
         file_size,
+        source,
     }))
 }
 
@@ -360,6 +455,7 @@ fn capture_test(
         width,
         height,
         file_size,
+        source: ScreenshotSource::Fullscreen,
     }))
 }
 

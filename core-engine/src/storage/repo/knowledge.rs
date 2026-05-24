@@ -4,7 +4,7 @@ use crate::storage::{
     db::current_ts_ms,
     error::StorageError,
     models_bake::{
-        BakeDesignRecord, BakeKnowledgeRecord, BakeMemorySourceRecord, BakeSopRecord,
+        BakeDocumentRecord, BakeKnowledgeRecord, BakeMemorySourceRecord, BakeSopRecord,
         EpisodicMemoryRecord, KnowledgeEntryRecord, NewBakeKnowledge, NewBakeSop,
         NewEpisodicMemory, NewKnowledgeEntry,
     },
@@ -12,27 +12,28 @@ use crate::storage::{
 };
 
 impl StorageManager {
-    pub fn get_design_templates(&self, limit: Option<usize>) -> Result<Vec<BakeDesignRecord>, StorageError> {
+    pub fn get_document_templates(&self, limit: Option<usize>) -> Result<Vec<BakeDocumentRecord>, StorageError> {
         self.with_conn(|conn| {
             let lim = limit.unwrap_or(10);
             let mut stmt = conn.prepare(
-                "SELECT id, name, category, status, tags, applicable_tasks, source_memory_ids,
+                "SELECT id, title, doc_type, status, tags, applicable_tasks, source_memory_ids,
                         source_capture_ids, source_episode_ids, linked_knowledge_ids,
-                        structure_sections, style_phrases, replacement_rules,
-                        prompt_hint, detailed_content, diagram_code, image_assets, usage_count,
-                        match_score, match_level, creation_mode, review_status,
+                        sections_json, style_phrases, replacement_rules, summary, full_content,
+                        structured_content, prompt_hint, diagram_code, image_assets,
+                        source_app_name, source_win_title, source_url, content_hash, language,
+                        usage_count, match_score, match_level, creation_mode, review_status,
                         evidence_summary, generation_version, deleted_at,
                         created_at, updated_at
-                 FROM bake_designs
+                 FROM bake_documents
                  WHERE deleted_at IS NULL AND status IN ('active', 'enabled')
                  ORDER BY COALESCE(match_score, 0) DESC, updated_at DESC
                  LIMIT ?1"
             )?;
             let rows = stmt.query_map([lim], |row| {
-                Ok(BakeDesignRecord {
+                Ok(BakeDocumentRecord {
                     id: row.get(0)?,
-                    name: row.get(1)?,
-                    category: row.get(2)?,
+                    title: row.get(1)?,
+                    doc_type: row.get(2)?,
                     status: row.get(3)?,
                     tags: row.get(4)?,
                     applicable_tasks: row.get(5)?,
@@ -40,23 +41,30 @@ impl StorageManager {
                     source_capture_ids: row.get(7)?,
                     source_episode_ids: row.get(8)?,
                     linked_knowledge_ids: row.get(9)?,
-                    structure_sections: row.get(10)?,
+                    sections_json: row.get(10)?,
                     style_phrases: row.get(11)?,
                     replacement_rules: row.get(12)?,
-                    prompt_hint: row.get(13)?,
-                    detailed_content: row.get(14)?,
-                    diagram_code: row.get(15)?,
-                    image_assets: row.get(16)?,
-                    usage_count: row.get(17)?,
-                    match_score: row.get(18)?,
-                    match_level: row.get(19)?,
-                    creation_mode: row.get(20)?,
-                    review_status: row.get(21)?,
-                    evidence_summary: row.get(22)?,
-                    generation_version: row.get(23)?,
-                    deleted_at: row.get(24)?,
-                    created_at: row.get(25)?,
-                    updated_at: row.get(26)?,
+                    summary: row.get(13)?,
+                    full_content: row.get(14)?,
+                    structured_content: row.get(15)?,
+                    prompt_hint: row.get(16)?,
+                    diagram_code: row.get(17)?,
+                    image_assets: row.get(18)?,
+                    source_app_name: row.get(19)?,
+                    source_win_title: row.get(20)?,
+                    source_url: row.get(21)?,
+                    content_hash: row.get(22)?,
+                    language: row.get(23)?,
+                    usage_count: row.get(24)?,
+                    match_score: row.get(25)?,
+                    match_level: row.get(26)?,
+                    creation_mode: row.get(27)?,
+                    review_status: row.get(28)?,
+                    evidence_summary: row.get(29)?,
+                    generation_version: row.get(30)?,
+                    deleted_at: row.get(31)?,
+                    created_at: row.get(32)?,
+                    updated_at: row.get(33)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -323,7 +331,7 @@ impl StorageManager {
                         k.created_at_ms, k.updated_at_ms, k.capture_ids, k.start_time, k.end_time, k.duration_minutes,
                         k.frag_app_name, k.frag_win_title, k.time_range_start, k.time_range_end, k.key_timestamps
                  FROM timelines k
-                 WHERE k.is_self_generated = 0",
+                 WHERE k.is_self_generated = 0 AND k.category = 'bake_article'",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             if let Some(q) = query {
@@ -364,7 +372,7 @@ impl StorageManager {
             let mut sql = String::from(
                 "SELECT COUNT(*)
                  FROM timelines k
-                 WHERE k.is_self_generated = 0",
+                 WHERE k.is_self_generated = 0 AND k.category = 'bake_article'",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             if let Some(q) = query {
@@ -590,6 +598,7 @@ impl StorageManager {
 
     pub fn list_bake_memory_init_candidates(
         &self,
+        since_ts_ms: i64,
         limit: usize,
     ) -> Result<Vec<BakeMemorySourceRecord>, StorageError> {
         self.with_conn(|conn| {
@@ -599,14 +608,16 @@ impl StorageManager {
                         k.history_view, k.content_origin, k.activity_type, k.is_self_generated,
                         k.evidence_strength, k.user_verified, k.user_edited, k.created_at, k.updated_at,
                         k.created_at_ms, k.updated_at_ms,
-                        c.ts, c.app_name, c.win_title, c.ax_text, c.ocr_text, c.input_text, c.audio_text
+                        c.ts, c.app_name, c.win_title, c.ax_text, c.ocr_text, c.input_text, c.audio_text,
+                        c.url, c.webpage_title
                  FROM timelines k
                  INNER JOIN captures c ON c.id = k.capture_id
                  WHERE k.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop')
-                 ORDER BY k.importance DESC, COALESCE(k.occurrence_count, 0) DESC, k.updated_at_ms DESC, k.id DESC
-                 LIMIT ?1",
+                   AND k.updated_at_ms > ?1
+                 ORDER BY k.updated_at_ms ASC, k.id ASC
+                 LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![limit as i64], |row| {
+            let rows = stmt.query_map(params![since_ts_ms, limit as i64], |row| {
                 Ok(BakeMemorySourceRecord {
                     knowledge: row_to_episodic_memory_as_knowledge(row).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     capture_ts: row.get(23)?,
@@ -616,9 +627,28 @@ impl StorageManager {
                     capture_ocr_text: row.get(27)?,
                     capture_input_text: row.get(28)?,
                     capture_audio_text: row.get(29)?,
+                    capture_url: row.get::<_, Option<String>>(30)?.and_then(|s| {
+                        let t = s.trim();
+                        if t.is_empty() { None } else { Some(t.to_string()) }
+                    }),
+                    capture_webpage_title: row.get(31)?,
+                    url_aggregated_text: None,
+                    url_aggregated_capture_count: 0,
                 })
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
+            let mut records: Vec<BakeMemorySourceRecord> =
+                rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)?;
+            for record in records.iter_mut() {
+                if let Some(url) = record.capture_url.clone() {
+                    if let Some((aggregated, count)) =
+                        aggregate_url_capture_text(conn, &url, record.capture_ts)?
+                    {
+                        record.url_aggregated_text = Some(aggregated);
+                        record.url_aggregated_capture_count = count;
+                    }
+                }
+            }
+            Ok(records)
         })
     }
 
@@ -867,6 +897,92 @@ impl StorageManager {
             _ => self.delete_episodic_memory(id),
         }
     }
+}
+
+const URL_AGGREGATION_LOOKBACK_MS: i64 = 30 * 24 * 3600 * 1000;
+const URL_AGGREGATION_MAX_CAPTURES: i64 = 30;
+const URL_AGGREGATION_TOTAL_BUDGET_CHARS: usize = 12000;
+const URL_AGGREGATION_PER_CAPTURE_CAP_CHARS: usize = 4000;
+const URL_AGGREGATION_DEDUP_HEAD_CHARS: usize = 200;
+
+fn aggregate_url_capture_text(
+    conn: &Connection,
+    url: &str,
+    anchor_ts: i64,
+) -> Result<Option<(String, i64)>, StorageError> {
+    let earliest = anchor_ts.saturating_sub(URL_AGGREGATION_LOOKBACK_MS);
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, ax_text, ocr_text, input_text
+         FROM captures
+         WHERE TRIM(COALESCE(url, '')) = ?1
+           AND ts >= ?2
+           AND ts <= ?3
+         ORDER BY ts ASC
+         LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        params![url, earliest, anchor_ts, URL_AGGREGATION_MAX_CAPTURES],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        },
+    )?;
+
+    let mut buf = String::new();
+    let mut last_head = String::new();
+    let mut budget = URL_AGGREGATION_TOTAL_BUDGET_CHARS;
+    let mut included = 0_i64;
+    for row in rows {
+        let (cap_id, ts, ax_text, ocr_text, input_text) = row.map_err(StorageError::Sqlite)?;
+        let combined = combine_capture_text_for_url(
+            ax_text.as_deref(),
+            ocr_text.as_deref(),
+            input_text.as_deref(),
+        );
+        if combined.is_empty() {
+            continue;
+        }
+        let head: String = combined.chars().take(URL_AGGREGATION_DEDUP_HEAD_CHARS).collect();
+        if !last_head.is_empty() && head == last_head {
+            continue;
+        }
+        last_head = head;
+        let allowed = budget.min(URL_AGGREGATION_PER_CAPTURE_CAP_CHARS);
+        if allowed == 0 {
+            break;
+        }
+        let truncated: String = combined.chars().take(allowed).collect();
+        let used = truncated.chars().count();
+        buf.push_str(&format!("--- capture#{} ts={} ---\n", cap_id, ts));
+        buf.push_str(&truncated);
+        buf.push_str("\n\n");
+        budget = budget.saturating_sub(used);
+        included += 1;
+        if budget == 0 {
+            break;
+        }
+    }
+    if included <= 1 {
+        return Ok(None);
+    }
+    Ok(Some((buf, included)))
+}
+
+fn combine_capture_text_for_url(
+    ax_text: Option<&str>,
+    ocr_text: Option<&str>,
+    input_text: Option<&str>,
+) -> String {
+    let pieces = [ax_text, ocr_text, input_text]
+        .iter()
+        .filter_map(|p| p.map(str::trim).filter(|t| !t.is_empty()))
+        .collect::<Vec<_>>();
+    pieces.join("\n")
 }
 
 fn insert_knowledge_entry_inner(
@@ -1481,6 +1597,7 @@ mod tests {
             ax_focused_id: None,
             ocr_text: None,
             screenshot_path: None,
+            screenshot_source: None,
             input_text: None,
             is_sensitive: false,
         })
@@ -1561,7 +1678,7 @@ mod tests {
         mgr.insert_knowledge_entry(&sample_entry(&mgr, "meeting"))
             .unwrap();
 
-        let candidates = mgr.list_bake_memory_init_candidates(10).unwrap();
+        let candidates = mgr.list_bake_memory_init_candidates(0, 10).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].knowledge.category, "meeting");
     }

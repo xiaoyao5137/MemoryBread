@@ -388,18 +388,18 @@ async fn test_bake_templates_crud_flow() {
 
     let create_req = Request::builder()
         .method(Method::POST)
-        .uri("/api/bake/designs")
+        .uri("/api/bake/documents")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{
-            "name":"周报模板",
-            "category":"周报",
+            "title":"周报模板",
+            "doc_type":"周报",
             "status":"draft",
             "tags":["周报"],
             "applicable_tasks":["creation"],
             "source_memory_ids":[],
             "linked_knowledge_ids":[],
-            "structure_sections":[{"title":"本周进展","keywords":["进展"],"notes":null}],
+            "sections":[{"title":"本周进展","keywords":["进展"],"notes":null}],
             "style_phrases":["整体看"],
             "replacement_rules":[{"from":"综上所述","to":"整体看"}],
             "prompt_hint":"聚焦本周主线",
@@ -416,7 +416,7 @@ async fn test_bake_templates_crud_flow() {
     assert_eq!(created["source_memory_ids"].as_array().unwrap().len(), 0);
 
     let list_req = Request::builder()
-        .uri("/api/bake/designs")
+        .uri("/api/bake/documents")
         .body(Body::empty())
         .unwrap();
     let (list_status, list_body) = oneshot(router.clone(), list_req).await;
@@ -426,18 +426,18 @@ async fn test_bake_templates_crud_flow() {
 
     let update_req = Request::builder()
         .method(Method::PUT)
-        .uri(format!("/api/bake/designs/{template_id}"))
+        .uri(format!("/api/bake/documents/{template_id}"))
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{
-            "name":"周报模板-更新",
-            "category":"周报",
+            "title":"周报模板-更新",
+            "doc_type":"周报",
             "status":"pending_review",
             "tags":["周报","精选"],
             "applicable_tasks":["creation"],
             "source_memory_ids":[],
             "linked_knowledge_ids":[],
-            "structure_sections":[],
+            "sections":[],
             "style_phrases":[],
             "replacement_rules":[],
             "prompt_hint":"更新后提示",
@@ -450,7 +450,7 @@ async fn test_bake_templates_crud_flow() {
     let (update_status, update_body) = oneshot(router.clone(), update_req).await;
     assert_eq!(update_status, StatusCode::OK, "body: {update_body}");
     let update_json: serde_json::Value = serde_json::from_str(&update_body).unwrap();
-    assert_eq!(update_json["name"], "周报模板-更新");
+    assert_eq!(update_json["title"], "周报模板-更新");
     assert_eq!(
         update_json["source_memory_ids"].as_array().unwrap().len(),
         0
@@ -458,7 +458,7 @@ async fn test_bake_templates_crud_flow() {
 
     let toggle_req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/api/bake/designs/{template_id}/toggle-status"))
+        .uri(format!("/api/bake/documents/{template_id}/toggle-status"))
         .body(Body::empty())
         .unwrap();
     let (toggle_status, toggle_body) = oneshot(router, toggle_req).await;
@@ -515,18 +515,18 @@ async fn test_bake_templates_bucket_filter_separates_pending_and_extracted() {
 
     let create_candidate_req = Request::builder()
         .method(Method::POST)
-        .uri("/api/bake/designs")
+        .uri("/api/bake/documents")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{
-            "name":"候选模板",
-            "category":"周报",
+            "title":"候选模板",
+            "doc_type":"周报",
             "status":"draft",
             "tags":["周报"],
             "applicable_tasks":["creation"],
             "source_memory_ids":[],
             "linked_knowledge_ids":[],
-            "structure_sections":[{"title":"背景","keywords":["背景"],"notes":null}],
+            "sections":[{"title":"背景","keywords":["背景"],"notes":null}],
             "style_phrases":["整体看"],
             "replacement_rules":[],
             "prompt_hint":"候选提示",
@@ -542,18 +542,18 @@ async fn test_bake_templates_bucket_filter_separates_pending_and_extracted() {
 
     let create_confirmed_req = Request::builder()
         .method(Method::POST)
-        .uri("/api/bake/designs")
+        .uri("/api/bake/documents")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{
-            "name":"已提炼模板",
-            "category":"周报",
+            "title":"已提炼模板",
+            "doc_type":"周报",
             "status":"enabled",
             "tags":["周报"],
             "applicable_tasks":["creation"],
             "source_memory_ids":[],
             "linked_knowledge_ids":[],
-            "structure_sections":[{"title":"进展","keywords":["进展"],"notes":null}],
+            "sections":[{"title":"进展","keywords":["进展"],"notes":null}],
             "style_phrases":["先结论后展开"],
             "replacement_rules":[],
             "prompt_hint":"已提炼提示",
@@ -568,24 +568,24 @@ async fn test_bake_templates_bucket_filter_separates_pending_and_extracted() {
     assert_eq!(confirmed_status, StatusCode::OK, "body: {confirmed_body}");
 
     let pending_req = Request::builder()
-        .uri("/api/bake/designs?bucket=pending")
+        .uri("/api/bake/documents?bucket=pending")
         .body(Body::empty())
         .unwrap();
     let (pending_status, pending_body) = oneshot(router.clone(), pending_req).await;
     assert_eq!(pending_status, StatusCode::OK, "body: {pending_body}");
     let pending_json: serde_json::Value = serde_json::from_str(&pending_body).unwrap();
     assert_eq!(pending_json["items"].as_array().unwrap().len(), 1);
-    assert_eq!(pending_json["items"][0]["name"], "候选模板");
+    assert_eq!(pending_json["items"][0]["title"], "候选模板");
 
     let extracted_req = Request::builder()
-        .uri("/api/bake/designs?bucket=extracted")
+        .uri("/api/bake/documents?bucket=extracted")
         .body(Body::empty())
         .unwrap();
     let (extracted_status, extracted_body) = oneshot(router, extracted_req).await;
     assert_eq!(extracted_status, StatusCode::OK, "body: {extracted_body}");
     let extracted_json: serde_json::Value = serde_json::from_str(&extracted_body).unwrap();
     assert_eq!(extracted_json["items"].as_array().unwrap().len(), 1);
-    assert_eq!(extracted_json["items"][0]["name"], "已提炼模板");
+    assert_eq!(extracted_json["items"][0]["title"], "已提炼模板");
 }
 
 #[tokio::test]
@@ -684,7 +684,7 @@ async fn test_bake_pipeline_chain_from_memory_to_knowledge_template_and_sop() {
     let (run_status, run_json, run_body) = run_bake(router.clone(), "manual_debug").await;
     assert_eq!(run_status, StatusCode::OK, "body: {run_body}");
     assert_eq!(run_json["knowledge_created_count"], 1);
-    assert_eq!(run_json["design_created_count"], 1);
+    assert_eq!(run_json["document_created_count"], 1);
     assert_eq!(run_json["sop_created_count"], 1);
 
     let knowledge_req = Request::builder()
@@ -697,7 +697,7 @@ async fn test_bake_pipeline_chain_from_memory_to_knowledge_template_and_sop() {
     assert_eq!(knowledge_json["items"].as_array().unwrap().len(), 1);
 
     let templates_req = Request::builder()
-        .uri("/api/bake/designs?bucket=extracted")
+        .uri("/api/bake/documents?bucket=extracted")
         .body(Body::empty())
         .unwrap();
     let (templates_status, templates_body) = oneshot(router.clone(), templates_req).await;
@@ -705,9 +705,9 @@ async fn test_bake_pipeline_chain_from_memory_to_knowledge_template_and_sop() {
     let templates_json: serde_json::Value = serde_json::from_str(&templates_body).unwrap();
     let template_item = &templates_json["items"][0];
     assert_eq!(templates_json["items"].as_array().unwrap().len(), 1);
-    assert_eq!(template_item["name"], "链路模板");
+    assert_eq!(template_item["title"], "链路模板");
     assert!(template_item["source_memory_ids"].as_array().unwrap().len() >= 1);
-    assert!(template_item["structure_sections"].as_array().unwrap().len() >= 2);
+    assert!(template_item["sections"].as_array().unwrap().len() >= 2);
 
     let sops_req = Request::builder()
         .uri("/api/bake/sops?bucket=extracted")
@@ -780,7 +780,7 @@ async fn test_bake_memories_promote_and_ignore_flow() {
 
     let promote_template_req = Request::builder()
         .method(Method::POST)
-        .uri(format!("/api/bake/memories/{memory_id}/promote-design"))
+        .uri(format!("/api/bake/memories/{memory_id}/promote-document"))
         .body(Body::empty())
         .unwrap();
     let (promote_template_status, promote_template_body) =
@@ -792,7 +792,7 @@ async fn test_bake_memories_promote_and_ignore_flow() {
     );
     let promote_template_json: serde_json::Value =
         serde_json::from_str(&promote_template_body).unwrap();
-    assert_eq!(promote_template_json["name"], "高价值情节记忆");
+    assert_eq!(promote_template_json["title"], "高价值情节记忆");
 
     let promote_sop_req = Request::builder()
         .method(Method::POST)
@@ -1029,7 +1029,7 @@ async fn test_bake_run_pipeline_creates_only_template() {
     assert_eq!(run_json["candidate_count"], 1);
     assert_eq!(run_json["discarded_count"], 2);
     assert_eq!(run_json["knowledge_created_count"], 0);
-    assert_eq!(run_json["design_created_count"], 1);
+    assert_eq!(run_json["document_created_count"], 1);
     assert_eq!(run_json["sop_created_count"], 0);
 
     let knowledge_req = Request::builder()
@@ -1042,14 +1042,14 @@ async fn test_bake_run_pipeline_creates_only_template() {
     assert_eq!(knowledge_json["items"].as_array().unwrap().len(), 0);
 
     let templates_req = Request::builder()
-        .uri("/api/bake/designs")
+        .uri("/api/bake/documents")
         .body(Body::empty())
         .unwrap();
     let (templates_status, templates_body) = oneshot(router.clone(), templates_req).await;
     assert_eq!(templates_status, StatusCode::OK, "body: {templates_body}");
     let templates_json: serde_json::Value = serde_json::from_str(&templates_body).unwrap();
     assert_eq!(templates_json["items"].as_array().unwrap().len(), 1);
-    assert_eq!(templates_json["items"][0]["name"], "周报模板");
+    assert_eq!(templates_json["items"][0]["title"], "周报模板");
 
     let sops_req = Request::builder()
         .uri("/api/bake/sops")
@@ -1103,7 +1103,7 @@ async fn test_bake_run_pipeline_creates_only_sop() {
     assert_eq!(run_json["candidate_count"], 1);
     assert_eq!(run_json["discarded_count"], 2);
     assert_eq!(run_json["knowledge_created_count"], 0);
-    assert_eq!(run_json["design_created_count"], 0);
+    assert_eq!(run_json["document_created_count"], 0);
     assert_eq!(run_json["sop_created_count"], 1);
 
     let knowledge_req = Request::builder()
@@ -1116,7 +1116,7 @@ async fn test_bake_run_pipeline_creates_only_sop() {
     assert_eq!(knowledge_json["items"].as_array().unwrap().len(), 0);
 
     let templates_req = Request::builder()
-        .uri("/api/bake/designs")
+        .uri("/api/bake/documents")
         .body(Body::empty())
         .unwrap();
     let (templates_status, templates_body) = oneshot(router.clone(), templates_req).await;
@@ -1180,7 +1180,7 @@ async fn test_bake_run_pipeline_creates_only_knowledge_and_updates_overview() {
     assert_eq!(run_json["candidate_count"], 1);
     assert_eq!(run_json["discarded_count"], 2);
     assert_eq!(run_json["knowledge_created_count"], 1);
-    assert_eq!(run_json["design_created_count"], 0);
+    assert_eq!(run_json["document_created_count"], 0);
     assert_eq!(run_json["sop_created_count"], 0);
 
     let overview_req = Request::builder()
@@ -1219,7 +1219,7 @@ async fn test_bake_run_pipeline_creates_only_knowledge_and_updates_overview() {
     assert_eq!(knowledge_json["items"][0]["summary"], "提炼后的知识");
 
     let templates_req = Request::builder()
-        .uri("/api/bake/designs")
+        .uri("/api/bake/documents")
         .body(Body::empty())
         .unwrap();
     let (templates_status, templates_body) = oneshot(router.clone(), templates_req).await;
@@ -1388,7 +1388,7 @@ async fn test_bake_run_pipeline_demotes_inconsistent_auto_created_scores_to_cand
     assert_eq!(knowledge_review_status, "candidate");
 
     let templates_req = Request::builder()
-        .uri("/api/bake/designs")
+        .uri("/api/bake/documents")
         .body(Body::empty())
         .unwrap();
     let (templates_status, templates_body) = oneshot(router.clone(), templates_req).await;
@@ -1443,7 +1443,7 @@ async fn test_bake_run_pipeline_is_idempotent() {
     assert_eq!(first_json["candidate_count"], 1);
     assert_eq!(first_json["discarded_count"], 0);
     assert_eq!(first_json["knowledge_created_count"], 1);
-    assert_eq!(first_json["design_created_count"], 1);
+    assert_eq!(first_json["document_created_count"], 1);
     assert_eq!(first_json["sop_created_count"], 1);
 
     let (second_status, second_json, second_body) = run_bake(router.clone(), "manual_debug").await;
@@ -1454,7 +1454,7 @@ async fn test_bake_run_pipeline_is_idempotent() {
     assert_eq!(second_json["candidate_count"], 0);
     assert_eq!(second_json["discarded_count"], 0);
     assert_eq!(second_json["knowledge_created_count"], 0);
-    assert_eq!(second_json["design_created_count"], 0);
+    assert_eq!(second_json["document_created_count"], 0);
     assert_eq!(second_json["sop_created_count"], 0);
 
     let knowledge_req = Request::builder()
@@ -1467,7 +1467,7 @@ async fn test_bake_run_pipeline_is_idempotent() {
     assert_eq!(knowledge_json["items"].as_array().unwrap().len(), 1);
 
     let templates_req = Request::builder()
-        .uri("/api/bake/designs")
+        .uri("/api/bake/documents")
         .body(Body::empty())
         .unwrap();
     let (templates_status, templates_body) = oneshot(router.clone(), templates_req).await;
@@ -1522,7 +1522,7 @@ async fn test_bake_run_pipeline_rejected_candidate_advances_watermark() {
     assert_eq!(run_json["candidate_count"], 1);
     assert_eq!(run_json["discarded_count"], 3);
     assert_eq!(run_json["knowledge_created_count"], 0);
-    assert_eq!(run_json["design_created_count"], 0);
+    assert_eq!(run_json["document_created_count"], 0);
     assert_eq!(run_json["sop_created_count"], 0);
 
     let memories_req = Request::builder()

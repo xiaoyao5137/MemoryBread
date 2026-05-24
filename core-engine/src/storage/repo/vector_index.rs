@@ -317,6 +317,7 @@ mod tests {
             ax_focused_id: None,
             ocr_text: None,
             screenshot_path: None,
+            screenshot_source: None,
             input_text: None,
             is_sensitive: false,
         })
