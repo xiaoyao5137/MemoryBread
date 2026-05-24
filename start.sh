@@ -61,6 +61,7 @@ mkdir -p "$LOG_DIR"
 # PID 文件
 SIDECAR_PID_FILE="$LOG_DIR/sidecar.pid"
 MODEL_API_PID_FILE="$LOG_DIR/model_api.pid"
+CREATION_PID_FILE="$LOG_DIR/creation.pid"
 CORE_PID_FILE="$LOG_DIR/core.pid"
 UI_PID_FILE="$LOG_DIR/ui.pid"
 UI_APP_PID_FILE="$LOG_DIR/ui_app.pid"
@@ -69,12 +70,14 @@ OLLAMA_PID_FILE="$LOG_DIR/ollama.pid"
 # 日志文件
 SIDECAR_LOG="$LOG_DIR/sidecar.log"
 MODEL_API_LOG="$LOG_DIR/model_api.log"
+CREATION_LOG="$LOG_DIR/creation.log"
 CORE_LOG="$LOG_DIR/core.log"
 UI_LOG="$LOG_DIR/ui.log"
 OLLAMA_LOG="$LOG_DIR/ollama.log"
 
 CORE_PORT=7070
 MODEL_API_PORT=7071
+CREATION_PORT=8001
 UI_PORT=1420
 OLLAMA_PORT=11434
 
@@ -282,6 +285,17 @@ show_status() {
         log_error "Ollama: 未运行 (Port: ${OLLAMA_PORT})"
     fi
 
+    if is_running "$CREATION_PID_FILE"; then
+        local creation_pid=$(cat "$CREATION_PID_FILE")
+        if is_http_ok "http://localhost:${CREATION_PORT}/health"; then
+            log_success "Creation Service: 运行中 (PID: ${creation_pid}, Port: ${CREATION_PORT})"
+        else
+            log_error "Creation Service: 进程存在但接口未就绪 (PID: ${creation_pid}, Port: ${CREATION_PORT})"
+        fi
+    else
+        log_error "Creation Service: 未运行"
+    fi
+
     if is_running "$CORE_PID_FILE"; then
         local core_pid=$(cat "$CORE_PID_FILE")
         if is_http_ok "http://localhost:${CORE_PORT}/health"; then
@@ -360,6 +374,20 @@ stop_all() {
     fi
 
     cleanup_port "$CORE_PORT" "Core Engine"
+
+    # 停止 Creation Service
+    if is_running "$CREATION_PID_FILE"; then
+        local pid=$(cat "$CREATION_PID_FILE")
+        log_info "停止 Creation Service (PID: $pid)"
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        if ps -p "$pid" > /dev/null 2>&1; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$CREATION_PID_FILE"
+    fi
+
+    cleanup_port "$CREATION_PORT" "Creation Service"
 
     # 停止 AI Sidecar
     if is_running "$SIDECAR_PID_FILE"; then
@@ -497,6 +525,45 @@ start_sidecar() {
     }
 }
 
+# 启动 Creation Service
+start_creation_service() {
+    if is_running "$CREATION_PID_FILE"; then
+        log_info "Creation Service 已在运行，复用现有进程"
+        wait_for_http "http://localhost:${CREATION_PORT}/health" "Creation Service" 10 1 || log_warn "现有 Creation Service 进程健康检查失败，建议执行 ./start.sh restart"
+        return 0
+    fi
+
+    log_info "启动 Creation Service..."
+
+    cd "$PROJECT_ROOT/ai-sidecar"
+
+    if [ ! -d ".venv" ]; then
+        log_warn "虚拟环境不存在，正在创建..."
+        python3 -m venv .venv
+        source .venv/bin/activate
+        pip install -r requirements.txt
+    else
+        source .venv/bin/activate
+    fi
+
+    cleanup_port "$CREATION_PORT" "Creation Service"
+
+    nohup python start_creation_service.py > "$CREATION_LOG" 2>&1 < /dev/null &
+    echo $! > "$CREATION_PID_FILE"
+    disown "$(cat "$CREATION_PID_FILE")" 2>/dev/null || true
+
+    log_success "Creation Service 已启动 (PID: $(cat "$CREATION_PID_FILE"))"
+    log_info "Creation Service 日志文件: $CREATION_LOG"
+
+    wait_for_http "http://localhost:${CREATION_PORT}/health" "Creation Service" 30 1 || {
+        log_error "Creation Service 启动失败，请查看日志: $CREATION_LOG"
+        if ! ps -p "$(cat "$CREATION_PID_FILE" 2>/dev/null)" > /dev/null 2>&1; then
+            rm -f "$CREATION_PID_FILE"
+        fi
+        exit 1
+    }
+}
+
 # 启动 Core Engine
 start_core() {
     if is_running "$CORE_PID_FILE"; then
@@ -591,6 +658,7 @@ main() {
             check_dependencies
             ensure_ollama_running
             start_sidecar
+            start_creation_service
             start_core
             start_ui
             show_status
@@ -607,6 +675,7 @@ main() {
             check_dependencies
             ensure_ollama_running
             start_sidecar
+            start_creation_service
             start_core
             start_ui
             show_status
@@ -617,7 +686,7 @@ main() {
             ;;
         logs)
             log_info "查看日志 (Ctrl+C 退出)..."
-            tail -f "$SIDECAR_LOG" "$CORE_LOG" "$UI_LOG" 2>/dev/null
+            tail -f "$SIDECAR_LOG" "$MODEL_API_LOG" "$CREATION_LOG" "$CORE_LOG" "$UI_LOG" 2>/dev/null
             ;;
         *)
             echo "用法: $0 {start|stop|restart|status|logs}"
