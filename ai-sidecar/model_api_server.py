@@ -15,6 +15,7 @@ import sqlite3
 import time
 import fcntl
 import asyncio
+import concurrent.futures
 import sys
 import threading
 from pathlib import Path
@@ -25,6 +26,11 @@ if str(IPC_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(IPC_PYTHON_DIR))
 
 from background_processor import BackgroundProcessor
+from inference_queue import (
+    Priority,
+    QueueEvictedError,
+    get_global_queue,
+)
 from monitor.llm_tracker import estimate_tokens, log_llm_usage
 from idle_compute.model_manager import _log_model_event
 
@@ -605,17 +611,19 @@ def rag_query():
             }), 503
 
         pipeline = _rag_pipeline
-        # 持有 RAG 锁，阻止知识提炼同时占用 Ollama
-        # 查询任务可以抢占提炼任务
+        # 通过 InferenceQueue 单 worker 串行所有 LLM 推理，P0 = 在线 RAG 查询
         try:
-            _lock_fd = _rag_acquire_lock(timeout_sec=3.0, owner="query", can_preempt=True)
-        except TimeoutError as te:
-            logger.warning(f"RAG 查询获取锁超时: {te}")
-            return jsonify({'error': 'AI 正在处理其他任务，请稍候再试'}), 503
-        try:
-            result = pipeline.query(query, top_k=top_k)
-        finally:
-            _rag_release_lock(_lock_fd)
+            result = get_global_queue().submit_sync(
+                Priority.P0,
+                lambda: pipeline.query(query, top_k=top_k),
+                timeout=120.0,
+            )
+        except QueueEvictedError as ee:
+            logger.warning(f"RAG 查询被队列淘汰: {ee}")
+            return jsonify({'error': '系统繁忙，请稍候再试'}), 503
+        except concurrent.futures.TimeoutError:
+            logger.warning("RAG 查询执行超时")
+            return jsonify({'error': '查询超时'}), 504
 
         contexts = [
             {
@@ -693,12 +701,24 @@ def extract_knowledge():
                 return jsonify({'error': 'limit 必须是正整数'}), 400
 
         processor = BackgroundProcessor(db_path=DB_PATH, interval=90, batch_size=8)
-        result = asyncio.run(
-            processor.run_once(
-                limit_override=limit,
-                force_finalize_tail=force_finalize_tail,
+        # 通过 InferenceQueue 单 worker 串行，P1 = knowledge 提炼
+        try:
+            result = get_global_queue().submit_sync(
+                Priority.P1,
+                lambda: asyncio.run(
+                    processor.run_once(
+                        limit_override=limit,
+                        force_finalize_tail=force_finalize_tail,
+                    )
+                ),
+                timeout=600.0,
             )
-        )
+        except QueueEvictedError as ee:
+            logger.warning(f"knowledge 提炼被队列淘汰: {ee}")
+            return jsonify({'error': '系统繁忙，请稍候再试'}), 503
+        except concurrent.futures.TimeoutError:
+            logger.warning("knowledge 提炼执行超时")
+            return jsonify({'error': '提炼超时'}), 504
 
         processed_count = int(result.get('processed_count', 0))
         fetched_count = int(result.get('fetched_count', 0))
@@ -749,22 +769,25 @@ def extract_bake():
             trigger_reason,
         )
         extractor = get_bake_extractor()
+        # 通过 InferenceQueue 单 worker 串行，P2 = bake 大批量提炼
         try:
-            _lock_fd = _rag_acquire_lock(timeout_sec=5.0, owner="extract", can_preempt=False)
-        except TimeoutError as te:
-            logger.warning(f"bake extract 获取锁超时: {te}")
+            result = get_global_queue().submit_sync(
+                Priority.P2,
+                lambda: extractor.extract_bake_bundle(candidate, preempt_check=lambda: False),
+                timeout=900.0,
+            )
+        except QueueEvictedError as ee:
+            logger.warning(f"bake extract 被队列淘汰: {ee}")
             return jsonify({'error': 'AI 正在处理其他任务，请稍候再试'}), 503
+        except concurrent.futures.TimeoutError:
+            logger.warning("bake extract 执行超时")
+            return jsonify({'error': 'bake 提炼超时'}), 504
         lock_wait_ms = int(time.time() * 1000) - lock_wait_start_ms
         logger.info(
-            "bake extract lock acquired source_knowledge_id=%s lock_wait_ms=%s",
+            "bake extract done source_knowledge_id=%s queue_wait_ms=%s",
             source_knowledge_id,
             lock_wait_ms,
         )
-        try:
-            result = extractor.extract_bake_bundle(candidate, preempt_check=_check_preempt_signal)
-        finally:
-            _rag_release_lock(_lock_fd)
-            logger.info("bake extract lock released source_knowledge_id=%s", source_knowledge_id)
 
         result['trigger_reason'] = trigger_reason
         result['latency_ms'] = int(time.time() * 1000) - start_ms

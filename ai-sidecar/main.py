@@ -28,6 +28,12 @@ if str(IPC_PYTHON_DIR) not in sys.path:
 
 from memory_bread_ipc import IpcServer
 
+# 模块级 runtime 状态：Flask daemon 线程通过它访问 BackgroundProcessor
+_RUNTIME_STATE: dict = {
+    "dispatch": None,
+    "bg_processor": None,
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 日志配置
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +125,20 @@ def _start_vector_search_server() -> None:
         def health():
             return jsonify({'status': 'ok', 'service': 'vector_search'})
 
+        @_vs_app.route('/internal/extraction_status', methods=['GET'])
+        def extraction_status():
+            bg = _RUNTIME_STATE.get("bg_processor")
+            if bg is None:
+                return jsonify({
+                    "running": False,
+                    "extracting_captures": [],
+                    "extracting_group_count": 0,
+                    "last_extraction_at_ms": None,
+                })
+            snapshot = bg.get_extraction_status()
+            snapshot["running"] = True
+            return jsonify(snapshot)
+
         logging.getLogger(__name__).info("内部向量搜索服务已启动 (port 7072)")
         _vs_app.run(host='127.0.0.1', port=7072, debug=False, threaded=True, use_reloader=False)
     except Exception as e:
@@ -142,10 +162,7 @@ async def _main() -> None:
     from ocr.engine import OcrEngine
 
     ocr_worker = OcrWorker(engine=OcrEngine.create_default())
-    runtime_state = {
-        "dispatch": None,
-        "bg_processor": None,
-    }
+    runtime_state = _RUNTIME_STATE
 
     async def limited_dispatch(req):
         if req.task.type == "ping":

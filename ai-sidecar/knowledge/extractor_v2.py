@@ -461,7 +461,9 @@ BAKE_KNOWLEDGE_PROMPT = """类别:knowledge
 
 只提炼未来工作中需要回想起来参照使用的有用知识。
 当你理解该时间线及对应采集记录描述的信息，是未来工作中会被拿来参考的事实、经验、约束、决策、结论、方法理解，或未来工作中需要参考某个设计方案的知识时，accepted=true。
-如果输入只是模板写法/文风参考，交给 design；如果重点是解决问题的行动路线，交给 sop；如果只是噪声或零散操作，没有形成稳定知识，就 reject。
+如果只是噪声或零散操作，没有形成任何可复用的知识点，就 reject。
+
+注意:knowledge / design / sop 三个类别相互独立判断，互不互斥。同一条候选可以同时被多个类别接受（事实部分进 knowledge、文档主体进 design、操作步骤进 sop），不要因为输入"看起来更像 design 或 sop"就推卸 knowledge 的判断——只要里面有可沉淀的稳定知识点，就独立 accept。
 
 accepted=true 时，payload schema:
 {
@@ -487,48 +489,71 @@ accepted=true 时，payload schema:
 约束:
 - `summary` 必须体现沉淀后的知识点，不要直接照抄流水账
 - `details` 必须是可渲染 Markdown，建议包含 `## 适用场景`、`## 可参考内容`、`## 证据依据`
-- 如果输入重点是模板骨架、章节标题、文章格式、文风、常用口语词、AI 替代词，即使可以总结出一些写作建议，也必须 reject，这类内容应交给 design 类别处理
-- 如果输入重点是触发条件、行动动线、处理步骤、排查路线，必须 reject，这类内容应交给 sop 类别处理
+- 输入即使含有写作模板特征或行动步骤，只要其中存在独立可复用的事实/经验/约束/决策/结论，就在 knowledge 中保留这部分；模板部分会由 design 处理，步骤部分由 sop 处理，不要替对方做拒绝判断
 - `match_score` 使用 0-1 小数
 - 证据强、知识明确时才用 `auto_created`，否则用 `candidate`
 - 若只是模糊猜测或噪声，直接 reject"""
 
-BAKE_DESIGN_PROMPT = """类别:design
+BAKE_DESIGN_PROMPT = """类别:design（用于沉淀「文档」资产）
 
-这里的 design 指"未来写新方案、设计、汇报总结等文档时可复用参考的文档模板/写作设计"。
-当你理解该时间线及对应采集记录描述的信息，是用户自己写的、或用户看到别人写的方案/设计/汇报/总结内容，并且它的章节标题风格、文章格式、文章脉络、文字描述风格、常用口语词、AI 替代词中有部分或全部参考意义时，accepted=true。
-如果只是方案里包含的事实知识，交给 knowledge；如果重点是解决问题的行动路线，交给 sop；如果没有可复用的写作模板价值，reject。
+这里的 design 对应用户产品中的「文档」tab，用来沉淀用户在工作中产出或参考过的「成体系内容资料」，覆盖以下场景:
+1. 用户自己写出/正在写的方案、设计稿、汇报、总结、技术文档、运营文档、PRD、项目计划、会议纪要、需求说明等成形内容；
+2. 用户认真阅读/反复参照的他人文档、资料、教程、范文，且其内容、结构、风格对未来工作有可借鉴价值；
+3. 围绕一个主题成体系组织的产物片段，例如完整的 Prompt 指令集合、视频脚本分镜表、数据 Schema 说明、配置脚本注释、计算公式与参数说明等——只要这些片段是被「当作文档来阅读/编写/反复修改」的（而不是一闪而过的中间产物），都属于 design。
+
+重要：候选输入可能只覆盖了文档的一部分（用户当时只看到了一段），但同一份文档往往会被多次浏览或编辑。如果候选包含 `url_document_context`，那是同一 URL 在过去被多次 capture 拼接出来的累计正文，应优先据此还原文档全貌；`url_document_context` 与当前 `capture_context` 来自同一份文档时不要重复抄录，按文档自身的章节顺序合并即可。
+
+只要候选片段对应的是「一份/一段成体系的文档型内容」（无论是产出还是参考、无论一次还是多次浏览拼出来的），就值得沉淀为 design，accepted=true。
+不要求文档必须"章节齐全/结构完整"——这是加分项，会反映在 match_score 的高低，而不是接受/拒绝的门槛。
+
+什么时候 reject:
+- 输入只是零散对话/聊天/任务清单/通知消息，没有围绕一份具体文档；
+- 输入只是一次性代码改动、操作流水或排查动线，且不涉及任何文档形态的内容；
+- 输入只是无意义的浏览噪声、UI 切换、应用界面观察；
+- 输入虽然涉及某个产品页面，但页面只是工具操作界面（如登录页、价格页、设置页），不承载任何文档式正文。
+
+如果输入既包含文档内容又包含事实知识或行动步骤，design 类别仍可 accepted=true，只要文档主体存在。事实知识/行动路线会由 knowledge/sop 类别各自再判断，不需要在 design 这里互相挤兑。
 
 accepted=true 时，payload schema:
 {
-  "name": "设计/模板名称",
-  "category": "方案|设计|汇报|总结|技术文档|其他",
-  "details": "详细描述，Markdown格式，说明可复用的章节结构、行文脉络、表达风格、口语词/AI替代词参考",
-  "prompt_hint": "未来生成类似文档时可直接使用的提示词建议",
+  "name": "文档名称（优先用文档自身的标题/页面 webpage_title；没有则用一句话概括其主题）",
+  "category": "方案|设计|汇报|总结|技术文档|运营文档|会议纪要|资料参考|其他",
+  "summary": "一句话概括这份文档讲了什么、是用户产出还是参考、未来在什么场景可再用，控制在 80 字以内",
+  "full_content": "文档完整正文，Markdown 格式。要求是文档**本身**的内容；如有 url_document_context 应据此尽可能还原全貌，按文档原本的章节顺序整理；列表、代码、Prompt 指令、表格用 Markdown 语法保留；无法识别完整原文时，把 capture/url_document_context 中可见的核心段落如实写入；不要写'结构参考/使用建议/写作风格'这类分析元信息。",
+  "details": "可选元信息说明，Markdown 格式。这里只放对文档使用方有帮助的辅助信息：未来什么场景可参考、风格/结构上值得借鉴的点、需要注意的限制。不要重复 full_content 的正文内容；如无可写，留空字符串。",
+  "prompt_hint": "未来生成或撰写类似文档时可直接使用的提示词建议；若候选只是阅读型，可写未来检索/复用该文档时的关键词",
   "status": "draft|enabled",
   "tags": ["标签1", "标签2"],
   "applicable_tasks": ["creation"],
-  "structure_sections": [{"title":"章节标题","keywords":["关键词"],"notes":"该章节的写法参考"}],
-  "style_phrases": ["值得复用的表达/口语词"],
+  "structure_sections": [{"title":"章节标题","keywords":["关键词"],"notes":"该章节的内容概要"}],
+  "style_phrases": ["值得复用的表达/口语词，可为空数组"],
   "replacement_rules": [{"from":"AI腔或不合适表达","to":"更贴近用户风格的替代表达"}],
   "diagram_code": null,
-  "evidence_summary": "一句话说明设计证据",
+  "evidence_summary": "一句话说明文档证据（看到了什么文档/写了什么内容；如使用了 url_document_context，请说明合并了几次 capture）",
   "match_score": 0.0,
   "match_level": "high|medium|low",
   "review_status": "auto_created|candidate"
 }
 
 约束:
-- `details` 必须是可渲染 Markdown，建议包含 `## 模板价值`、`## 结构参考`、`## 风格参考`、`## 使用建议`
-- `structure_sections` 至少提炼 1 条；看不出章节/脉络但能看出文风时，也可接受但要在 details 中说明
-- 不要把技术架构本身当成 design；只有它的文档结构、表达风格或模板写法有复用价值时才 accepted
-- 设计证据较弱时使用 `candidate`"""
+- `full_content` 是首要产出，必须基于输入证据（包括 url_document_context）如实还原文档原文，禁止生造、禁止用"## 文档概要 / ## 关键内容 / ## 结构参考 / ## 使用建议"这类分析模板替代正文
+- `summary` 必须是简洁的一句话；不要把元信息塞进 summary
+- `details` 仅用于"使用提示/借鉴点"，不是正文复述；没东西写就用空字符串 ""
+- `structure_sections` 至少 1 条；如果文档结构不清，可只放一条整体概要
+- `style_phrases`、`replacement_rules` 当作可选，识别不到时使用空数组
+- match_score 评估"这份文档对未来工作的可参考价值":
+  - 既有清晰章节骨架/可复用风格，又有明确主题: 0.75-0.95（high）
+  - 是一份完整文档或重要参考资料但模板特征不强: 0.55-0.75（medium）
+  - 内容偏单薄但仍有沉淀价值: 0.35-0.55（low/candidate）
+- 证据较弱或文档不完整时使用 `candidate`，证据强且文档主体清晰时用 `auto_created`"""
 
 BAKE_SOP_PROMPT = """类别:sop
 
 只提炼未来遇到相同需求/问题场景时，可以参考给出行动路线建议的操作手册。
 当你理解该时间线及对应采集记录描述的信息，是在描述工作中解决一个问题或需求的行动动线、触发条件、处理路线、排查/执行步骤、检查点或验证方式时，accepted=true。
-如果只是稳定知识但没有行动路线，交给 knowledge；如果重点是文档模板/写作风格，交给 design；如果没有可复用行动指引，reject。
+如果完全没有可复用的行动指引（纯事实陈述、纯文档阅读、纯噪声），reject。
+
+注意:knowledge / design / sop 三个类别相互独立判断，互不互斥。同一条候选既可能成为 knowledge（事实结论），也可能成为 design（文档主体），还可能成为 sop（操作步骤）。只要存在可复用的行动路线或排查步骤，就独立 accept，不要因为"输入更像 knowledge 或 design"就推卸判断。
 
 accepted=true 时，payload schema:
 {
@@ -1013,6 +1038,20 @@ class KnowledgeExtractorV2:
         if len(capture_text) > 5000:
             capture_text = capture_text[:5000].rstrip() + "\n...(已截断)"
 
+        url_aggregated_text = candidate.get('url_aggregated_text') or ''
+        url_aggregated_count = candidate.get('url_aggregated_capture_count') or 0
+        capture_url = candidate.get('capture_url') or ''
+        webpage_title = candidate.get('capture_webpage_title') or ''
+        url_block = ''
+        if url_aggregated_text:
+            url_block = (
+                f"\n\nurl_document_context: 同一 url 在过去被多次浏览/编辑，按时间顺序拼接的可见正文如下"
+                f"（共合并 {url_aggregated_count} 次 capture，可视为这份文档的累计可见内容）：\n"
+                f"url: {capture_url}\n"
+                f"webpage_title: {webpage_title}\n"
+                f"---\n{url_aggregated_text}"
+            )
+
         return (
             f"source_knowledge_id: {candidate.get('source_knowledge_id')}\n"
             f"source_capture_id: {candidate.get('source_capture_id')}\n"
@@ -1034,8 +1073,11 @@ class KnowledgeExtractorV2:
             f"capture_ts: {candidate.get('capture_ts')}\n"
             f"capture_app_name: {self._truncate_text(candidate.get('capture_app_name'), 80)}\n"
             f"capture_win_title: {self._truncate_text(candidate.get('capture_win_title'), 120)}\n"
+            f"capture_url: {capture_url}\n"
+            f"capture_webpage_title: {webpage_title}\n"
             f"entities: {self._truncate_text(entities_text, 160)}\n\n"
             f"capture_context:\n{capture_text}"
+            f"{url_block}"
         )
 
     def _count_marker_hits(self, text: str, markers: tuple[str, ...]) -> int:
@@ -1075,10 +1117,8 @@ class KnowledgeExtractorV2:
             return None
 
         if artifact_type == 'design':
-            if sop_hits >= 3 and design_hits <= 1:
+            if sop_hits >= 5 and design_hits == 0 and candidate_design_hits == 0:
                 return 'sop_like_content'
-            if knowledge_hits >= 3 and design_hits <= 1:
-                return 'knowledge_like_content'
             return None
 
         if artifact_type == 'sop':

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -181,6 +182,71 @@ class BackgroundProcessor:
         # 懒加载 workers
         self._embed_worker = None
         self._knowledge_extractor = None
+
+        # 提炼状态：写入本地 JSON 文件供 core-engine 直读，避免 sidecar 重负载时 Flask 被 GIL 卡住误报 stalled
+        self._extracting_lock = threading.Lock()
+        self._extracting_groups: dict[int, dict] = {}  # group_id -> {captures, started_at}
+        self._next_group_id = 0
+        self._last_extraction_at_ms: int | None = None
+        self._status_file = Path.home() / ".memory-bread" / "state" / "extraction_status.json"
+        self._status_file.parent.mkdir(parents=True, exist_ok=True)
+        # 初始化时立即写一次，保证 core-engine 拿得到 running=true 信号
+        self._write_status_file()
+
+    def _build_status_snapshot(self) -> dict:
+        """构造写入文件 / HTTP 响应共用的状态快照。调用前需持有 _extracting_lock。"""
+        extracting_captures: list[dict] = []
+        for entry in self._extracting_groups.values():
+            extracting_captures.extend(entry["captures"])
+        return {
+            "running": True,
+            "extracting_captures": extracting_captures,
+            "extracting_group_count": len(self._extracting_groups),
+            "last_extraction_at_ms": self._last_extraction_at_ms,
+            "updated_at_ms": int(time.time() * 1000),
+        }
+
+    def _write_status_file(self) -> None:
+        """原子写入状态文件（写 .tmp 后 rename）。调用前需持有 _extracting_lock。"""
+        try:
+            snapshot = self._build_status_snapshot()
+            tmp = self._status_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(snapshot, ensure_ascii=False))
+            tmp.replace(self._status_file)
+        except Exception as e:
+            logger.warning("写入 extraction_status.json 失败: %s", e)
+
+    def _mark_group_extracting(self, group: list[dict]) -> int:
+        """登记一组 captures 进入提炼，返回 group_id 用于结束时移除。"""
+        with self._extracting_lock:
+            gid = self._next_group_id
+            self._next_group_id += 1
+            self._extracting_groups[gid] = {
+                "captures": [
+                    {
+                        "id": int(c.get("id") or 0),
+                        "ts": int(c.get("ts") or 0),
+                        "app_name": c.get("app_name") or "",
+                        "win_title": c.get("window_title") or c.get("win_title") or "",
+                    }
+                    for c in group
+                ],
+                "started_at": int(time.time() * 1000),
+            }
+            self._write_status_file()
+            return gid
+
+    def _unmark_group_extracting(self, group_id: int, succeeded: bool) -> None:
+        with self._extracting_lock:
+            self._extracting_groups.pop(group_id, None)
+            if succeeded:
+                self._last_extraction_at_ms = int(time.time() * 1000)
+            self._write_status_file()
+
+    def get_extraction_status(self) -> dict:
+        """供外部 HTTP 端点读取的实时提炼状态快照（保留 HTTP 接口作为回退）。"""
+        with self._extracting_lock:
+            return self._build_status_snapshot()
 
     def _get_embed_worker(self):
         """懒加载 EmbedWorker"""
@@ -635,73 +701,89 @@ class BackgroundProcessor:
 
     async def _process_capture_group(self, group: list[dict]):
         """将一组 captures 合并提炼为一个 knowledge 条目"""
+        group_id = self._mark_group_extracting(group)
+        succeeded = False
         try:
-            capture_ids = [c['id'] for c in group]
-            logger.info(
-                "开始片段提炼: size=%s first_id=%s last_id=%s",
-                len(group),
-                capture_ids[0] if capture_ids else None,
-                capture_ids[-1] if capture_ids else None,
-            )
-            extractor = self._get_knowledge_extractor()
-            logger.info("KnowledgeExtractor 已就绪，开始执行 extract_merged")
-            knowledge = extractor.extract_merged(captures=group, preempt_check=_check_preempt_signal)
-
-            if not knowledge:
-                logger.warning(f"片段提炼未产出 knowledge ({len(group)} 条 captures)")
-                return False
-
-            conn = sqlite3.connect(self.db_path)
-
-            # 跨批次去重：若新 knowledge 与已有条目高度相似，则合并而非插入
-            overview = knowledge.get('overview') or knowledge.get('summary', '')
-            similar_id = extractor._find_similar_knowledge(
-                overview,
-                conn,
-                entities=json.loads(knowledge.get('entities') or '[]') if knowledge.get('entities') else None,
-                start_time=knowledge.get('start_time'),
-                end_time=knowledge.get('end_time'),
-            ) if overview else None
-
-            if similar_id:
-                # 合并：occurrence_count+1，追加 details（去重保留新信息）
-                existing = conn.execute(
-                    "SELECT details FROM timelines WHERE id = ?", (similar_id,)
-                ).fetchone()
-                existing_details = (existing[0] or "") if existing else ""
-                new_details = knowledge.get('details', '')
-                if new_details and new_details not in existing_details:
-                    from datetime import datetime as _dt
-                    merged_details = existing_details + f"\n\n--- 补充 ({_dt.now().strftime('%Y-%m-%d %H:%M')}) ---\n{new_details}"
-                else:
-                    merged_details = existing_details
-                conn.execute(
-                    "UPDATE timelines SET occurrence_count = occurrence_count + 1, details = ? WHERE id = ?",
-                    (merged_details, similar_id),
-                )
-                conn.commit()
-                self._mark_captures_processed(conn, capture_ids, similar_id)
-                conn.close()
+            try:
+                capture_ids = [c['id'] for c in group]
                 logger.info(
-                    f"🔀 知识已合并到已有条目: {len(group)} captures → knowledge_id={similar_id} (重复)"
+                    "开始片段提炼: size=%s first_id=%s last_id=%s",
+                    len(group),
+                    capture_ids[0] if capture_ids else None,
+                    capture_ids[-1] if capture_ids else None,
                 )
+                extractor = self._get_knowledge_extractor()
+                logger.info("KnowledgeExtractor 已就绪，提交 InferenceQueue 执行 extract_merged")
+                from inference_queue import Priority, get_global_queue, QueueEvictedError
+                try:
+                    knowledge = get_global_queue().submit_sync(
+                        Priority.P1,
+                        lambda: extractor.extract_merged(captures=group, preempt_check=lambda: False),
+                        timeout=600.0,
+                    )
+                except QueueEvictedError as ee:
+                    logger.warning(f"extract_merged 被队列淘汰: {ee}")
+                    return False
+
+                if not knowledge:
+                    logger.warning(f"片段提炼未产出 knowledge ({len(group)} 条 captures)")
+                    return False
+
+                conn = sqlite3.connect(self.db_path)
+
+                # 跨批次去重：若新 knowledge 与已有条目高度相似，则合并而非插入
+                overview = knowledge.get('overview') or knowledge.get('summary', '')
+                similar_id = extractor._find_similar_knowledge(
+                    overview,
+                    conn,
+                    entities=json.loads(knowledge.get('entities') or '[]') if knowledge.get('entities') else None,
+                    start_time=knowledge.get('start_time'),
+                    end_time=knowledge.get('end_time'),
+                ) if overview else None
+
+                if similar_id:
+                    # 合并：occurrence_count+1，追加 details（去重保留新信息）
+                    existing = conn.execute(
+                        "SELECT details FROM timelines WHERE id = ?", (similar_id,)
+                    ).fetchone()
+                    existing_details = (existing[0] or "") if existing else ""
+                    new_details = knowledge.get('details', '')
+                    if new_details and new_details not in existing_details:
+                        from datetime import datetime as _dt
+                        merged_details = existing_details + f"\n\n--- 补充 ({_dt.now().strftime('%Y-%m-%d %H:%M')}) ---\n{new_details}"
+                    else:
+                        merged_details = existing_details
+                    conn.execute(
+                        "UPDATE timelines SET occurrence_count = occurrence_count + 1, details = ? WHERE id = ?",
+                        (merged_details, similar_id),
+                    )
+                    conn.commit()
+                    self._mark_captures_processed(conn, capture_ids, similar_id)
+                    conn.close()
+                    logger.info(
+                        f"🔀 知识已合并到已有条目: {len(group)} captures → knowledge_id={similar_id} (重复)"
+                    )
+                    succeeded = True
+                    return True
+
+                knowledge_id = self._save_knowledge(conn, knowledge)
+                self._mark_captures_processed(conn, capture_ids, knowledge_id)
+                conn.close()
+
+                asyncio.create_task(self._process_knowledge_vectorization(group, knowledge_id, knowledge))
+
+                logger.info(
+                    f"✅ 片段提炼完成: {len(group)} captures → knowledge_id={knowledge_id}, "
+                    f"时长={knowledge.get('duration_minutes')}分钟"
+                )
+                succeeded = True
                 return True
 
-            knowledge_id = self._save_knowledge(conn, knowledge)
-            self._mark_captures_processed(conn, capture_ids, knowledge_id)
-            conn.close()
-
-            asyncio.create_task(self._process_knowledge_vectorization(group, knowledge_id, knowledge))
-
-            logger.info(
-                f"✅ 片段提炼完成: {len(group)} captures → knowledge_id={knowledge_id}, "
-                f"时长={knowledge.get('duration_minutes')}分钟"
-            )
-            return True
-
-        except Exception as e:
-            logger.error(f"片段提炼异常: {e}")
-            return False
+            except Exception as e:
+                logger.error(f"片段提炼异常: {e}")
+                return False
+        finally:
+            self._unmark_group_extracting(group_id, succeeded)
 
     async def _process_vectorization_batch(self, group: list[dict]):
         """对一组 captures 批量向量化"""
@@ -918,8 +1000,18 @@ class BackgroundProcessor:
             # 打开数据库连接用于去重
             conn = sqlite3.connect(self.db_path)
 
-            # 使用同步方法提炼（V2 版本）
-            knowledge = extractor.extract_sync(capture_data, db_conn=conn)
+            # 使用同步方法提炼（V2 版本）—— 走 InferenceQueue 单 worker
+            from inference_queue import Priority, get_global_queue, QueueEvictedError
+            try:
+                knowledge = get_global_queue().submit_sync(
+                    Priority.P1,
+                    lambda: extractor.extract_sync(capture_data, db_conn=conn),
+                    timeout=600.0,
+                )
+            except QueueEvictedError as ee:
+                logger.warning(f"extract_sync 被队列淘汰: {ee}")
+                conn.close()
+                return False
 
             if knowledge:
                 # 保存到数据库
