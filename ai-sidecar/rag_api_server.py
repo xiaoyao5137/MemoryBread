@@ -31,7 +31,8 @@ def get_rag_pipeline():
         db_path = str(Path.home() / ".memory-bread" / "memory-bread.db")
         qdrant_path = str(Path.home() / ".qdrant")
 
-        embedding_model = EmbeddingModel.create_default()
+        from model_registry_global import get_shared_embedding, get_active_ollama_model
+        embedding_model = get_shared_embedding()
         # 使用本地 Qdrant 模式
         vector_retriever = VectorRetriever(
             collection="memory_bread_captures",
@@ -39,7 +40,8 @@ def get_rag_pipeline():
         )
         fts5_retriever = Fts5Retriever(db_path=db_path)
         knowledge_retriever = KnowledgeFts5Retriever(db_path=db_path)
-        llm = OllamaBackend(model="qwen2.5:3b", timeout=300, num_predict=1024)  # 使用 3b 模型，报告模式由 pipeline 传 num_predict=4096
+        ollama_model = get_active_ollama_model()
+        llm = OllamaBackend(model=ollama_model, timeout=300, num_predict=1024)
 
         _rag_pipeline = RagPipeline(
             embedding_model=embedding_model,

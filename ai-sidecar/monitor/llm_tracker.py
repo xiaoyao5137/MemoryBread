@@ -79,7 +79,7 @@ class LLMCallTracker:
     上下文管理器，自动记录 LLM 调用的耗时和 token 用量。
 
     用法：
-        with LLMCallTracker(caller='rag', model='qwen2.5:3b') as tracker:
+        with LLMCallTracker(caller='rag', model='qwen3.5:4b') as tracker:
             response = client.chat(...)
             tracker.set_response(response)
     """
@@ -115,7 +115,11 @@ class LLMCallTracker:
         )
         # 如果没有 token 信息，用文本估算
         if self._prompt_tokens == 0:
-            content = response.get("message", {}).get("content", "")
+            msg = response.get("message", {})
+            content = msg.get("content", "")
+            # Qwen3.5 等推理模型可能将内容放在 thinking 字段
+            if not content:
+                content = msg.get("thinking", "")
             self._completion_tokens = estimate_tokens(content)
 
     def set_error(self, error_msg: str):

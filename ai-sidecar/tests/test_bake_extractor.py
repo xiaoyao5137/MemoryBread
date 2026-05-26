@@ -19,7 +19,7 @@ class ResponseLike:
 
 
 SAMPLE_CANDIDATE = {
-    "source_knowledge_id": 1,
+    "source_timeline_id": 1,
     "source_capture_id": 10,
     "summary": "修复 bake pipeline 的 JSON 提炼链路",
     "overview": "定位 sidecar 返回空内容导致 bake 三类产物全部 rejected。",
@@ -45,7 +45,7 @@ SAMPLE_CANDIDATE = {
 
 
 TEMPLATE_ONLY_CANDIDATE = {
-    "source_knowledge_id": 2,
+    "source_timeline_id": 2,
     "source_capture_id": 20,
     "summary": "整理周报撰写模板骨架",
     "overview": "抽象固定段落模板：背景、进展、风险、下周计划。",
@@ -295,7 +295,7 @@ def test_extract_bake_knowledge_rejects_sop_like_candidate_after_llm_accepts():
     extractor = make_extractor()
     sop_candidate = {
         **SAMPLE_CANDIDATE,
-        "source_knowledge_id": 3,
+        "source_timeline_id": 3,
         "source_capture_id": 30,
         "summary": "启动失败排查步骤",
         "overview": "按步骤排查本地服务启动失败。",

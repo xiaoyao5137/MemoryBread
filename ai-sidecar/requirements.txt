@@ -28,7 +28,8 @@ scikit-learn>=1.0           # 机器学习库（用于 reranker 等）
 
 # ── 向量数据库与 Embedding ────────────────────────────────────────────────────
 qdrant-client>=1.7          # Qdrant 向量数据库客户端
-sentence-transformers>=3.0  # 向量 embedding 模型库
+# 注：Embedding 已迁移到 Ollama API（bge-small-zh-v1.5），不再需要本地 sentence-transformers
+# 如需本地 PyTorch Embedding（已弃用），请手动安装：pip install sentence-transformers
 
 # ── LLM 客户端 ─────────────────────────────────────────────────────────────────
 openai>=1.0                 # OpenAI 兼容 API（用于 Ollama 调用）

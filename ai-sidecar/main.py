@@ -184,14 +184,17 @@ async def _main() -> None:
 
         try:
             from startup_checks import run_startup_checks, get_ollama_setup_detail
-            checks_passed = await asyncio.to_thread(run_startup_checks)
-            if not checks_passed:
+            checks_result = await asyncio.to_thread(run_startup_checks)
+            # 只有 Ollama+LLM 核心检查通过才能启动提炼；向量模型失败仅降级（不阻塞）
+            if not checks_result.get('critical_passed'):
                 detail = await asyncio.to_thread(get_ollama_setup_detail)
                 logger.warning(
-                    "启动检查未通过，保持基础 IPC 模式，仅保留 ping/OCR 能力（原因: %s）",
+                    "核心启动检查未通过，保持基础 IPC 模式，仅保留 ping/OCR 能力（原因: %s）",
                     detail.get('message', 'unknown'),
                 )
                 return
+            if not checks_result.get('embedding_ok'):
+                logger.warning("向量模型不可用，以降级模式启动（RAG 向量检索不可用，提炼功能正常）")
 
             from dispatcher_v2 import Dispatcher
             dispatcher = Dispatcher()
@@ -204,7 +207,7 @@ async def _main() -> None:
             bg_processor = BackgroundProcessor(db_path=db_path, interval=30, batch_size=20)
             runtime_state["bg_processor"] = bg_processor
             asyncio.create_task(bg_processor.run())
-            logger.info("后台处理器已启动（向量化 + 知识提炼）")
+            logger.info("后台处理器已启动（向量化 + 时间线提炼）")
         except Exception as exc:
             logger.error("完整能力初始化失败，保持基础 IPC 模式: %s", exc, exc_info=True)
 

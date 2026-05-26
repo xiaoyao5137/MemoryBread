@@ -1,5 +1,5 @@
 """
-知识提炼模块 - 使用 Qwen3.5-4B 从 OCR 文本中提取结构化知识
+时间线提炼模块（旧版） - 使用 Qwen3.5-4B 从 OCR 文本中提取结构化知识
 """
 
 import json
@@ -52,7 +52,7 @@ MENU_NOISE_KEYWORDS = {
 ACTION_HINTS = (
     ('修复', '修复问题'),
     ('排查', '排查异常'),
-    ('提炼', '执行知识提炼'),
+    ('提炼', '执行时间线提炼'),
     ('启动', '启动服务'),
     ('重启', '重启服务'),
     ('日志', '查看日志'),
@@ -133,7 +133,7 @@ def _build_work_summary(app_name: str, window_title: str, text: str) -> Optional
 
 def simple_extract(capture_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    基于规则的简单知识提炼（当 Ollama 不可用时使用）
+    基于规则的简单时间线提炼（当 Ollama 不可用时使用）
 
     Args:
         capture_data: 采集数据
@@ -195,11 +195,11 @@ def simple_extract(capture_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 class KnowledgeExtractor:
-    """知识提炼器"""
+    """时间线提炼器（旧版）"""
 
     def __init__(self, model: str = "qwen3.5:4b"):
         """
-        初始化知识提炼器
+        初始化时间线提炼器
 
         Args:
             model: Ollama 模型名称
@@ -210,12 +210,12 @@ class KnowledgeExtractor:
         if OLLAMA_AVAILABLE:
             try:
                 self.client = Client()
-                logger.info(f"初始化知识提炼器，模型: {model}")
+                logger.info(f"初始化时间线提炼器，模型: {model}")
             except Exception as e:
                 logger.warning(f"Ollama 客户端初始化失败: {e}，将使用简单提炼器")
                 self.use_ollama = False
         else:
-            logger.info("使用基于规则的简单知识提炼器")
+            logger.info("使用基于规则的简单时间线提炼器")
             self.use_ollama = False
 
     def _build_prompt(self, capture_data: Dict[str, Any]) -> str:
@@ -279,7 +279,11 @@ class KnowledgeExtractor:
             )
 
             # 3. 解析结果
-            content = response['message']['content']
+            msg = response['message']
+            content = msg.get('content', '')
+            # Qwen3.5 等推理模型可能将内容放在 thinking 字段
+            if not content:
+                content = msg.get('thinking', '')
             result = json.loads(content)
 
             # 4. 跳过无价值内容
@@ -303,7 +307,7 @@ class KnowledgeExtractor:
             logger.error(f"JSON 解析失败: {e}, 响应内容: {content}")
             return None
         except Exception as e:
-            logger.error(f"知识提炼失败: {e}")
+            logger.error(f"时间线提炼失败: {e}")
             return None
 
     def extract_sync(self, capture_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -338,7 +342,11 @@ class KnowledgeExtractor:
             )
 
             # 3. 解析结果
-            content = response['message']['content']
+            msg = response['message']
+            content = msg.get('content', '')
+            # Qwen3.5 等推理模型可能将内容放在 thinking 字段
+            if not content:
+                content = msg.get('thinking', '')
             result = json.loads(content)
 
             # 4. 跳过无价值内容
@@ -362,7 +370,7 @@ class KnowledgeExtractor:
             logger.error(f"JSON 解析失败: {e}")
             return None
         except Exception as e:
-            logger.error(f"知识提炼失败: {e}")
+            logger.error(f"时间线提炼失败: {e}")
             return None
 
 

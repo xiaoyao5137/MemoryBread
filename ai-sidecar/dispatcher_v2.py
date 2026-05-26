@@ -154,14 +154,15 @@ class Dispatcher:
         return OcrEngine.create_default()
 
     def _load_embedding_model(self):
-        """加载 Embedding 模型"""
-        from embedding.model import EmbeddingModel
-        return EmbeddingModel.create_default()
+        """加载 Embedding 模型（使用全局共享实例）"""
+        from model_registry_global import get_shared_embedding
+        return get_shared_embedding()
 
     def _load_llm_model(self):
         """加载 LLM 模型（通过 Ollama）"""
-        # LLM 通过 Ollama HTTP API 调用，不需要直接加载
-        return {"type": "llm", "model": "qwen2.5:3b"}
+        # LLM 通过 Ollama HTTP API 调用，使用全局统一的模型名
+        from model_registry_global import get_active_ollama_model
+        return {"type": "llm", "model": get_active_ollama_model()}
 
     def _load_asr_model(self):
         """加载 ASR 模型"""

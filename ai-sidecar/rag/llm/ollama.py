@@ -51,6 +51,10 @@ class OllamaBackend(LlmBackend):
             "prompt":      prompt,
             "stream":      False,
             "num_predict": kwargs.pop("num_predict", self._num_predict),
+            # keep_alive=10m：请求完成后模型在内存中保留 10 分钟，
+            # 避免频繁调用时 Ollama 反复加载/卸载模型（默认 5 分钟太短）。
+            # 对于 RAG 查询 + 时间线提炼交替使用的场景，10 分钟可以覆盖大部分间隔。
+            "keep_alive":  "10m",
         }
         if system:
             body["system"] = system

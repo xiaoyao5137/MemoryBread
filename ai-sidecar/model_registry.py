@@ -62,24 +62,6 @@ AVAILABLE_MODELS: List[ModelMeta] = [
         tags=["中文优化", "均衡"],
     ),
     ModelMeta(
-        id="qwen2.5-14b", name="Qwen2.5 14B", category="llm", provider="ollama",
-        size_gb=8.5, min_memory_gb=16.0,
-        description="阿里通义千问 2.5，14B 参数，高质量输出，需要 16GB+ 内存",
-        tags=["高质量", "中文优化"],
-    ),
-    ModelMeta(
-        id="llama3.2-3b", name="Llama 3.2 3B", category="llm", provider="ollama",
-        size_gb=2.0, min_memory_gb=4.0,
-        description="Meta Llama 3.2，3B 参数，英文能力强",
-        tags=["轻量", "英文优化"],
-    ),
-    ModelMeta(
-        id="gemma2-2b", name="Gemma 2 2B", category="llm", provider="ollama",
-        size_gb=1.6, min_memory_gb=4.0,
-        description="Google Gemma 2，2B 参数，最小内存需求",
-        tags=["超轻量"],
-    ),
-    ModelMeta(
         id="deepseek-r1-7b", name="DeepSeek-R1 7B", category="llm", provider="ollama",
         size_gb=4.7, min_memory_gb=8.0,
         description="DeepSeek R1 推理模型，7B 参数，推理能力强",
@@ -140,19 +122,10 @@ AVAILABLE_MODELS: List[ModelMeta] = [
 
     # ── 商业 LLM：Anthropic ──────────────────────────────────────────────────
     ModelMeta(
-        id="claude-3-5-sonnet", name="Claude 3.5 Sonnet", category="llm", provider="anthropic",
+        id="claude-4.7-opus", name="Claude 4.7 Opus", category="llm", provider="anthropic",
         size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="Anthropic Claude 3.5 Sonnet，代码和推理能力强",
-        tags=["高质量", "代码"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-ant-...", required=True, secret=True),
-        ],
-    ),
-    ModelMeta(
-        id="claude-3-haiku", name="Claude 3 Haiku", category="llm", provider="anthropic",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="Anthropic Claude 3 Haiku，速度最快，成本最低",
-        tags=["快速", "低成本"],
+        description="Anthropic Claude 4.7 Opus，最强推理与创作能力，旗舰模型",
+        tags=["最新", "高质量", "代码", "推理"],
         api_key_fields=[
             ApiKeyField("api_key", "API Key", "sk-ant-...", required=True, secret=True),
         ],
@@ -216,15 +189,6 @@ AVAILABLE_MODELS: List[ModelMeta] = [
         size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
         description="月之暗面 Kimi 2.5，最新版本，长文本理解能力更强，国内访问稳定",
         tags=["最新", "长上下文", "国内"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-        ],
-    ),
-    ModelMeta(
-        id="moonshot-v1-8k", name="Kimi moonshot-v1-8k", category="llm", provider="kimi",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="月之暗面 Kimi，长文本理解能力强，国内访问稳定",
-        tags=["长上下文", "国内"],
         api_key_fields=[
             ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
         ],

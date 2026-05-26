@@ -2,7 +2,7 @@
 模型管理器 - 管理本地 AI 模型的下载、配置和切换
 
 支持的模型类型：
-1. 文本推理模型（LLM）- 用于知识提炼
+1. 文本推理模型（LLM）- 用于时间线提炼与 bake 提炼
 2. 向量模型（Embedding）- 用于语义搜索
 """
 
@@ -203,6 +203,7 @@ class ModelManager:
         return {
             "active_llm": "qwen3.5-4b",
             "active_embedding": "bge-small-zh",
+            "llm_max_concurrency": 1,
             "api_keys": {}
         }
 
@@ -820,7 +821,7 @@ class ModelManager:
             elif provider == 'anthropic':
                 req = urllib.request.Request(
                     "https://api.anthropic.com/v1/messages",
-                    data=_json.dumps({"model": "claude-3-haiku-20240307", "max_tokens": 1,
+                    data=_json.dumps({"model": "claude-sonnet-4-20250514", "max_tokens": 1,
                                       "messages": [{"role": "user", "content": "hi"}]}).encode(),
                     headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
                              "content-type": "application/json"},

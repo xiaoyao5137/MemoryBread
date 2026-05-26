@@ -36,12 +36,9 @@ class PaddleBackend(OcrBackend):
     # ── 公共接口 ──────────────────────────────────────────────────────────────
 
     def is_available(self) -> bool:
-        """检查 paddleocr 是否已安装"""
-        try:
-            import paddleocr  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        """检查 paddleocr 是否已安装（不触发 import，避免间接加载 PyTorch）"""
+        import importlib.util
+        return importlib.util.find_spec('paddleocr') is not None
 
     def run(self, image_path: str) -> OcrOutput:
         self._ensure_loaded()

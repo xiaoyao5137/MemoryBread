@@ -27,8 +27,12 @@ if str(IPC_PYTHON_DIR) not in sys.path:
 
 from background_processor import BackgroundProcessor
 from inference_queue import (
+    LANE_P0_QUERY,
+    LANE_P1_PREEXTRACT,
+    LANE_P2_BAKE,
     Priority,
     QueueEvictedError,
+    configure_global_queue,
     get_global_queue,
 )
 from monitor.llm_tracker import estimate_tokens, log_llm_usage
@@ -39,7 +43,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-# RAG 查询期间持有此文件锁，阻止知识提炼同时占用 Ollama
+# RAG 查询期间持有此文件锁，阻止时间线提炼同时占用 Ollama
 _RAG_LOCK_FILE = "/tmp/memory-bread-rag.lock"
 _RAG_LOCK_OWNER_FILE = "/tmp/memory-bread-rag-owner.txt"
 _PREEMPT_SIGNAL_FILE = "/tmp/memory-bread-preempt.signal"
@@ -159,9 +163,9 @@ def _read_user_identity() -> str:
 def get_bake_extractor():
     global _bake_extractor
     identity = _read_user_identity()
-    active_llm_id = model_manager.config.get('active_llm', 'qwen3.5-4b')
-    active_llm = MANAGER_MODELS.get(active_llm_id)
-    ollama_model = active_llm.model_id if active_llm else 'qwen3.5:4b'
+    # 使用全局统一的 Ollama 模型名，避免与 RAG 查询使用不同模型导致 Ollama swap
+    from model_registry_global import get_active_ollama_model
+    ollama_model = get_active_ollama_model()
     cached_identity = getattr(get_bake_extractor, '_cached_identity', None)
     cached_model = getattr(get_bake_extractor, '_cached_model', None)
 
@@ -221,16 +225,27 @@ def get_rag_pipeline():
                     from rag.retriever import VectorRetriever, KnowledgeFts5Retriever, Fts5Retriever
                     from rag.llm.ollama import OllamaBackend
                     from rag.pipeline import RagPipeline
+                    from model_registry_global import (
+                        get_shared_embedding, get_active_ollama_model,
+                        should_proceed_with_model_load, set_active_ollama_model,
+                    )
 
                     db_path = str(Path.home() / ".memory-bread" / "memory-bread.db")
                     qdrant_path = str(Path.home() / ".qdrant")
-                    active_llm_id = model_manager.config.get('active_llm', 'qwen3.5-4b')
-                    active_llm = MANAGER_MODELS.get(active_llm_id)
-                    ollama_model = active_llm.model_id if active_llm else 'qwen3.5:4b'
 
-                    _log_model_event("load_start", "embedding", "RAG Embedding · BGE-M3-INT8", memory_mb=650)
+                    # 通过全局单例获取 Ollama 模型名，确保与时间线提炼使用同一模型
+                    ollama_model = get_active_ollama_model()
+
+                    # 内存门禁：LLM 预计占用 ~2.5GB，检查是否足够
+                    if not should_proceed_with_model_load(estimated_mb=2500):
+                        raise ServiceUnavailable(
+                            "内存不足，无法启动 RAG 服务。请关闭其他应用后重试。"
+                        )
+
+                    _log_model_event("load_start", "embedding", "RAG Embedding · Shared", memory_mb=650)
                     embed_start_ms = int(time.time() * 1000)
-                    embedding_model = EmbeddingModel.create_default()
+                    # 使用全局共享 EmbeddingModel，避免与 BackgroundProcessor 重复加载
+                    embedding_model = get_shared_embedding()
 
                     # 验证向量模型是否可用
                     if not embedding_model or not hasattr(embedding_model, 'encode'):
@@ -239,7 +254,7 @@ def get_rag_pipeline():
                     _log_model_event(
                         "load_done",
                         "embedding",
-                        "RAG Embedding · BGE-M3-INT8",
+                        "RAG Embedding · Shared",
                         duration_ms=int(time.time() * 1000) - embed_start_ms,
                         memory_mb=650,
                     )
@@ -484,6 +499,15 @@ def activate_model(model_id: str):
     try:
         success = model_manager.activate_model(model_id)
         if success:
+            # 同步更新全局 Ollama 模型名，确保后续所有调用使用新模型
+            active_llm = MANAGER_MODELS.get(model_id)
+            if active_llm and active_llm.provider == 'ollama':
+                from model_registry_global import set_active_ollama_model, reset_shared_embedding
+                set_active_ollama_model(active_llm.model_id)
+                # 切换模型时重置共享 Embedding（embedding 模型切换时才需要）
+                if active_llm.type.value == 'embedding':
+                    reset_shared_embedding()
+
             with _rag_pipeline_lock:
                 _rag_pipeline = None
             # 后台初始化 RAG pipeline
@@ -517,6 +541,48 @@ def get_config():
     try:
         return jsonify({'status': 'ok', 'config': model_manager.config})
     except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/models/llm-concurrency', methods=['GET'])
+def get_llm_concurrency():
+    try:
+        configured = int(model_manager.config.get('llm_max_concurrency', 1) or 1)
+        configured = max(1, min(3, configured))
+        stats = get_global_queue().stats()
+        return jsonify({
+            'status': 'ok',
+            'max_concurrency': configured,
+            'max_allowed': 3,
+            'stats': stats,
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/models/llm-concurrency', methods=['POST'])
+def update_llm_concurrency():
+    try:
+        data = request.get_json(silent=True) or {}
+        raw_value = data.get('max_concurrency')
+        try:
+            max_concurrency = int(raw_value)
+        except (TypeError, ValueError):
+            return jsonify({'status': 'error', 'message': 'max_concurrency 必须是 1 到 3 的整数'}), 400
+        if max_concurrency < 1 or max_concurrency > 3:
+            return jsonify({'status': 'error', 'message': 'max_concurrency 必须在 1 到 3 之间'}), 400
+
+        model_manager.config['llm_max_concurrency'] = max_concurrency
+        model_manager._save_config()
+        stats = configure_global_queue(max_concurrency)
+        return jsonify({
+            'status': 'ok',
+            'max_concurrency': max_concurrency,
+            'max_allowed': 3,
+            'stats': stats,
+        })
+    except Exception as e:
+        logger.error("更新 LLM 并发配置失败: %s", e, exc_info=True)
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
@@ -588,6 +654,224 @@ def ollama_upgrade_status():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
+@app.route('/api/models/<model_id>/chat', methods=['POST'])
+def model_chat(model_id: str):
+    """模型体验对话接口 - 流式返回模型回复。
+    
+    支持 Ollama 本地模型和商业 API 模型。
+    Body: { "messages": [{"role": "user", "content": "..."}] }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        messages = data.get('messages', [])
+        if not messages:
+            return jsonify({'status': 'error', 'message': '缺少 messages 参数'}), 400
+
+        meta = get_model(model_id)
+        if not meta:
+            return jsonify({'status': 'error', 'message': f'未知模型 {model_id}'}), 404
+
+        if meta.category != 'llm':
+            return jsonify({'status': 'error', 'message': f'模型 {model_id} 不是对话模型'}), 400
+
+        provider = meta.provider
+        cfg = model_manager.config.get('model_configs', {}).get(model_id, {})
+
+        # ── Ollama 本地模型 ──────────────────────────────────────────────────
+        if provider == 'ollama':
+            ollama_model_id = None
+            # 从 MANAGER_MODELS 获取 Ollama model_id
+            if model_id in MANAGER_MODELS:
+                ollama_model_id = MANAGER_MODELS[model_id].model_id
+            else:
+                # 回退：直接使用 model_id 转换
+                names = model_manager._ollama_names_for_model(model_id)
+                ollama_model_id = names[0] if names else model_id
+
+            payload = {
+                'model': ollama_model_id,
+                'messages': messages,
+                'stream': True,
+                'options': {'temperature': 0.7, 'num_predict': 2048},
+            }
+
+            def generate_ollama():
+                import http.client
+                conn = http.client.HTTPConnection('localhost', 11434, timeout=120)
+                conn.request('POST', '/api/chat', body=json.dumps(payload), headers={'Content-Type': 'application/json'})
+                resp = conn.getresponse()
+                if resp.status != 200:
+                    yield f"data: {json.dumps({'error': f'Ollama 返回 {resp.status}'})}\n\n"
+                    conn.close()
+                    return
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    line_str = line.decode('utf-8').strip()
+                    if not line_str:
+                        continue
+                    try:
+                        chunk = json.loads(line_str)
+                        content = chunk.get('message', {}).get('content', '')
+                        done = chunk.get('done', False)
+                        if content:
+                            yield f"data: {json.dumps({'content': content})}\n\n"
+                        if done:
+                            yield f"data: {json.dumps({'done': True})}\n\n"
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                conn.close()
+
+            return app.response_class(generate_ollama(), mimetype='text/event-stream')
+
+        # ── OpenAI 系列（含兼容接口的提供商）──────────────────────────────────
+        openai_compatible_providers = {
+            'openai':       {'default_base': 'https://api.openai.com/v1', 'model_key': None},
+            'deepseek':     {'default_base': 'https://api.deepseek.com/v1', 'model_key': None},
+            'tongyi':       {'default_base': 'https://dashscope.aliyuncs.com/compatible-mode/v1', 'model_key': None},
+            'doubao':       {'default_base': 'https://ark.cn-beijing.volces.com/api/v3', 'model_key': 'endpoint_id'},
+            'kimi':         {'default_base': 'https://api.moonshot.cn/v1', 'model_key': None},
+        }
+
+        if provider in openai_compatible_providers:
+            provider_info = openai_compatible_providers[provider]
+            api_key = cfg.get('api_key') or model_manager.config.get('api_keys', {}).get(provider, '')
+            if not api_key:
+                return jsonify({'status': 'error', 'message': f'{provider} API Key 未配置'}), 400
+
+            base_url = cfg.get('base_url', provider_info['default_base'])
+
+            # 确定 model_name
+            model_name = meta.id
+            # OpenAI 特殊模型名映射
+            if provider == 'openai':
+                model_name_map = {'gpt-5.5': 'gpt-4.5-preview', 'gpt-4o': 'gpt-4o', 'gpt-4o-mini': 'gpt-4o-mini'}
+                model_name = model_name_map.get(meta.id, meta.id)
+            elif provider == 'deepseek':
+                model_name_map = {'deepseek-chat': 'deepseek-chat', 'deepseek-reasoner': 'deepseek-reasoner'}
+                model_name = model_name_map.get(meta.id, meta.id)
+            elif provider == 'tongyi':
+                model_name_map = {'qwen-plus': 'qwen-plus', 'qwen-max': 'qwen-max'}
+                model_name = model_name_map.get(meta.id, meta.id)
+            elif provider == 'doubao':
+                endpoint_id = cfg.get('endpoint_id') or model_manager.config.get('model_configs', {}).get(model_id, {}).get('endpoint_id', '')
+                model_name = endpoint_id
+            elif provider == 'kimi':
+                model_name_map = {'kimi-2.5': 'moonshot-v1-auto'}
+                model_name = model_name_map.get(meta.id, meta.id)
+
+            def generate_openai():
+                req_payload = {
+                    'model': model_name,
+                    'messages': messages,
+                    'stream': True,
+                    'max_tokens': 2048,
+                }
+                req_data = json.dumps(req_payload).encode('utf-8')
+                req = urllib.request.Request(
+                    f"{base_url}/chat/completions",
+                    data=req_data,
+                    headers={
+                        'Authorization': f'Bearer {api_key}',
+                        'Content-Type': 'application/json',
+                    },
+                    method='POST',
+                )
+                try:
+                    resp = urllib.request.urlopen(req, timeout=120)
+                except Exception as e:
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                    return
+
+                for line in resp:
+                    line_str = line.decode('utf-8').strip()
+                    if not line_str:
+                        continue
+                    if line_str.startswith('data: '):
+                        data_str = line_str[6:]
+                        if data_str == '[DONE]':
+                            yield f"data: {json.dumps({'done': True})}\n\n"
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            choices = chunk.get('choices', [])
+                            if choices:
+                                delta = choices[0].get('delta', {}) or choices[0].get('text', '')
+                                content = delta.get('content', '') if isinstance(delta, dict) else delta
+                                if content:
+                                    yield f"data: {json.dumps({'content': content})}\n\n"
+                        except json.JSONDecodeError:
+                            continue
+
+            return app.response_class(generate_openai(), mimetype='text/event-stream')
+
+        # ── Anthropic ──────────────────────────────────────────────────
+        if provider == 'anthropic':
+            api_key = cfg.get('api_key') or model_manager.config.get('api_keys', {}).get('anthropic', '')
+            if not api_key:
+                return jsonify({'status': 'error', 'message': 'Anthropic API Key 未配置'}), 400
+
+            # Claude 模型名映射
+            model_name_map = {'claude-4.7-opus': 'claude-opus-4-20250514'}
+            model_name = model_name_map.get(meta.id, meta.id)
+
+            def generate_anthropic():
+                # Anthropic 不支持流式，直接返回完整响应
+                req_payload = {
+                    'model': model_name,
+                    'max_tokens': 2048,
+                    'messages': messages,
+                }
+                req_data = json.dumps(req_payload).encode('utf-8')
+                req = urllib.request.Request(
+                    'https://api.anthropic.com/v1/messages',
+                    data=req_data,
+                    headers={
+                        'x-api-key': api_key,
+                        'anthropic-version': '2023-06-01',
+                        'content-type': 'application/json',
+                    },
+                    method='POST',
+                )
+                try:
+                    resp = urllib.request.urlopen(req, timeout=120)
+                    resp_data = json.loads(resp.read().decode('utf-8'))
+                except Exception as e:
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                    return
+
+                # 提取回复内容
+                content_blocks = resp_data.get('content', [])
+                full_text = ''
+                for block in content_blocks:
+                    if block.get('type') == 'text':
+                        full_text += block.get('text', '')
+
+                # 分块流式发送
+                chunk_size = 20
+                for i in range(0, len(full_text), chunk_size):
+                    yield f"data: {json.dumps({'content': full_text[i:i+chunk_size]})}\n\n"
+                yield f"data: {json.dumps({'done': True})}\n\n"
+
+            return app.response_class(generate_anthropic(), mimetype='text/event-stream')
+
+        # ── Google Gemini ──────────────────────────────────────────────────
+        if provider == 'google':
+            api_key = cfg.get('api_key') or model_manager.config.get('api_keys', {}).get('google', '')
+            if not api_key:
+                return jsonify({'status': 'error', 'message': 'Google API Key 未配置'}), 400
+
+            return jsonify({'status': 'error', 'message': 'Google 模型对话暂未实现'}), 501
+
+        return jsonify({'status': 'error', 'message': f'提供商 {provider} 的对话接口暂未实现'}), 501
+
+    except Exception as e:
+        logger.error(f"模型对话失败: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
 @app.route('/query', methods=['POST'])
 def rag_query():
     """RAG 查询接口，与模型管理 API 共用 7071 端口。"""
@@ -603,6 +887,16 @@ def rag_query():
         top_k = data.get('top_k', 5)
         logger.info(f"收到 RAG 查询: {query}")
 
+        # 内存压力检查
+        from model_registry_global import check_memory_pressure
+        pressure = check_memory_pressure()
+        if pressure == "critical":
+            logger.warning("内存压力 Critical，RAG 查询降级处理")
+            return jsonify({
+                'error': 'MEMORY_PRESSURE',
+                'message': '系统内存不足，RAG 查询暂时不可用，请稍后再试'
+            }), 503
+
         # 检查模型是否就绪
         if _rag_pipeline is None:
             return jsonify({
@@ -611,12 +905,13 @@ def rag_query():
             }), 503
 
         pipeline = _rag_pipeline
-        # 通过 InferenceQueue 单 worker 串行所有 LLM 推理，P0 = 在线 RAG 查询
+        # 通过 InferenceQueue 统一调度所有 LLM 推理，P0 = 在线 RAG 查询
         try:
             result = get_global_queue().submit_sync(
                 Priority.P0,
                 lambda: pipeline.query(query, top_k=top_k),
                 timeout=120.0,
+                lane=LANE_P0_QUERY,
             )
         except QueueEvictedError as ee:
             logger.warning(f"RAG 查询被队列淘汰: {ee}")
@@ -665,9 +960,10 @@ def rag_query():
         latency_ms = int(time.time() * 1000) - start_ms
         error_text = str(e)
         if query:
+            from model_registry_global import get_active_ollama_model
             log_llm_usage(
                 caller='rag',
-                model_name='qwen2.5:3b',
+                model_name=get_active_ollama_model(),
                 prompt_tokens=estimate_tokens(query),
                 completion_tokens=0,
                 latency_ms=latency_ms,
@@ -686,7 +982,7 @@ def rag_query():
 
 @app.route('/knowledge/extract', methods=['POST'])
 def extract_knowledge():
-    """触发一次真实 knowledge 提炼。"""
+    """触发一次真实时间线提炼。"""
     try:
         data = request.get_json(silent=True) or {}
         limit = data.get('limit')
@@ -701,7 +997,7 @@ def extract_knowledge():
                 return jsonify({'error': 'limit 必须是正整数'}), 400
 
         processor = BackgroundProcessor(db_path=DB_PATH, interval=90, batch_size=8)
-        # 通过 InferenceQueue 单 worker 串行，P1 = knowledge 提炼
+        # 通过 InferenceQueue 统一调度，P1 = 时间线提炼
         try:
             result = get_global_queue().submit_sync(
                 Priority.P1,
@@ -712,12 +1008,13 @@ def extract_knowledge():
                     )
                 ),
                 timeout=600.0,
+                lane=LANE_P1_PREEXTRACT,
             )
         except QueueEvictedError as ee:
-            logger.warning(f"knowledge 提炼被队列淘汰: {ee}")
+            logger.warning(f"时间线提炼被队列淘汰: {ee}")
             return jsonify({'error': '系统繁忙，请稍候再试'}), 503
         except concurrent.futures.TimeoutError:
-            logger.warning("knowledge 提炼执行超时")
+            logger.warning("时间线提炼执行超时")
             return jsonify({'error': '提炼超时'}), 504
 
         processed_count = int(result.get('processed_count', 0))
@@ -726,13 +1023,13 @@ def extract_knowledge():
         reason = result.get('reason')
 
         if processed_count > 0:
-            message = f'知识提炼完成，本轮处理 {processed_count} 个片段'
+            message = f'时间线提炼完成，本轮处理 {processed_count} 个片段'
         elif fetched_count == 0:
             message = '当前没有待提炼的采集记录'
         elif reason == 'force_finalize_tail':
             message = '已强制收尾最后一组，但本轮未生成新知识'
         else:
-            message = '已触发知识提炼，本轮暂无可完成的片段'
+            message = '已触发时间线提炼，本轮暂无可完成的片段'
 
         return jsonify({
             'status': 'ok',
@@ -744,7 +1041,7 @@ def extract_knowledge():
             'reason': reason,
         })
     except Exception as e:
-        logger.error(f"知识提炼触发失败: {e}", exc_info=True)
+        logger.error(f"时间线提炼触发失败: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -759,22 +1056,25 @@ def extract_bake():
         trigger_reason = data.get('trigger_reason') or 'manual_debug'
         if not isinstance(candidate, dict):
             return jsonify({'error': '缺少 candidate 对象'}), 400
-        if not candidate.get('source_knowledge_id'):
-            return jsonify({'error': 'candidate.source_knowledge_id 缺失'}), 400
+        if not candidate.get('source_timeline_id') and candidate.get('source_knowledge_id'):
+            candidate['source_timeline_id'] = candidate.get('source_knowledge_id')
+        if not candidate.get('source_timeline_id'):
+            return jsonify({'error': 'candidate.source_timeline_id 缺失'}), 400
 
-        source_knowledge_id = candidate.get('source_knowledge_id')
+        source_timeline_id = candidate.get('source_timeline_id')
         logger.info(
-            "bake extract request start source_knowledge_id=%s trigger_reason=%s",
-            source_knowledge_id,
+            "bake extract request start source_timeline_id=%s trigger_reason=%s",
+            source_timeline_id,
             trigger_reason,
         )
         extractor = get_bake_extractor()
-        # 通过 InferenceQueue 单 worker 串行，P2 = bake 大批量提炼
+        # 通过 InferenceQueue 统一调度，P2 = bake 大批量提炼
         try:
             result = get_global_queue().submit_sync(
                 Priority.P2,
                 lambda: extractor.extract_bake_bundle(candidate, preempt_check=lambda: False),
                 timeout=900.0,
+                lane=LANE_P2_BAKE,
             )
         except QueueEvictedError as ee:
             logger.warning(f"bake extract 被队列淘汰: {ee}")
@@ -784,8 +1084,8 @@ def extract_bake():
             return jsonify({'error': 'bake 提炼超时'}), 504
         lock_wait_ms = int(time.time() * 1000) - lock_wait_start_ms
         logger.info(
-            "bake extract done source_knowledge_id=%s queue_wait_ms=%s",
-            source_knowledge_id,
+            "bake extract done source_timeline_id=%s queue_wait_ms=%s",
+            source_timeline_id,
             lock_wait_ms,
         )
 
@@ -793,8 +1093,8 @@ def extract_bake():
         result['latency_ms'] = int(time.time() * 1000) - start_ms
         result['lock_wait_ms'] = lock_wait_ms
         logger.info(
-            "bake extract request done source_knowledge_id=%s latency_ms=%s total_elapsed_ms=%s stage_elapsed_ms=%s degraded=%s",
-            source_knowledge_id,
+            "bake extract request done source_timeline_id=%s latency_ms=%s total_elapsed_ms=%s stage_elapsed_ms=%s degraded=%s",
+            source_timeline_id,
             result['latency_ms'],
             result.get('total_elapsed_ms'),
             result.get('stage_elapsed_ms'),
@@ -854,4 +1154,3 @@ if __name__ == '__main__':
     logger.info('RAG pipeline 异步预热已启动')
 
     app.run(host='0.0.0.0', port=7071, debug=False, threaded=True)
-

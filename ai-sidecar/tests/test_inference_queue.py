@@ -6,6 +6,10 @@ import pytest
 
 from inference_queue import (
     InferenceQueue,
+    LANE_P0_QUERY,
+    LANE_P1_CAPTURE,
+    LANE_P1_PREEXTRACT,
+    LANE_P2_BAKE,
     Priority,
     QueueEvictedError,
 )
@@ -115,5 +119,26 @@ def test_low_memory_blocks_worker():
         time.sleep(0.5)
         assert not fut.done()
         assert order == []
+    finally:
+        q.shutdown()
+
+
+def test_max_concurrency_reserves_p0_lane():
+    """max_concurrency=3 时，后台最多占 2 路，P0 仍可立即获得第 3 路。"""
+    q = InferenceQueue(per_priority_limit=8, total_limit=16, low_memory_threshold_mb=10, max_concurrency=3)
+    try:
+        order: list[str] = []
+        capture = q.submit(Priority.P1, _delayed_factory(order, "capture", 0.2), lane=LANE_P1_CAPTURE)
+        pre = q.submit(Priority.P1, _delayed_factory(order, "pre", 0.2), lane=LANE_P1_PREEXTRACT)
+        bake = q.submit(Priority.P2, _delayed_factory(order, "bake", 0.2), lane=LANE_P2_BAKE)
+        time.sleep(0.05)
+
+        stats = q.stats()
+        assert stats["running_total"] <= 2
+
+        p0 = q.submit(Priority.P0, _delayed_factory(order, "p0", 0.01), lane=LANE_P0_QUERY)
+        assert p0.result(timeout=5) == "p0"
+        for f in (capture, pre, bake):
+            f.result(timeout=5)
     finally:
         q.shutdown()

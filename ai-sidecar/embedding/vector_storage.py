@@ -55,7 +55,7 @@ class VectorStorage:
                 logger.info(f"使用 Qdrant 本地模式: {qdrant_path}")
                 self._qdrant_client = QdrantClient(path=str(qdrant_path))
 
-                # 主进程/检索器已占用本地目录时，后台向量化降级为仅写 SQLite，不阻断知识提炼
+                # 主进程/检索器已占用本地目录时，后台向量化降级为仅写 SQLite，不阻断时间线提炼
                 # 这里保留客户端初始化逻辑；失败时由 store_vector() 做降级处理
 
                 # 确保集合存在
@@ -173,7 +173,7 @@ class VectorStorage:
                     point_id,
                     int(metadata.get("chunk_index", 0)),
                     text,
-                    metadata.get("model_name", "bge-m3"),
+                    metadata.get("model_name", "bge-small-zh-v1.5"),
                     int(time_value or 0),
                     doc_key,
                     source_type,

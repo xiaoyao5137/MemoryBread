@@ -19,7 +19,7 @@ class EmbeddingModel:
     """
     Embedding 模型编排器。
 
-    默认使用 BgeM3Backend，可通过构造函数注入自定义后端（用于测试）。
+    默认使用 OllamaEmbeddingBackend（bge-small-zh-v1.5 量化模型），可通过构造函数注入自定义后端。
     """
 
     def __init__(self, backend: EmbeddingBackend | None = None) -> None:

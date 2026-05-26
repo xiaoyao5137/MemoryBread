@@ -73,9 +73,13 @@ class CreationService:
         self,
         ollama_base_url: str = "http://localhost:11434",
         db_path: str | None = None,
-        model: str = "qwen2.5:3b",
+        model: str | None = None,  # 默认 None，自动使用全局统一模型
     ):
         self.ollama_base_url = ollama_base_url
+        # 使用全局统一的 Ollama 模型名，避免频繁 swap
+        if model is None:
+            from model_registry_global import get_active_ollama_model
+            model = get_active_ollama_model()
         self.model = model
         self.db_path = db_path or str(Path.home() / ".memory-bread" / "memory-bread.db")
 
@@ -113,39 +117,68 @@ class CreationService:
         logger.info("System prompt 长度: %s", len(system_prompt))
         logger.info("User message 长度: %s", len(user_message))
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            "stream": True,
-            "options": {
-                "temperature": 0.65,
-                "top_p": 0.9,
-                "num_predict": 4096,
-            },
-        }
+        # Qwen3.5 在 Ollama chat 模式下有 thinking 解析 bug，导致长时间不输出内容。
+        # 改用 /api/generate raw 模式，绕过有问题的 chat 解析器。
+        is_qwen35 = "qwen3.5" in self.model.lower()
+
+        if is_qwen35:
+            prompt = self._build_qwen35_prompt(system_prompt, user_message)
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "raw": True,
+                "stream": True,
+                "options": {
+                    "temperature": 0.65,
+                    "top_p": 0.9,
+                    "num_predict": 4096,
+                },
+            }
+            endpoint = "/api/generate"
+        else:
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                "stream": True,
+                "options": {
+                    "temperature": 0.65,
+                    "top_p": 0.9,
+                    "num_predict": 4096,
+                },
+            }
+            endpoint = "/api/chat"
 
         chunk_count = 0
         async with httpx.AsyncClient(timeout=300.0) as client:
             async with client.stream(
-                "POST", f"{self.ollama_base_url}/api/chat", json=payload
+                "POST", f"{self.ollama_base_url}{endpoint}", json=payload
             ) as response:
                 response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    content = data.get("message", {}).get("content", "")
-                    if content:
-                        chunk_count += 1
-                        if chunk_count % 100 == 0:
-                            logger.info("已生成 %s 个块", chunk_count)
-                        yield content
+                if is_qwen35:
+                    async for chunk in self._stream_qwen35_raw(response):
+                        if chunk:
+                            chunk_count += 1
+                            if chunk_count % 100 == 0:
+                                logger.info("已生成 %s 个块", chunk_count)
+                            yield chunk
+                else:
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        msg = data.get("message", {})
+                        content = msg.get("content", "")
+                        if content:
+                            chunk_count += 1
+                            if chunk_count % 100 == 0:
+                                logger.info("已生成 %s 个块", chunk_count)
+                            yield content
 
         logger.info("生成完成，总共 %s 个块", chunk_count)
 
@@ -375,6 +408,7 @@ class CreationService:
 5. 若启用图片生成，请在合适章节插入图片建议占位符，格式为：[图片建议：用途 | 画面/图示要求]。
 6. 技术架构图、流程图、关系图优先给出 Mermaid 图，不用纯文字替代。
 7. 章节结构要完整，标题层级清晰，语言正式、克制、专业。
+8. 根据用户输入的语言进行回复。如果用户使用中文提问，全文必须使用中文输出；如果用户使用英文提问，全文必须使用英文输出。
 {template_hint}
 
 输出格式偏好：{options.output_format}"""
@@ -476,6 +510,56 @@ class CreationService:
         )
 
         return "\n".join(blocks)
+
+    def _build_qwen35_prompt(self, system_prompt: str, user_message: str) -> str:
+        """构建 Qwen3.5 的 raw 模式 prompt，使用官方 chat template。"""
+        return (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{user_message}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+    async def _stream_qwen35_raw(self, response):
+        """解析 Qwen3.5 raw 模式的流式响应，过滤 <think> 标签内的内容。"""
+        import re
+        in_think = False
+        think_buffer = ""
+        async for line in response.aiter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = data.get("response", "")
+            if not text:
+                continue
+            # 逐字符处理，过滤 <think>...</think> 块
+            output = ""
+            for ch in text:
+                if not in_think:
+                    if ch == "<":
+                        think_buffer = ch
+                    elif think_buffer:
+                        think_buffer += ch
+                        if think_buffer == "<think>":
+                            in_think = True
+                            think_buffer = ""
+                        elif not "<think>".startswith(think_buffer):
+                            output += think_buffer
+                            think_buffer = ""
+                    else:
+                        output += ch
+                else:
+                    if ch == ">":
+                        think_buffer += ch
+                        if think_buffer.endswith("</think>"):
+                            in_think = False
+                            think_buffer = ""
+                    else:
+                        think_buffer += ch
+            if output:
+                yield output
 
     def _infer_doc_type(self, text: str) -> str:
         mapping = [

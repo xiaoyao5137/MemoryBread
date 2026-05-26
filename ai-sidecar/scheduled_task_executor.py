@@ -616,7 +616,9 @@ class TaskExecutor:
             f"{weekly_rules}"
         )
         user_prompt = f"## 工作记录\n\n{context}\n\n---\n\n## 用户指令\n\n{user_instruction}"
-        model = "qwen2.5:3b"
+        # 使用全局统一的 Ollama 模型名，避免与 RAG 查询使用不同模型导致 Ollama swap
+        from model_registry_global import get_active_ollama_model
+        model = get_active_ollama_model()
 
         client = self._get_llm_client()
         with LLMCallTracker(
@@ -635,12 +637,17 @@ class TaskExecutor:
             )
             tracker.set_response(response)
             # 如果 Ollama 没返回 token 信息，用估算补充
+            msg = response['message']
+            content = msg.get('content', '')
+            # Qwen3.5 等推理模型可能将内容放在 thinking 字段
+            if not content:
+                content = msg.get('thinking', '')
             if tracker._prompt_tokens == 0:
                 tracker.set_tokens(
                     prompt=estimate_tokens(system_prompt + user_prompt),
-                    completion=estimate_tokens(response['message']['content']),
+                    completion=estimate_tokens(content),
                 )
-        return response['message']['content']
+        return content
 
 
     # ─────────────────────────────────────────────────────────────────────────

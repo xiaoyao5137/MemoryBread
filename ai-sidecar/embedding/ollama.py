@@ -58,7 +58,12 @@ class OllamaEmbeddingBackend(EmbeddingBackend):
             return []
 
         try:
-            payload = {"model": self._model_name, "input": valid_texts}
+            payload = {
+                "model": self._model_name,
+                "input": valid_texts,
+                # keep_alive=30m：Embedding 模型调用频繁，保留 30 分钟避免反复加载
+                "keep_alive": "30m",
+            }
             data = json.dumps(payload).encode()
             req = urllib.request.Request(
                 self._api_url,

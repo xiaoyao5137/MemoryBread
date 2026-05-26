@@ -469,9 +469,8 @@ class RagPipeline:
                 llm_kwargs["num_predict"] = 896
 
         primary_llm = self._llm
-        if is_report and getattr(self._llm, 'model_name', '') != 'qwen2.5:3b':
-            from rag.llm.ollama import OllamaBackend
-            primary_llm = OllamaBackend(model='qwen2.5:3b', timeout=120, num_predict=llm_kwargs.get("num_predict", 768))
+        # 报告模式不再切换为硬编码的 qwen2.5:3b，避免 Ollama 频繁 swap 模型
+        # 任何查询都使用当前激活的 LLM 模型
 
         try:
             llm_resp = primary_llm.complete(prompt, system=system, **llm_kwargs)
@@ -479,7 +478,7 @@ class RagPipeline:
         except Exception as e:
             err_str = str(e).lower()
             if "timed out" in err_str or "timeout" in err_str or "urlopen error" in err_str:
-                # Ollama 忙（后台知识提炼等任务占用），返回提示让用户稍后重试
+                # Ollama 忙（后台时间线提炼等任务占用），返回提示让用户稍后重试
                 fallback_context = self._build_context(
                     selected_contexts,
                     strip_user_subject=is_report,

@@ -38,8 +38,15 @@ def check_ollama_running() -> bool:
     return bool(detail.get('ollama_running'))
 
 
-def check_model_available(model_name: str = "qwen2.5:3b") -> bool:
-    """检查指定模型是否已下载"""
+def check_model_available(model_name: str | None = None) -> bool:
+    """检查指定模型是否已下载。model_name 为 None 时检查用户配置的 active_llm。"""
+    if model_name is None:
+        # 读取用户配置的 active_llm
+        try:
+            from model_registry_global import get_active_ollama_model
+            model_name = get_active_ollama_model()
+        except Exception:
+            model_name = "qwen3.5:4b"
     try:
         from ollama import Client
         client = Client()
@@ -120,19 +127,25 @@ def init_knowledge_fts() -> bool:
         return False
 
 
-def run_startup_checks() -> bool:
+def run_startup_checks() -> dict:
     """
-    运行启动前置检查
+    运行启动前置检查。
 
     Returns:
-        True 如果所有检查通过，False 否则
+        dict with keys:
+          - 'critical_passed': bool  Ollama+LLM 核心检查是否全部通过（决定是否能启动提炼）
+          - 'all_passed': bool       全部检查（含向量模型）是否通过
+          - 'embedding_ok': bool     向量模型是否可用
+          - 'message': str           摘要信息
     """
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("🔍 记忆面包启动前置检查")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print()
 
+    critical_passed = True  # Ollama + LLM（阻塞性）
     all_passed = True
+    embedding_ok = False
 
     ollama_detail = get_ollama_setup_detail()
 
@@ -146,6 +159,7 @@ def run_startup_checks() -> bool:
         print("   ❌ Ollama 未安装")
         print(f"   📝 {ollama_detail.get('message', '请安装 Ollama')}")
         print(f"   📝 安装方法：{ollama_detail.get('recommended_install_method', 'brew install ollama')}")
+        critical_passed = False
         all_passed = False
 
     print()
@@ -157,28 +171,37 @@ def run_startup_checks() -> bool:
     else:
         print("   ❌ Ollama 服务未运行")
         print("   📝 启动方法：ollama serve")
+        critical_passed = False
         all_passed = False
 
     print()
 
     # 3. 检查推理模型
-    print("3️⃣  检查推理模型 (qwen2.5:3b)...")
-    if check_model_available("qwen2.5:3b"):
-        print("   ✅ 推理模型已下载")
+    try:
+        from model_registry_global import get_active_ollama_model
+        active_model = get_active_ollama_model()
+    except Exception:
+        active_model = "qwen3.5:4b"
+    print(f"3️⃣  检查推理模型 ({active_model})...")
+    if check_model_available():
+        print(f"   ✅ 推理模型 {active_model} 已下载")
     else:
-        print("   ❌ 推理模型未下载")
-        print("   📝 下载方法：ollama pull qwen2.5:3b")
+        print(f"   ❌ 推理模型 {active_model} 未下载")
+        print(f"   📝 下载方法：ollama pull {active_model}")
+        critical_passed = False
         all_passed = False
 
     print()
 
-    # 4. 检查向量模型
-    print("4️⃣  检查向量模型 (BGE-M3)...")
+    # 4. 检查向量模型（非阻塞，仅警告；向量化是增强功能，提炼不依赖它）
+    print("4️⃣  检查向量模型 (bge-small-zh-v1.5)...")
     if check_embedding_model():
         print("   ✅ 向量模型已加载")
+        embedding_ok = True
     else:
-        print("   ❌ 向量模型未加载")
+        print("   ⚠️  向量模型未加载（RAG 向量检索不可用，提炼功能不受影响）")
         print("   📝 模型会自动下载，请检查网络连接")
+        # 注意：向量模型失败不影响 critical_passed，系统仍可正常提炼
         all_passed = False
 
     print()
@@ -200,22 +223,30 @@ def run_startup_checks() -> bool:
 
     if all_passed:
         print("✅ 所有检查通过，可以启动记忆面包")
+    elif critical_passed:
+        print("✅ 核心检查通过，记忆面包以降级模式启动（RAG 向量检索不可用）")
     else:
-        print("❌ 部分检查未通过，请先完成上述配置")
+        print("❌ 核心检查未通过，请先完成上述配置")
         print()
         print("📚 快速配置指南：")
         print(f"   1. 安装 Ollama: {ollama_detail.get('recommended_install_method', 'brew install ollama')}")
         print("   2. 启动 Ollama: ollama serve &")
-        print("   3. 下载模型: ollama pull qwen2.5:3b")
-        print("   4. 或在安装引导/模型页面点击“检测并安装 Ollama”")
+        print(f"   3. 下载模型: ollama pull {active_model}")
+        print('   4. 或在安装引导/模型页面点击"检测并安装 Ollama"')
         print("   5. 重新启动记忆面包")
 
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print()
 
-    return all_passed
+    return {
+        'critical_passed': critical_passed,
+        'all_passed': all_passed,
+        'embedding_ok': embedding_ok,
+        'message': 'ok' if critical_passed else ollama_detail.get('message', 'core checks failed'),
+    }
 
 
 if __name__ == "__main__":
-    if not run_startup_checks():
+    result = run_startup_checks()
+    if not result.get('critical_passed'):
         sys.exit(1)

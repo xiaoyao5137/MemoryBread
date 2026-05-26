@@ -90,12 +90,12 @@ class Dispatcher:
         return self._ocr_worker
 
     def _get_embed_worker(self):
-        """懒加载 EmbedWorker（首次调用时初始化模型）"""
+        """懒加载 EmbedWorker（首次调用时初始化模型，使用全局共享 Embedding）"""
         if self._embed_worker is None:
             from embedding.worker import EmbedWorker
-            from embedding.model  import EmbeddingModel
-            self._embed_worker = EmbedWorker(model=EmbeddingModel.create_default())
-            logger.info("EmbedWorker 已初始化")
+            from model_registry_global import get_shared_embedding
+            self._embed_worker = EmbedWorker(model=get_shared_embedding())
+            logger.info("EmbedWorker 已初始化（使用共享 Embedding）")
         return self._embed_worker
 
     def _get_asr_worker(self):
