@@ -116,6 +116,14 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "026_add_capture_screenshot_source",
         include_str!("migrations/026_add_capture_screenshot_source.sql"),
     ),
+    (
+        "027_bake_retry_state",
+        include_str!("migrations/027_bake_retry_state.sql"),
+    ),
+    (
+        "028_remove_bake_manual_review",
+        include_str!("migrations/028_remove_bake_manual_review.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

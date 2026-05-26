@@ -12,7 +12,7 @@ use crate::{
     services::bake_service::{
         BakeBucket, BakeCaptureFilter, BakeCapturePayload, BakeExtractResponse,
         BakeKnowledgePayload, BakeListFilter, BakeMemoryFilter, BakeMemoryPayload,
-        BakeOverviewPayload, BakePagedResponse, BakeRunPayload, BakeService, BakeSopPayload,
+        BakeOverviewPayload, BakePagedResponse, BakeService, BakeSopPayload,
         BakeStyleConfig, BakeDocumentPayload, CreateOrUpdateDocumentRequest,
         InitializeBakeMemoriesResponse,
     },
@@ -128,28 +128,6 @@ pub async fn list_bake_sops(
     }))
 }
 
-pub async fn adopt_bake_sop(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<BakeSopPayload>, ApiError> {
-    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let candidate = tokio::task::spawn_blocking(move || service.adopt_sop(id))
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(candidate))
-}
-
-pub async fn ignore_bake_sop(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<BakeSopPayload>, ApiError> {
-    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let candidate = tokio::task::spawn_blocking(move || service.ignore_sop(id))
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(candidate))
-}
-
 pub async fn delete_bake_sop(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -221,17 +199,6 @@ pub async fn toggle_bake_document_status(
     Ok(Json(document))
 }
 
-pub async fn adopt_bake_document(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<BakeDocumentPayload>, ApiError> {
-    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let candidate = tokio::task::spawn_blocking(move || service.adopt_document(id))
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(candidate))
-}
-
 pub async fn delete_bake_document(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -297,28 +264,6 @@ pub async fn list_bake_knowledge(
             offset: response.offset,
         })
     ))
-}
-
-pub async fn adopt_bake_knowledge(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<BakeKnowledgePayload>, ApiError> {
-    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let knowledge = tokio::task::spawn_blocking(move || service.adopt_knowledge(id))
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(knowledge))
-}
-
-pub async fn ignore_bake_knowledge(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<BakeKnowledgePayload>, ApiError> {
-    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
-    let knowledge = tokio::task::spawn_blocking(move || service.ignore_knowledge(id))
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))??;
-    Ok(Json(knowledge))
 }
 
 pub async fn delete_bake_knowledge(
@@ -449,14 +394,33 @@ pub async fn promote_bake_memory_to_sop(
 pub async fn run_bake_pipeline(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RunBakeRequest>,
-) -> Result<Json<BakeRunPayload>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
     let trigger_reason = body
         .trigger_reason
         .unwrap_or_else(|| "manual_debug".to_string());
     let limit = body.limit.unwrap_or(20).clamp(1, 100);
-    let result = service.run_bake_pipeline(&trigger_reason, limit).await?;
-    Ok(Json(result))
+
+    // 统一 bake pipeline 使用全局 watermark，多个 run 并发会重复扫描同一段历史候选，
+    // 让监控页出现多个长期“生成中”占位，并拖慢队列收敛。
+    const MAX_CONCURRENT_BAKE_RUNS: i64 = 1;
+    let running_count = state
+        .storage
+        .count_running_bake_runs()
+        .unwrap_or(0);
+    if running_count >= MAX_CONCURRENT_BAKE_RUNS {
+        return Ok(Json(serde_json::json!({
+            "id": null,
+            "status": "skipped",
+            "reason": format!("max {} concurrent bake runs reached", MAX_CONCURRENT_BAKE_RUNS),
+        })));
+    }
+
+    let run_id = service.spawn_bake_pipeline(trigger_reason, limit)?;
+    Ok(Json(serde_json::json!({
+        "id": run_id,
+        "status": "accepted",
+    })))
 }
 
 pub async fn get_bake_memory_preview(

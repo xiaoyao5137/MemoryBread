@@ -7,6 +7,8 @@ use crate::storage::{
     StorageManager,
 };
 
+const STALE_RUNNING_BAKE_RUN_MS: i64 = 35 * 60 * 1000;
+
 impl StorageManager {
     pub fn insert_bake_run(&self, run: &NewBakeRun) -> Result<i64, StorageError> {
         self.with_conn(|conn| insert_bake_run_inner(conn, run))
@@ -29,6 +31,42 @@ impl StorageManager {
             } else {
                 Ok(None)
             }
+        })
+    }
+
+    /// 返回当前处于 running 状态的 bake run 数量。
+    /// 用于并发保护：限制同时运行的 bake run 数量，避免过多 run 竞争 sidecar LLM。
+    pub fn count_running_bake_runs(&self) -> Result<i64, StorageError> {
+        self.with_conn(|conn| {
+            let fresh_after_ms = current_ts_ms() - STALE_RUNNING_BAKE_RUN_MS;
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM bake_runs
+                 WHERE status = 'running'
+                   AND started_at >= ?1",
+                params![fresh_after_ms],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        })
+    }
+
+    /// 更新 bake run 的实时进度字段（candidate_count / processed_episode_count），
+    /// 用于监控页实时展示"提炼中"数量，不改变 run 状态。
+    pub fn update_bake_run_progress(
+        &self,
+        id: i64,
+        candidate_count: i64,
+        processed_episode_count: i64,
+    ) -> Result<bool, StorageError> {
+        self.with_conn(|conn| {
+            let affected = conn.execute(
+                "UPDATE bake_runs
+                 SET candidate_count = ?1,
+                     processed_episode_count = ?2
+                 WHERE id = ?3",
+                params![candidate_count, processed_episode_count, id],
+            )?;
+            Ok(affected > 0)
         })
     }
 
@@ -117,6 +155,33 @@ impl StorageManager {
                 params![pipeline_name, last_processed_ts, updated_at],
             )?;
             Ok(())
+        })
+    }
+
+    /// 对单条 timeline 的烤制重试失败计数 +1，并记下最后一次错误。
+    /// 用于在 bake 流水线里跳过反复失败的候选，避免无限重试占用流水线资源。
+    pub fn bump_bake_retry_failure(
+        &self,
+        timeline_id: i64,
+        last_error: &str,
+    ) -> Result<i64, StorageError> {
+        let now = current_ts_ms();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO bake_retry_state (timeline_id, failure_count, last_error, last_failed_at_ms)
+                 VALUES (?1, 1, ?2, ?3)
+                 ON CONFLICT(timeline_id) DO UPDATE SET
+                     failure_count = bake_retry_state.failure_count + 1,
+                     last_error = excluded.last_error,
+                     last_failed_at_ms = excluded.last_failed_at_ms",
+                params![timeline_id, last_error, now],
+            )?;
+            let count: i64 = conn.query_row(
+                "SELECT failure_count FROM bake_retry_state WHERE timeline_id = ?1",
+                params![timeline_id],
+                |r| r.get(0),
+            )?;
+            Ok(count)
         })
     }
 }

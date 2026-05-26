@@ -211,6 +211,9 @@ pub struct ExtractingCapture {
     pub ts: i64,
     pub app_name: String,
     pub win_title: String,
+    /// 所属提炼分组的开始时刻（sidecar 调用 _mark_group_extracting 的瞬间）。
+    /// 用于前端显示「已提炼 Xs」，比 capture.ts 更精确（排除掉分组成熟前的等待时长）。
+    pub group_started_at_ms: i64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -655,11 +658,21 @@ async fn enrich_extractor_status(flow: &mut KnowledgeFlow, now_ms: i64) {
     }
 
     #[derive(Deserialize)]
+    struct SidecarGroup {
+        #[serde(default)]
+        started_at_ms: i64,
+        #[serde(default)]
+        captures: Vec<SidecarExtracting>,
+    }
+
+    #[derive(Deserialize)]
     struct SidecarStatus {
         #[serde(default)]
         running: bool,
         #[serde(default)]
         extracting_captures: Vec<SidecarExtracting>,
+        #[serde(default)]
+        extracting_groups: Vec<SidecarGroup>,
         #[serde(default)]
         last_extraction_at_ms: Option<i64>,
         #[serde(default)]
@@ -690,16 +703,33 @@ async fn enrich_extractor_status(flow: &mut KnowledgeFlow, now_ms: i64) {
         }
     };
 
-    flow.extracting = body
-        .extracting_captures
-        .into_iter()
-        .map(|c| ExtractingCapture {
-            id: c.id,
-            ts: c.ts,
-            app_name: c.app_name,
-            win_title: c.win_title,
-        })
-        .collect();
+    // 优先消费 extracting_groups（含 group started_at_ms），fallback 到平铺 captures
+    flow.extracting = if !body.extracting_groups.is_empty() {
+        body.extracting_groups
+            .into_iter()
+            .flat_map(|g| {
+                let started = g.started_at_ms;
+                g.captures.into_iter().map(move |c| ExtractingCapture {
+                    id: c.id,
+                    ts: c.ts,
+                    app_name: c.app_name,
+                    win_title: c.win_title,
+                    group_started_at_ms: started,
+                })
+            })
+            .collect()
+    } else {
+        body.extracting_captures
+            .into_iter()
+            .map(|c| ExtractingCapture {
+                id: c.id,
+                ts: c.ts,
+                app_name: c.app_name,
+                win_title: c.win_title,
+                group_started_at_ms: 0,
+            })
+            .collect()
+    };
     flow.last_extraction_at_ms = body.last_extraction_at_ms;
 
     // 状态判定优先级：
@@ -746,6 +776,103 @@ async fn enrich_extractor_status(flow: &mut KnowledgeFlow, now_ms: i64) {
     } else {
         "idle".to_string()
     };
+}
+
+// ── 实时提炼状态轻量端点 ─────────────────────────────────────────────────────
+//
+// GET /api/monitor/extraction_live
+// 专为「最近知识提炼记录」卡片高频轮询（3s）设计：
+// - 不计算 token / capture 趋势，不分组聚合，只查必要的 recent 行
+// - payload 体积约为 overview 的 1/30，便于浏览器侧 setState 不触发整页重渲染
+// - extracting / last_extraction_at_ms / extractor_status 走 status.json，sidecar 卡顿也不会假死
+
+#[derive(Debug, Serialize)]
+pub struct ExtractionLiveResponse {
+    pub extractor_status: String,
+    pub extracting: Vec<ExtractingCapture>,
+    pub last_extraction_at_ms: Option<i64>,
+    pub pending_extraction_count: i64,
+    pub recent: Vec<KnowledgeItem>,
+    pub server_now_ms: i64,
+}
+
+pub async fn monitor_extraction_live(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let now_ms = Utc::now().timestamp_millis();
+    let from_ms = now_ms - 24 * 3600 * 1000;
+    let fallback_noise_pattern = format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX);
+
+    let (pending_extraction_count, recent) = state
+        .storage
+        .with_conn_async(move |conn| {
+            let pending: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM captures
+                     WHERE knowledge_id IS NULL
+                       AND ts >= ?1
+                       AND COALESCE(text, '') != ''",
+                    rusqlite::params![from_ms],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            let mut stmt = conn.prepare(
+                "SELECT id,
+                        CAST(strftime('%s', created_at) AS INTEGER) * 1000,
+                        COALESCE(summary, ''),
+                        COALESCE(category, ''),
+                        COALESCE(importance, 0),
+                        COALESCE(frag_app_name, ''),
+                        COALESCE(frag_win_title, '')
+                 FROM timelines
+                 WHERE created_at >= datetime(?1/1000, 'unixepoch')
+                   AND summary NOT LIKE ?2
+                 ORDER BY created_at DESC LIMIT 10",
+            )?;
+            let recent: Vec<KnowledgeItem> = stmt
+                .query_map(
+                    rusqlite::params![from_ms, fallback_noise_pattern.as_str()],
+                    |r| {
+                        Ok(KnowledgeItem {
+                            id: r.get(0)?,
+                            ts: r.get(1)?,
+                            summary: r.get(2)?,
+                            category: r.get(3)?,
+                            importance: r.get(4)?,
+                            app_name: r.get(5)?,
+                            win_title: r.get(6)?,
+                        })
+                    },
+                )?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok((pending, recent))
+        })
+        .await?;
+
+    // 复用 enrich_extractor_status 的状态判定逻辑：把字段塞进临时 KnowledgeFlow 跑一遍
+    let mut tmp = KnowledgeFlow {
+        today_count: 0,
+        period_count: 0,
+        pending_extraction_count,
+        by_time: Vec::new(),
+        recent: Vec::new(),
+        extracting: Vec::new(),
+        last_extraction_at_ms: None,
+        extractor_status: "stalled".to_string(),
+    };
+    enrich_extractor_status(&mut tmp, now_ms).await;
+
+    Ok(Json(ExtractionLiveResponse {
+        extractor_status: tmp.extractor_status,
+        extracting: tmp.extracting,
+        last_extraction_at_ms: tmp.last_extraction_at_ms,
+        pending_extraction_count,
+        recent,
+        server_now_ms: now_ms,
+    }))
 }
 
 // ── 系统资源响应结构 ──────────────────────────────────────────────────────────
@@ -1648,4 +1775,588 @@ pub async fn monitor_system(
         .await?;
 
     Ok(Json(result))
+}
+
+// ── 提炼流水线 DAG 端点 ──────────────────────────────────────────────────────
+//
+// GET /api/monitor/pipeline_dag
+// 用于「监控 → DAG」子页面 3s 轮询。
+// 阶段定义：
+//   capture   → 采集（pending = 已采集但还没生成 timeline 的 capture）
+//   timeline  → 预提炼（pending = 已 timeline 但下游 bake_* 都为空）
+//   knowledge / sop / document → 自动入库产物，不再维护人工确认队列
+// in-progress：
+//   capture：sidecar status.json 中正在提炼的 capture（来自 enrich_extractor_status）
+//   timeline / knowledge / sop / document：当前 running bake run 的活跃批次数，并复用待处理
+//                                          timeline 作为详情占位，避免总数和抽屉列表脱节。
+
+const DAG_ITEM_LIMIT: i64 = 20;
+const DAG_TIMELINE_PENDING_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
+const DAG_RUNNING_BAKE_STALE_MS: i64 = 35 * 60 * 1000;
+
+#[derive(Debug, Serialize)]
+pub struct PipelineDagResponse {
+    pub server_now_ms: i64,
+    pub extractor_status: String,
+    /// 兼容旧 UI：第一个 running bake run（如果有）
+    pub running_bake_run: Option<DagRunningRun>,
+    /// 所有正在运行的 bake run 列表
+    pub running_bake_runs: Vec<DagRunningRun>,
+    pub stages: Vec<DagStage>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct DagRunningRun {
+    pub id: i64,
+    pub trigger_reason: String,
+    pub started_at: i64,
+    pub candidate_count: i64,
+    pub processed_episode_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DagStage {
+    pub key: String,
+    pub label: String,
+    pub in_progress_label: String,
+    pub pending_label: String,
+    pub in_progress_count: i64,
+    pub pending_count: i64,
+    pub completed_today: i64,
+    pub in_progress_items: Vec<DagItem>,
+    pub pending_items: Vec<DagItem>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct DagItem {
+    pub kind: String,
+    pub id: i64,
+    pub ts: i64,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub started_at_ms: Option<i64>,
+}
+
+pub async fn monitor_pipeline_dag(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let now_ms = Utc::now().timestamp_millis();
+    let day_start_ms = local_day_start_ms(now_ms);
+    // bake_knowledge/bake_sops 的 created_at 是文本格式 "YYYY-MM-DD HH:MM:SS"，用字符串前缀比较今日
+    let day_start_str = chrono::DateTime::<Utc>::from_timestamp_millis(day_start_ms)
+        .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    let pending_from_ms = now_ms - DAG_TIMELINE_PENDING_WINDOW_MS;
+
+    // 1. 实时提炼状态（sidecar）
+    let mut tmp_flow = KnowledgeFlow {
+        today_count: 0,
+        period_count: 0,
+        pending_extraction_count: 0,
+        by_time: Vec::new(),
+        recent: Vec::new(),
+        extracting: Vec::new(),
+        last_extraction_at_ms: None,
+        extractor_status: "stalled".to_string(),
+    };
+    enrich_extractor_status(&mut tmp_flow, now_ms).await;
+    let extracting_captures = tmp_flow.extracting;
+    let extractor_status = tmp_flow.extractor_status;
+
+    // 2. SQL 聚合：把 5 个 stage 的数字 + 每个 stage 的 pending 列表一次性查出来
+    let extracting_ids: Vec<i64> = extracting_captures.iter().map(|c| c.id).collect();
+
+    let aggregated = state
+        .storage
+        .with_conn_async(move |conn| -> Result<DagAggregated, crate::storage::error::StorageError> {
+            // ── capture ────────────────────────────────────────────────────
+            let placeholders = if extracting_ids.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " AND id NOT IN ({})",
+                    extracting_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            let capture_pending_sql = format!(
+                "SELECT COUNT(*) FROM captures
+                 WHERE knowledge_id IS NULL
+                   AND ts >= ?1
+                   AND (COALESCE(ax_text, '') != ''
+                        OR COALESCE(ocr_text, '') != ''
+                        OR COALESCE(input_text, '') != ''
+                        OR COALESCE(audio_text, '') != ''){placeholders}"
+            );
+            let capture_pending_count: i64 = conn
+                .query_row(&capture_pending_sql, rusqlite::params![pending_from_ms], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+
+            let capture_items_sql = format!(
+                "SELECT id, ts, COALESCE(app_name, ''), COALESCE(win_title, '')
+                 FROM captures
+                 WHERE knowledge_id IS NULL
+                   AND ts >= ?1
+                   AND (COALESCE(ax_text, '') != ''
+                        OR COALESCE(ocr_text, '') != ''
+                        OR COALESCE(input_text, '') != ''
+                        OR COALESCE(audio_text, '') != ''){placeholders}
+                 ORDER BY ts DESC
+                 LIMIT ?2"
+            );
+            let mut stmt = conn.prepare(&capture_items_sql)?;
+            let capture_pending_items: Vec<DagItem> = stmt
+                .query_map(rusqlite::params![pending_from_ms, DAG_ITEM_LIMIT], |r| {
+                    let id: i64 = r.get(0)?;
+                    let ts: i64 = r.get(1)?;
+                    let app: String = r.get(2)?;
+                    let title: String = r.get(3)?;
+                    Ok(DagItem {
+                        kind: "capture".to_string(),
+                        id,
+                        ts,
+                        title: if title.is_empty() { app.clone() } else { title },
+                        subtitle: if app.is_empty() { None } else { Some(app) },
+                        started_at_ms: None,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+
+            let capture_completed_today: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM captures c
+                     JOIN timelines t ON t.id = c.knowledge_id
+                     WHERE c.knowledge_id IS NOT NULL
+                       AND COALESCE(t.created_at_ms, CAST(strftime('%s', t.created_at) AS INTEGER) * 1000) >= ?1",
+                    rusqlite::params![day_start_ms],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            // ── timeline（预提炼）─────────────────────────────────────────
+            // pending = 水位线之后、已 timeline 但下游 bake_knowledge / bake_sops / bake_documents 都未产出
+            // 同时对齐 bake 流水线的候选条件：
+            //   1. 排除 bake_article / bake_knowledge / bake_sop 分类（自生成条目不进 bake）
+            //   2. 排除因重试失败次数 >= 3 而被永久跳过的条目
+            //   3. 排除不满足 is_high_value_candidate 条件的低价值条目
+            //      （importance < 4 且 evidence_strength NOT IN ('high','medium')）
+            //   4. 排除 unified bake 水位线之前已经处理过但被 LLM 判定丢弃的条目
+            let timeline_watermark_ts: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(last_processed_ts), 0)
+                     FROM bake_watermarks
+                     WHERE pipeline_name = 'unified'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let timeline_pending_sql = "
+                SELECT t.id,
+                       CAST(strftime('%s', t.created_at) AS INTEGER) * 1000 AS ts_ms,
+                       COALESCE(t.summary, ''),
+                       COALESCE(t.frag_app_name, ''),
+                       COALESCE(t.frag_win_title, '')
+                FROM timelines t
+                LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
+                WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop')
+                  AND t.updated_at_ms > ?1
+                  AND t.is_self_generated = 0
+                  AND COALESCE(r.failure_count, 0) < 3
+                  AND (
+                      t.importance >= 4
+                      OR t.user_verified = 1
+                      OR (
+                          t.evidence_strength IN ('high', 'medium')
+                          AND (t.history_view = 1
+                               OR t.activity_type IN ('coding','reading','reviewing_history','document_reference')
+                               OR t.content_origin IN ('historical_content','live_interaction')
+                          )
+                      )
+                  )
+                  AND NOT EXISTS (SELECT 1 FROM bake_knowledge bk WHERE bk.timeline_id = t.id)
+                  AND NOT EXISTS (SELECT 1 FROM bake_sops bs WHERE bs.timeline_id = t.id)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM bake_documents bd
+                      WHERE bd.deleted_at IS NULL
+                        AND bd.source_episode_ids LIKE '%' || t.id || '%'
+                  )
+                ORDER BY t.created_at DESC
+                LIMIT ?2";
+            let mut stmt = conn.prepare(timeline_pending_sql)?;
+            let timeline_pending_items: Vec<DagItem> = stmt
+                .query_map(rusqlite::params![timeline_watermark_ts, DAG_ITEM_LIMIT], |r| {
+                    let id: i64 = r.get(0)?;
+                    let ts: i64 = r.get(1)?;
+                    let summary: String = r.get(2)?;
+                    let app: String = r.get(3)?;
+                    let win: String = r.get(4)?;
+                    let subtitle = match (app.is_empty(), win.is_empty()) {
+                        (true, true) => None,
+                        (false, true) => Some(app),
+                        (true, false) => Some(win),
+                        (false, false) => Some(format!("{} · {}", app, win)),
+                    };
+                    Ok(DagItem {
+                        kind: "timeline".to_string(),
+                        id,
+                        ts,
+                        title: if summary.is_empty() {
+                            format!("Timeline #{}", id)
+                        } else {
+                            summary
+                        },
+                        subtitle,
+                        started_at_ms: None,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+
+            let timeline_pending_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM timelines t
+                     LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
+                     WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop')
+                       AND t.updated_at_ms > ?1
+                       AND t.is_self_generated = 0
+                       AND COALESCE(r.failure_count, 0) < 3
+                       AND (
+                           t.importance >= 4
+                           OR t.user_verified = 1
+                           OR (
+                               t.evidence_strength IN ('high', 'medium')
+                               AND (t.history_view = 1
+                                    OR t.activity_type IN ('coding','reading','reviewing_history','document_reference')
+                                    OR t.content_origin IN ('historical_content','live_interaction')
+                               )
+                           )
+                       )
+                       AND NOT EXISTS (SELECT 1 FROM bake_knowledge bk WHERE bk.timeline_id = t.id)
+                       AND NOT EXISTS (SELECT 1 FROM bake_sops bs WHERE bs.timeline_id = t.id)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM bake_documents bd
+                           WHERE bd.deleted_at IS NULL
+                             AND bd.source_episode_ids LIKE '%' || t.id || '%'
+                       )",
+                    rusqlite::params![timeline_watermark_ts],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            // timeline_completed_today：今日 bake 已完成提炼（产出了下游知识/sop/文档）的 timeline 数量
+            // 按下游产出表的 created_at（文本格式 YYYY-MM-DD）过滤今日，反映真实的今日 bake 产量
+            let timeline_completed_today: i64 = conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT t.id)
+                     FROM timelines t
+                     WHERE (
+                         EXISTS (
+                             SELECT 1 FROM bake_knowledge bk
+                             WHERE bk.timeline_id = t.id
+                               AND bk.created_at >= ?1
+                         )
+                         OR EXISTS (
+                             SELECT 1 FROM bake_sops bs
+                             WHERE bs.timeline_id = t.id
+                               AND bs.created_at >= ?1
+                         )
+                         OR EXISTS (
+                             SELECT 1 FROM bake_documents bd
+                             WHERE bd.deleted_at IS NULL
+                               AND bd.source_episode_ids LIKE '%' || t.id || '%'
+                               AND bd.created_at >= ?1
+                         )
+                     )",
+                    rusqlite::params![day_start_str],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            // ── knowledge ─────────────────────────────────────────────────
+            let (_, _, knowledge_completed_today) =
+                load_candidate_stage(
+                    conn,
+                    "bake_knowledge",
+                    pending_from_ms,
+                    day_start_ms,
+                )?;
+
+            // ── sop ───────────────────────────────────────────────────────
+            let (_, _, sop_completed_today) =
+                load_candidate_stage(
+                    conn,
+                    "bake_sop",
+                    pending_from_ms,
+                    day_start_ms,
+                )?;
+
+            // ── document ──────────────────────────────────────────────────
+            let document_completed_today: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM bake_documents
+                     WHERE deleted_at IS NULL
+                       AND COALESCE(updated_at, created_at) >= ?1",
+                    rusqlite::params![day_start_ms],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            // ── 当前 running 的 bake_run（全部，支持并发显示）─────────────────
+            let fresh_running_after_ms = now_ms - DAG_RUNNING_BAKE_STALE_MS;
+            let mut running_stmt = conn.prepare(
+                "SELECT id, trigger_reason, started_at,
+                        COALESCE(candidate_count, 0),
+                        COALESCE(processed_episode_count, 0)
+                 FROM bake_runs
+                 WHERE status = 'running'
+                   AND started_at >= ?1
+                 ORDER BY started_at DESC",
+            )?;
+            let running_runs: Vec<DagRunningRun> = running_stmt
+                .query_map(rusqlite::params![fresh_running_after_ms], |r| {
+                    Ok(DagRunningRun {
+                        id: r.get(0)?,
+                        trigger_reason: r.get(1)?,
+                        started_at: r.get(2)?,
+                        candidate_count: r.get(3)?,
+                        processed_episode_count: r.get(4)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(running_stmt);
+
+            Ok(DagAggregated {
+                capture_pending_count,
+                capture_pending_items,
+                capture_completed_today,
+                timeline_pending_count,
+                timeline_pending_items,
+                timeline_completed_today,
+                knowledge_pending_count: 0,
+                knowledge_pending_items: Vec::new(),
+                knowledge_completed_today,
+                sop_pending_count: 0,
+                sop_pending_items: Vec::new(),
+                sop_completed_today,
+                document_pending_count: 0,
+                document_pending_items: Vec::new(),
+                document_completed_today,
+                running_runs,
+            })
+        })
+        .await?;
+
+    // 3. 拼装 capture 阶段的 in-progress（来自 sidecar）
+    let capture_in_progress_items: Vec<DagItem> = extracting_captures
+        .iter()
+        .map(|c| DagItem {
+            kind: "capture".to_string(),
+            id: c.id,
+            ts: c.ts,
+            title: if c.win_title.is_empty() {
+                c.app_name.clone()
+            } else {
+                c.win_title.clone()
+            },
+            subtitle: if c.app_name.is_empty() {
+                None
+            } else {
+                Some(c.app_name.clone())
+            },
+            started_at_ms: Some(c.group_started_at_ms),
+        })
+        .collect();
+    let capture_in_progress_count = capture_in_progress_items.len() as i64;
+
+    // bake run 的 candidate_count 是整批候选总数，不能直接当作"正在提炼"。
+    // 这里用运行中的 run 数作为活跃 LLM 调用占位，并用 remaining 兜底避免空跑时显示。
+    let bake_remaining: i64 = aggregated
+        .running_runs
+        .iter()
+        .map(|r| r.candidate_count.saturating_sub(r.processed_episode_count))
+        .sum();
+    let bake_active_runs = aggregated
+        .running_runs
+        .iter()
+        .filter(|r| r.candidate_count == 0 || r.candidate_count > r.processed_episode_count)
+        .count() as i64;
+    let bake_in_progress = bake_active_runs.min(bake_remaining.max(bake_active_runs));
+    let bake_started_at = aggregated.running_runs.first().map(|r| r.started_at);
+    let timeline_in_progress_items: Vec<DagItem> = aggregated
+        .timeline_pending_items
+        .iter()
+        .take(bake_in_progress.max(0) as usize)
+        .cloned()
+        .map(|mut item| {
+            item.started_at_ms = bake_started_at;
+            item
+        })
+        .collect();
+
+    let stages = vec![
+        DagStage {
+            key: "capture".to_string(),
+            label: "采集".to_string(),
+            in_progress_label: "提炼中".to_string(),
+            pending_label: "排队".to_string(),
+            in_progress_count: capture_in_progress_count,
+            pending_count: aggregated.capture_pending_count,
+            completed_today: aggregated.capture_completed_today,
+            in_progress_items: capture_in_progress_items,
+            pending_items: aggregated.capture_pending_items,
+        },
+        DagStage {
+            key: "timeline".to_string(),
+            label: "预提炼".to_string(),
+            in_progress_label: "提炼中".to_string(),
+            pending_label: "待提炼".to_string(),
+            in_progress_count: bake_in_progress,
+            pending_count: aggregated.timeline_pending_count,
+            completed_today: aggregated.timeline_completed_today,
+            in_progress_items: timeline_in_progress_items,
+            pending_items: aggregated.timeline_pending_items,
+        },
+        DagStage {
+            key: "knowledge".to_string(),
+            label: "知识".to_string(),
+            in_progress_label: "生成中".to_string(),
+            pending_label: "".to_string(),
+            in_progress_count: 0,
+            pending_count: aggregated.knowledge_pending_count,
+            completed_today: aggregated.knowledge_completed_today,
+            in_progress_items: Vec::new(),
+            pending_items: aggregated.knowledge_pending_items,
+        },
+        DagStage {
+            key: "sop".to_string(),
+            label: "操作手册".to_string(),
+            in_progress_label: "生成中".to_string(),
+            pending_label: "".to_string(),
+            in_progress_count: 0,
+            pending_count: aggregated.sop_pending_count,
+            completed_today: aggregated.sop_completed_today,
+            in_progress_items: Vec::new(),
+            pending_items: aggregated.sop_pending_items,
+        },
+        DagStage {
+            key: "document".to_string(),
+            label: "文档".to_string(),
+            in_progress_label: "生成中".to_string(),
+            pending_label: "".to_string(),
+            in_progress_count: 0,
+            pending_count: aggregated.document_pending_count,
+            completed_today: aggregated.document_completed_today,
+            in_progress_items: Vec::new(),
+            pending_items: aggregated.document_pending_items,
+        },
+    ];
+
+    let first_run = aggregated.running_runs.first().cloned();
+
+    Ok(Json(PipelineDagResponse {
+        server_now_ms: now_ms,
+        extractor_status,
+        running_bake_run: first_run,
+        running_bake_runs: aggregated.running_runs,
+        stages,
+    }))
+}
+
+struct DagAggregated {
+    capture_pending_count: i64,
+    capture_pending_items: Vec<DagItem>,
+    capture_completed_today: i64,
+    timeline_pending_count: i64,
+    timeline_pending_items: Vec<DagItem>,
+    timeline_completed_today: i64,
+    knowledge_pending_count: i64,
+    knowledge_pending_items: Vec<DagItem>,
+    knowledge_completed_today: i64,
+    sop_pending_count: i64,
+    sop_pending_items: Vec<DagItem>,
+    sop_completed_today: i64,
+    document_pending_count: i64,
+    document_pending_items: Vec<DagItem>,
+    document_completed_today: i64,
+    running_runs: Vec<DagRunningRun>,
+}
+
+// stage 取值：'bake_knowledge' → 表 bake_knowledge / kind 'bake_knowledge'
+//             'bake_sop'       → 表 bake_sops      / kind 'bake_sop'
+fn load_candidate_stage(
+    conn: &rusqlite::Connection,
+    stage: &str,
+    _pending_from_ms: i64,
+    day_start_ms: i64,
+) -> Result<(i64, Vec<DagItem>, i64), crate::storage::error::StorageError> {
+    let (table, kind) = match stage {
+        "bake_knowledge" => ("bake_knowledge", "bake_knowledge"),
+        "bake_sop"       => ("bake_sops",      "bake_sop"),
+        other => {
+            tracing::warn!("load_candidate_stage: 未知 stage {}", other);
+            return Ok((0, Vec::new(), 0));
+        }
+    };
+
+    // 时间字段：created_at_ms（毫秒）若为空则把 created_at（ISO8601 文本）转换
+    let ts_expr = "COALESCE(created_at_ms, CAST(strftime('%s', created_at) AS INTEGER) * 1000)";
+
+    let pending_count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE user_verified = 0"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let pending_sql = format!(
+        "SELECT id, {ts_expr}, COALESCE(title, ''), COALESCE(summary, '')
+         FROM {table}
+         WHERE user_verified = 0
+         ORDER BY {ts_expr} DESC
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&pending_sql)?;
+    let kind_owned = kind.to_string();
+    let pending_items: Vec<DagItem> = stmt
+        .query_map(rusqlite::params![DAG_ITEM_LIMIT], |r| {
+            let id: i64 = r.get(0)?;
+            let ts: i64 = r.get(1).unwrap_or(0);
+            let title: String = r.get(2)?;
+            let summary: String = r.get(3)?;
+            Ok(DagItem {
+                kind: kind_owned.clone(),
+                id,
+                ts,
+                title: if title.is_empty() { format!("#{}", id) } else { title },
+                subtitle: if summary.is_empty() { None } else { Some(summary) },
+                started_at_ms: None,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    let completed_today: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {table}
+                 WHERE user_verified = 1
+                   AND COALESCE(updated_at_ms, {ts_expr}) >= ?1"
+            ),
+            rusqlite::params![day_start_ms],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    Ok((pending_count, pending_items, completed_today))
 }

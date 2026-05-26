@@ -186,8 +186,6 @@ pub struct TimelineRecord {
 // 向后兼容的类型别名
 pub type NewEpisodicMemory = NewTimeline;
 pub type EpisodicMemoryRecord = TimelineRecord;
-pub type NewKnowledgeEntry = NewTimeline;
-pub type KnowledgeEntryRecord = TimelineRecord;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // bake_knowledge 表 - 提炼后的知识
@@ -259,7 +257,7 @@ pub struct BakeSopRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeMemorySourceRecord {
-    pub knowledge: TimelineRecord,
+    pub timeline: TimelineRecord,
     pub capture_ts: i64,
     pub capture_app_name: Option<String>,
     pub capture_win_title: Option<String>,

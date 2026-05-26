@@ -13,15 +13,13 @@ use super::{
     handlers::{
         action::execute_action,
         bake::{
-            adopt_bake_document, adopt_bake_knowledge, adopt_bake_sop, create_bake_document,
-            delete_bake_document, delete_bake_knowledge, delete_bake_sop,
+            create_bake_document, delete_bake_document, delete_bake_knowledge, delete_bake_sop,
             get_bake_capture, get_bake_capture_screenshot,
             get_bake_memory_preview, get_bake_overview, get_bake_style_config,
-            ignore_bake_knowledge, ignore_bake_memory, ignore_bake_sop, initialize_bake_memories,
-            list_bake_captures, list_bake_documents, list_bake_knowledge, list_bake_memories,
-            list_bake_sops, promote_bake_memory_to_document, promote_bake_memory_to_sop,
-            run_bake_pipeline, toggle_bake_document_status, update_bake_document,
-            update_bake_style_config,
+            ignore_bake_memory, initialize_bake_memories, list_bake_captures,
+            list_bake_documents, list_bake_knowledge, list_bake_memories, list_bake_sops,
+            promote_bake_memory_to_document, promote_bake_memory_to_sop, run_bake_pipeline,
+            toggle_bake_document_status, update_bake_document, update_bake_style_config,
         },
         captures::list_captures,
         creation::{generate_document, preview_references},
@@ -30,7 +28,7 @@ use super::{
         },
         health::health_handler,
         knowledge::{delete_knowledge, extract_knowledge, list_knowledge, verify_knowledge},
-        monitor::{monitor_overview, monitor_system},
+        monitor::{monitor_extraction_live, monitor_overview, monitor_pipeline_dag, monitor_system},
         pii::pii_scrub,
         preferences::{list_preferences, run_screenshot_cleanup_now, update_preference},
         privacy::{
@@ -96,6 +94,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/tasks/:id/trigger", post(trigger_task))
         // 监控
         .route("/api/monitor/overview", get(monitor_overview))
+        .route("/api/monitor/extraction_live", get(monitor_extraction_live))
+        .route("/api/monitor/pipeline_dag", get(monitor_pipeline_dag))
         .route("/api/monitor/system", get(monitor_system))
         // 用户画像
         .route("/api/profiles", get(list_profiles))
@@ -129,14 +129,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/bake/sops", get(list_bake_sops))
         .route("/api/bake/sops/:id", axum::routing::delete(delete_bake_sop))
-        .route("/api/bake/sops/:id/adopt", post(adopt_bake_sop))
-        .route("/api/bake/sops/:id/ignore", post(ignore_bake_sop))
         .route("/api/bake/documents", get(list_bake_documents).post(create_bake_document))
         .route(
             "/api/bake/documents/:id",
             put(update_bake_document).delete(delete_bake_document),
         )
-        .route("/api/bake/documents/:id/adopt", post(adopt_bake_document))
         .route(
             "/api/bake/documents/:id/toggle-status",
             post(toggle_bake_document_status),
@@ -147,11 +144,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/bake/knowledge/:id",
             axum::routing::delete(delete_bake_knowledge),
-        )
-        .route("/api/bake/knowledge/:id/adopt", post(adopt_bake_knowledge))
-        .route(
-            "/api/bake/knowledge/:id/ignore",
-            post(ignore_bake_knowledge),
         )
         .route("/api/bake/captures", get(list_bake_captures))
         .route("/api/bake/captures/:id", get(get_bake_capture))

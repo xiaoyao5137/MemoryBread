@@ -5,8 +5,8 @@ use crate::storage::{
     error::StorageError,
     models_bake::{
         BakeDocumentRecord, BakeKnowledgeRecord, BakeMemorySourceRecord, BakeSopRecord,
-        EpisodicMemoryRecord, KnowledgeEntryRecord, NewBakeKnowledge, NewBakeSop,
-        NewEpisodicMemory, NewKnowledgeEntry,
+        EpisodicMemoryRecord, TimelineRecord, NewBakeKnowledge, NewBakeSop,
+        NewEpisodicMemory, NewTimeline,
     },
     StorageManager,
 };
@@ -71,7 +71,7 @@ impl StorageManager {
         })
     }
 
-    pub fn insert_knowledge_entry(&self, entry: &NewKnowledgeEntry) -> Result<i64, StorageError> {
+    pub fn insert_timeline_entry(&self, entry: &NewTimeline) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
             match entry.category.as_str() {
                 "bake_knowledge" | "bake_sop" => {
@@ -92,16 +92,16 @@ impl StorageManager {
                         activity_type: entry.activity_type.clone(),
                         is_self_generated: entry.is_self_generated,
                         evidence_strength: entry.evidence_strength.clone(),
-            capture_ids: None,
-            start_time: None,
-            end_time: None,
-            duration_minutes: None,
-            frag_app_name: None,
-            frag_win_title: None,
-            time_range_start: None,
-            time_range_end: None,
-            key_timestamps: None,
-        };
+                        capture_ids: None,
+                        start_time: None,
+                        end_time: None,
+                        duration_minutes: None,
+                        frag_app_name: None,
+                        frag_win_title: None,
+                        time_range_start: None,
+                        time_range_end: None,
+                        key_timestamps: None,
+                    };
                     let source_id = insert_episodic_memory_inner(conn, &source)?;
                     let now = current_ts_ms();
                     let title = entry.overview.as_deref().unwrap_or(&entry.summary);
@@ -110,14 +110,14 @@ impl StorageManager {
                             timeline_id, title, summary, content, detailed_content, entities, importance,
                             user_verified, user_edited,
                             created_at, updated_at, created_at_ms, updated_at_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0,
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0,
                                    datetime(?8 / 1000, 'unixepoch'), datetime(?8 / 1000, 'unixepoch'), ?8, ?8)"
                     } else {
                         "INSERT INTO bake_sops (
                             timeline_id, title, summary, content, detailed_content, entities, importance,
                             user_verified, user_edited,
                             created_at, updated_at, created_at_ms, updated_at_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0,
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0,
                                    datetime(?8 / 1000, 'unixepoch'), datetime(?8 / 1000, 'unixepoch'), ?8, ?8)"
                     };
                     conn.execute(
@@ -141,16 +141,16 @@ impl StorageManager {
     }
 
     /// 向后兼容函数：根据 category 查询对应的表
-    pub fn list_knowledge_by_category(
+    pub fn list_timelines_by_category(
         &self,
         category: &str,
-    ) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
+    ) -> Result<Vec<TimelineRecord>, StorageError> {
         match category {
             "bake_article" => {
                 let memories = self.list_timelines_paginated(Some("bake_article"), 5000, 0)?;
                 Ok(memories
                     .into_iter()
-                    .map(|m| KnowledgeEntryRecord {
+                    .map(|m| TimelineRecord {
                         id: m.id,
                         capture_id: m.capture_id,
                         summary: m.summary,
@@ -175,23 +175,23 @@ impl StorageManager {
                         updated_at: m.updated_at,
                         created_at_ms: m.created_at_ms,
                         updated_at_ms: m.updated_at_ms,
-                capture_ids: None,
-                start_time: None,
-                end_time: None,
-                duration_minutes: None,
-                frag_app_name: None,
-                frag_win_title: None,
-                time_range_start: None,
-                time_range_end: None,
-                key_timestamps: None,
-            })
+                        capture_ids: None,
+                        start_time: None,
+                        end_time: None,
+                        duration_minutes: None,
+                        frag_app_name: None,
+                        frag_win_title: None,
+                        time_range_start: None,
+                        time_range_end: None,
+                        key_timestamps: None,
+                    })
                     .collect())
             }
             "bake_knowledge" => {
                 let knowledge = self.list_bake_knowledge_new(5000, 0)?;
                 Ok(knowledge
                     .into_iter()
-                    .map(|k| KnowledgeEntryRecord {
+                    .map(|k| TimelineRecord {
                         id: k.id,
                         capture_id: k.timeline_id,
                         summary: k.summary,
@@ -216,23 +216,23 @@ impl StorageManager {
                         updated_at: k.updated_at,
                         created_at_ms: k.created_at_ms,
                         updated_at_ms: k.updated_at_ms,
-                capture_ids: None,
-                start_time: None,
-                end_time: None,
-                duration_minutes: None,
-                frag_app_name: None,
-                frag_win_title: None,
-                time_range_start: None,
-                time_range_end: None,
-                key_timestamps: None,
-            })
+                        capture_ids: None,
+                        start_time: None,
+                        end_time: None,
+                        duration_minutes: None,
+                        frag_app_name: None,
+                        frag_win_title: None,
+                        time_range_start: None,
+                        time_range_end: None,
+                        key_timestamps: None,
+                    })
                     .collect())
             }
             "bake_sop" => {
                 let sops = self.list_bake_sops_paginated(5000, 0)?;
                 Ok(sops
                     .into_iter()
-                    .map(|s| KnowledgeEntryRecord {
+                    .map(|s| TimelineRecord {
                         id: s.id,
                         capture_id: s.timeline_id,
                         summary: s.summary,
@@ -257,16 +257,16 @@ impl StorageManager {
                         updated_at: s.updated_at,
                         created_at_ms: s.created_at_ms,
                         updated_at_ms: s.updated_at_ms,
-                capture_ids: None,
-                start_time: None,
-                end_time: None,
-                duration_minutes: None,
-                frag_app_name: None,
-                frag_win_title: None,
-                time_range_start: None,
-                time_range_end: None,
-                key_timestamps: None,
-            })
+                        capture_ids: None,
+                        start_time: None,
+                        end_time: None,
+                        duration_minutes: None,
+                        frag_app_name: None,
+                        frag_win_title: None,
+                        time_range_start: None,
+                        time_range_end: None,
+                        key_timestamps: None,
+                    })
                     .collect())
             }
             _ => {
@@ -274,7 +274,7 @@ impl StorageManager {
                 let memories = self.list_timelines_paginated(Some(category), 5000, 0)?;
                 Ok(memories
                     .into_iter()
-                    .map(|m| KnowledgeEntryRecord {
+                    .map(|m| TimelineRecord {
                         id: m.id,
                         capture_id: m.capture_id,
                         summary: m.summary,
@@ -321,7 +321,7 @@ impl StorageManager {
         to_ts: Option<i64>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
+    ) -> Result<Vec<TimelineRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut sql = String::from(
                 "SELECT k.id, k.capture_id, k.summary, k.overview, k.details, k.entities, k.category, k.importance,
@@ -331,7 +331,7 @@ impl StorageManager {
                         k.created_at_ms, k.updated_at_ms, k.capture_ids, k.start_time, k.end_time, k.duration_minutes,
                         k.frag_app_name, k.frag_win_title, k.time_range_start, k.time_range_end, k.key_timestamps
                  FROM timelines k
-                 WHERE k.is_self_generated = 0 AND k.category = 'bake_article'",
+                 WHERE k.is_self_generated = 0",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             if let Some(q) = query {
@@ -356,7 +356,7 @@ impl StorageManager {
             let mut stmt = conn.prepare(&sql)?;
             let params: Vec<&dyn rusqlite::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
             let rows = stmt.query_map(params.as_slice(), |row| {
-                Ok(row_to_knowledge_entry(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
+                Ok(row_to_timeline_entry(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
         })
@@ -372,7 +372,7 @@ impl StorageManager {
             let mut sql = String::from(
                 "SELECT COUNT(*)
                  FROM timelines k
-                 WHERE k.is_self_generated = 0 AND k.category = 'bake_article'",
+                 WHERE k.is_self_generated = 0",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             if let Some(q) = query {
@@ -402,12 +402,12 @@ impl StorageManager {
         query: Option<&str>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
+    ) -> Result<Vec<TimelineRecord>, StorageError> {
         // 使用新表，但返回旧格式以保持兼容
         let knowledge = self.list_bake_knowledge_new(limit, offset)?;
         Ok(knowledge
             .into_iter()
-            .map(|k| KnowledgeEntryRecord {
+            .map(|k| TimelineRecord {
                 id: k.id,
                 capture_id: k.timeline_id,
                 summary: k.summary,
@@ -488,14 +488,16 @@ impl StorageManager {
         query: Option<&str>,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
+    ) -> Result<Vec<TimelineRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut sql = String::from(
                 "SELECT id, capture_id, summary, overview, details, entities, category, importance,
                         occurrence_count, observed_at, event_time_start, event_time_end,
                         history_view, content_origin, activity_type, is_self_generated,
                         evidence_strength, user_verified, user_edited, created_at, updated_at,
-                        created_at_ms, updated_at_ms
+                        created_at_ms, updated_at_ms, capture_ids, start_time, end_time,
+                        duration_minutes, frag_app_name, frag_win_title, time_range_start,
+                        time_range_end, key_timestamps
                  FROM timelines
                  WHERE category NOT IN (?, ?, ?)",
             );
@@ -519,7 +521,7 @@ impl StorageManager {
             let mut stmt = conn.prepare(&sql)?;
             let params: Vec<&dyn rusqlite::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
             let rows = stmt.query_map(params.as_slice(), |row| {
-                Ok(row_to_knowledge_entry(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
+                Ok(row_to_timeline_entry(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
         })
@@ -557,14 +559,16 @@ impl StorageManager {
         &self,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<KnowledgeEntryRecord>, StorageError> {
+    ) -> Result<Vec<TimelineRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, capture_id, summary, overview, details, entities, category, importance,
                         occurrence_count, observed_at, event_time_start, event_time_end,
                         history_view, content_origin, activity_type, is_self_generated,
                         evidence_strength, user_verified, user_edited, created_at, updated_at,
-                        created_at_ms, updated_at_ms
+                        created_at_ms, updated_at_ms, capture_ids, start_time, end_time,
+                        duration_minutes, frag_app_name, frag_win_title, time_range_start,
+                        time_range_end, key_timestamps
                  FROM timelines
                  WHERE category NOT IN (?1, ?2, ?3)
                  ORDER BY updated_at_ms DESC, id DESC
@@ -578,7 +582,7 @@ impl StorageManager {
                     limit as i64,
                     offset as i64
                 ],
-                |row| Ok(row_to_knowledge_entry(row).map_err(|_| rusqlite::Error::InvalidQuery)?),
+                |row| Ok(row_to_timeline_entry(row).map_err(|_| rusqlite::Error::InvalidQuery)?),
             )?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(StorageError::Sqlite)
@@ -601,37 +605,52 @@ impl StorageManager {
         since_ts_ms: i64,
         limit: usize,
     ) -> Result<Vec<BakeMemorySourceRecord>, StorageError> {
+        self.list_bake_memory_init_candidates_with_max_failures(since_ts_ms, limit, i64::MAX)
+    }
+
+    /// 与 [`list_bake_memory_init_candidates`] 相同，但额外按 `bake_retry_state.failure_count`
+    /// 过滤：失败次数 >= `max_failures` 的 timeline 会被永久跳过，避免毒丸候选反复触发整轮失败。
+    pub fn list_bake_memory_init_candidates_with_max_failures(
+        &self,
+        since_ts_ms: i64,
+        limit: usize,
+        max_failures: i64,
+    ) -> Result<Vec<BakeMemorySourceRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT k.id, k.capture_id, k.summary, k.overview, k.details, k.entities, k.category, k.importance,
                         k.occurrence_count, k.observed_at, k.event_time_start, k.event_time_end,
                         k.history_view, k.content_origin, k.activity_type, k.is_self_generated,
                         k.evidence_strength, k.user_verified, k.user_edited, k.created_at, k.updated_at,
-                        k.created_at_ms, k.updated_at_ms,
+                        k.created_at_ms, k.updated_at_ms, k.capture_ids, k.start_time, k.end_time,
+                        k.duration_minutes, k.frag_app_name, k.frag_win_title, k.time_range_start,
+                        k.time_range_end, k.key_timestamps,
                         c.ts, c.app_name, c.win_title, c.ax_text, c.ocr_text, c.input_text, c.audio_text,
                         c.url, c.webpage_title
                  FROM timelines k
                  INNER JOIN captures c ON c.id = k.capture_id
+                 LEFT JOIN bake_retry_state r ON r.timeline_id = k.id
                  WHERE k.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop')
                    AND k.updated_at_ms > ?1
+                   AND COALESCE(r.failure_count, 0) < ?3
                  ORDER BY k.updated_at_ms ASC, k.id ASC
                  LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![since_ts_ms, limit as i64], |row| {
+            let rows = stmt.query_map(params![since_ts_ms, limit as i64, max_failures], |row| {
                 Ok(BakeMemorySourceRecord {
-                    knowledge: row_to_episodic_memory_as_knowledge(row).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    capture_ts: row.get(23)?,
-                    capture_app_name: row.get(24)?,
-                    capture_win_title: row.get(25)?,
-                    capture_ax_text: row.get(26)?,
-                    capture_ocr_text: row.get(27)?,
-                    capture_input_text: row.get(28)?,
-                    capture_audio_text: row.get(29)?,
-                    capture_url: row.get::<_, Option<String>>(30)?.and_then(|s| {
+                    timeline: row_to_timeline_record(row).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    capture_ts: row.get(32)?,
+                    capture_app_name: row.get(33)?,
+                    capture_win_title: row.get(34)?,
+                    capture_ax_text: row.get(35)?,
+                    capture_ocr_text: row.get(36)?,
+                    capture_input_text: row.get(37)?,
+                    capture_audio_text: row.get(38)?,
+                    capture_url: row.get::<_, Option<String>>(39)?.and_then(|s| {
                         let t = s.trim();
                         if t.is_empty() { None } else { Some(t.to_string()) }
                     }),
-                    capture_webpage_title: row.get(31)?,
+                    capture_webpage_title: row.get(40)?,
                     url_aggregated_text: None,
                     url_aggregated_capture_count: 0,
                 })
@@ -652,12 +671,12 @@ impl StorageManager {
         })
     }
 
-    pub fn get_knowledge_entry(
+    pub fn get_timeline_entry(
         &self,
         id: i64,
-    ) -> Result<Option<KnowledgeEntryRecord>, StorageError> {
+    ) -> Result<Option<TimelineRecord>, StorageError> {
         if let Some(knowledge) = self.get_bake_knowledge(id)? {
-            return Ok(Some(KnowledgeEntryRecord {
+            return Ok(Some(TimelineRecord {
                 id: knowledge.id,
                 capture_id: knowledge.timeline_id,
                 summary: knowledge.summary,
@@ -695,7 +714,7 @@ impl StorageManager {
         }
 
         if let Some(sop) = self.get_bake_sop(id)? {
-            return Ok(Some(KnowledgeEntryRecord {
+            return Ok(Some(TimelineRecord {
                 id: sop.id,
                 capture_id: sop.timeline_id,
                 summary: sop.summary,
@@ -733,7 +752,7 @@ impl StorageManager {
         }
 
         if let Some(memory) = self.get_episodic_memory(id)? {
-            return Ok(Some(KnowledgeEntryRecord {
+            return Ok(Some(TimelineRecord {
                 id: memory.id,
                 capture_id: memory.capture_id,
                 summary: memory.summary,
@@ -773,7 +792,7 @@ impl StorageManager {
         Ok(None)
     }
 
-    pub fn update_knowledge_details(
+    pub fn update_timeline_details(
         &self,
         id: i64,
         summary: &str,
@@ -781,7 +800,7 @@ impl StorageManager {
         details: Option<&str>,
         entities: &str,
     ) -> Result<bool, StorageError> {
-        let Some(entry) = self.get_knowledge_entry(id)? else {
+        let Some(entry) = self.get_timeline_entry(id)? else {
             return Ok(false);
         };
 
@@ -799,7 +818,7 @@ impl StorageManager {
         }
     }
 
-    pub fn update_knowledge_details_system(
+    pub fn update_timeline_details_system(
         &self,
         id: i64,
         summary: &str,
@@ -807,7 +826,7 @@ impl StorageManager {
         details: Option<&str>,
         entities: &str,
     ) -> Result<bool, StorageError> {
-        let Some(entry) = self.get_knowledge_entry(id)? else {
+        let Some(entry) = self.get_timeline_entry(id)? else {
             return Ok(false);
         };
 
@@ -849,7 +868,7 @@ impl StorageManager {
     }
 
     pub fn set_knowledge_verified(&self, id: i64, verified: bool) -> Result<bool, StorageError> {
-        let Some(entry) = self.get_knowledge_entry(id)? else {
+        let Some(entry) = self.get_timeline_entry(id)? else {
             return Ok(false);
         };
 
@@ -886,7 +905,7 @@ impl StorageManager {
     }
 
     pub fn delete_knowledge_entry(&self, id: i64) -> Result<bool, StorageError> {
-        let Some(entry) = self.get_knowledge_entry(id)? else {
+        let Some(entry) = self.get_timeline_entry(id)? else {
             return Ok(false);
         };
 
@@ -985,9 +1004,9 @@ fn combine_capture_text_for_url(
     pieces.join("\n")
 }
 
-fn insert_knowledge_entry_inner(
+fn insert_timeline_entry_inner(
     conn: &Connection,
-    entry: &NewKnowledgeEntry,
+    entry: &NewTimeline,
 ) -> Result<i64, StorageError> {
     let now = current_ts_ms();
     conn.execute(
@@ -1022,8 +1041,8 @@ fn insert_knowledge_entry_inner(
     Ok(conn.last_insert_rowid())
 }
 
-fn row_to_knowledge_entry(row: &rusqlite::Row<'_>) -> Result<KnowledgeEntryRecord, StorageError> {
-    Ok(KnowledgeEntryRecord {
+fn row_to_timeline_entry(row: &rusqlite::Row<'_>) -> Result<TimelineRecord, StorageError> {
+    Ok(TimelineRecord {
         id: row.get(0)?,
         capture_id: row.get(1)?,
         summary: row.get(2)?,
@@ -1060,11 +1079,11 @@ fn row_to_knowledge_entry(row: &rusqlite::Row<'_>) -> Result<KnowledgeEntryRecor
     })
 }
 
-/// 将 episodic_memory 行转换为 KnowledgeEntryRecord（用于向后兼容）
-fn row_to_episodic_memory_as_knowledge(
+/// 将 episodic_memory 行转换为 TimelineRecord（用于向后兼容）
+fn row_to_timeline_record(
     row: &rusqlite::Row<'_>,
-) -> Result<KnowledgeEntryRecord, StorageError> {
-    Ok(KnowledgeEntryRecord {
+) -> Result<TimelineRecord, StorageError> {
+    Ok(TimelineRecord {
         id: row.get(0)?,
         capture_id: row.get(1)?,
         summary: row.get(2)?,
@@ -1089,15 +1108,15 @@ fn row_to_episodic_memory_as_knowledge(
         updated_at: row.get(20)?,
         created_at_ms: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
         updated_at_ms: row.get::<_, Option<i64>>(22)?.unwrap_or(0),
-        capture_ids: None,
-        start_time: None,
-        end_time: None,
-        duration_minutes: None,
-        frag_app_name: None,
-        frag_win_title: None,
-        time_range_start: None,
-        time_range_end: None,
-        key_timestamps: None,
+        capture_ids: row.get(23)?,
+        start_time: row.get(24)?,
+        end_time: row.get(25)?,
+        duration_minutes: row.get(26)?,
+        frag_app_name: row.get(27)?,
+        frag_win_title: row.get(28)?,
+        time_range_start: row.get(29)?,
+        time_range_end: row.get(30)?,
+        key_timestamps: row.get(31)?,
     })
 }
 
@@ -1124,7 +1143,9 @@ impl StorageManager {
                         occurrence_count, observed_at, event_time_start, event_time_end,
                         history_view, content_origin, activity_type, is_self_generated,
                         evidence_strength, user_verified, user_edited, created_at, updated_at,
-                        created_at_ms, updated_at_ms
+                        created_at_ms, updated_at_ms, capture_ids, start_time, end_time,
+                        duration_minutes, frag_app_name, frag_win_title, time_range_start,
+                        time_range_end, key_timestamps
                  FROM timelines",
             );
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
@@ -1178,7 +1199,9 @@ impl StorageManager {
                         occurrence_count, observed_at, event_time_start, event_time_end,
                         history_view, content_origin, activity_type, is_self_generated,
                         evidence_strength, user_verified, user_edited, created_at, updated_at,
-                        created_at_ms, updated_at_ms
+                        created_at_ms, updated_at_ms, capture_ids, start_time, end_time,
+                        duration_minutes, frag_app_name, frag_win_title, time_range_start,
+                        time_range_end, key_timestamps
                  FROM timelines WHERE id = ?1",
             )?;
             match stmt.query_row(params![id], |row| {
@@ -1285,9 +1308,12 @@ fn insert_episodic_memory_inner(
             occurrence_count, observed_at, event_time_start, event_time_end,
             history_view, content_origin, activity_type, is_self_generated,
             evidence_strength, user_verified, user_edited,
-            created_at, updated_at, created_at_ms, updated_at_ms
+            created_at, updated_at, created_at_ms, updated_at_ms,
+            capture_ids, start_time, end_time, duration_minutes, frag_app_name,
+            frag_win_title, time_range_start, time_range_end, key_timestamps
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0, 0,
-                   datetime(?17 / 1000, 'unixepoch'), datetime(?17 / 1000, 'unixepoch'), ?17, ?17)",
+                   datetime(?17 / 1000, 'unixepoch'), datetime(?17 / 1000, 'unixepoch'), ?17, ?17,
+                   ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         params![
             entry.capture_id,
             entry.summary,
@@ -1306,6 +1332,15 @@ fn insert_episodic_memory_inner(
             entry.is_self_generated,
             entry.evidence_strength,
             now,  // ?17: 用于 created_at, updated_at, created_at_ms, updated_at_ms
+            entry.capture_ids,
+            entry.start_time,
+            entry.end_time,
+            entry.duration_minutes,
+            entry.frag_app_name,
+            entry.frag_win_title,
+            entry.time_range_start,
+            entry.time_range_end,
+            entry.key_timestamps,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1337,15 +1372,15 @@ fn row_to_episodic_memory(row: &rusqlite::Row<'_>) -> Result<EpisodicMemoryRecor
         updated_at: row.get(20)?,
         created_at_ms: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
         updated_at_ms: row.get::<_, Option<i64>>(22)?.unwrap_or(0),
-        capture_ids: None,
-        start_time: None,
-        end_time: None,
-        duration_minutes: None,
-        frag_app_name: None,
-        frag_win_title: None,
-        time_range_start: None,
-        time_range_end: None,
-        key_timestamps: None,
+        capture_ids: row.get(23)?,
+        start_time: row.get(24)?,
+        end_time: row.get(25)?,
+        duration_minutes: row.get(26)?,
+        frag_app_name: row.get(27)?,
+        frag_win_title: row.get(28)?,
+        time_range_start: row.get(29)?,
+        time_range_end: row.get(30)?,
+        key_timestamps: row.get(31)?,
     })
 }
 
@@ -1362,7 +1397,7 @@ impl StorageManager {
                     timeline_id, title, summary, content, detailed_content, entities, importance,
                     user_verified, user_edited,
                     created_at, updated_at, created_at_ms, updated_at_ms, source_capture_ids
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0,
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0,
                            datetime(?8 / 1000, 'unixepoch'), datetime(?8 / 1000, 'unixepoch'), ?8, ?8, ?9)",
                 params![
                     knowledge.timeline_id,
@@ -1466,7 +1501,7 @@ impl StorageManager {
                     timeline_id, title, summary, content, detailed_content, entities, importance,
                     user_verified, user_edited,
                     created_at, updated_at, created_at_ms, updated_at_ms, source_capture_ids
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0,
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0,
                            datetime(?8 / 1000, 'unixepoch'), datetime(?8 / 1000, 'unixepoch'), ?8, ?8, ?9)",
                 params![
                     sop.timeline_id,
@@ -1604,8 +1639,8 @@ mod tests {
         .expect("插入 capture 失败")
     }
 
-    fn sample_entry(mgr: &StorageManager, category: &str) -> NewKnowledgeEntry {
-        NewKnowledgeEntry {
+    fn sample_entry(mgr: &StorageManager, category: &str) -> NewTimeline {
+        NewTimeline {
             capture_id: seed_capture(mgr),
             summary: "客服问题处理".to_string(),
             overview: Some("标准处理流程".to_string()),
@@ -1635,11 +1670,11 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_and_list_knowledge_by_category() {
+    fn test_insert_and_list_timelines_by_category() {
         let mgr = make_mgr();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_sop"))
+        mgr.insert_timeline_entry(&sample_entry(&mgr, "bake_sop"))
             .unwrap();
-        let entries = mgr.list_knowledge_by_category("bake_sop").unwrap();
+        let entries = mgr.list_timelines_by_category("bake_sop").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].summary, "客服问题处理");
     }
@@ -1648,19 +1683,19 @@ mod tests {
     fn test_set_knowledge_verified() {
         let mgr = make_mgr();
         let id = mgr
-            .insert_knowledge_entry(&sample_entry(&mgr, "bake_article"))
+            .insert_timeline_entry(&sample_entry(&mgr, "bake_article"))
             .unwrap();
         assert!(mgr.set_knowledge_verified(id, true).unwrap());
-        let entry = mgr.get_knowledge_entry(id).unwrap().unwrap();
+        let entry = mgr.get_timeline_entry(id).unwrap().unwrap();
         assert!(entry.user_verified);
     }
 
     #[test]
     fn test_count_non_bake_knowledge_filtered_excludes_bake_knowledge() {
         let mgr = make_mgr();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_knowledge"))
+        mgr.insert_timeline_entry(&sample_entry(&mgr, "bake_knowledge"))
             .unwrap();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "meeting"))
+        mgr.insert_timeline_entry(&sample_entry(&mgr, "meeting"))
             .unwrap();
 
         assert_eq!(mgr.count_non_bake_knowledge_filtered(None).unwrap(), 1);
@@ -1673,25 +1708,25 @@ mod tests {
     #[test]
     fn test_list_bake_memory_init_candidates_excludes_bake_knowledge() {
         let mgr = make_mgr();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "bake_knowledge"))
+        mgr.insert_timeline_entry(&sample_entry(&mgr, "bake_knowledge"))
             .unwrap();
-        mgr.insert_knowledge_entry(&sample_entry(&mgr, "meeting"))
+        mgr.insert_timeline_entry(&sample_entry(&mgr, "meeting"))
             .unwrap();
 
         let candidates = mgr.list_bake_memory_init_candidates(0, 10).unwrap();
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].knowledge.category, "meeting");
+        assert_eq!(candidates[0].timeline.category, "meeting");
     }
 
     #[test]
     fn test_update_bake_article_details_system_works() {
         let mgr = make_mgr();
         let id = mgr
-            .insert_knowledge_entry(&sample_entry(&mgr, "meeting"))
+            .insert_timeline_entry(&sample_entry(&mgr, "meeting"))
             .unwrap();
 
         assert!(mgr
-            .update_knowledge_details_system(
+            .update_timeline_details_system(
                 id,
                 "更新后的情节记忆",
                 Some("新的概述"),
@@ -1719,7 +1754,7 @@ mod tests {
             .unwrap();
 
         assert!(mgr
-            .update_knowledge_details_system(
+            .update_timeline_details_system(
                 id,
                 "更新后的 SOP",
                 Some("新的概述"),
