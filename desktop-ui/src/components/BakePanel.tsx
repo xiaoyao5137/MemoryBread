@@ -1,9 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { ArrowLeft } from 'lucide-react'
 import {
-  useAdoptBakeKnowledge,
-  useAdoptBakeSop,
-  useAdoptBakeTemplate,
   useCreateBakeTemplate,
   useDeleteBakeKnowledge,
   useDeleteBakeSop,
@@ -12,8 +9,6 @@ import {
   useFetchBakeOverview,
   useFetchBakeSops,
   useFetchBakeTemplates,
-  useIgnoreBakeKnowledge,
-  useIgnoreBakeSop,
   useToggleBakeTemplateStatus,
   useUpdateBakeTemplate,
   useModelStatus,
@@ -108,18 +103,13 @@ const BakePanel: React.FC = () => {
   const { status: modelStatus, ready: modelsReady, loading: modelStatusLoading } = useModelStatus()
   const fetchOverview = useFetchBakeOverview()
   const fetchKnowledge = useFetchBakeKnowledge()
-  const adoptKnowledge = useAdoptBakeKnowledge()
   const deleteKnowledge = useDeleteBakeKnowledge()
-  const ignoreKnowledge = useIgnoreBakeKnowledge()
   const fetchTemplates = useFetchBakeTemplates()
   const createTemplate = useCreateBakeTemplate()
-  const adoptTemplate = useAdoptBakeTemplate()
   const updateTemplate = useUpdateBakeTemplate()
   const toggleTemplateStatus = useToggleBakeTemplateStatus()
   const deleteTemplate = useDeleteBakeTemplate()
   const fetchSops = useFetchBakeSops()
-  const adoptSop = useAdoptBakeSop()
-  const ignoreSop = useIgnoreBakeSop()
   const deleteSop = useDeleteBakeSop()
 
   const [overview, setOverview] = useState<BakeOverview>(defaultOverview)
@@ -351,17 +341,6 @@ const BakePanel: React.FC = () => {
     }
   }
 
-  const handleAdoptTemplate = async (templateId: string) => {
-    try {
-      const adopted = await adoptTemplate(templateId)
-      setTemplates(prev => prev.map(item => item.id === templateId ? adopted : item))
-      setStatusMessage(`已采纳模板「${adopted.title}」`)
-      await refreshOverview()
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '采纳模板失败')
-    }
-  }
-
   const handleViewSourceMemory = (memoryId?: string) => {
     if (!memoryId) {
       setStatusMessage('当前模板还没有关联来源时间线')
@@ -381,61 +360,6 @@ const BakePanel: React.FC = () => {
     setStatusMessage('已切换到关联知识')
   }
 
-  const handleAdoptSop = async (id: string) => {
-    try {
-      const adopted = await adoptSop(id)
-      const nextOffset = getFallbackOffsetAfterRemoval(sopCandidates.length, bakeSopOffset, bakeSopLimit)
-      setSelectedSopId(null)
-      if (nextOffset !== bakeSopOffset) {
-        setBakeSopOffset(nextOffset)
-      } else {
-        await refreshSops(nextOffset)
-      }
-      setStatusMessage(`已采纳工作流程指导「${adopted.extractedProblem || adopted.sourceTitle || id}」`)
-      await refreshOverview()
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '采纳工作流程指导失败')
-    }
-  }
-
-  const handleAdoptKnowledge = async (id: string) => {
-    try {
-      const adopted = await adoptKnowledge(id)
-      const nextOffset = getFallbackOffsetAfterRemoval(knowledgeItems.length, bakeKnowledgeOffset, bakeKnowledgeLimit)
-      if (selectedKnowledgeId === id || resolvedKnowledgeId === id) {
-        setSelectedKnowledgeId(null)
-      }
-      if (nextOffset !== bakeKnowledgeOffset) {
-        setBakeKnowledgeOffset(nextOffset)
-      } else {
-        await refreshKnowledge(nextOffset)
-      }
-      setStatusMessage('已采纳知识')
-      await refreshOverview()
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '采纳知识失败')
-    }
-  }
-
-  const handleIgnoreKnowledge = async (id: string) => {
-    try {
-      await ignoreKnowledge(id)
-      const nextOffset = getFallbackOffsetAfterRemoval(knowledgeItems.length, bakeKnowledgeOffset, bakeKnowledgeLimit)
-      if (selectedKnowledgeId === id || resolvedKnowledgeId === id) {
-        setSelectedKnowledgeId(null)
-      }
-      if (nextOffset !== bakeKnowledgeOffset) {
-        setBakeKnowledgeOffset(nextOffset)
-      } else {
-        await refreshKnowledge(nextOffset)
-      }
-      setStatusMessage('已忽略知识')
-      await refreshOverview()
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '忽略知识失败')
-    }
-  }
-
   const handleDeleteKnowledge = async (id: string) => {
     try {
       await deleteKnowledge(id)
@@ -452,25 +376,6 @@ const BakePanel: React.FC = () => {
       await refreshOverview()
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : '删除知识失败')
-    }
-  }
-
-  const handleIgnoreSop = async (id: string) => {
-    try {
-      await ignoreSop(id)
-      const nextOffset = getFallbackOffsetAfterRemoval(sopCandidates.length, bakeSopOffset, bakeSopLimit)
-      if (selectedSopId === id || resolvedSopId === id) {
-        setSelectedSopId(null)
-      }
-      if (nextOffset !== bakeSopOffset) {
-        setBakeSopOffset(nextOffset)
-      } else {
-        await refreshSops(nextOffset)
-      }
-      setStatusMessage('已忽略操作手册')
-      await refreshOverview()
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '忽略操作手册失败')
     }
   }
 
@@ -624,7 +529,6 @@ const BakePanel: React.FC = () => {
             onCreateTemplate={handleCreateTemplate}
             onUpdateTemplate={handleUpdateTemplate}
             onToggleTemplateStatus={handleToggleTemplateStatus}
-            onAdoptTemplate={handleAdoptTemplate}
             onDeleteTemplate={handleDeleteTemplate}
             onViewSourceMemory={handleViewSourceMemory}
             onPageChange={setBakeTemplateOffset}

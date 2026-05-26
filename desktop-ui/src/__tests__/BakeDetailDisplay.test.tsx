@@ -56,7 +56,6 @@ describe('Bake 详情展示优化', () => {
         onCreateTemplate={noop}
         onUpdateTemplate={noop}
         onToggleTemplateStatus={noop}
-        onAdoptTemplate={noop}
         onDeleteTemplate={noop}
         onViewSourceMemory={noop}
         onPageChange={noop}

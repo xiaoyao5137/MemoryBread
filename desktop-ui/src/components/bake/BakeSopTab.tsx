@@ -8,13 +8,6 @@ const confidenceLabel: Record<SopCandidate['confidence'], string> = {
   high: '高',
 }
 
-const statusLabel: Record<SopCandidate['status'], string> = {
-  candidate: '待采纳',
-  confirmed: '已采纳',
-  ignored: '已忽略',
-}
-
-
 const BakeSopTab: React.FC<{
   candidates: SopCandidate[]
   total: number
@@ -151,7 +144,6 @@ const BakeSopTab: React.FC<{
                   <div className="bake-list-item__title bake-line-clamp-2">{item.extractedProblem || item.sourceTitle || '未命名问题'}</div>
                   <div className="bake-muted bake-line-clamp-1">关键词：{item.triggerKeywords.join(' / ') || '暂无'}</div>
                 </div>
-                <BakePill text={statusLabel[item.status]} />
               </div>
               <div className="bake-inline-pills">
                 <BakePill text={`置信度 ${confidenceLabel[item.confidence]}`} />
@@ -207,7 +199,7 @@ const BakeSopTab: React.FC<{
                 <div className="bake-muted" style={{ marginTop: 4 }}>来源：{selected.sourceTitle || '—'} · 置信度：{confidenceLabel[selected.confidence]}</div>
               </div>
               <div className="bake-inline-pills">
-                <BakePill text={statusLabel[selected.status]} />
+                <BakePill text={`置信度 ${confidenceLabel[selected.confidence]}`} />
               </div>
             </div>
             <div className="bake-knowledge-detail__section">

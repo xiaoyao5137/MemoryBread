@@ -303,32 +303,12 @@ export function useFetchBakeKnowledge() {
   }, [apiBaseUrl])
 }
 
-export function useAdoptBakeKnowledge() {
-  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
-
-  return useCallback(async (id: string): Promise<BakeKnowledgeItem> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/knowledge/${encodeURIComponent(id)}/adopt`, { method: 'POST' })
-    if (!resp.ok) throw new Error(`adopt bake knowledge failed: ${resp.status}`)
-    return mapBakeKnowledge(await resp.json())
-  }, [apiBaseUrl])
-}
-
 export function useDeleteBakeKnowledge() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
   return useCallback(async (id: string): Promise<void> => {
     const resp = await fetch(`${apiBaseUrl}/api/bake/knowledge/${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (!resp.ok) throw new Error(`delete bake knowledge failed: ${resp.status}`)
-  }, [apiBaseUrl])
-}
-
-export function useIgnoreBakeKnowledge() {
-  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
-
-  return useCallback(async (id: string): Promise<BakeKnowledgeItem> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/knowledge/${encodeURIComponent(id)}/ignore`, { method: 'POST' })
-    if (!resp.ok) throw new Error(`ignore bake knowledge failed: ${resp.status}`)
-    return mapBakeKnowledge(await resp.json())
   }, [apiBaseUrl])
 }
 
@@ -477,16 +457,6 @@ export function useToggleBakeTemplateStatus() {
   }, [apiBaseUrl])
 }
 
-export function useAdoptBakeTemplate() {
-  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
-
-  return useCallback(async (id: string): Promise<ArticleTemplate> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/documents/${encodeURIComponent(id)}/adopt`, { method: 'POST' })
-    if (!resp.ok) throw new Error(`adopt bake document failed: ${resp.status}`)
-    return mapBakeTemplate(await resp.json())
-  }, [apiBaseUrl])
-}
-
 export function useDeleteBakeTemplate() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
@@ -515,26 +485,6 @@ export function useFetchBakeSops() {
       limit: data.limit ?? params.limit ?? 20,
       offset: data.offset ?? params.offset ?? 0,
     }
-  }, [apiBaseUrl])
-}
-
-export function useAdoptBakeSop() {
-  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
-
-  return useCallback(async (id: string): Promise<SopCandidate> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/sops/${encodeURIComponent(id)}/adopt`, { method: 'POST' })
-    if (!resp.ok) throw new Error(`adopt bake sop failed: ${resp.status}`)
-    return mapBakeSop(await resp.json())
-  }, [apiBaseUrl])
-}
-
-export function useIgnoreBakeSop() {
-  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
-
-  return useCallback(async (id: string): Promise<SopCandidate> => {
-    const resp = await fetch(`${apiBaseUrl}/api/bake/sops/${encodeURIComponent(id)}/ignore`, { method: 'POST' })
-    if (!resp.ok) throw new Error(`ignore bake sop failed: ${resp.status}`)
-    return mapBakeSop(await resp.json())
   }, [apiBaseUrl])
 }
 
@@ -597,7 +547,8 @@ function mapBakeMemory(item: any): TimelineItem {
     title: item.title,
     url: item.url,
     sourceCaptureId: item.source_capture_id ?? '',
-    sourceKnowledgeId: item.source_knowledge_id ?? undefined,
+    sourceTimelineId: item.source_timeline_id ?? item.source_knowledge_id ?? undefined,
+    details: item.details ?? undefined,
     summary: item.summary,
     weight: item.weight,
     openCount: item.open_count,

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
-import type { MonitorOverview, SystemResources } from '../types'
+import type { ExtractionLive, MonitorOverview, SystemResources } from '../types'
 import { useAppStore } from '../store/useAppStore'
+import PipelineDagPanel from './PipelineDagPanel'
 
 const API = 'http://localhost:7070'
 
@@ -170,6 +171,17 @@ function fmtMs(ms: number | null): string {
   if (!ms) return '—'
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
   return `${ms}ms`
+}
+
+function fmtElapsed(deltaMs: number): string {
+  if (deltaMs < 0) deltaMs = 0
+  const totalSec = Math.floor(deltaMs / 1000)
+  if (totalSec < 60) return `${totalSec}s`
+  const m = Math.floor(totalSec / 60)
+  const s = totalSec % 60
+  if (m < 60) return `${m}m${s.toString().padStart(2, '0')}s`
+  const h = Math.floor(m / 60)
+  return `${h}h${(m % 60).toString().padStart(2, '0')}m`
 }
 
 // ── 迷你折线图（纯 SVG）────────────────────────────────────────────────────
@@ -514,7 +526,12 @@ const RuntimeBreakdownCard: React.FC<{
 }
 
 // ── 总览内容 ─────────────────────────────────────────────────────────────────
-const OverviewContent: React.FC<{ data: MonitorOverview; range: OverviewRange }> = ({ data, range }) => {
+const OverviewContent: React.FC<{
+  data: MonitorOverview
+  range: OverviewRange
+  liveData: ExtractionLive | null
+  nowMs: number
+}> = ({ data, range, liveData, nowMs }) => {
   const token_usage = {
     ...EMPTY_OVERVIEW.token_usage,
     ...(data?.token_usage ?? {}),
@@ -534,12 +551,23 @@ const OverviewContent: React.FC<{ data: MonitorOverview; range: OverviewRange }>
     ...(data?.rag_sessions ?? {}),
     recent: data?.rag_sessions?.recent ?? [],
   }
+  // 实时区域优先采用 3s 轮询的 liveData，fallback 到 15s overview，再 fallback 到空值
+  // 注意：by_time/today/period_count 这类聚合字段不在 live 中，必须沿用 data
   const knowledge_flow = {
     ...EMPTY_OVERVIEW.knowledge_flow,
     ...(data?.knowledge_flow ?? {}),
     by_time: data?.knowledge_flow?.by_time ?? [],
-    recent: data?.knowledge_flow?.recent ?? [],
-    extracting: data?.knowledge_flow?.extracting ?? [],
+    recent: liveData?.recent ?? data?.knowledge_flow?.recent ?? [],
+    extracting: liveData?.extracting ?? data?.knowledge_flow?.extracting ?? [],
+    last_extraction_at_ms: liveData?.last_extraction_at_ms
+      ?? data?.knowledge_flow?.last_extraction_at_ms
+      ?? null,
+    extractor_status: liveData?.extractor_status
+      ?? data?.knowledge_flow?.extractor_status
+      ?? 'idle',
+    pending_extraction_count: liveData?.pending_extraction_count
+      ?? data?.knowledge_flow?.pending_extraction_count
+      ?? 0,
   }
   const task_executions = {
     ...EMPTY_OVERVIEW.task_executions,
@@ -769,9 +797,16 @@ const OverviewContent: React.FC<{ data: MonitorOverview; range: OverviewRange }>
               </div>
               <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 2 }}>{fmtTs(c.ts)}</div>
             </div>
-            <span style={{ fontSize: 11, padding: '1px 6px', borderRadius: 4, background: 'rgba(52,199,89,0.12)', color: '#34C759', fontWeight: 600 }}>
-              提炼中
-            </span>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2, flexShrink: 0 }}>
+              <span style={{ fontSize: 11, padding: '1px 6px', borderRadius: 4, background: 'rgba(52,199,89,0.12)', color: '#34C759', fontWeight: 600 }}>
+                提炼中
+              </span>
+              {c.group_started_at_ms > 0 && (
+                <span style={{ fontSize: 10, color: '#34C759', fontVariantNumeric: 'tabular-nums' }}>
+                  已提炼 {fmtElapsed(nowMs - c.group_started_at_ms)}
+                </span>
+              )}
+            </div>
           </div>
         ))}
         {knowledge_flow.recent.length === 0 && knowledge_flow.extracting.length === 0
@@ -1291,10 +1326,12 @@ const MonitorPanel: React.FC = () => {
   const { apiBaseUrl } = useAppStore()
   const base = apiBaseUrl || API
 
-  const [tab, setTab] = useState<'overview' | 'system'>('overview')
+  const [tab, setTab] = useState<'overview' | 'dag' | 'system'>('overview')
   const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
   const systemAbortRef = useRef<AbortController | null>(null)
   const [data, setData] = useState<MonitorOverview | null>(null)
+  const [liveData, setLiveData] = useState<ExtractionLive | null>(null)
+  const [nowMs, setNowMs] = useState<number>(() => Date.now())
   const [sysData, setSysData] = useState<SystemResources | null>(null)
   const [range, setRange] = useState<OverviewRange>('7d')
   const [sysRange, setSysRange] = useState<SystemRange>('6h')
@@ -1320,6 +1357,17 @@ const MonitorPanel: React.FC = () => {
       console.error(e)
     } finally {
       setLoadingOverview(false)
+    }
+  }
+
+  const loadLive = async () => {
+    try {
+      const res = await fetch(`${base}/api/monitor/extraction_live`)
+      if (!res.ok) return
+      const json = (await res.json()) as ExtractionLive
+      setLiveData(json)
+    } catch {
+      // 静默失败：保留上一次 liveData，避免短暂网络抖动导致 UI 闪烁
     }
   }
 
@@ -1379,6 +1427,26 @@ const MonitorPanel: React.FC = () => {
     return () => window.clearInterval(timer)
   }, [tab, base, range, isVisible])
 
+  // 实时提炼状态：3s 高频轮询 /api/monitor/extraction_live，
+  // 体积约为 overview 的 1/30，在切回 tab/恢复可见时立即拉一次
+  useEffect(() => {
+    if (tab !== 'overview' || !isVisible) return
+    loadLive()
+    const timer = window.setInterval(() => {
+      loadLive()
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [tab, base, isVisible])
+
+  // 1s 计时器：让「提炼中」行的「已提炼 Xs」逐秒跳。
+  // 仅在 overview tab 可见 且 当前确实有提炼中条目时启用，避免空转。
+  const hasExtracting = (liveData?.extracting?.length ?? 0) > 0
+  useEffect(() => {
+    if (tab !== 'overview' || !isVisible || !hasExtracting) return
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [tab, isVisible, hasExtracting])
+
   useEffect(() => () => {
     systemAbortRef.current?.abort()
   }, [])
@@ -1395,13 +1463,13 @@ const MonitorPanel: React.FC = () => {
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 10 }}>
         <div style={{ display: 'flex', gap: 4 }}>
-          {(['overview', 'system'] as const).map(t => (
+          {(['overview', 'system', 'dag'] as const).map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               fontSize: 12, padding: '4px 10px', borderRadius: 7, border: 'none', cursor: 'pointer',
               background: tab === t ? '#007AFF' : 'white',
               color: tab === t ? 'white' : '#6E6E73',
               fontWeight: tab === t ? 600 : 400,
-            }}>{t === 'overview' ? '总览' : '系统资源'}</button>
+            }}>{t === 'overview' ? '总览' : t === 'system' ? '系统资源' : '提炼流程'}</button>
           ))}
         </div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -1424,9 +1492,10 @@ const MonitorPanel: React.FC = () => {
               color: sysRange === value ? 'white' : '#6E6E73',
             }}>{label}</button>
           ))}
-          <button onClick={tab === 'overview' ? load : loadSys} style={{
+          <button onClick={tab === 'overview' ? load : tab === 'system' ? loadSys : () => {}} style={{
             fontSize: 11, padding: '3px 8px', borderRadius: 6, border: '1px solid rgba(0,0,0,0.1)',
             background: 'white', color: '#6E6E73', cursor: 'pointer',
+            visibility: tab === 'dag' ? 'hidden' : 'visible',
           }}>刷新</button>
         </div>
       </div>
@@ -1434,11 +1503,14 @@ const MonitorPanel: React.FC = () => {
       {tab === 'overview' && overviewError && <ErrorNotice message={`${overviewError}，请检查 API 地址或确认 Core Engine 已启动`} />}
       {tab === 'system' && systemError && <ErrorNotice message={`${systemError}，请检查 API 地址或确认 Core Engine 已启动`} />}
 
-      {tab === 'overview' && data && <OverviewContent data={data} range={range} />}
+      {tab === 'overview' && data && (
+        <OverviewContent data={data} range={range} liveData={liveData} nowMs={nowMs} />
+      )}
       {tab === 'overview' && !data && !overviewError && !loadingOverview && (
         <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '24px 0' }}>暂无监控数据</div>
       )}
       {tab === 'system' && <SystemContent data={sysData} range={sysRange} />}
+      {tab === 'dag' && <PipelineDagPanel base={base} isVisible={isVisible} />}
 
     </div>
   )

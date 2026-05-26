@@ -189,4 +189,90 @@ describe('显式搜索交互', () => {
     })
     expect(useAppStore.getState().repositoryCaptureSourceCaptureId).toBeNull()
   })
+
+  it('RepositoryPanel 从时间线点击采集记录会限定到对应采集片段', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/bake/memories')) {
+        return jsonResponse({
+          memories: [{
+            id: 1,
+            title: '周报情节记忆',
+            summary: '整理周报提纲',
+            source_capture_id: '41',
+            weight: 6,
+            open_count: 2,
+            dwell_seconds: 30,
+            has_edit_action: true,
+            knowledge_ref_count: 3,
+            status: 'candidate',
+            suggested_action: 'template',
+            tags: ['周报'],
+            created_at: '2026-04-11 09:30',
+            created_at_ms: 0,
+            capture_ids: [41, 42],
+          }],
+          total: 1,
+          limit: 20,
+          offset: 0,
+        })
+      }
+      if (url === 'http://localhost:7070/captures?limit=500&ids=41%2C42') {
+        return jsonResponse({
+          total: 2,
+          captures: [
+            { id: 41, ts: 1710000000000, app_name: 'Chrome', win_title: '旧页面', ax_text: '旧片段' },
+            { id: 42, ts: 1710000001000, app_name: 'Chrome', win_title: '目标页面', ax_text: '目标片段' },
+          ],
+        })
+      }
+      if (url === 'http://localhost:7070/api/bake/captures/42') {
+        return jsonResponse({
+          id: 42,
+          ts: 1710000001000,
+          app_name: 'Chrome',
+          win_title: '目标页面',
+          event_type: 'manual',
+          ax_text: '目标片段',
+          is_sensitive: false,
+          pii_scrubbed: false,
+        })
+      }
+      if (url.includes('/api/bake/captures')) {
+        return jsonResponse({
+          items: [{
+            id: 42,
+            ts: 1710000001000,
+            app_name: 'Chrome',
+            win_title: '目标页面',
+            event_type: 'manual',
+            ax_text: '目标片段',
+            is_sensitive: false,
+            pii_scrubbed: false,
+          }],
+          total: 1,
+          limit: 20,
+          offset: 0,
+        })
+      }
+      throw new Error(`unexpected url: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    useAppStore.setState({ repositoryTab: 'memory' })
+
+    render(<RepositoryPanel />)
+
+    await waitFor(() => {
+      expect(screen.getByText('#42')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText('#42'))
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/captures?source_capture_id=42&limit=20&offset=0')
+    })
+    expect(useAppStore.getState().repositoryCaptureSourceCaptureId).toBe('42')
+    expect(useAppStore.getState().selectedCaptureId).toBe('42')
+  })
 })

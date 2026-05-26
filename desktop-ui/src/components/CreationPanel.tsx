@@ -66,7 +66,24 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const [isPreviewing, setIsPreviewing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copySuccess, setCopySuccess] = useState(false)
+  const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const contentRef = useRef<HTMLDivElement>(null)
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const startTimer = () => {
+    setElapsedSeconds(0)
+    if (timerRef.current) clearInterval(timerRef.current)
+    timerRef.current = setInterval(() => {
+      setElapsedSeconds((prev) => prev + 1)
+    }, 1000)
+  }
+
+  const stopTimer = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current)
+      timerRef.current = null
+    }
+  }
 
   const handleOpenReferenceSource = (item: ReferenceItem) => {
     setCreationBackTarget({
@@ -140,6 +157,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     setIsGenerating(true)
     setError(null)
     setGeneratedContent('')
+    startTimer()
 
     try {
       if (enableRag) {
@@ -180,8 +198,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
           try {
             const content = JSON.parse(jsonStr)
             setGeneratedContent(prev => prev + content)
+            stopTimer()
           } catch {
             setGeneratedContent(prev => prev + jsonStr)
+            stopTimer()
           }
         }
       }
@@ -189,6 +209,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       setError(err instanceof Error ? err.message : '生成失败')
     } finally {
       setIsGenerating(false)
+      stopTimer()
     }
   }
 
@@ -282,6 +303,14 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             <div ref={contentRef} style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
               {generatedContent ? (
                 <ReactMarkdown components={markdownComponents}>{generatedContent}</ReactMarkdown>
+              ) : isGenerating ? (
+                <div style={{ height: '100%', display: 'grid', placeItems: 'center', color: '#667085', fontSize: 14, gap: 12 }}>
+                  <Loader2 size={28} className="spin" color="#0f766e" />
+                  <div style={{ textAlign: 'center', lineHeight: 1.6 }}>
+                    <div style={{ fontWeight: 600, color: '#0f766e', marginBottom: 4 }}>模型正在深度推理中</div>
+                    <div>请稍候，正式内容即将开始输出...（已等待 {elapsedSeconds} 秒）</div>
+                  </div>
+                </div>
               ) : (
                 <div style={{ height: '100%', display: 'grid', placeItems: 'center', color: '#98a2b3', fontSize: 14 }}>
                   输入创作需求后，可以先预览参考资料，也可以直接开始生成。

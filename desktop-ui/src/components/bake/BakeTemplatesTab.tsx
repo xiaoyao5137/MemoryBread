@@ -4,21 +4,10 @@ import { BakeButton, BakeCard, BakeMarkdown, BakePill, BakeSectionHeader } from 
 
 const formatTemplateStatus = (status: ArticleTemplate['status']) => {
   if (status === 'enabled') return '已启用'
-  if (status === 'pending_review') return '待确认'
+  if (status === 'pending_review') return '草稿'
   if (status === 'disabled') return '已停用'
   if (status === 'auto_generated') return '自动生成'
   return '草稿'
-}
-
-const formatReviewStatus = (status?: string) => {
-  if (!status) return '状态未知'
-  if (status === 'candidate') return '待提炼'
-  if (status === 'confirmed') return '已确认'
-  if (status === 'auto_created') return '自动入库'
-  if (status === 'pending_review') return '待复核'
-  if (status === 'ignored') return '已忽略'
-  if (status === 'draft') return '草稿'
-  return status
 }
 
 const BakeTemplatesTab: React.FC<{
@@ -32,7 +21,6 @@ const BakeTemplatesTab: React.FC<{
   onCreateTemplate: () => void
   onUpdateTemplate: (templateId: string, updater: (template: ArticleTemplate) => ArticleTemplate) => void
   onToggleTemplateStatus: (templateId: string) => void
-  onAdoptTemplate: (templateId: string) => void
   onDeleteTemplate: (templateId: string) => void
   onViewSourceMemory: (memoryId?: string) => void
   onPageChange: (offset: number) => void
@@ -49,7 +37,6 @@ const BakeTemplatesTab: React.FC<{
   onCreateTemplate,
   onUpdateTemplate,
   onToggleTemplateStatus,
-  onAdoptTemplate,
   onDeleteTemplate,
   onViewSourceMemory,
   onPageChange,
@@ -164,7 +151,6 @@ const BakeTemplatesTab: React.FC<{
                   <BakePill text={formatTemplateStatus(item.status)} />
                 </div>
                 <div className="bake-inline-pills">
-                  <BakePill text={formatReviewStatus(item.reviewStatus)} />
                   {item.matchLevel && <BakePill text={item.matchLevel} />}
                   {item.matchScore != null && <BakePill text={`匹配分 ${item.matchScore.toFixed(2)}`} />}
                 </div>
@@ -221,14 +207,12 @@ const BakeTemplatesTab: React.FC<{
               </div>
               <div className="bake-inline-pills">
                 <BakePill text={formatTemplateStatus(selected.status)} />
-                <BakePill text={formatReviewStatus(selected.reviewStatus)} />
               </div>
             </div>
 
             <div className="bake-knowledge-detail__section">
               <div className="bake-kv__title">提炼状态</div>
               <div className="bake-memory-detail__stats">
-                <span className="bake-stat-chip">复核：{formatReviewStatus(selected.reviewStatus)}</span>
                 {selected.matchScore != null && <span className="bake-stat-chip">匹配分：{selected.matchScore.toFixed(2)}</span>}
                 {selected.matchLevel && <span className="bake-stat-chip">匹配等级：{selected.matchLevel}</span>}
                 <span className="bake-stat-chip">来源记忆：{selected.sourceMemoryIds.length}</span>
@@ -307,9 +291,7 @@ const BakeTemplatesTab: React.FC<{
               ) : (
                 <>
                   <BakeButton primary onClick={() => setIsEditing(true)}>编辑模板</BakeButton>
-                  {selected.reviewStatus === 'candidate'
-                    ? <BakeButton onClick={() => onAdoptTemplate(selected.id)}>采纳模板</BakeButton>
-                    : <BakeButton onClick={() => onToggleTemplateStatus(selected.id)}>{selected.status === 'enabled' ? '停用' : '启用'}</BakeButton>}
+                  <BakeButton onClick={() => onToggleTemplateStatus(selected.id)}>{selected.status === 'enabled' ? '停用' : '启用'}</BakeButton>
                   <BakeButton onClick={() => onDeleteTemplate(selected.id)}>删除模板</BakeButton>
                   <BakeButton compact onClick={() => onViewSourceMemory(selected.sourceMemoryIds[0])}>查看来源时间线</BakeButton>
                 </>

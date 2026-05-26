@@ -557,6 +557,7 @@ const RepositoryPanel: React.FC = () => {
                                             selectedMemoryId: selectedMemory.id,
                                           })
                                           setRepositoryTab('capture')
+                                          setRepositoryCaptureSourceCaptureId(String(id))
                                           setSelectedCaptureId(String(id))
                                           setStatusMessage(`已切换到采集记录 #${id}`)
                                         }}
@@ -597,7 +598,7 @@ const RepositoryPanel: React.FC = () => {
                         setSelectedCaptureId(selectedMemory.sourceCaptureId)
                         setStatusMessage('已切换到来源采集记录')
                       }}>来源采集记录</BakeButton>
-                      <BakeButton compact onClick={() => handleViewLinkedKnowledge(selectedMemory.sourceKnowledgeId)}>关联知识</BakeButton>
+                      <BakeButton compact onClick={() => handleViewLinkedKnowledge(selectedMemory.sourceTimelineId)}>关联时间线</BakeButton>
                     </div>
                   </div>
                 </div>

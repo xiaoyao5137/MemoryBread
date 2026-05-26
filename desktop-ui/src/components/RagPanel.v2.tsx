@@ -98,8 +98,8 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
       <div className="rag-panel__header" data-testid="rag-panel-header">
         <div className="rag-panel__title-group">
           <h2 className="rag-panel__title">咨询</h2>
+          <p className="rag-panel__header-subtitle">向记忆面包提问，获取基于你的知识库的回答</p>
         </div>
-        <p className="rag-panel__subtitle">看见就会记住，记住就会理解<br />理解就能生产，生产就有希望</p>
       </div>
 
       {/* 模型未就绪提示 */}

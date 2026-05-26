@@ -61,6 +61,8 @@ const BakeMemoriesTab: React.FC<{
   modelStatusLoading = false,
 }) => {
   const selected = memories.find(item => item.id === selectedMemoryId) ?? memories[0]
+  const selectedCaptureIds = selected?.captureIds ?? []
+  const selectedKeyTimestamps = selected?.keyTimestamps ?? []
   const page = Math.floor(offset / PAGE_SIZE) + 1
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasPrev = offset > 0
@@ -162,12 +164,31 @@ const BakeMemoriesTab: React.FC<{
                 <div className="bake-kv__title">摘要概览</div>
                 <div className="bake-muted" style={{ lineHeight: 1.8 }}>{selected.summary || '暂无摘要'}</div>
               </div>
-              {selected.captureIds && selected.captureIds.length > 0 && (
+              {selected.details && (
+                <div>
+                  <div className="bake-kv__title">详情描述</div>
+                  <div className="bake-muted" style={{ lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>{selected.details}</div>
+                </div>
+              )}
+              {(selectedKeyTimestamps.length > 0 || selectedCaptureIds.length > 0) && (
                 <div>
                   <div className="bake-kv__title">详细内容</div>
                   <div className="bake-muted" style={{ lineHeight: 1.8 }}>
-                    包含 {selected.captureIds.length} 个采集记录
-                    {selected.captureIds.map((captureId, idx) => (
+                    {selectedKeyTimestamps.length > 0 && (
+                      <div>
+                        {selectedKeyTimestamps.map((segment, idx) => (
+                          <div key={`${segment.start_ts}-${idx}`} style={{ marginTop: idx === 0 ? 0 : 8 }}>
+                            {segment.summary || `关键片段 ${idx + 1}`}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {selectedCaptureIds.length > 0 && (
+                      <div style={{ marginTop: selectedKeyTimestamps.length > 0 ? 8 : 0 }}>
+                        包含 {selectedCaptureIds.length} 个采集记录
+                      </div>
+                    )}
+                    {selectedCaptureIds.map((captureId) => (
                       <div key={captureId} style={{ marginTop: 4 }}>
                         <button
                           type="button"

@@ -1,21 +1,6 @@
 import React, { useMemo, useState } from 'react'
-import type { BakeBucket, BakeKnowledgeItem } from '../../types'
+import type { BakeKnowledgeItem } from '../../types'
 import { BakeButton, BakeCard, BakeMarkdown, BakePill, BakeSectionHeader } from './BakeShared'
-
-
-const formatReviewStatus = (status?: string) => {
-  if (!status) return '状态未知'
-  if (status === 'candidate') return '待提炼'
-  if (status === 'confirmed') return '已确认'
-  if (status === 'auto_created') return '自动入库'
-  if (status === 'pending_review') return '待复核'
-  if (status === 'ignored') return '已忽略'
-  return status
-}
-
-const formatMatchScore = (score?: number) => (
-  typeof score === 'number' ? `匹配分 ${score.toFixed(2)}` : null
-)
 
 const BakeKnowledgeTab: React.FC<{
   items: BakeKnowledgeItem[]
@@ -144,7 +129,6 @@ const BakeKnowledgeTab: React.FC<{
                   <span>{item.category || '未分类'}</span>
                   <span>重要度 {item.importance}</span>
                   <span>重复观察 {item.occurrenceCount} 次</span>
-                  {item.reviewStatus && <span>{formatReviewStatus(item.reviewStatus)}</span>}
                   {item.matchLevel && <span>{item.matchLevel}</span>}
                   {item.matchScore != null && <span>匹配 {item.matchScore.toFixed(2)}</span>}
                 </div>
@@ -205,7 +189,6 @@ const BakeKnowledgeTab: React.FC<{
                 </div>
               </div>
               <div className="bake-inline-pills">
-                <BakePill text={formatReviewStatus(selected.reviewStatus)} />
                 {selected.matchLevel && <BakePill text={selected.matchLevel} />}
                 {selected.matchScore != null && <BakePill text={`匹配 ${selected.matchScore.toFixed(2)}`} />}
               </div>
@@ -237,8 +220,6 @@ const BakeKnowledgeTab: React.FC<{
             <div className="bake-knowledge-detail__section">
               <div className="bake-kv__title">提炼状态</div>
               <div className="bake-memory-detail__stats">
-                <span className="bake-stat-chip">状态：{formatReviewStatus(selected.status)}</span>
-                <span className="bake-stat-chip">复核：{formatReviewStatus(selected.reviewStatus)}</span>
                 {selected.matchScore != null && <span className="bake-stat-chip">匹配分：{selected.matchScore.toFixed(2)}</span>}
                 {selected.matchLevel && <span className="bake-stat-chip">匹配等级：{selected.matchLevel}</span>}
                 <span className="bake-stat-chip">重复观察：{selected.occurrenceCount} 次</span>

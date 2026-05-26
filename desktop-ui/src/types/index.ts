@@ -112,7 +112,8 @@ export interface TimelineItem {
   title: string
   url?: string
   sourceCaptureId?: string
-  sourceKnowledgeId?: string
+  sourceTimelineId?: string
+  details?: string
   summary?: string
   weight: number
   openCount: number
@@ -253,7 +254,7 @@ export interface SopCandidate {
   steps: string[]
   linkedKnowledgeIds: string[]
   linkedKnowledgeSummaries: LinkedKnowledgeSummary[]
-  status: 'candidate' | 'confirmed' | 'ignored'
+  status: 'candidate' | 'confirmed' | 'auto_created' | 'ignored'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -290,7 +291,7 @@ export interface MonitorOverview {
     pending_extraction_count: number
     by_time: { ts: number; count: number }[]
     recent: { id: number; ts: number; summary: string; category: string; importance: number; app_name: string; win_title: string }[]
-    extracting: { id: number; ts: number; app_name: string; win_title: string }[]
+    extracting: { id: number; ts: number; app_name: string; win_title: string; group_started_at_ms: number }[]
     last_extraction_at_ms: number | null
     extractor_status: 'running' | 'waiting' | 'idle' | 'stalled'
   }
@@ -307,6 +308,50 @@ export interface MonitorOverview {
     success_rate: number
     recent:       { id: number; task_name: string; status: string; started_at: number; latency_ms: number | null; knowledge_count: number | null }[]
   }
+}
+
+export interface ExtractionLive {
+  extractor_status: 'running' | 'waiting' | 'idle' | 'stalled'
+  extracting:       { id: number; ts: number; app_name: string; win_title: string; group_started_at_ms: number }[]
+  last_extraction_at_ms: number | null
+  pending_extraction_count: number
+  recent:           { id: number; ts: number; summary: string; category: string; importance: number; app_name: string; win_title: string }[]
+  server_now_ms:    number
+}
+
+// ─── 提炼流水线 DAG ───────────────────────────────────────────────────────────
+
+export type DagStageKey = 'capture' | 'timeline' | 'knowledge' | 'sop' | 'document'
+
+export interface DagItem {
+  kind:           string  // 'capture' | 'timeline' | 'bake_knowledge' | 'bake_sop' | 'document'
+  id:             number
+  ts:             number
+  title:          string
+  subtitle:       string | null
+  started_at_ms:  number | null
+}
+
+export interface DagStage {
+  key:               DagStageKey
+  label:             string
+  in_progress_label: string
+  pending_label:     string
+  in_progress_count: number
+  pending_count:     number
+  completed_today:   number
+  in_progress_items: DagItem[]
+  pending_items:     DagItem[]
+}
+
+export interface PipelineDagResponse {
+  server_now_ms:     number
+  extractor_status:  'running' | 'waiting' | 'idle' | 'stalled'
+  /// 兼容旧 UI：第一个 running bake run（如有）
+  running_bake_run:  { id: number; trigger_reason: string; started_at: number; candidate_count: number } | null
+  /// 所有正在运行的 bake run 列表
+  running_bake_runs: { id: number; trigger_reason: string; started_at: number; candidate_count: number }[]
+  stages:            DagStage[]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -357,8 +402,9 @@ export type ModelProvider =
   | 'ollama' | 'huggingface'
   | 'openai' | 'anthropic'
   | 'tongyi' | 'doubao' | 'deepseek' | 'kimi'
+  | 'google' | 'kling'
 
-export type ModelCategory = 'llm' | 'embedding' | 'ocr' | 'asr' | 'vlm'
+export type ModelCategory = 'llm' | 'embedding' | 'ocr' | 'asr' | 'vlm' | 'image' | 'inference_engine'
 export type ModelStatus = 'not_installed' | 'downloading' | 'installed' | 'active' | 'loading' | 'error'
 
 export interface ApiKeyField {

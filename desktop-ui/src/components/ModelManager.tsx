@@ -15,6 +15,16 @@ type OllamaSetupDetail = {
   recommended_install_method?: string
 }
 
+type LlmConcurrencyConfig = {
+  max_concurrency: number
+  max_allowed: number
+  stats?: {
+    running_total?: number
+    queue_lengths?: Record<string, number>
+    running_by_lane?: Record<string, number>
+  }
+}
+
 const PROVIDER_LABEL: Record<string, string> = {
   ollama: '本地模型', huggingface: 'HuggingFace',
   openai: 'OpenAI', anthropic: 'Anthropic',
@@ -124,6 +134,201 @@ const ApiKeyDialog: React.FC<{
   )
 }
 
+// ── 模型体验对话弹窗 ──────────────────────────────────────────────────────────
+type ChatMessage = { role: 'user' | 'assistant'; content: string }
+
+const ModelChatDialog: React.FC<{
+  model: ModelEntry
+  onClose: () => void
+}> = ({ model, onClose }) => {
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [inputValue, setInputValue] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const [chatError, setChatError] = useState('')
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }
+  useEffect(scrollToBottom, [messages])
+
+  const handleSend = async () => {
+    const q = inputValue.trim()
+    if (!q || chatLoading) return
+    setInputValue('')
+    setChatError('')
+    const userMsg: ChatMessage = { role: 'user', content: q }
+    setMessages(prev => [...prev, userMsg])
+    setChatLoading(true)
+
+    try {
+      const chatMessages = [...messages, userMsg].map(m => ({ role: m.role, content: m.content }))
+      const response = await fetch(`${SIDECAR}/api/models/${model.id}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: chatMessages }),
+      })
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({ message: `HTTP ${response.status}` }))
+        setChatError(errData.message || `请求失败 (${response.status})`)
+        setChatLoading(false)
+        return
+      }
+
+      // 流式读取 SSE
+      const reader = response.body?.getReader()
+      if (!reader) {
+        setChatError('无法读取响应流')
+        setChatLoading(false)
+        return
+      }
+
+      const decoder = new TextDecoder()
+      let assistantContent = ''
+      setMessages(prev => [...prev, { role: 'assistant', content: '' }])
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const chunk = decoder.decode(value, { stream: true })
+        const lines = chunk.split('\n')
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const dataStr = line.slice(6).trim()
+          if (!dataStr) continue
+          try {
+            const evt = JSON.parse(dataStr)
+            if (evt.content) {
+              assistantContent += evt.content
+              setMessages(prev => {
+                const updated = [...prev]
+                updated[updated.length - 1] = { role: 'assistant', content: assistantContent }
+                return updated
+              })
+            }
+            if (evt.error) {
+              setChatError(evt.error)
+            }
+            if (evt.done) {
+              // 流式结束
+            }
+          } catch { /* ignore parse errors */ }
+        }
+      }
+    } catch (e: any) {
+      setChatError(e.message || '连接失败')
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
+  const handleReset = () => {
+    setMessages([])
+    setChatError('')
+    setInputValue('')
+  }
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+    }}>
+      <div style={{
+        background: 'white', borderRadius: 16, width: 520, maxHeight: '80vh',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.2)', display: 'flex', flexDirection: 'column',
+      }}>
+        {/* 标题栏 */}
+        <div style={{
+          padding: '12px 16px', borderBottom: '1px solid rgba(0,0,0,0.07)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 15, fontWeight: 700 }}>体验 {model.name}</span>
+            <span style={{
+              fontSize: 10, padding: '1px 6px', borderRadius: 4,
+              background: `${PROVIDER_COLOR[model.provider]}18`, color: PROVIDER_COLOR[model.provider],
+            }}>{PROVIDER_LABEL[model.provider]}</span>
+          </div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button onClick={handleReset} style={btn('#F2F2F7', '#333', 11)}>重置</button>
+            <button onClick={onClose} style={btn('#F2F2F7', '#333', 11)}>关闭</button>
+          </div>
+        </div>
+
+        {/* 对话区域 */}
+        <div style={{
+          flex: 1, overflow: 'auto', padding: '12px 16px',
+          minHeight: 300, maxHeight: 'calc(80vh - 120px)',
+          background: '#F5F5F7',
+        }}>
+          {messages.length === 0 && !chatLoading && (
+            <div style={{ textAlign: 'center', color: '#AEAEB2', fontSize: 13, padding: 60 }}>
+              <div style={{ fontSize: 40, marginBottom: 8 }}>💬</div>
+              <div>和 {model.name} 开始对话</div>
+              <div style={{ fontSize: 11, marginTop: 4 }}>输入任何问题来体验这个模型的能力</div>
+            </div>
+          )}
+          {messages.map((msg, idx) => (
+            <div key={idx} style={{
+              display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
+              marginBottom: 8,
+            }}>
+              <div style={{
+                maxWidth: '80%', padding: '8px 12px', borderRadius: 12, fontSize: 13, lineHeight: 1.5,
+                background: msg.role === 'user' ? '#007AFF' : 'white',
+                color: msg.role === 'user' ? 'white' : '#333',
+                border: msg.role === 'user' ? 'none' : '1px solid rgba(0,0,0,0.07)',
+              }}>{msg.content}</div>
+            </div>
+          ))}
+          {chatLoading && messages[messages.length - 1]?.role === 'user' && (
+            <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: 8 }}>
+              <div style={{
+                padding: '8px 12px', borderRadius: 12, fontSize: 13,
+                background: 'white', border: '1px solid rgba(0,0,0,0.07)', color: '#AEAEB2',
+              }}>思考中...</div>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* 错误提示 */}
+        {chatError && (
+          <div style={{ padding: '4px 16px', fontSize: 12, color: '#FF3B30', background: '#FF3B3010' }}>
+            ⚠️ {chatError}
+          </div>
+        )}
+
+        {/* 输入区域 */}
+        <div style={{
+          padding: '8px 16px', borderTop: '1px solid rgba(0,0,0,0.07)',
+          display: 'flex', gap: 8,
+        }}>
+          <input
+            value={inputValue}
+            onChange={e => setInputValue(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
+            placeholder="输入消息..."
+            disabled={chatLoading}
+            style={{
+              flex: 1, padding: '8px 12px', borderRadius: 8, fontSize: 13,
+              border: '1px solid rgba(0,0,0,0.15)', outline: 'none',
+            }}
+          />
+          <button
+            onClick={handleSend}
+            disabled={!inputValue.trim() || chatLoading}
+            style={btn(chatLoading ? '#AEAEB2' : '#007AFF', 'white', 13)}
+          >
+            {chatLoading ? '...' : '发送'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── 模型卡片 ──────────────────────────────────────────────────────────────────
 const ModelCard: React.FC<{
   model: ModelEntry
@@ -132,9 +337,10 @@ const ModelCard: React.FC<{
   onDelete: () => void
   onConfigure: () => void
   onUpgrade?: () => void
+  onChat?: () => void
   downloading: boolean
   activating?: boolean
-}> = ({ model, onDownload, onActivate, onDelete, onConfigure, onUpgrade, downloading, activating }) => {
+}> = ({ model, onDownload, onActivate, onDelete, onConfigure, onUpgrade, onChat, downloading, activating }) => {
   const isApi = model.requires_api_key
   const isInferenceEngine = model.category === 'inference_engine'
   const isActive = model.status === 'active'
@@ -226,6 +432,10 @@ const ModelCard: React.FC<{
             {isActive && (
               <span style={{ fontSize: 11, color: '#007AFF', fontWeight: 600 }}>使用中</span>
             )}
+            {/* 体验入口：LLM 模型已可用时显示 */}
+            {(isActive || (isApi && isInstalled)) && !isInferenceEngine && onChat && (
+              <button onClick={onChat} style={btn('#AF52DE18', '#AF52DE', 11)}>💬 体验</button>
+            )}
             {isLoading && (
               <span style={{ fontSize: 11, color: '#FF9500', fontWeight: 600 }}>加载中</span>
             )}
@@ -247,6 +457,7 @@ const ModelManager: React.FC = () => {
   const [models, setModels] = useState<ModelEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [configuringModel, setConfiguringModel] = useState<ModelEntry | null>(null)
+  const [chattingModel, setChattingModel] = useState<ModelEntry | null>(null)
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set())
   const [activatingIds, setActivatingIds] = useState<Set<string>>(new Set())
   const [ollamaSetup, setOllamaSetup] = useState<OllamaSetupDetail | null>(null)
@@ -254,6 +465,9 @@ const ModelManager: React.FC = () => {
   const [ollamaInstalling, setOllamaInstalling] = useState(false)
   const [ollamaUpgrading, setOllamaUpgrading] = useState(false)
   const [ollamaError, setOllamaError] = useState('')
+  const [llmConcurrency, setLlmConcurrency] = useState<LlmConcurrencyConfig | null>(null)
+  const [llmConcurrencySaving, setLlmConcurrencySaving] = useState(false)
+  const [llmConcurrencyError, setLlmConcurrencyError] = useState('')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const loadModels = async () => {
@@ -278,6 +492,56 @@ const ModelManager: React.FC = () => {
       setOllamaError('无法获取 Ollama 状态')
     } finally {
       setOllamaChecking(false)
+    }
+  }
+
+  const refreshLlmConcurrency = async () => {
+    setLlmConcurrencyError('')
+    try {
+      const r = await fetch(`${SIDECAR}/api/models/llm-concurrency`)
+      if (r.status === 404) {
+        setLlmConcurrency({ max_concurrency: 1, max_allowed: 3 })
+        return
+      }
+      const d = await r.json()
+      if (d.status === 'ok') {
+        setLlmConcurrency({
+          max_concurrency: d.max_concurrency,
+          max_allowed: d.max_allowed || 3,
+          stats: d.stats,
+        })
+      } else {
+        setLlmConcurrencyError(d.message || '无法获取 LLM 并发配置')
+      }
+    } catch {
+      setLlmConcurrencyError('无法获取 LLM 并发配置')
+    }
+  }
+
+  const updateLlmConcurrency = async (value: number) => {
+    setLlmConcurrencySaving(true)
+    setLlmConcurrencyError('')
+    try {
+      const r = await fetch(`${SIDECAR}/api/models/llm-concurrency`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ max_concurrency: value }),
+      })
+      if (r.status === 404) {
+        setLlmConcurrencyError('AI Sidecar 需要重启后才能配置 LLM 并发')
+        return
+      }
+      const d = await r.json()
+      if (d.status !== 'ok') throw new Error(d.message || '保存失败')
+      setLlmConcurrency({
+        max_concurrency: d.max_concurrency,
+        max_allowed: d.max_allowed || 3,
+        stats: d.stats,
+      })
+    } catch (e: any) {
+      setLlmConcurrencyError(e.message || '保存失败')
+    } finally {
+      setLlmConcurrencySaving(false)
     }
   }
 
@@ -311,6 +575,7 @@ const ModelManager: React.FC = () => {
   useEffect(() => {
     loadModels()
     refreshOllamaSetup()
+    refreshLlmConcurrency()
   }, [])
 
   // 轮询下载进度
@@ -494,6 +759,56 @@ const ModelManager: React.FC = () => {
         }}>刷新</button>
       </div>
 
+      {tab === 'llm' && (
+        <div style={{ padding: '10px 14px 0' }}>
+          <div style={{
+            background: 'white',
+            borderRadius: 10,
+            padding: '10px 12px',
+            border: '1px solid rgba(0,0,0,0.07)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 12,
+          }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#1D1D1F' }}>LLM 并发</div>
+              <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 2 }}>
+                运行中 {llmConcurrency?.stats?.running_total ?? 0} · P0 快速通道保留
+              </div>
+              {llmConcurrencyError && (
+                <div style={{ fontSize: 11, color: '#FF3B30', marginTop: 4 }}>{llmConcurrencyError}</div>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+              {[1, 2, 3].map(value => {
+                const active = llmConcurrency?.max_concurrency === value
+                return (
+                  <button
+                    key={value}
+                    onClick={() => updateLlmConcurrency(value)}
+                    disabled={llmConcurrencySaving}
+                    style={{
+                      width: 32,
+                      height: 28,
+                      borderRadius: 8,
+                      border: active ? 'none' : '1px solid rgba(0,0,0,0.1)',
+                      background: active ? '#007AFF' : '#F2F2F7',
+                      color: active ? 'white' : '#333',
+                      fontSize: 12,
+                      fontWeight: active ? 700 : 500,
+                      cursor: llmConcurrencySaving ? 'default' : 'pointer',
+                    }}
+                  >
+                    {value}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 内容区 */}
       <div style={{ flex: 1, overflow: 'auto', padding: '10px 14px 14px' }}>
         {loading && models.length === 0 && (
@@ -566,6 +881,7 @@ const ModelManager: React.FC = () => {
                 onDelete={() => handleDelete(m)}
                 onConfigure={() => setConfiguringModel(m)}
                 onUpgrade={m.category === 'inference_engine' ? handleUpgrade : undefined}
+                onChat={m.category === 'llm' && (m.status === 'active' || (m.requires_api_key && (m.status as string === 'installed' || m.status as string === 'active'))) ? () => setChattingModel(m) : undefined}
               />
             ))}
           </div>
@@ -573,7 +889,7 @@ const ModelManager: React.FC = () => {
 
         {!loading && filtered.length === 0 && (
           <div style={{ textAlign: 'center', color: '#AEAEB2', fontSize: 13, padding: 40 }}>
-            {tab === 'quantized' ? '暂无量化模型' : '暂无模型'}
+            暂无模型
           </div>
         )}
       </div>
@@ -583,6 +899,12 @@ const ModelManager: React.FC = () => {
           model={configuringModel}
           onClose={() => setConfiguringModel(null)}
           onSaved={loadModels}
+        />
+      )}
+      {chattingModel && (
+        <ModelChatDialog
+          model={chattingModel}
+          onClose={() => setChattingModel(null)}
         />
       )}
     </div>
