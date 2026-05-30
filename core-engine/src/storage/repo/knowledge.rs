@@ -499,12 +499,13 @@ impl StorageManager {
                         duration_minutes, frag_app_name, frag_win_title, time_range_start,
                         time_range_end, key_timestamps
                  FROM timelines
-                 WHERE category NOT IN (?, ?, ?)",
+                 WHERE category NOT IN (?, ?, ?, ?)",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![
                 Box::new("bake_article".to_string()),
                 Box::new("bake_sop".to_string()),
                 Box::new("bake_knowledge".to_string()),
+                Box::new("legacy_bake_candidate".to_string()),
             ];
             if let Some(q) = query {
                 sql.push_str(" AND (summary LIKE ? OR COALESCE(overview, '') LIKE ? OR COALESCE(details, '') LIKE ? OR COALESCE(category, '') LIKE ?)");
@@ -533,12 +534,13 @@ impl StorageManager {
     ) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
             let mut sql = String::from(
-                "SELECT COUNT(*) FROM timelines WHERE category NOT IN (?, ?, ?)",
+                "SELECT COUNT(*) FROM timelines WHERE category NOT IN (?, ?, ?, ?)",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![
                 Box::new("bake_article".to_string()),
                 Box::new("bake_sop".to_string()),
                 Box::new("bake_knowledge".to_string()),
+                Box::new("legacy_bake_candidate".to_string()),
             ];
             if let Some(q) = query {
                 sql.push_str(" AND (summary LIKE ? OR COALESCE(overview, '') LIKE ? OR COALESCE(details, '') LIKE ? OR COALESCE(category, '') LIKE ?)");
@@ -570,15 +572,16 @@ impl StorageManager {
                         duration_minutes, frag_app_name, frag_win_title, time_range_start,
                         time_range_end, key_timestamps
                  FROM timelines
-                 WHERE category NOT IN (?1, ?2, ?3)
+                 WHERE category NOT IN (?1, ?2, ?3, ?4)
                  ORDER BY updated_at_ms DESC, id DESC
-                 LIMIT ?4 OFFSET ?5",
+                 LIMIT ?5 OFFSET ?6",
             )?;
             let rows = stmt.query_map(
                 params![
                     "bake_article",
                     "bake_sop",
                     "bake_knowledge",
+                    "legacy_bake_candidate",
                     limit as i64,
                     offset as i64
                 ],
@@ -592,8 +595,13 @@ impl StorageManager {
     pub fn count_non_bake_knowledge(&self) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT COUNT(*) FROM timelines WHERE category NOT IN (?1, ?2, ?3)",
-                params!["bake_article", "bake_sop", "bake_knowledge"],
+                "SELECT COUNT(*) FROM timelines WHERE category NOT IN (?1, ?2, ?3, ?4)",
+                params![
+                    "bake_article",
+                    "bake_sop",
+                    "bake_knowledge",
+                    "legacy_bake_candidate"
+                ],
                 |row| row.get(0),
             )
             .map_err(StorageError::Sqlite)
@@ -630,7 +638,7 @@ impl StorageManager {
                  FROM timelines k
                  INNER JOIN captures c ON c.id = k.capture_id
                  LEFT JOIN bake_retry_state r ON r.timeline_id = k.id
-                 WHERE k.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop')
+                 WHERE k.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
                    AND k.updated_at_ms > ?1
                    AND COALESCE(r.failure_count, 0) < ?3
                  ORDER BY k.updated_at_ms ASC, k.id ASC

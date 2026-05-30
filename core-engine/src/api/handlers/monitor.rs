@@ -116,11 +116,39 @@ fn bucket_label(range: &str, bucket_start_ms: i64) -> String {
 pub struct MonitorOverview {
     pub db_size_bytes: i64,
     pub capture_total_count: i64,
+    pub service_health: ServiceHealth,
     pub token_usage: TokenUsage,
     pub capture_flow: CaptureFlow,
     pub knowledge_flow: KnowledgeFlow,
     pub rag_sessions: RagSessionStats,
     pub task_executions: TaskExecutionStats,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ServiceHealth {
+    pub status: String,
+    pub mode: String,
+    pub full_dispatch_ready: bool,
+    pub background_processor_running: bool,
+    pub critical_checks_passed: bool,
+    pub embedding_ok: bool,
+    pub issues: Vec<String>,
+    pub updated_at_ms: Option<i64>,
+}
+
+impl ServiceHealth {
+    fn unknown(reason: impl Into<String>) -> Self {
+        Self {
+            status: "down".to_string(),
+            mode: "unknown".to_string(),
+            full_dispatch_ready: false,
+            background_processor_running: false,
+            critical_checks_passed: false,
+            embedding_ok: false,
+            issues: vec![reason.into()],
+            updated_at_ms: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -374,7 +402,7 @@ pub async fn monitor_overview(
             |r| r.get(0),
         ).unwrap_or(0);
         let knowledge_generated_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM captures WHERE ts >= ?1 AND knowledge_id IS NOT NULL",
+            "SELECT COUNT(*) FROM captures WHERE ts >= ?1 AND timeline_id IS NOT NULL",
             rusqlite::params![from_ms],
             |r| r.get(0),
         ).unwrap_or(0);
@@ -444,7 +472,7 @@ pub async fn monitor_overview(
             "SELECT COUNT(*) FROM captures c
              WHERE ((c.ocr_text IS NOT NULL AND c.ocr_text != '')
                 OR (c.ax_text IS NOT NULL AND c.ax_text != ''))
-               AND c.knowledge_id IS NULL
+               AND c.timeline_id IS NULL
                AND c.is_sensitive = 0
                AND ({app_not_like})
                AND ({win_not_like})"
@@ -570,6 +598,7 @@ pub async fn monitor_overview(
         Ok(MonitorOverview {
             db_size_bytes,
             capture_total_count,
+            service_health: ServiceHealth::unknown("Sidecar 运行时状态尚未读取"),
             token_usage: TokenUsage {
                 total_period,
                 total_today,
@@ -618,8 +647,80 @@ pub async fn monitor_overview(
     }).await?;
 
     enrich_extractor_status(&mut overview.knowledge_flow, now_ms).await;
+    overview.service_health = read_sidecar_runtime_health(now_ms).await;
 
     Ok(Json(overview))
+}
+
+async fn read_sidecar_runtime_health(now_ms: i64) -> ServiceHealth {
+    const RUNTIME_STATUS_STALENESS_MS: i64 = 5 * 60 * 1000;
+
+    let path = match std::env::var_os("HOME") {
+        Some(home) => std::path::PathBuf::from(home)
+            .join(".memory-bread")
+            .join("state")
+            .join("sidecar_runtime_status.json"),
+        None => return ServiceHealth::unknown("无法定位 HOME，不能读取 sidecar 运行状态"),
+    };
+
+    #[derive(Deserialize)]
+    struct RuntimeStatusFile {
+        #[serde(default)]
+        mode: String,
+        #[serde(default)]
+        full_dispatch_ready: bool,
+        #[serde(default)]
+        background_processor_running: bool,
+        #[serde(default)]
+        critical_checks_passed: bool,
+        #[serde(default)]
+        embedding_ok: bool,
+        #[serde(default)]
+        issues: Vec<String>,
+        #[serde(default)]
+        updated_at_ms: Option<i64>,
+    }
+
+    let read_path = path.clone();
+    let read_result = tokio::task::spawn_blocking(move || std::fs::read(&read_path)).await;
+    let bytes = match read_result {
+        Ok(Ok(b)) => b,
+        _ => return ServiceHealth::unknown("Sidecar 未写入运行时状态，完整后台能力可能未启动"),
+    };
+
+    let body: RuntimeStatusFile = match serde_json::from_slice(&bytes) {
+        Ok(b) => b,
+        Err(_) => return ServiceHealth::unknown("Sidecar 运行时状态文件无法解析"),
+    };
+
+    let stale = body
+        .updated_at_ms
+        .map(|updated| now_ms.saturating_sub(updated) > RUNTIME_STATUS_STALENESS_MS)
+        .unwrap_or(true);
+
+    let mut issues = body.issues;
+    if stale {
+        issues.push("Sidecar 运行时状态超过 5 分钟未更新".to_string());
+    }
+
+    let status = if stale || !body.critical_checks_passed || !body.full_dispatch_ready {
+        "down"
+    } else if !body.background_processor_running || !body.embedding_ok || !issues.is_empty() {
+        "degraded"
+    } else {
+        "ok"
+    };
+
+    ServiceHealth {
+        status: status.to_string(),
+        mode: if body.mode.is_empty() { "unknown".to_string() } else { body.mode },
+        full_dispatch_ready: body.full_dispatch_ready,
+        background_processor_running: body.background_processor_running,
+        critical_checks_passed: body.critical_checks_passed,
+        embedding_ok: body.embedding_ok,
+        issues,
+        updated_at_ms: body.updated_at_ms,
+    }
 }
 
 /// 直接读取 sidecar 写入的 ~/.memory-bread/state/extraction_status.json，
@@ -789,6 +890,7 @@ async fn enrich_extractor_status(flow: &mut KnowledgeFlow, now_ms: i64) {
 #[derive(Debug, Serialize)]
 pub struct ExtractionLiveResponse {
     pub extractor_status: String,
+    pub service_health: ServiceHealth,
     pub extracting: Vec<ExtractingCapture>,
     pub last_extraction_at_ms: Option<i64>,
     pub pending_extraction_count: i64,
@@ -802,19 +904,26 @@ pub async fn monitor_extraction_live(
     let now_ms = Utc::now().timestamp_millis();
     let from_ms = now_ms - 24 * 3600 * 1000;
     let fallback_noise_pattern = format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX);
+    let app_not_like = build_not_like_clause("app_name", &SELF_GENERATED_APP_KEYWORDS);
+    let win_not_like = build_not_like_clause("win_title", &SELF_GENERATED_WINDOW_KEYWORDS);
 
     let (pending_extraction_count, recent) = state
         .storage
         .with_conn_async(move |conn| {
+            let pending_sql = format!(
+                "SELECT COUNT(*) FROM captures
+                 WHERE ((ocr_text IS NOT NULL AND ocr_text != '')
+                    OR (ax_text IS NOT NULL AND ax_text != '')
+                    OR (input_text IS NOT NULL AND input_text != '')
+                    OR (audio_text IS NOT NULL AND audio_text != ''))
+                   AND timeline_id IS NULL
+                   AND is_sensitive = 0
+                   AND ts >= ?1
+                   AND ({app_not_like})
+                   AND ({win_not_like})"
+            );
             let pending: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM captures
-                     WHERE knowledge_id IS NULL
-                       AND ts >= ?1
-                       AND COALESCE(text, '') != ''",
-                    rusqlite::params![from_ms],
-                    |r| r.get(0),
-                )
+                .query_row(&pending_sql, rusqlite::params![from_ms], |r| r.get(0))
                 .unwrap_or(0);
 
             let mut stmt = conn.prepare(
@@ -864,9 +973,11 @@ pub async fn monitor_extraction_live(
         extractor_status: "stalled".to_string(),
     };
     enrich_extractor_status(&mut tmp, now_ms).await;
+    let service_health = read_sidecar_runtime_health(now_ms).await;
 
     Ok(Json(ExtractionLiveResponse {
         extractor_status: tmp.extractor_status,
+        service_health,
         extracting: tmp.extracting,
         last_extraction_at_ms: tmp.last_extraction_at_ms,
         pending_extraction_count,
@@ -1802,6 +1913,10 @@ pub struct PipelineDagResponse {
     pub running_bake_run: Option<DagRunningRun>,
     /// 所有正在运行的 bake run 列表
     pub running_bake_runs: Vec<DagRunningRun>,
+    /// bake 流水线的 unified watermark 距离最老一条等待处理候选的 ms 间隔。
+    /// 用来揭穿"timeline pending=0 但其实 watermark 卡死"的假象：
+    /// 如果 lag_ms 远大于正常推进节奏，说明系统假装空闲实际堆积。0 表示已追上。
+    pub bake_watermark_lag_ms: i64,
     pub stages: Vec<DagStage>,
 }
 
@@ -1884,7 +1999,7 @@ pub async fn monitor_pipeline_dag(
             };
             let capture_pending_sql = format!(
                 "SELECT COUNT(*) FROM captures
-                 WHERE knowledge_id IS NULL
+                 WHERE timeline_id IS NULL
                    AND ts >= ?1
                    AND (COALESCE(ax_text, '') != ''
                         OR COALESCE(ocr_text, '') != ''
@@ -1900,7 +2015,7 @@ pub async fn monitor_pipeline_dag(
             let capture_items_sql = format!(
                 "SELECT id, ts, COALESCE(app_name, ''), COALESCE(win_title, '')
                  FROM captures
-                 WHERE knowledge_id IS NULL
+                 WHERE timeline_id IS NULL
                    AND ts >= ?1
                    AND (COALESCE(ax_text, '') != ''
                         OR COALESCE(ocr_text, '') != ''
@@ -1932,8 +2047,8 @@ pub async fn monitor_pipeline_dag(
             let capture_completed_today: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM captures c
-                     JOIN timelines t ON t.id = c.knowledge_id
-                     WHERE c.knowledge_id IS NOT NULL
+                     JOIN timelines t ON t.id = c.timeline_id
+                     WHERE c.timeline_id IS NOT NULL
                        AND COALESCE(t.created_at_ms, CAST(strftime('%s', t.created_at) AS INTEGER) * 1000) >= ?1",
                     rusqlite::params![day_start_ms],
                     |r| r.get(0),
@@ -1965,7 +2080,7 @@ pub async fn monitor_pipeline_dag(
                        COALESCE(t.frag_win_title, '')
                 FROM timelines t
                 LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
-                WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop')
+                WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
                   AND t.updated_at_ms > ?1
                   AND t.is_self_generated = 0
                   AND COALESCE(r.failure_count, 0) < 3
@@ -2024,7 +2139,7 @@ pub async fn monitor_pipeline_dag(
                 .query_row(
                     "SELECT COUNT(*) FROM timelines t
                      LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
-                     WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop')
+                     WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
                        AND t.updated_at_ms > ?1
                        AND t.is_self_generated = 0
                        AND COALESCE(r.failure_count, 0) < 3
@@ -2051,7 +2166,48 @@ pub async fn monitor_pipeline_dag(
                 )
                 .unwrap_or(0);
 
-            // timeline_completed_today：今日 bake 已完成提炼（产出了下游知识/sop/文档）的 timeline 数量
+            // bake_watermark_lag_ms：watermark 距离"最老一条仍在排队的高价值候选"有多远。
+            // 用同一套候选过滤 SQL 的前置条件查 MIN(updated_at_ms)，再减 watermark。
+            // 已追上（无候选）时返回 0；watermark 卡死时这个值会持续增长，揭穿"假 0 排队"。
+            let bake_watermark_lag_ms: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MIN(t.updated_at_ms), 0)
+                     FROM timelines t
+                     LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
+                     WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
+                       AND t.updated_at_ms > ?1
+                       AND t.is_self_generated = 0
+                       AND COALESCE(r.failure_count, 0) < 3
+                       AND (
+                           t.importance >= 4
+                           OR t.user_verified = 1
+                           OR (
+                               t.evidence_strength IN ('high', 'medium')
+                               AND (t.history_view = 1
+                                    OR t.activity_type IN ('coding','reading','reviewing_history','document_reference')
+                                    OR t.content_origin IN ('historical_content','live_interaction')
+                               )
+                           )
+                       )
+                       AND NOT EXISTS (SELECT 1 FROM bake_knowledge bk WHERE bk.timeline_id = t.id)
+                       AND NOT EXISTS (SELECT 1 FROM bake_sops bs WHERE bs.timeline_id = t.id)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM bake_documents bd
+                           WHERE bd.deleted_at IS NULL
+                             AND bd.source_episode_ids LIKE '%' || t.id || '%'
+                       )",
+                    rusqlite::params![timeline_watermark_ts],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|oldest_pending_ts| {
+                    if oldest_pending_ts <= 0 {
+                        0
+                    } else {
+                        (oldest_pending_ts - timeline_watermark_ts).max(0)
+                    }
+                })
+                .unwrap_or(0);
+
             // 按下游产出表的 created_at（文本格式 YYYY-MM-DD）过滤今日，反映真实的今日 bake 产量
             let timeline_completed_today: i64 = conn
                 .query_row(
@@ -2151,6 +2307,7 @@ pub async fn monitor_pipeline_dag(
                 document_pending_items: Vec::new(),
                 document_completed_today,
                 running_runs,
+                bake_watermark_lag_ms,
             })
         })
         .await?;
@@ -2267,6 +2424,7 @@ pub async fn monitor_pipeline_dag(
         extractor_status,
         running_bake_run: first_run,
         running_bake_runs: aggregated.running_runs,
+        bake_watermark_lag_ms: aggregated.bake_watermark_lag_ms,
         stages,
     }))
 }
@@ -2288,6 +2446,8 @@ struct DagAggregated {
     document_pending_items: Vec<DagItem>,
     document_completed_today: i64,
     running_runs: Vec<DagRunningRun>,
+    /// bake watermark 距离最老一条等待处理候选 timeline 的间隔（ms），0 表示已追上。
+    bake_watermark_lag_ms: i64,
 }
 
 // stage 取值：'bake_knowledge' → 表 bake_knowledge / kind 'bake_knowledge'

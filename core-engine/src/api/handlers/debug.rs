@@ -299,7 +299,7 @@ pub struct ClearExtractionQueueResponse {
 
 /// POST /api/debug/clear-extraction-queue
 ///
-/// 在 knowledge_entries 插入一条占位记录，然后将所有 knowledge_id IS NULL 的
+/// 在 knowledge_entries 插入一条占位记录，然后将所有 timeline_id IS NULL 的
 /// capture 指向该占位记录，从而跳过知识提炼处理。
 pub async fn clear_extraction_queue(
     State(state): State<Arc<AppState>>,
@@ -308,7 +308,7 @@ pub async fn clear_extraction_queue(
         .with_conn_async(|conn| {
             // 1. 找一个待处理 capture 的 id 用于满足外键约束
             let first_capture_id: Option<i64> = conn.query_row(
-                "SELECT id FROM captures WHERE knowledge_id IS NULL LIMIT 1",
+                "SELECT id FROM captures WHERE timeline_id IS NULL LIMIT 1",
                 [],
                 |r| r.get(0),
             ).ok();
@@ -328,7 +328,7 @@ pub async fn clear_extraction_queue(
 
             // 3. 批量将待处理 captures 指向该占位记录
             let n = conn.execute(
-                "UPDATE captures SET knowledge_id = ? WHERE knowledge_id IS NULL",
+                "UPDATE captures SET timeline_id = ? WHERE timeline_id IS NULL",
                 rusqlite::params![skip_id],
             ).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 

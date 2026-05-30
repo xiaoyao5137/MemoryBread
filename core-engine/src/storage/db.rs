@@ -124,6 +124,14 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "028_remove_bake_manual_review",
         include_str!("migrations/028_remove_bake_manual_review.sql"),
     ),
+    (
+        "029_rename_capture_knowledge_id_to_timeline_id",
+        include_str!("migrations/029_rename_capture_knowledge_id_to_timeline_id.sql"),
+    ),
+    (
+        "030_archive_legacy_bake_article_timelines",
+        include_str!("migrations/030_archive_legacy_bake_article_timelines.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +224,17 @@ impl StorageManager {
                 continue;
             }
 
+            if *version == "029_rename_capture_knowledge_id_to_timeline_id"
+                && self.capture_timeline_column_already_renamed(&conn)?
+            {
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    rusqlite::params![version, current_ts_ms()],
+                )?;
+                info!("迁移 {} 已由现有 schema 满足，登记后跳过", version);
+                continue;
+            }
+
             info!("执行迁移: {}", version);
             conn.execute_batch(sql)
                 .map_err(|e| StorageError::MigrationFailed {
@@ -241,6 +260,19 @@ impl StorageManager {
         }
 
         Ok(())
+    }
+
+    fn capture_timeline_column_already_renamed(
+        &self,
+        conn: &Connection,
+    ) -> Result<bool, StorageError> {
+        let mut stmt = conn.prepare("PRAGMA table_info(captures)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_timeline_id = columns.iter().any(|name| name == "timeline_id");
+        let has_knowledge_id = columns.iter().any(|name| name == "knowledge_id");
+        Ok(has_timeline_id && !has_knowledge_id)
     }
 
     // ── 工具方法 ─────────────────────────────────────────────────────────────

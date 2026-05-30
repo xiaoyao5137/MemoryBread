@@ -68,3 +68,7 @@ node_modules/
 
 # Claude Code worktrees
 .claude/worktrees/
+
+# IDE / 一次性诊断产物
+.qoder/
+diagnose_*.py

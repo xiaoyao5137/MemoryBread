@@ -264,6 +264,7 @@ export interface SopCandidate {
 export interface MonitorOverview {
   db_size_bytes: number
   capture_total_count: number
+  service_health: ServiceHealth
   token_usage: {
     total_period:  number
     total_today:   number
@@ -310,8 +311,20 @@ export interface MonitorOverview {
   }
 }
 
+export interface ServiceHealth {
+  status: 'ok' | 'degraded' | 'down' | string
+  mode: string
+  full_dispatch_ready: boolean
+  background_processor_running: boolean
+  critical_checks_passed: boolean
+  embedding_ok: boolean
+  issues: string[]
+  updated_at_ms: number | null
+}
+
 export interface ExtractionLive {
   extractor_status: 'running' | 'waiting' | 'idle' | 'stalled'
+  service_health?: ServiceHealth
   extracting:       { id: number; ts: number; app_name: string; win_title: string; group_started_at_ms: number }[]
   last_extraction_at_ms: number | null
   pending_extraction_count: number
@@ -351,6 +364,8 @@ export interface PipelineDagResponse {
   running_bake_run:  { id: number; trigger_reason: string; started_at: number; candidate_count: number } | null
   /// 所有正在运行的 bake run 列表
   running_bake_runs: { id: number; trigger_reason: string; started_at: number; candidate_count: number }[]
+  /// bake watermark 距离最老一条排队候选的 ms 间隔；0 表示已追上
+  bake_watermark_lag_ms: number
   stages:            DagStage[]
 }
 

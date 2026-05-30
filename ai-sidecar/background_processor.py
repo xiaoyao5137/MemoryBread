@@ -302,13 +302,15 @@ class BackgroundProcessor:
                 from knowledge.extractor_v2 import KnowledgeExtractorV2
                 from model_registry_global import get_active_ollama_model
 
-                # 先初始化 EmbedWorker，确保向量模型可用
-                embed_worker = self._get_embed_worker()
-                embed_model = embed_worker._model if embed_worker else None
-
-                if not embed_model:
-                    logger.error("❌ 向量模型未就绪，知识去重功能将被禁用")
-                    raise RuntimeError("向量模型未就绪，无法启用知识去重")
+                try:
+                    embed_worker = self._get_embed_worker()
+                    embed_model = embed_worker._model if embed_worker else None
+                except Exception as embed_exc:
+                    embed_model = None
+                    logger.warning(
+                        "向量模型未就绪，时间线提炼将降级运行（禁用语义去重/向量化增强）: %s",
+                        embed_exc,
+                    )
 
                 # 使用全局统一的 Ollama 模型名，确保与 RAG 查询使用同一模型
                 ollama_model = get_active_ollama_model()
@@ -318,7 +320,11 @@ class BackgroundProcessor:
                     embedding_model=embed_model,
                     user_identity=current_identity,
                 )
-                logger.info("KnowledgeExtractor V2 已初始化（后台任务，模型提炼模式，model=%s）", ollama_model)
+                logger.info(
+                    "KnowledgeExtractor V2 已初始化（后台任务，模型提炼模式，model=%s, embedding=%s）",
+                    ollama_model,
+                    "enabled" if embed_model else "disabled",
+                )
             except Exception as exc:
                 logger.error("KnowledgeExtractor V2 初始化失败: %s", exc)
                 raise RuntimeError(f"KnowledgeExtractor V2 初始化失败: {exc}") from exc
@@ -329,7 +335,7 @@ class BackgroundProcessor:
     def _get_unprocessed_captures(self, conn: sqlite3.Connection, limit: int):
         """获取未处理的采集记录（按时间升序，用于分组）"""
         cursor = conn.cursor()
-        # knowledge_id IS NULL 表示尚未被合并进任何工作片段
+        # timeline_id IS NULL 表示尚未被合并进任何时间线片段
         # 自生成 app/窗口在 SQL 层直接过滤，避免 LIMIT 被自生成记录占满导致真实内容取不到
         app_kws = tuple(k.lower() for k in _SELF_GENERATED_APP_KEYWORDS)
         win_kws = tuple(k.lower() for k in _SELF_GENERATED_WINDOW_KEYWORDS)
@@ -344,7 +350,7 @@ class BackgroundProcessor:
             FROM captures c
             WHERE ((c.ocr_text IS NOT NULL AND c.ocr_text != '')
                OR (c.ax_text IS NOT NULL AND c.ax_text != ''))
-              AND c.knowledge_id IS NULL
+              AND c.timeline_id IS NULL
               AND c.is_sensitive = 0
               AND ({app_not_like})
               AND ({win_not_like})
@@ -689,13 +695,13 @@ class BackgroundProcessor:
         return cursor.lastrowid
 
     def _mark_captures_processed(
-        self, conn: sqlite3.Connection, capture_ids: list[int], knowledge_id: int
+        self, conn: sqlite3.Connection, capture_ids: list[int], timeline_id: int
     ):
-        """标记 captures 已被合并进 knowledge"""
+        """标记 captures 已被合并进 timeline"""
         placeholders = ','.join('?' * len(capture_ids))
         conn.execute(
-            f"UPDATE captures SET knowledge_id = ? WHERE id IN ({placeholders})",
-            [knowledge_id] + capture_ids,
+            f"UPDATE captures SET timeline_id = ? WHERE id IN ({placeholders})",
+            [timeline_id] + capture_ids,
         )
         conn.commit()
 
@@ -808,18 +814,18 @@ class BackgroundProcessor:
                 self._mark_captures_processed(conn, capture_ids, similar_id)
                 conn.close()
                 logger.info(
-                    f"🔀 知识已合并到已有条目: {len(group)} captures → knowledge_id={similar_id} (重复)"
+                    f"🔀 片段已合并到已有时间线: {len(group)} captures → timeline_id={similar_id} (重复)"
                 )
                 return True
 
-            knowledge_id = self._save_knowledge(conn, knowledge)
-            self._mark_captures_processed(conn, capture_ids, knowledge_id)
+            timeline_id = self._save_knowledge(conn, knowledge)
+            self._mark_captures_processed(conn, capture_ids, timeline_id)
             conn.close()
 
-            asyncio.create_task(self._process_knowledge_vectorization(group, knowledge_id, knowledge))
+            asyncio.create_task(self._process_knowledge_vectorization(group, timeline_id, knowledge))
 
             logger.info(
-                f"✅ 片段提炼完成: {len(group)} captures → knowledge_id={knowledge_id}, "
+                f"✅ 片段提炼完成: {len(group)} captures → timeline_id={timeline_id}, "
                 f"时长={knowledge.get('duration_minutes')}分钟"
             )
             return True
@@ -1128,7 +1134,7 @@ class BackgroundProcessor:
                 cursor.execute("""
                     SELECT COUNT(*) FROM timelines t
                     LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
-                    WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop')
+                    WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
                       AND t.is_self_generated = 0
                       AND COALESCE(r.failure_count, 0) < 3
                       AND (

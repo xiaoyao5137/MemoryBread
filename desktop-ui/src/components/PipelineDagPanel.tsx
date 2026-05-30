@@ -49,6 +49,22 @@ function fmtRelTime(ms: number, nowMs: number): string {
   return `${Math.floor(diff / 86_400_000)}d 前`
 }
 
+// watermark 滞后值的人类可读格式 + 配色阈值。
+// 已追上=灰色；<2h=正常浅色；2-24h=橙色提示；>24h=红色异常（八成是 watermark 卡死）。
+function fmtWatermarkLag(lagMs: number): { text: string; color: string } {
+  if (lagMs <= 0) return { text: '水位已追上', color: '#8E8E93' }
+  const min = Math.floor(lagMs / 60_000)
+  const hr = Math.floor(lagMs / 3_600_000)
+  const day = Math.floor(lagMs / 86_400_000)
+  let text: string
+  if (lagMs < 60_000) text = '水位滞后 <1m'
+  else if (lagMs < 3_600_000) text = `水位滞后 ${min}m`
+  else if (lagMs < 86_400_000) text = `水位滞后 ${hr}h ${min - hr * 60}m`
+  else text = `水位滞后 ${day}d ${hr - day * 24}h`
+  const color = lagMs >= 86_400_000 ? '#FF3B30' : lagMs >= 7_200_000 ? '#FF9500' : '#34C759'
+  return { text, color }
+}
+
 const PipelineDagPanel: React.FC<Props> = ({ base, isVisible }) => {
   const setWindowMode = useAppStore((s) => s.setWindowMode)
   const setBakeTab = useAppStore((s) => s.setBakeTab)
@@ -186,7 +202,19 @@ const PipelineDagPanel: React.FC<Props> = ({ base, isVisible }) => {
           </>
         )}
         <span style={{ color: '#D1D1D6' }}>|</span>
-        <span style={{ color: '#AEAEB2', fontVariantNumeric: 'tabular-nums', marginLeft: 'auto' }}>
+        {(() => {
+          const lag = fmtWatermarkLag(data?.bake_watermark_lag_ms ?? 0)
+          return (
+            <span
+              title="bake watermark 距离最老一条排队候选 timeline 的间隔。>2h 提示积压；>24h 通常意味着 watermark 卡死，需要排查。"
+              style={{ color: lag.color, fontWeight: 600, fontVariantNumeric: 'tabular-nums', marginLeft: 'auto' }}
+            >
+              {lag.text}
+            </span>
+          )
+        })()}
+        <span style={{ color: '#D1D1D6' }}>|</span>
+        <span style={{ color: '#AEAEB2', fontVariantNumeric: 'tabular-nums' }}>
           3s 自动刷新
         </span>
       </div>

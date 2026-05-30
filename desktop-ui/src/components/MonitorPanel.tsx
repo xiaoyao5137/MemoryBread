@@ -8,6 +8,16 @@ const API = 'http://localhost:7070'
 const EMPTY_OVERVIEW: MonitorOverview = {
   db_size_bytes: 0,
   capture_total_count: 0,
+  service_health: {
+    status: 'down',
+    mode: 'unknown',
+    full_dispatch_ready: false,
+    background_processor_running: false,
+    critical_checks_passed: false,
+    embedding_ok: false,
+    issues: [],
+    updated_at_ms: null,
+  },
   token_usage: {
     total_period: 0,
     total_today: 0,
@@ -574,8 +584,10 @@ const OverviewContent: React.FC<{
     ...(data?.task_executions ?? {}),
     recent: data?.task_executions?.recent ?? [],
   }
+  const serviceHealth = liveData?.service_health ?? data?.service_health ?? EMPTY_OVERVIEW.service_health
   return (
     <>
+      <ServiceHealthBanner health={serviceHealth} />
       <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
         <StatCard label="Token 用量" value={fmt(token_usage.total_period)}
           sub={`今日 ${fmt(token_usage.total_today)}`} color="#007AFF" />
@@ -852,6 +864,65 @@ const OverviewContent: React.FC<{
     </>
   )
 }
+
+const SERVICE_HEALTH_META: Record<string, { title: string; color: string; bg: string; border: string }> = {
+  ok: { title: '关键服务正常', color: '#248A3D', bg: 'rgba(52,199,89,0.10)', border: 'rgba(52,199,89,0.24)' },
+  degraded: { title: '关键服务降级', color: '#B26A00', bg: 'rgba(255,149,0,0.13)', border: 'rgba(255,149,0,0.28)' },
+  down: { title: '关键服务不可用', color: '#C52828', bg: 'rgba(255,59,48,0.12)', border: 'rgba(255,59,48,0.28)' },
+}
+
+const formatServiceMode = (mode?: string) => {
+  if (mode === 'full') return '完整能力'
+  if (mode === 'basic_ipc') return '基础 IPC'
+  if (mode === 'limited') return '受限模式'
+  if (mode === 'dry_run') return 'dry-run'
+  if (mode === 'starting') return '启动中'
+  return mode || '未知模式'
+}
+
+const ServiceHealthBanner: React.FC<{ health: MonitorOverview['service_health'] }> = ({ health }) => {
+  const meta = SERVICE_HEALTH_META[health.status] ?? SERVICE_HEALTH_META.down
+  if (health.status === 'ok') return null
+  const issues = health.issues?.length ? health.issues : ['Sidecar 完整后台能力未确认，时间线提炼和 bake 可能不会运行']
+  return (
+    <div style={{
+      ...cardStyle,
+      borderColor: meta.border,
+      background: meta.bg,
+      marginBottom: 12,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+        <span style={{ width: 8, height: 8, borderRadius: '50%', background: meta.color, flexShrink: 0 }} />
+        <span style={{ fontSize: 13, fontWeight: 700, color: meta.color }}>{meta.title}</span>
+        <span style={{ fontSize: 11, color: '#6E6E73' }}>{formatServiceMode(health.mode)}</span>
+      </div>
+      <div style={{ fontSize: 12, color: '#3A3A3C', lineHeight: 1.6 }}>
+        {issues.slice(0, 3).map((issue, idx) => (
+          <div key={idx}>{issue}</div>
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+        <HealthChip ok={health.critical_checks_passed} label="Ollama/LLM" />
+        <HealthChip ok={health.embedding_ok} label="Embedding" />
+        <HealthChip ok={health.full_dispatch_ready} label="完整分发器" />
+        <HealthChip ok={health.background_processor_running} label="后台提炼" />
+      </div>
+    </div>
+  )
+}
+
+const HealthChip: React.FC<{ ok: boolean; label: string }> = ({ ok, label }) => (
+  <span style={{
+    fontSize: 11,
+    padding: '2px 7px',
+    borderRadius: 6,
+    background: ok ? 'rgba(52,199,89,0.12)' : 'rgba(255,59,48,0.12)',
+    color: ok ? '#248A3D' : '#C52828',
+    fontWeight: 600,
+  }}>
+    {label} {ok ? '正常' : '异常'}
+  </span>
+)
 
 // ── 系统资源内容 ──────────────────────────────────────────────────────────────
 const formatCoverageText = (note?: string | null, status?: string | null) => {

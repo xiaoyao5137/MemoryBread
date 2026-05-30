@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -33,6 +35,9 @@ _RUNTIME_STATE: dict = {
     "dispatch": None,
     "bg_processor": None,
 }
+_STATE_DIR = Path.home() / ".memory-bread" / "state"
+_RUNTIME_STATUS_FILE = _STATE_DIR / "sidecar_runtime_status.json"
+_RUNTIME_STATUS_CACHE: dict | None = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 日志配置
@@ -44,6 +49,54 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("sidecar.main")
+
+
+def _write_runtime_status(
+    *,
+    mode: str,
+    full_dispatch_ready: bool,
+    background_processor_running: bool,
+    critical_checks_passed: bool,
+    embedding_ok: bool,
+    issues: list[str] | None = None,
+    checks: dict | None = None,
+) -> None:
+    """写入关键后台能力状态，供 Core Engine 监控页读取。"""
+    global _RUNTIME_STATUS_CACHE
+    _RUNTIME_STATUS_CACHE = {
+        "mode": mode,
+        "full_dispatch_ready": full_dispatch_ready,
+        "background_processor_running": background_processor_running,
+        "critical_checks_passed": critical_checks_passed,
+        "embedding_ok": embedding_ok,
+        "issues": list(issues or []),
+        "checks": checks or {},
+    }
+    payload = {
+        "mode": mode,
+        "full_dispatch_ready": full_dispatch_ready,
+        "background_processor_running": background_processor_running,
+        "critical_checks_passed": critical_checks_passed,
+        "embedding_ok": embedding_ok,
+        "issues": issues or [],
+        "checks": checks or {},
+        "updated_at_ms": int(time.time() * 1000),
+    }
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _RUNTIME_STATUS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_RUNTIME_STATUS_FILE)
+    except Exception as exc:
+        logger.warning("写入 sidecar_runtime_status.json 失败: %s", exc)
+
+
+async def _runtime_status_heartbeat() -> None:
+    while True:
+        await asyncio.sleep(60)
+        if _RUNTIME_STATUS_CACHE is None:
+            continue
+        _write_runtime_status(**_RUNTIME_STATUS_CACHE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -153,6 +206,15 @@ async def _main() -> None:
     args = _parse_args()
     logging.getLogger().setLevel(args.log_level)
     limited_mode = os.environ.get("SIDECAR_LIMITED_MODE") == "1"
+    _write_runtime_status(
+        mode="starting",
+        full_dispatch_ready=False,
+        background_processor_running=False,
+        critical_checks_passed=False,
+        embedding_ok=False,
+        issues=["Sidecar 正在启动，完整能力尚未就绪"],
+    )
+    asyncio.create_task(_runtime_status_heartbeat())
 
     # 启动内部向量搜索 HTTP 服务（daemon 线程）
     threading.Thread(target=_start_vector_search_server, daemon=True, name="vector-search-server").start()
@@ -180,6 +242,14 @@ async def _main() -> None:
     async def bootstrap_full_dispatch() -> None:
         if limited_mode:
             logger.warning("SIDECAR_LIMITED_MODE=1，保持基础 IPC 模式，仅保留 ping/OCR 能力")
+            _write_runtime_status(
+                mode="limited",
+                full_dispatch_ready=False,
+                background_processor_running=False,
+                critical_checks_passed=False,
+                embedding_ok=False,
+                issues=["SIDECAR_LIMITED_MODE=1，仅启用 ping/OCR，时间线提炼与 bake 不会运行"],
+            )
             return
 
         try:
@@ -188,6 +258,18 @@ async def _main() -> None:
             # 只有 Ollama+LLM 核心检查通过才能启动提炼；向量模型失败仅降级（不阻塞）
             if not checks_result.get('critical_passed'):
                 detail = await asyncio.to_thread(get_ollama_setup_detail)
+                _write_runtime_status(
+                    mode="basic_ipc",
+                    full_dispatch_ready=False,
+                    background_processor_running=False,
+                    critical_checks_passed=False,
+                    embedding_ok=bool(checks_result.get('embedding_ok')),
+                    issues=[
+                        "核心启动检查未通过，仅保留 ping/OCR 能力",
+                        detail.get('message', 'Ollama/LLM 不可用'),
+                    ],
+                    checks=checks_result,
+                )
                 logger.warning(
                     "核心启动检查未通过，保持基础 IPC 模式，仅保留 ping/OCR 能力（原因: %s）",
                     detail.get('message', 'unknown'),
@@ -207,12 +289,38 @@ async def _main() -> None:
             bg_processor = BackgroundProcessor(db_path=db_path, interval=30, batch_size=20)
             runtime_state["bg_processor"] = bg_processor
             asyncio.create_task(bg_processor.run())
+            issues = [] if checks_result.get('embedding_ok') else ["向量模型不可用，RAG 向量检索降级"]
+            _write_runtime_status(
+                mode="full",
+                full_dispatch_ready=True,
+                background_processor_running=True,
+                critical_checks_passed=True,
+                embedding_ok=bool(checks_result.get('embedding_ok')),
+                issues=issues,
+                checks=checks_result,
+            )
             logger.info("后台处理器已启动（向量化 + 时间线提炼）")
         except Exception as exc:
+            _write_runtime_status(
+                mode="basic_ipc",
+                full_dispatch_ready=False,
+                background_processor_running=False,
+                critical_checks_passed=False,
+                embedding_ok=False,
+                issues=[f"完整能力初始化失败：{exc}"],
+            )
             logger.error("完整能力初始化失败，保持基础 IPC 模式: %s", exc, exc_info=True)
 
     if args.dry_run:
         logger.info("dry-run 模式：使用基础 IPC 分发器（ping + OCR）")
+        _write_runtime_status(
+            mode="dry_run",
+            full_dispatch_ready=False,
+            background_processor_running=False,
+            critical_checks_passed=False,
+            embedding_ok=False,
+            issues=["dry-run 模式，仅启用 ping/OCR"],
+        )
     else:
         asyncio.create_task(bootstrap_full_dispatch())
 

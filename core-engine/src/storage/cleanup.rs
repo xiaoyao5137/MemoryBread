@@ -4,7 +4,7 @@
 //!
 //! # 设计策略
 //!
-//! - 截图文件（screenshot_purge）：删除 90 天前的 JPEG 文件，并更新 captures 中的路径为 NULL
+//! - 截图文件（screenshot_purge）：按用户配置删除过期且未关联时间线的 JPEG 文件，并更新 captures 中的路径为 NULL
 //! - 旧采集记录（old_captures）：删除 180 天前的全部采集行（FTS5 触发器自动同步）
 //! - VACUUM：整理 SQLite 碎片空间，建议每周运行一次
 
@@ -20,10 +20,10 @@ use super::{db::current_ts_ms, error::StorageError, StorageManager};
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl StorageManager {
-    /// 清理过期截图文件（默认保留 90 天）。
+    /// 清理过期截图文件。
     ///
     /// 步骤：
-    /// 1. 查找 `captures.screenshot_path IS NOT NULL AND ts < older_than_ms` 的记录
+    /// 1. 查找 `captures.screenshot_path IS NOT NULL AND ts < older_than_ms AND timeline_id IS NULL` 的记录
     /// 2. 尝试删除对应的文件
     /// 3. 将 captures.screenshot_path 置为 NULL
     /// 4. 写入 data_cleanup_log
@@ -34,11 +34,13 @@ impl StorageManager {
         older_than_ms: i64,
         captures_dir: &Path,
     ) -> Result<(usize, u64), StorageError> {
-        // 1. 查询待清理记录
+        // 只清理未被时间线使用的孤立截图；已提炼/已关联的 capture 需要保留截图路径作为证据链。
         let rows = self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, screenshot_path FROM captures
-                 WHERE screenshot_path IS NOT NULL AND ts < ?1",
+                 WHERE screenshot_path IS NOT NULL
+                   AND ts < ?1
+                   AND timeline_id IS NULL",
             )?;
             let result = stmt
                 .query_map(params![older_than_ms], |row| {
@@ -71,7 +73,11 @@ impl StorageManager {
             // 将数据库中的路径置为 NULL
             self.with_conn(|conn| {
                 conn.execute(
-                    "UPDATE captures SET screenshot_path = NULL WHERE id = ?1",
+                    "UPDATE captures
+                     SET screenshot_path = NULL,
+                         screenshot_source = NULL
+                     WHERE id = ?1
+                       AND timeline_id IS NULL",
                     params![id],
                 )?;
                 Ok(())
@@ -302,6 +308,8 @@ mod tests {
             screenshot_source: None,
             input_text: None,
             is_sensitive: false,
+            url: None,
+            webpage_title: None,
         };
         mgr.insert_capture(&cap).unwrap();
 

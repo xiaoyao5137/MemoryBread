@@ -52,13 +52,20 @@ def check_model_available(model_name: str | None = None) -> bool:
         client = Client()
         models = client.list()
 
-        # 检查模型列表
-        for model in models.get('models', []):
-            # ollama 客户端返回的是对象，直接访问 model 属性
-            if hasattr(model, 'model') and model.model == model_name:
+        # 兼容新版 ollama SDK 的 ListResponse 和旧版 dict 响应。
+        model_items = getattr(models, 'models', None)
+        if model_items is None and isinstance(models, dict):
+            model_items = models.get('models', [])
+
+        for model in model_items or []:
+            candidate = getattr(model, 'model', None)
+            if candidate is None and isinstance(model, dict):
+                candidate = model.get('model') or model.get('name')
+            if candidate == model_name:
                 return True
         return False
-    except Exception:
+    except Exception as exc:
+        logger.error("检查推理模型失败: %s", exc)
         return False
 
 

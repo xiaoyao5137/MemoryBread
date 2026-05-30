@@ -321,9 +321,9 @@ impl StorageManager {
 
     /// 查询一批 capture 各自所属时间线的 (timeline_id, summary)。
     ///
-    /// 走 captures.knowledge_id → timelines 直连，能正确覆盖被合并到时间线的从属
+    /// 走 captures.timeline_id → timelines 直连，能正确覆盖被合并到时间线的从属
     /// capture（leader/follower 都能查到归属）。
-    pub fn list_capture_knowledge_links(
+    pub fn list_capture_timeline_links(
         &self,
         capture_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, (i64, String)>, StorageError> {
@@ -339,8 +339,8 @@ impl StorageManager {
             let sql = format!(
                 "SELECT c.id, t.id, t.summary
                  FROM captures c
-                 JOIN timelines t ON t.id = c.knowledge_id
-                 WHERE c.id IN ({}) AND c.knowledge_id IS NOT NULL",
+                 JOIN timelines t ON t.id = c.timeline_id
+                 WHERE c.id IN ({}) AND c.timeline_id IS NOT NULL",
                 placeholders
             );
             let mut stmt = conn.prepare(&sql)?;

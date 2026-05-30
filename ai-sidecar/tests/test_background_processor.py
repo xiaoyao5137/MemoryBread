@@ -31,7 +31,7 @@ def _init_db(db_path: str) -> None:
             win_title TEXT,
             ocr_text TEXT,
             ax_text TEXT,
-            knowledge_id INTEGER,
+            timeline_id INTEGER,
             is_sensitive INTEGER NOT NULL DEFAULT 0
         )
         """

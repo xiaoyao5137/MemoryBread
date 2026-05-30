@@ -3,7 +3,7 @@
 -- 日期: 2026-03-17
 -- 描述:
 --   1. knowledge_entries 新增片段相关字段（capture_ids, start_time, end_time 等）
---   2. captures 新增 knowledge_id 反向关联字段
+--   2. captures 新增 timeline_id 反向关联字段
 --   3. 新增 scheduled_tasks 定时任务表
 --   4. 新增 task_executions 任务执行历史表
 -- =============================================================================
@@ -25,11 +25,11 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_time ON knowledge_entries(start_time, e
 CREATE INDEX IF NOT EXISTS idx_knowledge_app  ON knowledge_entries(frag_app_name);
 
 -- =============================================================================
--- 2. captures 新增 knowledge_id 反向关联
+-- 2. captures 新增 timeline_id 反向关联
 -- =============================================================================
-ALTER TABLE captures ADD COLUMN knowledge_id INTEGER REFERENCES knowledge_entries(id);
+ALTER TABLE captures ADD COLUMN timeline_id INTEGER REFERENCES knowledge_entries(id);
 
-CREATE INDEX IF NOT EXISTS idx_captures_knowledge ON captures(knowledge_id);
+CREATE INDEX IF NOT EXISTS idx_captures_timeline ON captures(timeline_id);
 
 -- =============================================================================
 -- 3. scheduled_tasks — 定时任务定义表

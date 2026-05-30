@@ -46,7 +46,7 @@ class EmbeddingModel:
         if not self._backend.is_available():
             raise RuntimeError(
                 f"Embedding 后端 {self._backend.model_name!r} 不可用"
-                "（请确认 sentence-transformers 已安装）"
+                "（请确认 Ollama 正在运行，且该 embedding 模型已安装）"
             )
         return self._backend.encode(texts)
 

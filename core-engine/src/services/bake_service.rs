@@ -18,7 +18,9 @@ const CATEGORY_BAKE_SOP: &str = "bake_sop";
 const CATEGORY_BAKE_KNOWLEDGE: &str = "bake_knowledge";
 const UNIFIED_BAKE_PIPELINE_NAME: &str = "unified";
 const BAKE_GENERATION_VERSION: &str = "bake-v1";
-const BAKE_SIDECAR_TIMEOUT_SECS: u64 = 360;
+// sidecar HTTP 调用超时：必须 ≥ ai-sidecar 内 ollama 客户端超时（当前 1200s），
+// 否则会先在 core 这层断开但 sidecar 还在算，浪费一整次 LLM 推理。
+const BAKE_SIDECAR_TIMEOUT_SECS: u64 = 1200;
 /// 整个 bake run 的最大执行时间（含候选查询、LLM 提炼、数据库写入）。
 /// 超过此时间强制标记为 failed，防止因死锁或无限等待导致 run 永久挂起。
 const BAKE_RUN_MAX_TOTAL_SECS: u64 = 30 * 60;
@@ -718,12 +720,11 @@ impl BakeService {
     }
 
     pub fn list_memories(&self) -> Result<Vec<BakeMemoryPayload>, ApiError> {
-        Ok(self
-            .storage
+        self.storage
             .list_timelines_by_category(CATEGORY_BAKE_ARTICLE)?
             .into_iter()
-            .map(map_memory_record)
-            .collect())
+            .map(|record| self.map_memory_record_with_capture_url(record))
+            .collect()
     }
 
     pub fn list_memories_paginated(
@@ -745,8 +746,8 @@ impl BakeService {
                 filter.offset,
             )?
             .into_iter()
-            .map(map_memory_record)
-            .collect();
+            .map(|record| self.map_memory_record_with_capture_url(record))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(BakePagedResponse {
             items,
             total,
@@ -810,7 +811,7 @@ impl BakeService {
         let total = self.storage.count_captures(&capture_filter)?;
         let records = self.storage.list_captures(&capture_filter)?;
         let capture_ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
-        let timeline_links = self.storage.list_capture_knowledge_links(&capture_ids)?;
+        let timeline_links = self.storage.list_capture_timeline_links(&capture_ids)?;
         let items = records
             .into_iter()
             .map(|record| {
@@ -831,7 +832,7 @@ impl BakeService {
             .storage
             .get_capture(id)?
             .ok_or_else(|| ApiError::NotFound(format!("capture {id} not found")))?;
-        let timeline_links = self.storage.list_capture_knowledge_links(&[record.id])?;
+        let timeline_links = self.storage.list_capture_timeline_links(&[record.id])?;
         Ok(map_capture_record(record, timeline_links.get(&id)))
     }
 
@@ -839,46 +840,18 @@ impl BakeService {
         &self,
         limit: usize,
     ) -> Result<InitializeBakeMemoriesResponse, ApiError> {
-        let existing_memories = self
+        // 历史版本会在 timelines 中创建 category=bake_article 的候选壳；新流程直接写入专门的 bake_* 表。
+        let skipped = self
             .storage
-            .list_timelines_by_category(CATEGORY_BAKE_ARTICLE)?;
-        let existing_sops = self.storage.list_timelines_by_category(CATEGORY_BAKE_SOP)?;
-        let existing_sources = collect_source_timeline_ids(&existing_memories);
-        let existing_sop_sources = collect_source_timeline_ids(&existing_sops);
-
-        let candidates = self
-            .storage
-            .list_bake_memory_init_candidates(0, limit.saturating_mul(4).max(limit))?;
-        let mut created = Vec::new();
-        let mut skipped = 0_i64;
-
-        for candidate in candidates {
-            if created.len() >= limit {
-                break;
-            }
-            if !is_high_value_candidate(&candidate.timeline) {
-                skipped += 1;
-                continue;
-            }
-            if existing_sources.contains(&candidate.timeline.id)
-                || existing_sop_sources.contains(&candidate.timeline.id)
-            {
-                skipped += 1;
-                continue;
-            }
-
-            let score = score_candidate(&candidate.timeline);
-            let record = build_bake_memory_from_source(&candidate, score)?;
-            let id = self.storage.insert_episodic_memory(&record)?;
-            let memory = self
-                .storage
-                .get_timeline_entry(id)?
-                .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found after init")))?;
-            created.push(map_memory_record(memory));
-        }
+            .list_bake_memory_init_candidates(0, limit.saturating_mul(4).max(limit))?
+            .into_iter()
+            .filter(|candidate| is_high_value_candidate(&candidate.timeline))
+            .take(limit)
+            .count() as i64;
+        let created = Vec::new();
 
         Ok(InitializeBakeMemoriesResponse {
-            created_count: created.len() as i64,
+            created_count: 0,
             skipped_count: skipped,
             articles: created.clone(),
             memories: created,
@@ -960,7 +933,7 @@ impl BakeService {
             )));
         }
 
-        let payload = map_memory_record(memory.clone());
+        let payload = self.map_memory_record_with_capture_url(memory.clone())?;
         let source_memory_ids = vec![id.to_string()];
         let source_capture_ids = payload
             .source_capture_id
@@ -1018,7 +991,7 @@ impl BakeService {
             image_assets: "[]".to_string(),
             source_app_name: None,
             source_win_title: None,
-            source_url: None,
+            source_url: payload.url.clone(),
             content_hash: None,
             language: None,
             usage_count: 0,
@@ -1043,7 +1016,7 @@ impl BakeService {
             .storage
             .get_timeline_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found")))?;
-        let payload = map_memory_record(memory.clone());
+        let payload = self.map_memory_record_with_capture_url(memory.clone())?;
         let details = json!({
             "source_capture_id": memory.capture_id.to_string(),
             "source_title": payload.title,
@@ -1229,17 +1202,12 @@ impl BakeService {
         limit: usize,
     ) -> Result<BakeRunPayload, ApiError> {
         tracing::info!("bake run {} execute_bake_pipeline start", run_id);
-        let existing_memories = self
-            .storage
-            .list_timelines_by_category(CATEGORY_BAKE_ARTICLE)?;
         let existing_sops = self.storage.list_timelines_by_category(CATEGORY_BAKE_SOP)?;
         let existing_knowledge = self.storage.list_bake_knowledge_paginated(None, 500, 0)?;
         let existing_documents = self.storage.list_bake_documents()?;
         let watermark = self
             .storage
             .get_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME)?;
-        let mut existing_memory_sources = collect_source_timeline_ids(&existing_memories);
-        let mut existing_memory_ids = collect_source_memory_ids(&existing_memories);
         let mut existing_sop_sources = collect_current_bake_source_timeline_ids(&existing_sops);
         let mut existing_knowledge_sources =
             collect_current_bake_source_timeline_ids(&existing_knowledge);
@@ -1276,8 +1244,7 @@ impl BakeService {
                     MAX_BAKE_RETRY_FAILURES,
                 )?
                 .into_iter()
-                .any(|c| !existing_memory_sources.contains(&c.timeline.id)
-                      && !existing_sop_sources.contains(&c.timeline.id)
+                .any(|c| !existing_sop_sources.contains(&c.timeline.id)
                       && !existing_knowledge_sources.contains(&c.timeline.id));
             if any_pending {
                 tracing::info!(
@@ -1313,10 +1280,38 @@ impl BakeService {
         let mut document_created_count = 0_i64;
         let mut sop_created_count = 0_i64;
 
+        // watermark 推进策略（Q2a "处理过即推进，不论成败"）：
+        // 每条 candidate 走完任一终态（skip / extract 失败 / persist 失败 / persist 成功），
+        // 都把 max_processed_ts 推到该 candidate.updated_at_ms 并立刻写库。
+        // 这样即便 LLM 慢、整轮 1800s 超时被外层强杀，已处理的进度也已落库，
+        // 下一轮不会再原地打转。毒丸 timeline（failure_count >= MAX_BAKE_RETRY_FAILURES）
+        // 由候选 SQL 自身过滤；watermark 跨过它们之后，要回头重试只需:
+        //     DELETE FROM bake_retry_state WHERE failure_count >= 3;
+        // 然后把 watermark 回退到目标位置即可重新入候选。
         for candidate in candidates {
             if processed_episode_count >= limit as i64 {
                 break;
             }
+
+            let candidate_ts = candidate.timeline.updated_at_ms;
+            // 已被 watermark 跨过的（理论上 SQL 已过滤，这里是兜底），不重复处理也不退步推进。
+            if candidate_ts <= max_processed_ts {
+                continue;
+            }
+
+            // 所有终态共用的"推进 + 落库"工具。failure 路径也调用，保证 watermark 单调向前。
+            let advance = |ts: i64,
+                           current: &mut i64,
+                           storage: &StorageManager|
+             -> Result<(), ApiError> {
+                let next = (*current).max(ts);
+                if next != *current {
+                    *current = next;
+                }
+                storage.upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, next)?;
+                Ok(())
+            };
+
             if !is_high_value_candidate(&candidate.timeline) {
                 tracing::info!(
                     "bake skip: timeline_id={} importance={} evidence={:?} activity={:?} origin={:?} history_view={} self_generated={} reason=not_high_value",
@@ -1328,9 +1323,7 @@ impl BakeService {
                     candidate.timeline.history_view,
                     candidate.timeline.is_self_generated,
                 );
-                continue;
-            }
-            if candidate.timeline.updated_at_ms <= max_processed_ts {
+                advance(candidate_ts, &mut max_processed_ts, &self.storage)?;
                 continue;
             }
 
@@ -1356,11 +1349,11 @@ impl BakeService {
                         count,
                         err
                     );
+                    advance(candidate_ts, &mut max_processed_ts, &self.storage)?;
                     continue;
                 }
             };
             processed_episode_count += 1;
-            max_processed_ts = max_processed_ts.max(candidate.timeline.updated_at_ms);
 
             // 实时更新进度，让监控页能看到提炼中的数字变化
             let _ = self.storage.update_bake_run_progress(
@@ -1369,51 +1362,8 @@ impl BakeService {
                 processed_episode_count,
             );
 
-            let memory_id = if existing_memory_sources.contains(&candidate.timeline.id) {
-                discarded_count += 1;
-                existing_memory_ids.get(&candidate.timeline.id).copied()
-            } else {
-                let score = score_candidate(&candidate.timeline);
-                let record = match build_bake_memory_from_source(&candidate, score) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        let count = self
-                            .storage
-                            .bump_bake_retry_failure(candidate.timeline.id, &err.to_string())
-                            .unwrap_or(0);
-                        tracing::warn!(
-                            "bake build memory failed: timeline_id={} failure_count={} err={}",
-                            candidate.timeline.id,
-                            count,
-                            err
-                        );
-                        continue;
-                    }
-                };
-                let memory_id = match self.storage.insert_episodic_memory(&record) {
-                    Ok(id) => id,
-                    Err(err) => {
-                        let count = self
-                            .storage
-                            .bump_bake_retry_failure(candidate.timeline.id, &err.to_string())
-                            .unwrap_or(0);
-                        tracing::warn!(
-                            "bake insert episodic_memory failed: timeline_id={} failure_count={} err={}",
-                            candidate.timeline.id,
-                            count,
-                            err
-                        );
-                        continue;
-                    }
-                };
-                existing_memory_sources.insert(candidate.timeline.id);
-                existing_memory_ids.insert(candidate.timeline.id, memory_id);
-                candidate_count += 1;
-                Some(memory_id)
-            };
-
             let candidate_result = match self.persist_extracted_candidate(
-                memory_id,
+                None,
                 &candidate,
                 trigger_reason,
                 extracted,
@@ -1434,6 +1384,7 @@ impl BakeService {
                         count,
                         err
                     );
+                    advance(candidate_ts, &mut max_processed_ts, &self.storage)?;
                     continue;
                 }
             };
@@ -1445,8 +1396,7 @@ impl BakeService {
             document_created_count += candidate_result.document_created_count;
             sop_created_count += candidate_result.sop_created_count;
 
-            self.storage
-                .upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, max_processed_ts)?;
+            advance(candidate_ts, &mut max_processed_ts, &self.storage)?;
         }
 
         let completed_at = now_ms();
@@ -1924,7 +1874,18 @@ impl BakeService {
             .storage
             .get_timeline_entry(id)?
             .ok_or_else(|| ApiError::NotFound(format!("memory {id} not found after update")))?;
-        Ok(map_memory_record(updated))
+        self.map_memory_record_with_capture_url(updated)
+    }
+
+    fn map_memory_record_with_capture_url(
+        &self,
+        record: TimelineRecord,
+    ) -> Result<BakeMemoryPayload, ApiError> {
+        let capture_url = self
+            .storage
+            .get_capture(record.capture_id)?
+            .and_then(|capture| normalize_optional_url(capture.url));
+        Ok(map_memory_record(record, capture_url))
     }
 }
 
@@ -2091,6 +2052,11 @@ fn normalize_doc_url(url: &str) -> String {
     let trimmed = url.trim();
     let no_fragment = trimmed.split('#').next().unwrap_or(trimmed);
     no_fragment.trim_end_matches('/').to_string()
+}
+
+fn normalize_optional_url(url: Option<String>) -> Option<String> {
+    url.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn build_bake_knowledge_entry(
@@ -2481,7 +2447,7 @@ fn map_document_record(record: BakeDocumentRecord) -> BakeDocumentPayload {
     }
 }
 
-fn map_memory_record(record: TimelineRecord) -> BakeMemoryPayload {
+fn map_memory_record(record: TimelineRecord, capture_url: Option<String>) -> BakeMemoryPayload {
     let details = parse_details(record.details.as_deref());
     let tags = details
         .get("tags")
@@ -2499,7 +2465,8 @@ fn map_memory_record(record: TimelineRecord) -> BakeMemoryPayload {
         url: details
             .get("url")
             .and_then(Value::as_str)
-            .map(ToString::to_string),
+            .and_then(|value| normalize_optional_url(Some(value.to_string())))
+            .or(capture_url),
         source_capture_id: details
             .get("source_capture_id")
             .and_then(Value::as_str)
@@ -2694,37 +2661,6 @@ fn resolve_linked_knowledge_summaries(
         .collect()
 }
 
-fn collect_source_timeline_ids(
-    records: &[TimelineRecord],
-) -> std::collections::HashSet<i64> {
-    records
-        .iter()
-        .filter_map(|record| {
-            let details = parse_details(record.details.as_deref());
-            details
-                .get("source_timeline_id")
-                .or_else(|| details.get("source_knowledge_id"))
-                .and_then(Value::as_i64)
-        })
-        .collect()
-}
-
-fn collect_source_memory_ids(
-    records: &[TimelineRecord],
-) -> std::collections::HashMap<i64, i64> {
-    records
-        .iter()
-        .filter_map(|record| {
-            let details = parse_details(record.details.as_deref());
-            details
-                .get("source_timeline_id")
-                .or_else(|| details.get("source_knowledge_id"))
-                .and_then(Value::as_i64)
-                .map(|source_id| (source_id, record.id))
-        })
-        .collect()
-}
-
 fn collect_current_bake_source_timeline_ids(
     records: &[TimelineRecord],
 ) -> std::collections::HashSet<i64> {
@@ -2763,138 +2699,6 @@ fn is_high_value_candidate(record: &TimelineRecord) -> bool {
     );
 
     strong_evidence && (record.history_view || preferred_activity || preferred_origin)
-}
-
-fn score_candidate(record: &TimelineRecord) -> i64 {
-    let mut score = record.importance * 20;
-    score += record.occurrence_count.unwrap_or(0).min(5) * 8;
-    if record.user_verified {
-        score += 15;
-    }
-    if record.history_view {
-        score += 8;
-    }
-    if matches!(record.evidence_strength.as_deref(), Some("high")) {
-        score += 10;
-    } else if matches!(record.evidence_strength.as_deref(), Some("medium")) {
-        score += 5;
-    }
-    if matches!(
-        record.activity_type.as_deref(),
-        Some("coding") | Some("reading") | Some("reviewing_history") | Some("document_reference")
-    ) {
-        score += 8;
-    }
-    score
-}
-
-fn build_bake_memory_from_source(
-    source: &BakeMemorySourceRecord,
-    score: i64,
-) -> Result<NewTimeline, ApiError> {
-    let fallback_tags = parse_json_vec_string(&source.timeline.entities);
-    let tags = if fallback_tags.is_empty() {
-        infer_tags_from_capture(source)
-    } else {
-        fallback_tags
-    };
-    let last_visited_at = format_ts_ms(source.capture_ts);
-    let source_capture_ids = source
-        .timeline
-        .capture_ids
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Vec<i64>>(raw).ok())
-        .filter(|ids| !ids.is_empty())
-        .unwrap_or_else(|| vec![source.timeline.capture_id]);
-    let fallback_key_timestamps = json!([{
-        "capture_ids": source_capture_ids.clone(),
-        "start_ts": source.timeline.time_range_start.or(source.timeline.start_time).unwrap_or(source.capture_ts),
-        "end_ts": source.timeline.time_range_end.or(source.timeline.end_time).unwrap_or(source.capture_ts),
-        "summary": source.timeline.summary.clone(),
-    }]);
-    let key_timestamps = source
-        .timeline
-        .key_timestamps
-        .as_ref()
-        .filter(|raw| !raw.trim().is_empty() && serde_json::from_str::<Value>(raw).is_ok())
-        .cloned()
-        .unwrap_or_else(|| fallback_key_timestamps.to_string());
-    let details = json!({
-        "source_timeline_id": source.timeline.id,
-        "source_capture_id": source.timeline.capture_id.to_string(),
-        "description": source.timeline.details.clone(),
-        "init_method": "knowledge_bootstrap",
-        "init_version": 1,
-        "score": score,
-        "weight": score.max(source.timeline.importance * 20),
-        "tags": tags,
-        "status": "candidate",
-        "knowledge_ref_count": source.timeline.occurrence_count.unwrap_or(0),
-        "suggested_action": infer_suggested_action(&tags),
-        "last_visited_at": last_visited_at,
-        "open_count": 0,
-        "dwell_seconds": 0,
-        "has_edit_action": false,
-        "knowledge_match_score": null,
-        "knowledge_match_level": null,
-        "template_match_score": null,
-        "template_match_level": null,
-        "sop_match_score": null,
-        "sop_match_level": null,
-    });
-
-    Ok(NewTimeline {
-        capture_id: source.timeline.capture_id,
-        summary: source.timeline.summary.clone(),
-        overview: source.timeline.overview.clone(),
-        details: Some(details.to_string()),
-        entities: to_json_string(&tags)?,
-        category: CATEGORY_BAKE_ARTICLE.to_string(),
-        importance: source.timeline.importance,
-        occurrence_count: source.timeline.occurrence_count,
-        observed_at: source.timeline.observed_at.or(Some(source.capture_ts)),
-        event_time_start: source.timeline.event_time_start,
-        event_time_end: source.timeline.event_time_end,
-        history_view: source.timeline.history_view,
-        content_origin: source.timeline.content_origin.clone(),
-        activity_type: source.timeline.activity_type.clone(),
-        is_self_generated: false,
-        evidence_strength: source.timeline.evidence_strength.clone(),
-        capture_ids: Some(to_json_string(&source_capture_ids)?),
-        start_time: source.timeline.start_time.or(Some(source.capture_ts)),
-        end_time: source.timeline.end_time.or(Some(source.capture_ts)),
-        duration_minutes: source.timeline.duration_minutes.or(Some(0)),
-        frag_app_name: source
-            .timeline
-            .frag_app_name
-            .clone()
-            .or_else(|| source.capture_app_name.clone()),
-        frag_win_title: source
-            .timeline
-            .frag_win_title
-            .clone()
-            .or_else(|| source.capture_win_title.clone()),
-        time_range_start: source.timeline.time_range_start.or(Some(source.capture_ts)),
-        time_range_end: source.timeline.time_range_end.or(Some(source.capture_ts)),
-        key_timestamps: Some(key_timestamps),
-    })
-}
-
-fn infer_tags_from_capture(source: &BakeMemorySourceRecord) -> Vec<String> {
-    let mut tags = Vec::new();
-    if let Some(app_name) = &source.capture_app_name {
-        tags.push(app_name.clone());
-    }
-    if let Some(win_title) = &source.capture_win_title {
-        let trimmed = win_title.trim();
-        if !trimmed.is_empty() {
-            tags.push(trimmed.chars().take(24).collect());
-        }
-    }
-    if tags.is_empty() {
-        tags.push("高价值内容".to_string());
-    }
-    tags
 }
 
 fn parse_details(value: Option<&str>) -> Value {
@@ -3088,16 +2892,6 @@ fn infer_confidence(importance: i64, occurrence_count: Option<i64>) -> String {
 fn extract_status(entry: &TimelineRecord) -> String {
     let details = parse_details(entry.details.as_deref());
     extract_status_from_details(&details, entry.user_verified)
-}
-
-fn format_ts_ms(ts: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts)
-        .map(|dt| {
-            dt.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|| now_ms().to_string())
 }
 
 fn first_or_default(values: &[String], default: &str) -> String {

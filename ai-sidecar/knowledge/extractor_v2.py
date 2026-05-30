@@ -759,7 +759,10 @@ class KnowledgeExtractorV2:
             from model_registry_global import get_active_ollama_model
             model = get_active_ollama_model()
         self.model = model
-        self.timeout = 90
+        # Ollama 推理 HTTP 超时：4B 模型在 M 系 Mac 上对 ~10k token prompt 的 P50 ≈ 135s、
+        # P95 ≈ 342s，原先 90s 的设置导致 ~66% 请求被错杀。1200s 给冷启动 + 大 prompt 留余量。
+        # 必须 ≤ core-engine BAKE_SIDECAR_TIMEOUT_SECS（当前 1200s），否则会先在 core 那层断开。
+        self.timeout = 1200
 
         # 测试 Ollama 是否可用
         try:
