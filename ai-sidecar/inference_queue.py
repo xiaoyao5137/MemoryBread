@@ -65,6 +65,8 @@ _DEFAULT_PER_PRIORITY_LIMIT = 32
 _DEFAULT_TOTAL_LIMIT = 64
 _LOW_MEMORY_THRESHOLD_MB = 500
 _MEMORY_RECHECK_INTERVAL = 2.0
+# 内存不足持续超过此秒数时，evict 所有 P2 任务，防止 worker 无限空转
+_MEMORY_PRESSURE_EVICT_SECS = 30.0
 _MAX_CONCURRENCY_CAP = 3
 _DEFAULT_MAX_CONCURRENCY = 1
 
@@ -256,6 +258,7 @@ class InferenceQueue:
             return 1 << 30  # 拿不到就当作"内存充足"，fail-open
 
     def _worker_loop(self) -> None:
+        _low_mem_since: float | None = None
         while True:
             task: Optional[_Task] = None
             with self._cv:
@@ -269,12 +272,32 @@ class InferenceQueue:
                 # 内存门禁：内存不足时不取任务，2s 后再检查
                 avail = self._available_mb()
                 if avail < self._low_mem_mb:
+                    if _low_mem_since is None:
+                        _low_mem_since = time.monotonic()
                     logger.warning(
                         "InferenceQueue 内存门禁 avail=%dMB < %dMB，暂停 worker %.1fs",
                         avail, self._low_mem_mb, _MEMORY_RECHECK_INTERVAL,
                     )
+                    # 内存持续不足超过阈值时，evict 所有 P2 任务，防止 worker 无限空转
+                    if time.monotonic() - _low_mem_since >= _MEMORY_PRESSURE_EVICT_SECS:
+                        q2 = self._queues[Priority.P2]
+                        while q2:
+                            victim = q2.popleft()
+                            self._stats[Priority.P2.name]["evicted"] += 1
+                            if not victim.future.done():
+                                victim.future.set_exception(
+                                    QueueEvictedError(
+                                        f"内存持续不足 {_MEMORY_PRESSURE_EVICT_SECS:.0f}s，P2 任务被强制淘汰"
+                                    )
+                                )
+                        logger.error(
+                            "InferenceQueue 内存压力超 %.0fs，P2 全部 evict",
+                            _MEMORY_PRESSURE_EVICT_SECS,
+                        )
+                        _low_mem_since = None  # 重置计时，下一轮压力重新计
                     self._cv.wait(timeout=_MEMORY_RECHECK_INTERVAL)
                     continue
+                _low_mem_since = None  # 内存恢复正常，重置计时
                 task = self._pop_highest_locked()
                 if task is None:
                     self._cv.wait(timeout=0.1)

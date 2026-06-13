@@ -32,7 +32,7 @@ const BakeOverviewTab: React.FC<{
               <BakeButton compact onClick={() => onOpenRepository('capture')}>采集记录</BakeButton>
               <BakeButton compact onClick={() => onOpenTab('templates')}>文档</BakeButton>
               <BakeButton compact onClick={() => onOpenTab('knowledge')}>知识</BakeButton>
-              <BakeButton compact onClick={() => onOpenTab('sop')}>操作手册</BakeButton>
+              <BakeButton compact onClick={() => onOpenTab('sop')}>操作</BakeButton>
             </div>
           </div>
         </div>
@@ -72,8 +72,8 @@ const BakeOverviewTab: React.FC<{
             <div className="bake-list-item">
               <div className="bake-inline-meta">
                 <div style={{ minWidth: 0 }}>
-                  <div className="bake-list-item__title">管理操作手册</div>
-                  <div className="bake-muted">查看和管理操作手册</div>
+                  <div className="bake-list-item__title">管理操作</div>
+                  <div className="bake-muted">查看和管理操作</div>
                 </div>
                 <BakeButton primary onClick={() => onOpenTab('sop')}>打开</BakeButton>
               </div>

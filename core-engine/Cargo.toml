@@ -23,6 +23,9 @@ tokio      = { version = "1", features = ["rt-multi-thread", "macros", "sync", "
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Hash
+sha2       = "0.10"
+
 # 错误处理
 thiserror  = "1"
 anyhow     = "1"

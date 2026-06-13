@@ -12,8 +12,9 @@
 #   Windows: pip install paddlepaddle>=2.6 paddleocr>=2.7
 #   macOS:   可选（通常不需要）
 
-# 注：PyObjC 用于 macOS Apple Vision，但作为可选引入
-# pyobjc-framework-Vision>=9.0  # macOS 10.15+（可选）
+# PyObjC 用于 macOS Apple Vision OCR（主 OCR 引擎）
+pyobjc-framework-Vision>=9.0   # macOS 10.15+
+pyobjc-framework-Quartz>=9.0   # CGImage 图片加载
 
 # ── ASR（待实现）──────────────────────────────────────────────────────────────
 # pywhispercpp>=1.0          # Whisper.cpp Python 绑定（按需启用）
@@ -28,8 +29,8 @@ scikit-learn>=1.0           # 机器学习库（用于 reranker 等）
 
 # ── 向量数据库与 Embedding ────────────────────────────────────────────────────
 qdrant-client>=1.7          # Qdrant 向量数据库客户端
-# 注：Embedding 已迁移到 Ollama API（bge-small-zh-v1.5），不再需要本地 sentence-transformers
-# 如需本地 PyTorch Embedding（已弃用），请手动安装：pip install sentence-transformers
+sentence-transformers>=2.6   # Ollama embedding 不可用时的 fallback（如 Ollama 0.30.x 移除 llama-server）
 
 # ── LLM 客户端 ─────────────────────────────────────────────────────────────────
 openai>=1.0                 # OpenAI 兼容 API（用于 Ollama 调用）
+ollama>=0.6                 # Ollama 官方客户端（V1 提炼器依赖；缺失时会回退到规则提炼器并输出原始 OCR）

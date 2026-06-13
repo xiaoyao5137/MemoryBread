@@ -297,10 +297,12 @@ def _model_to_dict(meta, status_info: dict) -> dict:
     status = status_info.get('status', 'not_installed')
 
     # 特殊处理：本地模型需要检查 RAG pipeline 是否就绪
-    # 如果配置为 active 但 RAG pipeline 未就绪，则显示为 loading
+    # 仅当模型已安装（active/installed）但 RAG pipeline 未就绪时，才显示 loading
+    # not_installed 时保留原状态，以便前端显示"下载"按钮
     if status_info.get('is_active') and meta.provider == 'ollama':
         if meta.category in ('llm', 'embedding') and _rag_pipeline is None:
-            status = 'loading'
+            if status in ('active', 'installed'):
+                status = 'loading'
 
     d['status']            = status
     d['download_progress'] = status_info.get('download_progress', 0)
@@ -1108,6 +1110,30 @@ def extract_bake():
             return jsonify({'error': str(e)}), 502
         if 'service unavailable' in lowered or 'busy' in lowered:
             return jsonify({'error': str(e)}), 503
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/bake/merge_document', methods=['POST'])
+def merge_bake_document():
+    """将新 capture 合并进已有文档，返回更新后的字段。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        existing_document = data.get('existing_document')
+        candidate = data.get('candidate')
+        if not isinstance(existing_document, dict) or not isinstance(candidate, dict):
+            return jsonify({'error': '缺少 existing_document 或 candidate'}), 400
+        if not candidate.get('source_timeline_id'):
+            return jsonify({'error': 'candidate.source_timeline_id 缺失'}), 400
+        extractor = get_bake_extractor()
+        result = get_global_queue().submit_sync(
+            Priority.P2,
+            lambda: extractor.merge_bake_document(existing_document, candidate),
+            timeout=600.0,
+            lane=LANE_P2_BAKE,
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error("bake merge_document 失败: %s", e, exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 

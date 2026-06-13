@@ -30,7 +30,13 @@
       "Bash(which pdftotext && pdftotext \"/Users/xianjiaqi/Documents/mygit/cy/gzdz/[MRD]本地化记忆面包应用市场方案.pdf\" - 2>&1 | head -300)",
       "Bash(pdftotext \"/Users/xianjiaqi/Documents/mygit/cy/gzdz/[MRD]本地化记忆面包应用市场方案.pdf\" - 2>&1 | tail -200)",
       "Bash(sqlite3 /tmp/wb_test.db \".tables\")",
-      "Bash(python3 -m pip install pydantic --quiet && python3 -c \"import pydantic; print\\(pydantic.__version__\\)\")"
+      "Bash(python3 -m pip install pydantic --quiet && python3 -c \"import pydantic; print\\(pydantic.__version__\\)\")",
+      "Skill(run)",
+      "Skill(run:*)",
+      "Bash(cargo build *)",
+      "Bash(sleep 8 *)",
+      "Read(//Users/xianjiaqi/.memory-bread/logs/**)",
+      "Bash(cargo check *)"
     ]
   }
 }

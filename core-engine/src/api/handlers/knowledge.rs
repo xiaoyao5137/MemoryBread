@@ -55,6 +55,8 @@ pub struct KnowledgeQuery {
     #[serde(default)]
     pub offset: i64,
     pub category: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
 }
 
 fn default_limit() -> i64 {
@@ -312,18 +314,25 @@ pub async fn list_knowledge(
             }
         } else {
             // 没有 category 参数，查询 timelines
-            let mut stmt = conn.prepare(
+            let noise_prefix = format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX);
+            let mut sql = String::from(
                 "SELECT id, capture_id, summary, overview, details, entities, category, importance,
                  occurrence_count, observed_at, event_time_start, event_time_end,
                  history_view, content_origin, activity_type, is_self_generated,
                  evidence_strength, user_verified, user_edited, created_at, updated_at,
                  created_at_ms, updated_at_ms, capture_ids, key_timestamps
-                 FROM timelines
-                 WHERE summary NOT LIKE ?1
-                 ORDER BY updated_at_ms DESC LIMIT ?2 OFFSET ?3"
-            ).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
+                 FROM timelines WHERE summary NOT LIKE ?"
+            );
+            let mut bind: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(noise_prefix.clone())];
+            if let Some(f) = params.from { sql.push_str(" AND created_at_ms >= ?"); bind.push(Box::new(f)); }
+            if let Some(t) = params.to   { sql.push_str(" AND created_at_ms <= ?"); bind.push(Box::new(t)); }
+            sql.push_str(" ORDER BY updated_at_ms DESC LIMIT ? OFFSET ?");
+            bind.push(Box::new(params.limit));
+            bind.push(Box::new(params.offset));
 
-            let entries = stmt.query_map(rusqlite::params![format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX), params.limit, params.offset], |row: &rusqlite::Row| {
+            let mut stmt = conn.prepare(&sql).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
+            let p: Vec<&dyn rusqlite::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+            let entries = stmt.query_map(p.as_slice(), |row: &rusqlite::Row| {
                 let entities_json: String = row.get(5).unwrap_or_default();
                 let entities: Vec<String> = serde_json::from_str(&entities_json).unwrap_or_default();
                 let capture_ids: Option<Vec<i64>> = row.get::<_, Option<String>>(23).ok().flatten()
@@ -358,11 +367,13 @@ pub async fn list_knowledge(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
-            let total: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM timelines WHERE summary NOT LIKE ?1",
-                [format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX)],
-                |row| row.get(0),
-            ).map_err(|e| crate::storage::StorageError::Sqlite(e))?;
+            let mut count_sql = String::from("SELECT COUNT(*) FROM timelines WHERE summary NOT LIKE ?");
+            let mut count_bind: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(noise_prefix)];
+            if let Some(f) = params.from { count_sql.push_str(" AND created_at_ms >= ?"); count_bind.push(Box::new(f)); }
+            if let Some(t) = params.to   { count_sql.push_str(" AND created_at_ms <= ?"); count_bind.push(Box::new(t)); }
+            let cp: Vec<&dyn rusqlite::ToSql> = count_bind.iter().map(|b| b.as_ref()).collect();
+            let total: i64 = conn.query_row(&count_sql, cp.as_slice(), |row| row.get(0))
+                .map_err(|e| crate::storage::StorageError::Sqlite(e))?;
 
             (entries, total)
         };

@@ -11,6 +11,7 @@ import logging
 
 from .base import EmbeddingBackend, EmbeddingVector
 from .ollama import OllamaEmbeddingBackend
+from .sentence_transformers_backend import SentenceTransformersBackend
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +30,24 @@ class EmbeddingModel:
 
     @classmethod
     def create_default(cls) -> "EmbeddingModel":
-        """创建默认配置的 EmbeddingModel（Ollama，量化模型）"""
-        return cls(backend=OllamaEmbeddingBackend())
+        """创建默认配置的 EmbeddingModel。
+        优先 Ollama，不可用时（如 Ollama 0.30.x 移除 llama-server）降级到 sentence-transformers。
+        """
+        ollama = OllamaEmbeddingBackend()
+        # 快速探测：Ollama 运行但 embed 调用会 500（llama-server not found）
+        # 用实际 encode 探一下，避免 is_available() 仅检查服务存活就认为 OK
+        if ollama.is_available():
+            try:
+                ollama.encode(["test"])
+                return cls(backend=ollama)
+            except Exception as e:
+                logger.warning("Ollama embedding 不可用，降级到 sentence-transformers: %s", e)
+        st = SentenceTransformersBackend()
+        if st.is_available():
+            logger.info("使用 sentence-transformers 本地 embedding 后端")
+            return cls(backend=st)
+        # 两者都不行，保留 Ollama 后端（encode 时会报出清晰错误）
+        return cls(backend=ollama)
 
     # ── 公共接口 ──────────────────────────────────────────────────────────────
 

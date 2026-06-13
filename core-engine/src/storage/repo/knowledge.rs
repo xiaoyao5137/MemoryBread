@@ -11,6 +11,47 @@ use crate::storage::{
     StorageManager,
 };
 
+fn extract_document_identity(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return url.to_string();
+    }
+
+    let doc_markers = [
+        "docs.corp", "/docs/", "docs.google", "/document/", "yuque.com",
+        "feishu.cn/docx", "feishu.cn/wiki", "notion.so", "confluence",
+        "/wiki/", "shimo.im", "/d/home/", "/s/home/",
+    ];
+
+    let lowered = url.to_lowercase();
+    if !doc_markers.iter().any(|m| lowered.contains(m)) {
+        return url.to_string();
+    }
+
+    let without_protocol = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+
+    if let Some((host, rest)) = without_protocol.split_once('/') {
+        let path = rest.split('?').next().unwrap_or(rest).trim_end_matches('/');
+
+        if path.is_empty() {
+            return host.to_lowercase();
+        }
+
+        if let Some(last_segment) = path.rsplit('/').next() {
+            if last_segment.len() >= 6 {
+                return format!("{}::{}", host.to_lowercase(), last_segment);
+            }
+        }
+
+        format!("{}::{}", host.to_lowercase(), path.to_lowercase())
+    } else {
+        without_protocol.to_lowercase()
+    }
+}
+
 impl StorageManager {
     pub fn get_document_templates(&self, limit: Option<usize>) -> Result<Vec<BakeDocumentRecord>, StorageError> {
         self.with_conn(|conn| {
@@ -331,7 +372,7 @@ impl StorageManager {
                         k.created_at_ms, k.updated_at_ms, k.capture_ids, k.start_time, k.end_time, k.duration_minutes,
                         k.frag_app_name, k.frag_win_title, k.time_range_start, k.time_range_end, k.key_timestamps
                  FROM timelines k
-                 WHERE k.is_self_generated = 0",
+                 WHERE k.category = 'bake_article'",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             if let Some(q) = query {
@@ -372,7 +413,7 @@ impl StorageManager {
             let mut sql = String::from(
                 "SELECT COUNT(*)
                  FROM timelines k
-                 WHERE k.is_self_generated = 0",
+                 WHERE k.category = 'bake_article'",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             if let Some(q) = query {
@@ -443,6 +484,70 @@ impl StorageManager {
                 key_timestamps: None,
             })
             .collect())
+    }
+
+    pub fn find_document_by_source_url(&self, url: &str) -> Result<Option<BakeDocumentRecord>, StorageError> {
+        if url.trim().is_empty() {
+            return Ok(None);
+        }
+        let doc_id = extract_document_identity(url);
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, doc_type, status, tags, applicable_tasks, source_memory_ids,
+                        source_capture_ids, source_episode_ids, linked_knowledge_ids,
+                        sections_json, style_phrases, replacement_rules, summary, full_content,
+                        structured_content, prompt_hint, diagram_code, image_assets,
+                        source_app_name, source_win_title, source_url, content_hash, language,
+                        usage_count, match_score, match_level, creation_mode, review_status,
+                        evidence_summary, generation_version, deleted_at,
+                        created_at, updated_at
+                 FROM bake_documents
+                 WHERE deleted_at IS NULL AND source_url IS NOT NULL
+                   AND (source_url = ?1 OR instr(source_url, ?2) > 0)
+                 LIMIT 1"
+            )?;
+            let mut rows = stmt.query(rusqlite::params![url, &doc_id])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(BakeDocumentRecord {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    doc_type: row.get(2)?,
+                    status: row.get(3)?,
+                    tags: row.get(4)?,
+                    applicable_tasks: row.get(5)?,
+                    source_memory_ids: row.get(6)?,
+                    source_capture_ids: row.get(7)?,
+                    source_episode_ids: row.get(8)?,
+                    linked_knowledge_ids: row.get(9)?,
+                    sections_json: row.get(10)?,
+                    style_phrases: row.get(11)?,
+                    replacement_rules: row.get(12)?,
+                    summary: row.get(13)?,
+                    full_content: row.get(14)?,
+                    structured_content: row.get(15)?,
+                    prompt_hint: row.get(16)?,
+                    diagram_code: row.get(17)?,
+                    image_assets: row.get(18)?,
+                    source_app_name: row.get(19)?,
+                    source_win_title: row.get(20)?,
+                    source_url: row.get(21)?,
+                    content_hash: row.get(22)?,
+                    language: row.get(23)?,
+                    usage_count: row.get(24)?,
+                    match_score: row.get(25)?,
+                    match_level: row.get(26)?,
+                    creation_mode: row.get(27)?,
+                    review_status: row.get(28)?,
+                    evidence_summary: row.get(29)?,
+                    generation_version: row.get(30)?,
+                    deleted_at: row.get(31)?,
+                    created_at: row.get(32)?,
+                    updated_at: row.get(33)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
     }
 
     /// 新的 bake_knowledge 查询函数（返回新类型）
@@ -666,7 +771,24 @@ impl StorageManager {
             let mut records: Vec<BakeMemorySourceRecord> =
                 rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)?;
             for record in records.iter_mut() {
-                if let Some(url) = record.capture_url.clone() {
+                // 优先聚合 timeline 全部成员 capture 的内容（含文档型成员的正文），
+                // 因为主 capture 常是 IM，代表不了 timeline 里浏览/编辑的文档。
+                let member_ids = parse_capture_ids(record.timeline.capture_ids.as_deref());
+                let member_aggregated = if member_ids.len() > 1 {
+                    aggregate_member_capture_text(
+                        conn,
+                        &member_ids,
+                        record.timeline.capture_id,
+                    )?
+                } else {
+                    None
+                };
+
+                if let Some((aggregated, count)) = member_aggregated {
+                    record.url_aggregated_text = Some(aggregated);
+                    record.url_aggregated_capture_count = count;
+                } else if let Some(url) = record.capture_url.clone() {
+                    // 回退：单 capture 场景仍按主 capture 的 URL 聚合历史浏览。
                     if let Some((aggregated, count)) =
                         aggregate_url_capture_text(conn, &url, record.capture_ts)?
                     {
@@ -931,6 +1053,173 @@ const URL_AGGREGATION_MAX_CAPTURES: i64 = 30;
 const URL_AGGREGATION_TOTAL_BUDGET_CHARS: usize = 12000;
 const URL_AGGREGATION_PER_CAPTURE_CAP_CHARS: usize = 4000;
 const URL_AGGREGATION_DEDUP_HEAD_CHARS: usize = 200;
+
+// 成员聚合：把一条 timeline 的 capture_ids 数组里所有成员的可见文本拼起来，
+// 用于补充主 capture 之外的内容（尤其文档型成员，主 capture 常是 IM 无法代表）。
+const MEMBER_AGGREGATION_MAX_CAPTURES: usize = 40;
+const MEMBER_AGGREGATION_TOTAL_BUDGET_CHARS: usize = 12000;
+const MEMBER_AGGREGATION_PER_CAPTURE_CAP_CHARS: usize = 2000;
+const MEMBER_AGGREGATION_DEDUP_HEAD_CHARS: usize = 200;
+
+/// 聚合一条 timeline 全部成员 capture 的可见文本。
+///
+/// 设计要点：
+/// - 文档型成员（URL 含文档域名）优先靠前，保证有限预算下文档正文不被 IM/编码噪声挤掉；
+/// - 同一份文档的多次 capture 按 head 去重，避免重复抄录；
+/// - 返回 (聚合文本, 纳入的成员数)。成员数 <= 1 时返回 None（无聚合价值，回退到主 capture）。
+fn aggregate_member_capture_text(
+    conn: &Connection,
+    capture_ids: &[i64],
+    primary_capture_id: i64,
+) -> Result<Option<(String, i64)>, StorageError> {
+    if capture_ids.len() <= 1 {
+        return Ok(None);
+    }
+
+    // 读取成员的文本与 URL；按时间序，文档型优先。
+    let placeholders = capture_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, ts, ax_text, ocr_text, input_text, url
+         FROM captures
+         WHERE id IN ({placeholders})
+         ORDER BY ts ASC
+         LIMIT {MEMBER_AGGREGATION_MAX_CAPTURES}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params_vec: Vec<&dyn rusqlite::ToSql> =
+        capture_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params_vec.as_slice(), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+
+    struct Member {
+        cap_id: i64,
+        ts: i64,
+        text: String,
+        is_doc: bool,
+    }
+    let mut members: Vec<Member> = Vec::new();
+    for row in rows {
+        let (cap_id, ts, ax_text, ocr_text, input_text, url) = row.map_err(StorageError::Sqlite)?;
+        let combined = combine_capture_text_for_url(
+            ax_text.as_deref(),
+            ocr_text.as_deref(),
+            input_text.as_deref(),
+        );
+        if combined.is_empty() {
+            continue;
+        }
+        let is_doc = url
+            .as_deref()
+            .map(is_document_url)
+            .unwrap_or(false);
+        members.push(Member { cap_id, ts, text: combined, is_doc });
+    }
+
+    if members.len() <= 1 {
+        return Ok(None);
+    }
+
+    // 文档型优先（稳定排序：先 is_doc 降序，再时间升序），保证预算先喂文档正文。
+    members.sort_by(|a, b| b.is_doc.cmp(&a.is_doc).then(a.ts.cmp(&b.ts)));
+
+    let mut buf = String::new();
+    let mut seen_heads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut budget = MEMBER_AGGREGATION_TOTAL_BUDGET_CHARS;
+    let mut included = 0_i64;
+    for m in &members {
+        let head: String = m
+            .text
+            .chars()
+            .take(MEMBER_AGGREGATION_DEDUP_HEAD_CHARS)
+            .collect();
+        if !seen_heads.insert(head) {
+            continue; // 同一份内容已收录，跳过重复
+        }
+        let allowed = budget.min(MEMBER_AGGREGATION_PER_CAPTURE_CAP_CHARS);
+        if allowed == 0 {
+            break;
+        }
+        let truncated: String = m.text.chars().take(allowed).collect();
+        let used = truncated.chars().count();
+        let tag = if m.is_doc { "doc" } else { "ctx" };
+        let primary_mark = if m.cap_id == primary_capture_id { " primary" } else { "" };
+        buf.push_str(&format!(
+            "--- capture#{} ts={} [{}{}] ---\n",
+            m.cap_id, m.ts, tag, primary_mark
+        ));
+        buf.push_str(&truncated);
+        buf.push_str("\n\n");
+        budget = budget.saturating_sub(used);
+        included += 1;
+        if budget == 0 {
+            break;
+        }
+    }
+
+    if included <= 1 {
+        return Ok(None);
+    }
+    Ok(Some((buf, included)))
+}
+
+/// 判断 URL 是否指向文档（用于成员聚合时优先文档型 capture）。
+fn is_document_url(url: &str) -> bool {
+    let u = url.trim().to_lowercase();
+    if u.is_empty() {
+        return false;
+    }
+    // 常见企业/通用文档域名与路径特征。
+    const DOC_MARKERS: &[&str] = &[
+        "docs.corp",
+        "/docs/",
+        "docs.google",
+        "/document/",
+        "yuque.com",
+        "feishu.cn/docx",
+        "feishu.cn/wiki",
+        "notion.so",
+        "confluence",
+        "/wiki/",
+        "shimo.im",
+        "/d/home/",
+        "/s/home/",
+    ];
+    DOC_MARKERS.iter().any(|marker| u.contains(marker))
+}
+
+/// 解析 timeline.capture_ids（JSON 数组，元素可能是数字或字符串）为 i64 列表。
+fn parse_capture_ids(raw: Option<&str>) -> Vec<i64> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                serde_json::Value::Number(n) => n.as_i64(),
+                serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 
 fn aggregate_url_capture_text(
     conn: &Connection,
@@ -1401,12 +1690,18 @@ impl StorageManager {
         self.with_conn(|conn| {
             let now = current_ts_ms();
             conn.execute(
+                // episodic_memory_id 是列重命名为 timeline_id 前的旧列，仍带 NOT NULL 约束。
+                // 二者语义等价（见 db.rs 中 timeline_id = episodic_memory_id 的回填），
+                // 这里同时写入旧列，避免 NOT NULL 约束导致 knowledge 提炼结果无法落库。
+                // source_capture_ids 为 NOT NULL DEFAULT '[]'，但 build_bake_knowledge_entry
+                // 可能传入 None；显式绑定 NULL 会覆盖 DEFAULT 触发约束失败，用 COALESCE 兜底。
+                // （废弃列 episodic_memory_id 已由迁移 033 移除，无需再写入。）
                 "INSERT INTO bake_knowledge (
                     timeline_id, title, summary, content, detailed_content, entities, importance,
                     user_verified, user_edited,
                     created_at, updated_at, created_at_ms, updated_at_ms, source_capture_ids
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0,
-                           datetime(?8 / 1000, 'unixepoch'), datetime(?8 / 1000, 'unixepoch'), ?8, ?8, ?9)",
+                           datetime(?8 / 1000, 'unixepoch'), datetime(?8 / 1000, 'unixepoch'), ?8, ?8, COALESCE(?9, '[]'))",
                 params![
                     knowledge.timeline_id,
                     knowledge.title,
@@ -1505,12 +1800,13 @@ impl StorageManager {
         self.with_conn(|conn| {
             let now = current_ts_ms();
             conn.execute(
+                // 废弃列 episodic_memory_id 已由迁移 033 移除；source_capture_ids 用 COALESCE 兜底。
                 "INSERT INTO bake_sops (
                     timeline_id, title, summary, content, detailed_content, entities, importance,
                     user_verified, user_edited,
                     created_at, updated_at, created_at_ms, updated_at_ms, source_capture_ids
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0,
-                           datetime(?8 / 1000, 'unixepoch'), datetime(?8 / 1000, 'unixepoch'), ?8, ?8, ?9)",
+                           datetime(?8 / 1000, 'unixepoch'), datetime(?8 / 1000, 'unixepoch'), ?8, ?8, COALESCE(?9, '[]'))",
                 params![
                     sop.timeline_id,
                     sop.title,
@@ -1549,6 +1845,43 @@ impl StorageManager {
         self.with_conn(|conn| {
             conn.query_row("SELECT COUNT(*) FROM bake_sops", [], |row| row.get(0))
                 .map_err(StorageError::Sqlite)
+        })
+    }
+
+    /// 给定候选 timeline_id 集合，返回其中已在 bake_knowledge 中有记录的 timeline_id 子集。
+    /// 代替全量拉取所有 knowledge 再构建 HashSet，避免随数据增长内存和时间开销线性膨胀。
+    pub fn find_existing_knowledge_timeline_ids(
+        &self,
+        candidate_ids: &[i64],
+    ) -> Result<std::collections::HashSet<i64>, StorageError> {
+        if candidate_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        self.with_conn(|conn| {
+            let placeholders = candidate_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT timeline_id FROM bake_knowledge WHERE timeline_id IN ({})", placeholders);
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(StorageError::Sqlite)
+        })
+    }
+
+    /// 给定候选 timeline_id 集合，返回其中已在 bake_sops 中有记录的 timeline_id 子集。
+    pub fn find_existing_sop_timeline_ids(
+        &self,
+        candidate_ids: &[i64],
+    ) -> Result<std::collections::HashSet<i64>, StorageError> {
+        if candidate_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        self.with_conn(|conn| {
+            let placeholders = candidate_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT timeline_id FROM bake_sops WHERE timeline_id IN ({})", placeholders);
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(StorageError::Sqlite)
         })
     }
 
@@ -1600,21 +1933,21 @@ impl StorageManager {
 
 fn row_to_bake_sop(row: &rusqlite::Row<'_>) -> Result<BakeSopRecord, StorageError> {
     Ok(BakeSopRecord {
-        id: row.get(0)?,
-        timeline_id: row.get(1)?,
-        title: row.get(2)?,
-        summary: row.get(3)?,
-        content: row.get(4)?,
-        detailed_content: row.get(5)?,
-        entities: row.get(6)?,
-        importance: row.get::<_, Option<i64>>(7)?.unwrap_or(3),
-        user_verified: row.get::<_, Option<bool>>(8)?.unwrap_or(false),
-        user_edited: row.get::<_, Option<bool>>(9)?.unwrap_or(false),
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-        created_at_ms: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
-        updated_at_ms: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
-        source_capture_ids: row.get(14)?,
+        id: row.get("id")?,
+        timeline_id: row.get::<_, Option<i64>>("timeline_id")?.unwrap_or(0),
+        title: row.get("title")?,
+        summary: row.get("summary")?,
+        content: row.get("content")?,
+        detailed_content: row.get("detailed_content")?,
+        entities: row.get::<_, Option<String>>("entities")?.unwrap_or_default(),
+        importance: row.get::<_, Option<i64>>("importance")?.unwrap_or(3),
+        user_verified: row.get::<_, Option<bool>>("user_verified")?.unwrap_or(false),
+        user_edited: row.get::<_, Option<bool>>("user_edited")?.unwrap_or(false),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        created_at_ms: row.get::<_, Option<i64>>("created_at_ms")?.unwrap_or(0),
+        updated_at_ms: row.get::<_, Option<i64>>("updated_at_ms")?.unwrap_or(0),
+        source_capture_ids: row.get("source_capture_ids")?,
     })
 }
 

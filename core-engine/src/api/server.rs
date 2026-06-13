@@ -22,7 +22,7 @@ use super::{
             toggle_bake_document_status, update_bake_document, update_bake_style_config,
         },
         captures::list_captures,
-        creation::{generate_document, preview_references},
+        creation::{generate_document, list_history, preview_references, save_history},
         debug::{
             clear_extraction_queue, debug_log_content, debug_log_files, system_stats, vector_status,
         },
@@ -69,6 +69,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/pii/scrub", post(pii_scrub))
         .route("/api/creation/generate", post(generate_document))
         .route("/api/creation/references", post(preview_references))
+        .route("/api/creation/history", post(save_history))
+        .route("/api/creation/history", get(list_history))
         .route("/api/vector/status", get(vector_status))
         .route("/api/stats", get(system_stats))
         .route("/api/debug/log-files", get(debug_log_files))

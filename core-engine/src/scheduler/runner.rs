@@ -15,6 +15,8 @@ use crate::storage::StorageManager;
 
 const POLL_INTERVAL_SECS: u64 = 30;
 const PYTHON_EXECUTOR_URL: &str = "http://127.0.0.1:7071/tasks/execute";
+/// 允许同时触发的最大任务数，防止长时间离线后恢复时大量任务并发打垮 Python executor
+const MAX_CONCURRENT_TRIGGERS: usize = 5;
 
 pub struct Scheduler {
     storage: StorageManager,
@@ -46,6 +48,8 @@ impl Scheduler {
         let now_ms = Utc::now().timestamp_millis();
         let tasks = TaskRepo::list_enabled(&self.storage)?;
 
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRIGGERS));
+
         for task in tasks {
             // 计算下次执行时间（如果 next_run_at 未设置则立即计算）
             let next_run = match task.next_run_at {
@@ -60,17 +64,17 @@ impl Scheduler {
             if now_ms >= next_run {
                 info!("触发任务: id={}, name={}", task.id, task.name);
 
-                // 异步触发，不阻塞调度循环
+                let sem = semaphore.clone();
                 let client = self.client.clone();
                 let task_id = task.id;
                 let cron_expr = task.cron_expression.clone();
                 let storage = self.storage.clone();
 
                 tokio::spawn(async move {
+                    let _permit = sem.acquire().await.expect("semaphore closed");
                     if let Err(e) = Self::trigger_task(&client, task_id).await {
                         error!("任务触发失败: id={task_id}, error={e}");
                     }
-                    // 计算并更新下次执行时间
                     if let Ok(next) = Self::calc_next_run_static(&cron_expr) {
                         let _ = TaskRepo::set_next_run(&storage, task_id, next);
                         info!("任务 {task_id} 下次执行: {next}");

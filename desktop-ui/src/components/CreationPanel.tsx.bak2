@@ -67,10 +67,6 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const [error, setError] = useState<string | null>(null)
   const [copySuccess, setCopySuccess] = useState(false)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
-  const [referenceCollapsed, setReferenceCollapsed] = useState(true)
-  const [configCollapsed, setConfigCollapsed] = useState(true)
-  const [historyCollapsed, setHistoryCollapsed] = useState(true)
-  const [creationHistory, setCreationHistory] = useState<Array<{ prompt: string; timestamp: string; preview: string }>>([])
   const contentRef = useRef<HTMLDivElement>(null)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -102,7 +98,6 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
 
   const buildPayload = () => ({
     user_prompt: prompt,
-    design_templates: [],
     design_ids: [],
     timeline_ids: [],
     capture_ids: [],
@@ -165,17 +160,11 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     startTimer()
 
     try {
-      let refCount = 0
       if (enableRag) {
         try {
           const refResponse = await postReferencePreview()
           if (refResponse.ok) {
-            const refData = await refResponse.json()
-            setReferencePreview(refData)
-            refCount = refData?.references?.length || 0
-            if (refCount > 0) {
-              setReferenceCollapsed(false)
-            }
+            setReferencePreview(await refResponse.json())
           }
         } catch (refErr) {
           console.warn('参考资料同步加载失败,继续生成:', refErr)
@@ -195,7 +184,6 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       if (!reader) throw new Error('无法读取响应流')
 
       let buffer = ''
-      let finalContent = ''
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
@@ -209,41 +197,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
           const jsonStr = line.slice(6)
           try {
             const content = JSON.parse(jsonStr)
-            finalContent += content
             setGeneratedContent(prev => prev + content)
             stopTimer()
           } catch {
-            finalContent += jsonStr
             setGeneratedContent(prev => prev + jsonStr)
             stopTimer()
           }
-        }
-      }
-
-      if (finalContent) {
-        try {
-          await fetch(`${apiBaseUrl}/api/creation/history`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              prompt: prompt.trim(),
-              generated_content: finalContent,
-              doc_type: docType || null,
-              audience: audience || null,
-              reference_count: refCount,
-            }),
-          })
-          const historyResponse = await fetch(`${apiBaseUrl}/api/creation/history`)
-          if (historyResponse.ok) {
-            const histories = await historyResponse.json()
-            setCreationHistory(histories.map((h: any) => ({
-              prompt: h.prompt,
-              timestamp: new Date(h.created_at).toLocaleString('zh-CN'),
-              preview: h.generated_content.slice(0, 100) + (h.generated_content.length > 100 ? '...' : '')
-            })))
-          }
-        } catch (saveErr) {
-          console.error('保存创作记录失败:', saveErr)
         }
       }
     } catch (err) {
@@ -253,39 +212,6 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       stopTimer()
     }
   }
-
-  useEffect(() => {
-    if (!isGenerating && generatedContent && prompt) {
-      const preview = generatedContent.slice(0, 100) + (generatedContent.length > 100 ? '...' : '')
-      setCreationHistory(prev => {
-        if (prev[0]?.prompt === prompt.trim()) return prev
-        return [{
-          prompt: prompt.trim(),
-          timestamp: new Date().toLocaleString('zh-CN'),
-          preview
-        }, ...prev].slice(0, 10)
-      })
-    }
-  }, [isGenerating, generatedContent, prompt])
-
-  useEffect(() => {
-    const loadHistory = async () => {
-      try {
-        const response = await fetch(`${apiBaseUrl}/api/creation/history`)
-        if (response.ok) {
-          const histories = await response.json()
-          setCreationHistory(histories.map((h: any) => ({
-            prompt: h.prompt,
-            timestamp: new Date(h.created_at).toLocaleString('zh-CN'),
-            preview: h.generated_content.slice(0, 100) + (h.generated_content.length > 100 ? '...' : '')
-          })))
-        }
-      } catch (err) {
-        console.error('加载创作记录失败:', err)
-      }
-    }
-    loadHistory()
-  }, [apiBaseUrl])
 
   const handleCopy = async () => {
     await navigator.clipboard.writeText(generatedContent)
@@ -301,6 +227,47 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
 
   return (
     <div className={className} style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: '#f6f7f9', color: '#172033' }}>
+      <aside style={{ borderRight: '1px solid #e1e5ea', background: '#fff', overflowY: 'auto' }}>
+        <div style={{ padding: '22px 20px', borderBottom: '1px solid #e1e5ea' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <Sparkles size={22} color="#0f766e" />
+            <h2 style={{ fontSize: 21, fontWeight: 700, margin: 0 }}>智能创作</h2>
+          </div>
+          <p style={{ margin: '8px 0 0', color: '#667085', fontSize: 13, lineHeight: 1.5 }}>
+            基于历史文档、知识和操作手册生成新内容。
+          </p>
+        </div>
+
+        <div style={{ padding: 20, display: 'grid', gap: 16 }}>
+          <label style={{ display: 'grid', gap: 7, fontSize: 13, color: '#475467' }}>
+            文档类型
+            <input value={docType} onChange={(e) => setDocType(e.target.value)} placeholder="建设方案 / 操作手册 / 汇报材料" style={inputStyle} />
+          </label>
+          <label style={{ display: 'grid', gap: 7, fontSize: 13, color: '#475467' }}>
+            目标读者
+            <input value={audience} onChange={(e) => setAudience(e.target.value)} placeholder="客户 / 管理人员 / 研发团队" style={inputStyle} />
+          </label>
+
+          <Toggle label="启用 RAG 参考" checked={enableRag} onChange={setEnableRag} />
+          <Toggle label="继承历史格式" checked={inheritFormat} onChange={setInheritFormat} />
+          <Toggle label="互联网检索补充" checked={enableWebSearch} onChange={setEnableWebSearch} icon={<Search size={16} />} />
+          <Toggle label="图片/图示生成建议" checked={enableImageGeneration} onChange={setEnableImageGeneration} icon={<Image size={16} />} />
+
+          <div style={{ height: 1, background: '#edf0f3' }} />
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, color: '#475467', marginBottom: 10 }}>
+              <span>权重配置</span>
+              <span style={{ color: totalWeight === 100 ? '#0f766e' : '#b54708' }}>{totalWeight}%</span>
+            </div>
+            <WeightSlider label="内容相关度" value={contentWeight} onChange={setContentWeight} />
+            <WeightSlider label="文档质量" value={qualityWeight} onChange={setQualityWeight} />
+            <WeightSlider label="完整性" value={completenessWeight} onChange={setCompletenessWeight} />
+            <WeightSlider label="打开/引用热度" value={usageWeight} onChange={setUsageWeight} />
+            <WeightSlider label="格式匹配" value={formatWeight} onChange={setFormatWeight} />
+            <WeightSlider label="时效性" value={freshnessWeight} onChange={setFreshnessWeight} />
+          </div>
+        </div>
+      </aside>
 
       <main style={{ minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <section style={{ padding: 22, borderBottom: '1px solid #e1e5ea', background: '#fff' }}>
@@ -352,156 +319,30 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             </div>
           </div>
         </section>
-        {/* 底部三栏折叠卡片 */}
-        <section style={{ padding: '0 22px 22px', display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
-          {/* 参考资料 */}
-          <div style={{ border: '1px solid #e1e5ea', borderRadius: 12, background: '#fff', overflow: 'hidden' }}>
-            <div
-              onClick={() => setReferenceCollapsed(!referenceCollapsed)}
-              style={{
-                padding: '16px 20px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                cursor: 'pointer',
-                borderBottom: referenceCollapsed ? 'none' : '1px solid #e1e5ea',
-                background: referenceCollapsed ? '#fff' : 'linear-gradient(to right, #f0fdfa, #fff)',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ width: 32, height: 32, borderRadius: 8, background: '#0f766e', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 16 }}>
-                  📚
-                </div>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 650 }}>参考资料</div>
-                  <div style={{ fontSize: 12, color: '#667085', marginTop: 2 }}>
-                    {referencePreview?.references?.length || 0} 条
-                  </div>
-                </div>
-              </div>
-              <div style={{ padding: '6px 12px', borderRadius: 6, background: referenceCollapsed ? '#f3f4f6' : '#0f766e', color: referenceCollapsed ? '#6b7280' : '#fff', fontSize: 13, fontWeight: 600 }}>
-                {referenceCollapsed ? '展开' : '收起'}
-              </div>
-            </div>
-            {!referenceCollapsed && (
-              <div style={{ padding: 16, maxHeight: 300, overflowY: 'auto', background: '#fafbfc' }}>
-                {referencePreview?.references?.length ? (
-                  <div style={{ display: 'grid', gap: 10 }}>
-                    {referencePreview.references.map((ref: any) => (
-                      <ReferenceRow key={ref.id} item={ref} onOpenSource={handleOpenReferenceSource} />
-                    ))}
-                  </div>
-                ) : (
-                  <div style={{ color: '#667085', fontSize: 13 }}>暂无资料</div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* 创作参数 */}
-          <div style={{ border: '1px solid #e1e5ea', borderRadius: 12, background: '#fff', overflow: 'hidden' }}>
-            <div
-              onClick={() => setConfigCollapsed(!configCollapsed)}
-              style={{
-                padding: '16px 20px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                cursor: 'pointer',
-                borderBottom: configCollapsed ? 'none' : '1px solid #e1e5ea',
-                background: configCollapsed ? '#fff' : 'linear-gradient(to right, #f0fdfa, #fff)',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ width: 32, height: 32, borderRadius: 8, background: '#0f766e', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' }}>
-                  <Sparkles size={18} />
-                </div>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 650 }}>创作参数</div>
-                  <div style={{ fontSize: 12, color: '#667085', marginTop: 2 }}>配置创作选项</div>
-                </div>
-              </div>
-              <div style={{ padding: '6px 12px', borderRadius: 6, background: configCollapsed ? '#f3f4f6' : '#0f766e', color: configCollapsed ? '#6b7280' : '#fff', fontSize: 13, fontWeight: 600 }}>
-                {configCollapsed ? '展开' : '收起'}
-              </div>
-            </div>
-            {!configCollapsed && (
-              <div style={{ padding: 16, maxHeight: 300, overflowY: 'auto', background: '#fafbfc', display: 'grid', gap: 12 }}>
-                <label style={{ display: 'grid', gap: 7, fontSize: 13 }}>
-                  文档类型
-                  <input value={docType} onChange={(e) => setDocType(e.target.value)} placeholder="建设方案" style={inputStyle} />
-                </label>
-                <label style={{ display: 'grid', gap: 7, fontSize: 13 }}>
-                  目标读者
-                  <input value={audience} onChange={(e) => setAudience(e.target.value)} placeholder="客户" style={inputStyle} />
-                </label>
-                <Toggle label="启用 RAG 参考" checked={enableRag} onChange={setEnableRag} />
-                <Toggle label="继承历史格式" checked={inheritFormat} onChange={setInheritFormat} />
-                <Toggle label="互联网检索" checked={enableWebSearch} onChange={setEnableWebSearch} icon={<Search size={16} />} />
-                <Toggle label="图片生成建议" checked={enableImageGeneration} onChange={setEnableImageGeneration} icon={<Image size={16} />} />
-                <div style={{ height: 1, background: '#e1e5ea', margin: '4px 0' }} />
-                <div style={{ fontSize: 12, color: '#475467', display: 'flex', justifyContent: 'space-between' }}>
-                  <span>权重配置</span>
-                  <span style={{ color: totalWeight === 100 ? '#0f766e' : '#b54708' }}>{totalWeight}%</span>
-                </div>
-                <WeightSlider label="内容相关度" value={contentWeight} onChange={setContentWeight} />
-                <WeightSlider label="文档质量" value={qualityWeight} onChange={setQualityWeight} />
-                <WeightSlider label="完整性" value={completenessWeight} onChange={setCompletenessWeight} />
-                <WeightSlider label="打开/引用热度" value={usageWeight} onChange={setUsageWeight} />
-                <WeightSlider label="格式匹配" value={formatWeight} onChange={setFormatWeight} />
-                <WeightSlider label="时效性" value={freshnessWeight} onChange={setFreshnessWeight} />
-              </div>
-            )}
-          </div>
-
-          {/* 创作记录 */}
-          <div style={{ border: '1px solid #e1e5ea', borderRadius: 12, background: '#fff', overflow: 'hidden' }}>
-            <div
-              onClick={() => setHistoryCollapsed(!historyCollapsed)}
-              style={{
-                padding: '16px 20px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                cursor: 'pointer',
-                borderBottom: historyCollapsed ? 'none' : '1px solid #e1e5ea',
-                background: historyCollapsed ? '#fff' : 'linear-gradient(to right, #f0fdfa, #fff)',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ width: 32, height: 32, borderRadius: 8, background: '#0f766e', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 16 }}>
-                  📝
-                </div>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 650 }}>创作记录</div>
-                  <div style={{ fontSize: 12, color: '#667085', marginTop: 2 }}>{creationHistory.length} 条记录</div>
-                </div>
-              </div>
-              <div style={{ padding: '6px 12px', borderRadius: 6, background: historyCollapsed ? '#f3f4f6' : '#0f766e', color: historyCollapsed ? '#6b7280' : '#fff', fontSize: 13, fontWeight: 600 }}>
-                {historyCollapsed ? '展开' : '收起'}
-              </div>
-            </div>
-            {!historyCollapsed && (
-              <div style={{ padding: 16, maxHeight: 300, overflowY: 'auto', background: '#fafbfc' }}>
-                {creationHistory.length > 0 ? (
-                  <div style={{ display: 'grid', gap: 10 }}>
-                    {creationHistory.map((item, idx) => (
-                      <div key={idx} style={{ padding: 12, border: '1px solid #e1e5ea', borderRadius: 8, background: '#fff' }}>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: '#1f2937', marginBottom: 6 }}>{item.prompt}</div>
-                        <div style={{ fontSize: 11, color: '#667085', marginBottom: 6 }}>{item.timestamp}</div>
-                        <div style={{ fontSize: 12, color: '#475467', lineHeight: 1.5 }}>{item.preview}</div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div style={{ color: '#667085', fontSize: 13 }}>暂无创作记录</div>
-                )}
-              </div>
-            )}
-          </div>
-        </section>
       </main>
 
+      <aside style={{ borderLeft: '1px solid #e1e5ea', background: '#fff', overflowY: 'auto' }}>
+        <div style={{ padding: '22px 20px', borderBottom: '1px solid #e1e5ea' }}>
+          <h3 style={{ fontSize: 16, margin: 0 }}>参考资料</h3>
+          <p style={{ margin: '7px 0 0', color: '#667085', fontSize: 13 }}>按综合权重排序，用于内容、格式和风格参考。</p>
+        </div>
+        <div style={{ padding: 16, display: 'grid', gap: 12 }}>
+          {referencePreview?.requirement && (
+            <div style={{ paddingBottom: 12, borderBottom: '1px solid #edf0f3', fontSize: 13, color: '#475467', lineHeight: 1.7 }}>
+              <div>主题：{referencePreview.requirement.topic}</div>
+              <div>类型：{referencePreview.requirement.doc_type}</div>
+              <div>风格：{referencePreview.requirement.style}</div>
+            </div>
+          )}
+          {referencePreview?.references?.length ? referencePreview.references.map((item) => (
+            <ReferenceRow key={item.id} item={item} onOpenSource={handleOpenReferenceSource} />
+          )) : (
+            <div style={{ color: '#98a2b3', fontSize: 13, lineHeight: 1.6 }}>
+              暂无参考资料预览。点击“预览参考”后，这里会显示高权重历史文档和推荐原因。
+            </div>
+          )}
+        </div>
+      </aside>
     </div>
   )
 }

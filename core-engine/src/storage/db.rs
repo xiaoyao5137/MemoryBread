@@ -132,6 +132,22 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "030_archive_legacy_bake_article_timelines",
         include_str!("migrations/030_archive_legacy_bake_article_timelines.sql"),
     ),
+    (
+        "031_ensure_full_schema",
+        include_str!("migrations/031_ensure_full_schema.sql"),
+    ),
+    (
+        "032_restore_bake_article_from_legacy",
+        include_str!("migrations/032_restore_bake_article_from_legacy.sql"),
+    ),
+    (
+        "033_drop_bake_episodic_memory_id",
+        include_str!("migrations/033_drop_bake_episodic_memory_id.sql"),
+    ),
+    (
+        "034_create_creation_history",
+        include_str!("migrations/034_create_creation_history.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,6 +184,10 @@ impl StorageManager {
             conn: Arc::new(Mutex::new(conn)),
         };
         mgr.run_migrations()?;
+        mgr.with_conn(|conn| {
+            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+            Ok(())
+        })?;
 
         info!("StorageManager 初始化完成: {}", db_path.display());
         Ok(mgr)
@@ -224,6 +244,17 @@ impl StorageManager {
                 continue;
             }
 
+            if *version == "019_rename_to_timelines"
+                && self.timelines_table_already_exists(&conn)?
+            {
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    rusqlite::params![version, current_ts_ms()],
+                )?;
+                info!("迁移 {} 已由现有 schema 满足，登记后跳过", version);
+                continue;
+            }
+
             if *version == "029_rename_capture_knowledge_id_to_timeline_id"
                 && self.capture_timeline_column_already_renamed(&conn)?
             {
@@ -232,6 +263,23 @@ impl StorageManager {
                     rusqlite::params![version, current_ts_ms()],
                 )?;
                 info!("迁移 {} 已由现有 schema 满足，登记后跳过", version);
+                continue;
+            }
+
+            if *version == "031_ensure_full_schema" {
+                self.run_ensure_full_schema(&conn)?;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    rusqlite::params![version],
+                    |row| row.get(0),
+                )?;
+                if count == 0 {
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        rusqlite::params![version, current_ts_ms()],
+                    )?;
+                }
+                info!("迁移 {} 执行成功", version);
                 continue;
             }
 
@@ -260,6 +308,91 @@ impl StorageManager {
         }
 
         Ok(())
+    }
+
+    fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool, StorageError> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            rusqlite::params![table, col],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn add_column_if_missing(
+        conn: &Connection,
+        table: &str,
+        col: &str,
+        col_def: &str,
+    ) -> Result<(), StorageError> {
+        if !Self::has_column(conn, table, col)? {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {col_def};"))?;
+        }
+        Ok(())
+    }
+
+    fn run_ensure_full_schema(&self, conn: &Connection) -> Result<(), StorageError> {
+        // timelines 补列
+        Self::add_column_if_missing(conn, "timelines", "created_at_ms", "INTEGER")?;
+        Self::add_column_if_missing(conn, "timelines", "updated_at_ms", "INTEGER")?;
+        Self::add_column_if_missing(conn, "timelines", "time_range_start", "INTEGER")?;
+        Self::add_column_if_missing(conn, "timelines", "time_range_end", "INTEGER")?;
+        Self::add_column_if_missing(conn, "timelines", "key_timestamps", "TEXT")?;
+
+        // captures 补列
+        Self::add_column_if_missing(conn, "captures", "url", "TEXT")?;
+        Self::add_column_if_missing(conn, "captures", "webpage_title", "TEXT")?;
+        Self::add_column_if_missing(conn, "captures", "screenshot_source", "TEXT")?;
+        Self::add_column_if_missing(conn, "captures", "timeline_id", "INTEGER")?;
+
+        // bake_knowledge 补列
+        Self::add_column_if_missing(conn, "bake_knowledge", "detailed_content", "TEXT")?;
+        Self::add_column_if_missing(conn, "bake_knowledge", "document_id", "INTEGER")?;
+        Self::add_column_if_missing(conn, "bake_knowledge", "section_ids", "TEXT DEFAULT '[]'")?;
+        Self::add_column_if_missing(conn, "bake_knowledge", "source_timeline_ids", "TEXT DEFAULT '[]'")?;
+        Self::add_column_if_missing(conn, "bake_knowledge", "source_capture_ids", "TEXT NOT NULL DEFAULT '[]'")?;
+        // 023 迁移可能未真正执行：episodic_memory_id → timeline_id
+        if Self::has_column(conn, "bake_knowledge", "episodic_memory_id")?
+            && !Self::has_column(conn, "bake_knowledge", "timeline_id")?
+        {
+            conn.execute_batch(
+                "ALTER TABLE bake_knowledge ADD COLUMN timeline_id INTEGER;
+                 UPDATE bake_knowledge SET timeline_id = episodic_memory_id WHERE timeline_id IS NULL;",
+            )?;
+        }
+
+        // 023 迁移可能未真正执行：template_created_count → design_created_count
+        if Self::has_column(conn, "bake_runs", "template_created_count")?
+            && !Self::has_column(conn, "bake_runs", "design_created_count")?
+        {
+            conn.execute_batch(
+                "ALTER TABLE bake_runs ADD COLUMN design_created_count INTEGER NOT NULL DEFAULT 0;
+                 UPDATE bake_runs SET design_created_count = template_created_count WHERE design_created_count = 0;",
+            )?;
+        }
+
+        // bake_sops 补列
+        Self::add_column_if_missing(conn, "bake_sops", "timeline_id", "INTEGER")?;
+        Self::add_column_if_missing(conn, "bake_sops", "detailed_content", "TEXT")?;
+        Self::add_column_if_missing(conn, "bake_sops", "source_capture_ids", "TEXT DEFAULT '[]'")?;
+
+        // vector_index 补列
+        Self::add_column_if_missing(conn, "vector_index", "document_id", "INTEGER")?;
+        Self::add_column_if_missing(conn, "vector_index", "section_id", "INTEGER")?;
+
+        // 缺失的表（CREATE TABLE IF NOT EXISTS 本身幂等，直接执行 SQL 片段）
+        conn.execute_batch(include_str!("migrations/031_ensure_full_schema.sql"))?;
+
+        Ok(())
+    }
+
+    fn timelines_table_already_exists(&self, conn: &Connection) -> Result<bool, StorageError> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='timelines'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     fn capture_timeline_column_already_renamed(

@@ -352,6 +352,18 @@ const BakePanel: React.FC = () => {
     setStatusMessage('已切换到来源时间线')
   }
 
+  const handleViewRelatedDocument = async (timelineId: string) => {
+    const relatedDoc = templates.find(t => t.sourceMemoryIds.includes(timelineId))
+    if (!relatedDoc) {
+      setStatusMessage('当前时间线还没有被提炼为文档')
+      return
+    }
+    setBakeTab('templates')
+    setBakeTemplateOffset(0)
+    setSelectedTemplateId(relatedDoc.id)
+    setStatusMessage(`已切换到关联文档「${relatedDoc.title}」`)
+  }
+
   const handleViewLinkedKnowledge = (knowledgeId: string) => {
     setBakeTab('knowledge')
     setBakeKnowledgeQuery('')

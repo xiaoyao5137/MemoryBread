@@ -286,3 +286,51 @@ fn default_freshness_weight() -> f64 {
 fn default_max_references() -> i64 {
     6
 }
+
+#[derive(Debug, Deserialize)]
+pub struct SaveHistoryRequest {
+    pub prompt: String,
+    pub generated_content: String,
+    pub doc_type: Option<String>,
+    pub audience: Option<String>,
+    pub reference_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SaveHistoryResponse {
+    pub id: i64,
+}
+
+pub async fn save_history(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SaveHistoryRequest>,
+) -> Result<Json<SaveHistoryResponse>, (StatusCode, String)> {
+    let id = state.storage.with_conn(|conn| {
+        crate::storage::repo::creation_history::insert(
+            conn,
+            &req.prompt,
+            &req.generated_content,
+            req.doc_type.as_deref(),
+            req.audience.as_deref(),
+            req.reference_count,
+        ).map_err(Into::into)
+    }).map_err(|e| {
+        error!("保存创作记录失败: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    Ok(Json(SaveHistoryResponse { id }))
+}
+
+pub async fn list_history(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<crate::storage::repo::creation_history::CreationHistory>>, (StatusCode, String)> {
+    let histories = state.storage.with_conn(|conn| {
+        crate::storage::repo::creation_history::list_recent(conn, 50).map_err(Into::into)
+    }).map_err(|e| {
+        error!("查询创作记录失败: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    Ok(Json(histories))
+}

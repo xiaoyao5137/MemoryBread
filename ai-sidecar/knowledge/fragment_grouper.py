@@ -9,8 +9,50 @@ import re
 import logging
 import numpy as np
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+# 文档类 URL 识别：用于"一份文档独占一个 timeline"的边界判断。
+_DOC_URL_MARKERS = (
+    'docs.corp', '/docs/', 'docs.google', '/document/', 'yuque.com',
+    'feishu.cn/docx', 'feishu.cn/wiki', 'notion.so', 'confluence',
+    '/wiki/', 'shimo.im', '/d/home/', '/s/home/',
+)
+
+
+def _is_document_url(url: Optional[str]) -> bool:
+    """URL 是否指向一份文档。"""
+    if not url:
+        return False
+    u = url.strip().lower()
+    if not u:
+        return False
+    return any(marker in u for marker in _DOC_URL_MARKERS)
+
+
+def _document_identity(url: Optional[str]) -> Optional[str]:
+    """从文档 URL 提取稳定的文档标识，用于区分"是否同一份文档"。
+
+    多数企业文档形如 https://docs.corp.x.com/d/home/<docId>，docId 段唯一标识一份文档。
+    取 path 最后一个非空段作为标识；无法解析时回退到去掉 query/fragment 的完整 path。
+    """
+    if not _is_document_url(url):
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return None
+    path = (parsed.path or '').rstrip('/')
+    if not path:
+        return (parsed.netloc or url).lower()
+    last_segment = path.rsplit('/', 1)[-1]
+    # docId 通常是较长的标识串；过短的段（如 home/d）回退到完整 path 以免误并不同文档。
+    if len(last_segment) >= 6:
+        return f"{parsed.netloc.lower()}::{last_segment}"
+    return f"{parsed.netloc.lower()}::{path.lower()}"
+
+
 
 _HISTORY_APP_KEYWORDS = (
     'wechat', 'wecom', 'feishu', 'slack', 'teams', 'discord',
@@ -96,6 +138,16 @@ class FragmentGrouper:
                 current_vectors = [vectors[i]] if vectors else []
                 continue
 
+            # 规则1.5：文档边界 —— 一份文档独占一个片段。
+            # 当前组的"主文档"由组内首个文档型 capture 确定；
+            # 新 capture 指向不同文档，或在文档组里出现非文档内容时，强制切断。
+            doc_split = self._document_boundary_split(current_group, curr)
+            if doc_split:
+                groups.append(current_group)
+                current_group = [curr]
+                current_vectors = [vectors[i]] if vectors else []
+                continue
+
             # 规则2/3/4：语义判断
             if vectors:
                 should_merge = self._semantic_judge(
@@ -105,6 +157,15 @@ class FragmentGrouper:
                     current_group=current_group,
                     curr_capture=curr,
                 )
+                # 夹心检测：curr 与主题相似度不高，但下一条会回归主题 → curr 是短暂插入，强制切断
+                if should_merge and i + 1 < len(captures):
+                    theme_vec = self._compute_theme_vector(current_vectors)
+                    curr_sim = self._cosine_similarity(vectors[i], theme_vec)
+                    if curr_sim < self.SAME_TASK_THRESHOLD:
+                        next_sim = self._cosine_similarity(vectors[i + 1], theme_vec)
+                        next_gap = (captures[i + 1]['ts'] - curr['ts']) / 60000
+                        if next_sim >= self.SAME_TASK_THRESHOLD and next_gap < self.SOFT_SPLIT_MINUTES:
+                            should_merge = False
             else:
                 # 无向量模型时，退化为关键词判断
                 should_merge = self._keyword_judge(current_group, curr)
@@ -127,6 +188,42 @@ class FragmentGrouper:
     # ─────────────────────────────────────────────────────────────────────────
     # 内部方法
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _group_primary_document(self, group: list[dict]) -> Optional[str]:
+        """当前组的主文档标识：组内第一个文档型 capture 决定。无则 None。"""
+        for cap in group:
+            ident = _document_identity(cap.get('url'))
+            if ident:
+                return ident
+        return None
+
+    def _document_boundary_split(self, current_group: list[dict], curr: dict) -> bool:
+        """判断是否因文档边界而强制切片。
+
+        规则（"一份文档独占一个片段，且片段聚焦同一份文档"）：
+        - 组已有主文档 A（文档组）：严格排他，只接纳 A 自己的后续浏览。
+            * curr 是文档 A → 不切（继续浏览同一文档）
+            * curr 是其它文档 B → 切（B 另起一组）
+            * curr 非文档型 → 切（IM/编码等杂项不并入文档组，避免污染）
+        - 组无主文档（操作/IM/编码组）：
+            * curr 是文档型 → 切（让文档干净地独占新组）
+            * curr 非文档型 → 不切（留给语义判断）
+        """
+        curr_doc = _document_identity(curr.get('url'))
+        primary_doc = self._group_primary_document(current_group)
+
+        if primary_doc is not None:
+            if curr_doc == primary_doc:
+                return False
+            if curr_doc is not None and curr_doc != primary_doc:
+                return True
+            # curr 非文档型：文档组一旦确立即严格排他，
+            # 不让 IM/编码等杂项靠应用回归吸附进来污染文档 timeline。
+            return True
+        else:
+            if curr_doc is not None:
+                return True
+            return False
 
     def _batch_encode(self, captures: list[dict]) -> Optional[list]:
         """批量向量化所有 captures"""

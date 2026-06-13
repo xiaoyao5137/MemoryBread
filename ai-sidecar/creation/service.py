@@ -73,15 +73,25 @@ class CreationService:
         self,
         ollama_base_url: str = "http://localhost:11434",
         db_path: str | None = None,
-        model: str | None = None,  # 默认 None，自动使用全局统一模型
+        model: str | None = None,
+        enable_vector_recall: bool = True,
     ):
         self.ollama_base_url = ollama_base_url
-        # 使用全局统一的 Ollama 模型名，避免频繁 swap
         if model is None:
             from model_registry_global import get_active_ollama_model
             model = get_active_ollama_model()
         self.model = model
         self.db_path = db_path or str(Path.home() / ".memory-bread" / "memory-bread.db")
+        self.enable_vector_recall = enable_vector_recall
+        self._embedding_model = None
+        if enable_vector_recall:
+            try:
+                from embedding.model import EmbeddingModel
+                self._embedding_model = EmbeddingModel.create_default()
+                logger.info("向量召回已启用，embedding模型: %s", self._embedding_model.model_name)
+            except Exception as e:
+                logger.warning("初始化embedding模型失败，将禁用向量召回: %s", e)
+                self.enable_vector_recall = False
 
     async def generate_document(
         self,
@@ -206,25 +216,44 @@ class CreationService:
         parsed_requirement: dict,
         options: CreationOptions,
     ) -> list[ReferenceDocument]:
-        """从 bake_documents 中召回参考资料并按内容、质量、完整性、热度、格式、时效加权。"""
+        """多路召回：关键词召回 + 向量召回，融合排序。"""
         db = Path(self.db_path)
         if not db.exists():
             logger.warning("知识库数据库不存在: %s", db)
             return []
 
+        # 路径1: 关键词召回
         try:
-            rows = self._query_document_rows(user_prompt, parsed_requirement, options)
+            keyword_rows = self._query_document_rows(user_prompt, parsed_requirement, options)
         except Exception as exc:
-            logger.warning("召回参考文档失败: %s", exc)
+            logger.warning("关键词召回失败: %s", exc)
+            keyword_rows = []
+
+        # 路径2: 向量召回
+        vector_rows = []
+        if self.enable_vector_recall and self._embedding_model:
+            try:
+                vector_rows = self._vector_recall(user_prompt, options.max_references * 2)
+            except Exception as exc:
+                logger.warning("向量召回失败: %s", exc)
+
+        # 合并去重
+        seen_ids = set()
+        merged_rows = []
+        for row in keyword_rows + vector_rows:
+            doc_id = int(row.get("id") or 0)
+            if doc_id and doc_id not in seen_ids:
+                seen_ids.add(doc_id)
+                merged_rows.append(row)
+
+        if not merged_rows:
             return []
 
-        if not rows:
-            return []
-
-        max_usage = max(int(row.get("usage_count") or 0) for row in rows) or 1
+        # 统一评分
+        max_usage = max(int(row.get("usage_count") or 0) for row in merged_rows) or 1
         now_ms = int(time.time() * 1000)
         refs: list[ReferenceDocument] = []
-        for row in rows:
+        for row in merged_rows:
             relevance = self._score_relevance(row, parsed_requirement)
             quality = self._score_quality(row)
             completeness = self._score_completeness(row)
@@ -240,6 +269,10 @@ class CreationService:
                 + format_score * options.format_weight
                 + freshness * options.freshness_weight
             )
+
+            # 宁缺毋滥：相关性低于阈值直接丢弃
+            if relevance < 0.25 or (relevance < 0.4 and final < 0.6):
+                continue
 
             refs.append(
                 ReferenceDocument(
@@ -312,13 +345,13 @@ class CreationService:
         for term in like_terms:
             pattern = f"%{term}%"
             keyword_clauses.append(
-                "(title LIKE ? OR doc_type LIKE ? OR COALESCE(summary, '') LIKE ? OR "
-                "COALESCE(full_content, '') LIKE ? OR COALESCE(sections_json, '') LIKE ? OR "
-                "COALESCE(prompt_hint, '') LIKE ?)"
+                "CASE WHEN (title LIKE ? OR COALESCE(summary, '') LIKE ? OR "
+                "COALESCE(full_content, '') LIKE ?) THEN 1 ELSE 0 END"
             )
-            params.extend([pattern] * 6)
+            params.extend([pattern] * 3)
         if keyword_clauses:
-            clauses.append("(" + " OR ".join(keyword_clauses) + ")")
+            min_matches = max(1, len(like_terms) // 2)  # 至少匹配一半关键词
+            clauses.append(f"({' + '.join(keyword_clauses)}) >= {min_matches}")
 
         sql = f"""
             SELECT id, title, doc_type, summary, full_content, sections_json, style_phrases,
@@ -352,6 +385,70 @@ class CreationService:
             ]
         finally:
             conn.close()
+
+    def _vector_recall(self, query: str, limit: int = 10) -> list[dict]:
+        """向量召回：通过embedding相似度召回文档。"""
+        if not self._embedding_model:
+            return []
+
+        # 生成query向量
+        try:
+            query_emb = self._embedding_model.encode([query])[0]
+            query_vector = query_emb.vector
+        except Exception as e:
+            logger.error("生成query向量失败: %s", e)
+            return []
+
+        # 从数据库加载所有文档及其内容
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, title, doc_type, summary, full_content, sections_json, style_phrases,
+                       prompt_hint, usage_count, review_status, updated_at
+                FROM bake_documents
+                WHERE deleted_at IS NULL AND full_content IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT 100
+                """
+            ).fetchall()
+
+            if not rows:
+                return []
+
+            # 计算相似度
+            scored_docs = []
+            for row in rows:
+                text = (row["summary"] or "") + "\n" + (row["full_content"] or "")[:500]
+                if not text.strip():
+                    continue
+                try:
+                    doc_emb = self._embedding_model.encode([text])[0]
+                    doc_vector = doc_emb.vector
+                    similarity = self._cosine_similarity(query_vector, doc_vector)
+                    if similarity > 0.5:  # 相似度阈值
+                        scored_docs.append((dict(row), similarity))
+                except Exception as e:
+                    logger.debug("计算文档 %s 向量失败: %s", row["id"], e)
+                    continue
+
+            # 按相似度排序
+            scored_docs.sort(key=lambda x: x[1], reverse=True)
+            logger.info("向量召回: %d个文档（相似度>0.5）", len(scored_docs))
+            return [doc for doc, score in scored_docs[:limit]]
+
+        finally:
+            conn.close()
+
+    def _cosine_similarity(self, vec1: list[float], vec2: list[float]) -> float:
+        """计算余弦相似度。"""
+        dot = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = math.sqrt(sum(a * a for a in vec1))
+        norm2 = math.sqrt(sum(b * b for b in vec2))
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot / (norm1 * norm2)
 
     def _build_search_queries(self, user_prompt: str, parsed_requirement: dict) -> list[str]:
         topic = parsed_requirement.get("topic") or user_prompt
@@ -597,7 +694,25 @@ class CreationService:
         return "专业清晰"
 
     def _extract_keywords(self, text: str) -> list[str]:
-        tokens = re.findall(r"[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9_-]{1,}", text)
+        try:
+            import jieba
+            tokens = list(jieba.cut(text))
+        except (ImportError, Exception):
+            # 智能切分：优先长词，避免重叠
+            tokens = []
+            text_clean = text.replace("生成一份", "").replace("帮我", "")
+            i = 0
+            while i < len(text_clean):
+                matched = False
+                for length in [6, 5, 4, 3, 2]:
+                    if i + length <= len(text_clean):
+                        token = text_clean[i:i+length]
+                        if all(c not in "的了是在" for c in token):
+                            tokens.append(token)
+                            matched = True
+                            break
+                i += 1 if not matched else length
+
         stop = {"帮我", "生成", "一份", "关于", "根据", "参考", "文档", "内容", "格式", "需要", "本次"}
         seen: set[str] = set()
         result: list[str] = []
@@ -615,10 +730,12 @@ class CreationService:
         )
         keywords = parsed_requirement.get("keywords") or []
         if not keywords:
-            return 0.45
+            return 0.35
         hits = sum(1 for word in keywords if word and word in haystack)
         title_hits = sum(1 for word in keywords if word and word in str(row.get("title") or ""))
-        score = (hits / max(len(keywords), 1)) * 0.75 + min(title_hits, 3) * 0.08
+        score = (hits / max(len(keywords), 1)) + min(title_hits, 3) * 0.12
+        if score < 0.4:  # 相关度过低直接返回0
+            return 0.0
         if parsed_requirement.get("doc_type") and parsed_requirement["doc_type"] == row.get("doc_type"):
             score += 0.15
         return min(score, 1.0)

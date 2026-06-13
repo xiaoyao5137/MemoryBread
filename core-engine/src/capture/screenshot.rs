@@ -275,45 +275,66 @@ fn capture_focused_window_image() -> Result<image::RgbaImage, String> {
         return Err("Window::all 返回空列表".into());
     }
 
-    let mut focused: Option<Window> = None;
+    // 注意：xcap 在 macOS 上的 is_focused() 是「应用级」判断（只比较进程 PID），
+    // 而非「窗口级」。当前台应用弹出下拉框 / popup / 输入法候选框时，这些都是
+    // 属于同一进程的独立窗口，is_focused() 同样返回 true。因此不能取第一个就 break，
+    // 否则可能选中那个面积很小的弹层而漏掉真正的软件主框体。
+    // 策略：收集所有 focused 且未最小化的窗口，选面积最大的作为主框体。
+    const MIN_WINDOW_WIDTH: u32 = 200;
+    const MIN_WINDOW_HEIGHT: u32 = 150;
+
     let mut focused_check_errors: Vec<String> = Vec::new();
+    let mut candidates: Vec<(Window, u32, u32, u64)> = Vec::new();
     for w in windows {
         match w.is_focused() {
             Ok(true) => {
-                focused = Some(w);
-                break;
+                if w.is_minimized().unwrap_or(false) {
+                    continue;
+                }
+                let width = w.width().unwrap_or(0);
+                let height = w.height().unwrap_or(0);
+                let area = (width as u64) * (height as u64);
+                candidates.push((w, width, height, area));
             }
             Ok(false) => {}
             Err(e) => focused_check_errors.push(format!("is_focused err: {e}")),
         }
     }
 
-    let win = focused.ok_or_else(|| {
-        if focused_check_errors.is_empty() {
-            "无 focused 窗口（可能处于 Mission Control / 桌面 / 菜单栏弹层）".to_string()
+    if candidates.is_empty() {
+        return Err(if focused_check_errors.is_empty() {
+            "无 focused 窗口（可能处于 Mission Control / 桌面 / 菜单栏弹层 / 窗口已最小化）"
+                .to_string()
         } else {
             format!(
                 "无 focused 窗口；is_focused 调用错误 {} 次：{}",
                 focused_check_errors.len(),
                 focused_check_errors.join("; ")
             )
-        }
-    })?;
+        });
+    }
+
+    let candidate_count = candidates.len();
+    // 同一前台应用可能有多个 focused 窗口（主窗体 + 下拉框等弹层），取面积最大的主框体。
+    candidates.sort_by(|a, b| b.3.cmp(&a.3));
+    let (win, width, height, _area) = candidates.into_iter().next().unwrap();
 
     let app_name = win.app_name().unwrap_or_default();
     let win_title = win.title().unwrap_or_default();
 
-    if win.is_minimized().unwrap_or(false) {
-        return Err(format!(
-            "focused 窗口已最小化 app={app_name:?} title={win_title:?}"
-        ));
+    if candidate_count > 1 {
+        tracing::debug!(
+            app = %app_name,
+            title = %win_title,
+            candidate_count,
+            chosen = format!("{width}x{height}"),
+            "同一前台应用存在多个 focused 窗口，已选面积最大的主框体（排除下拉框 / 弹层）"
+        );
     }
 
-    let width = win.width().unwrap_or(0);
-    let height = win.height().unwrap_or(0);
-    if width == 0 || height == 0 {
+    if width < MIN_WINDOW_WIDTH || height < MIN_WINDOW_HEIGHT {
         return Err(format!(
-            "focused 窗口尺寸为 0 app={app_name:?} title={win_title:?} {width}x{height}"
+            "focused 窗口过小，跳过 app={app_name:?} title={win_title:?} {width}x{height}"
         ));
     }
 

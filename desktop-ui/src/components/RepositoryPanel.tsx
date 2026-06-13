@@ -260,6 +260,20 @@ const RepositoryPanel: React.FC = () => {
     setStatusMessage('已切换到已提炼知识页；来源 knowledge 不在这里展示')
   }
 
+  const handleViewRelatedDocument = async (timelineId: string) => {
+    try {
+      const { items: templates } = await fetchMemories({ limit: 1000 })
+      // Note: This requires API support for fetching templates with sourceMemoryIds
+      // For now, we'll navigate to templates tab and let user search
+      setWindowMode('bake')
+      setBakeTab('templates')
+      setSelectedTemplateId(null)
+      setStatusMessage('已切换到文档页，请在该页面中查找关联文档')
+    } catch (error) {
+      setStatusMessage('查询关联文档失败')
+    }
+  }
+
   const handleViewLinkedTimeline = (timelineId?: string | null) => {
     if (!timelineId) {
       setStatusMessage('该采集尚未归入任何时间线')
@@ -599,6 +613,7 @@ const RepositoryPanel: React.FC = () => {
                         setStatusMessage('已切换到来源采集记录')
                       }}>来源采集记录</BakeButton>
                       <BakeButton compact onClick={() => handleViewLinkedKnowledge(selectedMemory.sourceTimelineId)}>关联时间线</BakeButton>
+                      <BakeButton compact onClick={() => handleViewRelatedDocument(selectedMemory.id)}>关联文档</BakeButton>
                     </div>
                   </div>
                 </div>

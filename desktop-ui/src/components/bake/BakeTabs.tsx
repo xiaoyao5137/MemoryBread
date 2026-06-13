@@ -6,7 +6,7 @@ const tabs: Array<{ key: BakeTab; label: string }> = [
   { key: 'overview', label: '总览' },
   { key: 'templates', label: '文档' },
   { key: 'knowledge', label: '知识' },
-  { key: 'sop', label: '操作手册' },
+  { key: 'sop', label: '操作' },
 ]
 
 const BakeTabs: React.FC<{

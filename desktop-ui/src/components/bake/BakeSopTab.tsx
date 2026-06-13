@@ -106,9 +106,9 @@ const BakeSopTab: React.FC<{
     <>
       <BakeCard>
         <BakeSectionHeader
-          title="操作手册"
+          title="操作"
           subtitle="管理可复用的操作流程和最佳实践"
-          right={onCreateSop && <BakeButton primary onClick={() => setShowCreateDialog(true)}>新建手册</BakeButton>}
+          right={onCreateSop && <BakeButton primary onClick={() => setShowCreateDialog(true)}>新建</BakeButton>}
         />
         <div className="bake-list-toolbar">
           <div className="bake-list-toolbar__filters">

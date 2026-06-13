@@ -38,6 +38,7 @@ const BakeMemoriesTab: React.FC<{
   onIgnoreMemory: (id: string) => void
   onCopyMemory: (memory: TimelineItem) => void
   onOpenMemoryLink: (url?: string, sourceCaptureId?: string) => void
+  onViewRelatedDocument: (timelineId: string) => void
   onInitializeMemories: () => void
   isInitializing: boolean
   modelsReady?: boolean
@@ -55,6 +56,7 @@ const BakeMemoriesTab: React.FC<{
   onIgnoreMemory,
   onCopyMemory,
   onOpenMemoryLink,
+  onViewRelatedDocument,
   onInitializeMemories,
   isInitializing,
   modelsReady = true,
@@ -100,10 +102,9 @@ const BakeMemoriesTab: React.FC<{
                     <div className="bake-list-item__title bake-line-clamp-1">{item.title}</div>
                     <div className="bake-muted bake-line-clamp-2">{item.summary || '暂无摘要'}</div>
                     <div className="bake-memory-list-item__meta">
-                      <span>创建于 {formatMemoryTime(item)}</span>
+                      <span>#{item.id}</span>
+                      <span>{formatMemoryTime(item)}</span>
                       <span>权重 {item.weight}</span>
-                      <span>打开 {item.openCount} 次</span>
-                      <span>停留 {item.dwellSeconds}s</span>
                     </div>
                   </button>
                 )
@@ -130,26 +131,34 @@ const BakeMemoriesTab: React.FC<{
               <div className="bake-inline-meta">
                 <div style={{ minWidth: 0 }}>
                   <div className="bake-title" style={{ fontSize: 20, lineHeight: 1.4 }}>{selected.title}</div>
-                  <div className="bake-muted bake-line-clamp-1" style={{ marginTop: 6 }}>{selected.url || `片段 #${selected.sourceCaptureId || '—'}`}</div>
                 </div>
                 <BakePill text={`建议：${selected.suggestedAction || 'template'}`} />
               </div>
               <div className="bake-memory-detail__stats">
+                <span className="bake-stat-chip">ID #{selected.id}</span>
                 <span className="bake-stat-chip">创建于 {formatMemoryTime(selected)}</span>
                 <span className="bake-stat-chip">权重 {selected.weight}</span>
-                <span className="bake-stat-chip">打开 {selected.openCount} 次</span>
-                <span className="bake-stat-chip">停留 {selected.dwellSeconds}s</span>
                 <span className="bake-stat-chip">重复观察 {selected.knowledgeRefCount} 次</span>
               </div>
+              {selected.url && (
+                <a
+                  href={selected.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="bake-memory-detail__url-chip"
+                  title={selected.url}
+                >
+                  🔗 {selected.url}
+                </a>
+              )}
             </div>
 
             <div className="bake-kv bake-memory-detail__content-block">
               <div>
                 <div className="bake-kv__title">系统判断原因</div>
                 <div className="bake-muted" style={{ lineHeight: 1.8 }}>
-                  最近 7 天访问 {selected.openCount} 次，累计停留 {selected.dwellSeconds}s，
-                  {selected.hasEditAction ? '存在编辑行为，' : '暂无编辑行为，'}
-                  已被重复观察 {selected.knowledgeRefCount} 次。
+                  已被重复观察 {selected.knowledgeRefCount} 次，权重 {selected.weight}。
+                  {selected.hasEditAction ? '存在编辑行为。' : ''}
                 </div>
               </div>
               <div>
@@ -227,10 +236,11 @@ const BakeMemoriesTab: React.FC<{
               <div className="bake-memory-action-card bake-memory-action-card--secondary">
                 <div>
                   <div className="bake-kv__title">辅助操作</div>
-                  <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>回看来源采集记录、复制链接与忽略操作单独放置，避免和提炼动作混在一起。</div>
+                  <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>回看来源采集记录、关联文档、复制链接与忽略操作单独放置，避免和提炼动作混在一起。</div>
                 </div>
                 <div className="bake-actions bake-actions--secondary bake-memory-detail__action-copy">
                   <BakeButton compact onClick={() => onOpenMemoryLink(selected.url, selected.sourceCaptureId)}>来源采集记录</BakeButton>
+                  <BakeButton compact onClick={() => onViewRelatedDocument(selected.id)}>关联文档</BakeButton>
                   <BakeButton compact onClick={() => onCopyMemory(selected)}>复制标题/链接</BakeButton>
                   <BakeButton compact onClick={() => onIgnoreMemory(selected.id)}>忽略</BakeButton>
                 </div>

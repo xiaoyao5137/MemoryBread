@@ -48,20 +48,13 @@ def check_model_available(model_name: str | None = None) -> bool:
         except Exception:
             model_name = "qwen3.5:4b"
     try:
-        from ollama import Client
-        client = Client()
-        models = client.list()
-
-        # 兼容新版 ollama SDK 的 ListResponse 和旧版 dict 响应。
-        model_items = getattr(models, 'models', None)
-        if model_items is None and isinstance(models, dict):
-            model_items = models.get('models', [])
-
-        for model in model_items or []:
-            candidate = getattr(model, 'model', None)
-            if candidate is None and isinstance(model, dict):
-                candidate = model.get('model') or model.get('name')
-            if candidate == model_name:
+        import urllib.request
+        import json
+        with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        for model in data.get('models', []):
+            candidate = model.get('model') or model.get('name', '')
+            if candidate == model_name or candidate.split(':')[0] == model_name.split(':')[0]:
                 return True
         return False
     except Exception as exc:

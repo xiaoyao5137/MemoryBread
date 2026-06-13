@@ -266,14 +266,11 @@ export function useFetchBakeMemories() {
       return url
     }
 
-    let resp = await fetch(buildUrl('/api/bake/memories').toString())
-    if (resp.status === 404) {
-      resp = await fetch(buildUrl('/api/bake/articles').toString())
-    }
-    if (!resp.ok) throw new Error(`bake memories fetch failed: ${resp.status}`)
+    const resp = await fetch(buildUrl('/api/knowledge').toString())
+    if (!resp.ok) throw new Error(`timelines fetch failed: ${resp.status}`)
     const data = await resp.json()
     return {
-      items: (data.memories ?? data.articles ?? []).map(mapBakeMemory),
+      items: (data.entries ?? []).map(mapKnowledgeEntryToTimeline),
       total: data.total ?? 0,
       limit: data.limit ?? params.limit ?? 20,
       offset: data.offset ?? params.offset ?? 0,
@@ -539,6 +536,29 @@ export function useUpdateBakeStyleConfig() {
       applyToTemplateEditing: item.apply_to_template_editing ?? true,
     }
   }, [apiBaseUrl])
+}
+
+function mapKnowledgeEntryToTimeline(item: any): TimelineItem {
+  return {
+    id: String(item.id),
+    title: item.summary ?? '',
+    summary: item.overview ?? item.summary,
+    details: item.details ?? undefined,
+    sourceCaptureId: item.capture_id != null ? String(item.capture_id) : '',
+    weight: item.importance ?? 3,
+    openCount: item.occurrence_count ?? 0,
+    dwellSeconds: 0,
+    hasEditAction: false,
+    knowledgeRefCount: 0,
+    status: 'confirmed' as const,
+    tags: [],
+    createdAt: item.created_at ?? '',
+    createdAtMs: item.created_at_ms ?? 0,
+    captureIds: item.capture_ids ?? [],
+    // 后端 KnowledgeEntry 通过 #[serde(rename = "keyTimestamps")] 序列化为驼峰，
+    // 这里优先读驼峰键，兼容历史 snake_case 以防回退。
+    keyTimestamps: item.keyTimestamps ?? item.key_timestamps ?? undefined,
+  }
 }
 
 function mapBakeMemory(item: any): TimelineItem {

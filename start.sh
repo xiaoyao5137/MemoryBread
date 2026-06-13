@@ -502,11 +502,11 @@ start_sidecar() {
     cleanup_port "$MODEL_API_PORT" "Model API / RAG API"
 
     # 启动 Sidecar（后台运行）
-    nohup python main.py > "$SIDECAR_LOG" 2>&1 &
+    nohup .venv/bin/python main.py > "$SIDECAR_LOG" 2>&1 &
     echo $! > "$SIDECAR_PID_FILE"
 
     # 启动 Model API / RAG API Server（后台运行）
-    nohup python model_api_server.py > "$MODEL_API_LOG" 2>&1 &
+    nohup .venv/bin/python model_api_server.py > "$MODEL_API_LOG" 2>&1 &
     echo $! > "$MODEL_API_PID_FILE"
 
     log_success "AI Sidecar 已启动 (PID: $(cat "$SIDECAR_PID_FILE"))"
@@ -548,7 +548,7 @@ start_creation_service() {
 
     cleanup_port "$CREATION_PORT" "Creation Service"
 
-    nohup python start_creation_service.py > "$CREATION_LOG" 2>&1 < /dev/null &
+    nohup .venv/bin/python start_creation_service.py > "$CREATION_LOG" 2>&1 < /dev/null &
     echo $! > "$CREATION_PID_FILE"
     disown "$(cat "$CREATION_PID_FILE")" 2>/dev/null || true
 

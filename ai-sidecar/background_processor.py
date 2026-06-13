@@ -340,13 +340,13 @@ class BackgroundProcessor:
         app_kws = tuple(k.lower() for k in _SELF_GENERATED_APP_KEYWORDS)
         win_kws = tuple(k.lower() for k in _SELF_GENERATED_WINDOW_KEYWORDS)
         app_not_like = " AND ".join(
-            f"LOWER(c.app_name) NOT LIKE '%{k}%'" for k in app_kws
+            f"LOWER(COALESCE(c.app_name, '')) NOT LIKE '%{k}%'" for k in app_kws
         )
         win_not_like = " AND ".join(
-            f"LOWER(c.win_title) NOT LIKE '%{k}%'" for k in win_kws
+            f"LOWER(COALESCE(c.win_title, '')) NOT LIKE '%{k}%'" for k in win_kws
         )
         cursor.execute(f"""
-            SELECT c.id, c.ts, c.app_name, c.win_title, c.ocr_text, c.ax_text
+            SELECT c.id, c.ts, c.app_name, c.win_title, c.ocr_text, c.ax_text, c.url
             FROM captures c
             WHERE ((c.ocr_text IS NOT NULL AND c.ocr_text != '')
                OR (c.ax_text IS NOT NULL AND c.ax_text != ''))
@@ -362,8 +362,42 @@ class BackgroundProcessor:
             {
                 'id': r[0], 'ts': r[1], 'app_name': r[2],
                 'window_title': r[3], 'ocr_text': r[4], 'ax_text': r[5],
+                'url': r[6],
             }
             for r in rows
+        ]
+
+    # 跨批上下文回溯条数：用于判断新 batch 开头是否与前一批末尾属于同一件事
+    _CROSS_BATCH_CONTEXT_N = 5
+
+    def _get_recent_processed_captures(self, conn: sqlite3.Connection, before_ts: int) -> list[dict]:
+        """查出 before_ts 之前最近已处理的 N 条 captures，用于跨批语义判断。
+        每条附带所属 timeline_id，供合并时使用。"""
+        app_kws = tuple(k.lower() for k in _SELF_GENERATED_APP_KEYWORDS)
+        win_kws = tuple(k.lower() for k in _SELF_GENERATED_WINDOW_KEYWORDS)
+        app_not_like = " AND ".join(f"LOWER(COALESCE(c.app_name, '')) NOT LIKE '%{k}%'" for k in app_kws)
+        win_not_like = " AND ".join(f"LOWER(COALESCE(c.win_title, '')) NOT LIKE '%{k}%'" for k in win_kws)
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT c.id, c.ts, c.app_name, c.win_title, c.ocr_text, c.ax_text, c.timeline_id, c.url
+            FROM captures c
+            WHERE c.timeline_id IS NOT NULL
+              AND c.ts < ?
+              AND c.is_sensitive = 0
+              AND ({app_not_like})
+              AND ({win_not_like})
+            ORDER BY c.ts DESC
+            LIMIT ?
+        """, (before_ts, self._CROSS_BATCH_CONTEXT_N))
+        rows = cursor.fetchall()
+        # 返回时间升序（DESC 取出后反转）
+        return [
+            {
+                'id': r[0], 'ts': r[1], 'app_name': r[2],
+                'window_title': r[3], 'ocr_text': r[4], 'ax_text': r[5],
+                'timeline_id': r[6], 'url': r[7], '_is_context': True,  # 标记为前缀上下文
+            }
+            for r in reversed(rows)
         ]
 
     def _get_fragment_grouper(self):
@@ -490,6 +524,11 @@ class BackgroundProcessor:
         try:
             limit = limit_override or self.batch_size
             captures = self._get_unprocessed_captures(conn, limit)
+            # 跨批上下文：取当前 batch 第一条之前最近已处理的若干条，用于语义合并判断
+            context_prefix = (
+                self._get_recent_processed_captures(conn, captures[0]['ts'])
+                if captures else []
+            )
         finally:
             conn.close()
 
@@ -501,11 +540,10 @@ class BackgroundProcessor:
         last_capture = captures[-1]
 
         logger.info(
-            "📦 发现 %s 条待处理 captures，开始语义分组 (first_id=%s, last_id=%s, force_finalize_tail=%s)",
-            len(captures),
-            first_capture['id'],
-            last_capture['id'],
-            force_finalize_tail,
+            "📦 发现 %s 条待处理 captures，开始语义分组 (first_id=%s, last_id=%s, "
+            "context_prefix=%s force_finalize_tail=%s)",
+            len(captures), first_capture['id'], last_capture['id'],
+            len(context_prefix), force_finalize_tail,
         )
 
         if len(captures) < FragmentGrouper.MIN_GROUP_WAIT:
@@ -521,9 +559,19 @@ class BackgroundProcessor:
             if not should_finalize:
                 return self._build_skipped_summary(len(captures), reason)
             groups = [captures]
+            # 跨批上下文合并信号（小 batch 情况）
+            merge_first_group_into: Optional[int] = self._detect_cross_batch_merge(
+                context_prefix, captures
+            )
         else:
             grouper = self._get_fragment_grouper()
-            groups = grouper.group_captures(captures)
+            # 把前缀上下文拼在 batch 前面，让 grouper 感知跨批连续性
+            combined = context_prefix + captures
+            combined_groups = grouper.group_captures(combined)
+            # 分离：若第一组包含了前缀 captures，则其中的新 captures 应合并到前缀的 timeline
+            groups, merge_first_group_into = self._split_context_from_groups(
+                combined_groups, context_prefix, captures
+            )
 
         groups_to_process = groups[:-1] if len(groups) > 1 else []
         last_group = groups[-1] if groups else []
@@ -542,18 +590,14 @@ class BackgroundProcessor:
                 groups_to_process.append(last_group)
 
         logger.info(
-            "分组结果: captures=%s groups=%s process_now=%s last_group_size=%s last_group_idle=%.1fmin finalize_last=%s reason=%s",
-            len(captures),
-            len(groups),
-            len(groups_to_process),
-            len(last_group),
-            last_group_idle,
-            finalize_last_group,
-            finalize_reason,
+            "分组结果: captures=%s groups=%s process_now=%s last_group_size=%s "
+            "last_group_idle=%.1fmin finalize_last=%s reason=%s merge_into_timeline=%s",
+            len(captures), len(groups), len(groups_to_process), len(last_group),
+            last_group_idle, finalize_last_group, finalize_reason, merge_first_group_into,
         )
 
         if not groups_to_process:
-            logger.debug("所有 captures 可能仍属于进行中的任务，等待下一轮")
+            logger.info("跳过本轮: captures=%s reason=%s last_group_idle=%.1fmin", len(captures), finalize_reason, last_group_idle)
             return self._build_skipped_summary(len(captures), finalize_reason)
 
         return {
@@ -561,7 +605,75 @@ class BackgroundProcessor:
             "groups_to_process": groups_to_process,
             "fetched_count": len(captures),
             "finalize_reason": finalize_reason,
+            # 若第一组需要合并到已有 timeline，传递 timeline_id
+            "merge_first_group_into": merge_first_group_into,
         }
+
+    def _detect_cross_batch_merge(
+        self, context_prefix: list[dict], new_captures: list[dict]
+    ) -> Optional[int]:
+        """小 batch 情况下，判断新 captures 是否与前缀属于同一件事。
+        返回需要合并进的 timeline_id，或 None。"""
+        if not context_prefix or not new_captures:
+            return None
+        grouper = self._get_fragment_grouper()
+        combined = context_prefix + new_captures
+        groups = grouper.group_captures(combined)
+        if not groups:
+            return None
+        first_group = groups[0]
+        first_ids = {c['id'] for c in first_group}
+        has_prefix = any(c['id'] in first_ids for c in context_prefix)
+        has_new = any(c['id'] in first_ids for c in new_captures)
+        if has_prefix and has_new:
+            # 取前缀中的最后一个 timeline_id 作为合并目标
+            for c in reversed(context_prefix):
+                if c.get('timeline_id') and c['id'] in first_ids:
+                    return c['timeline_id']
+        return None
+
+    def _split_context_from_groups(
+        self,
+        combined_groups: list[list[dict]],
+        context_prefix: list[dict],
+        new_captures: list[dict],
+    ) -> tuple[list[list[dict]], Optional[int]]:
+        """把 grouper 对 (context_prefix + new_captures) 的分组结果拆开：
+        - 返回只含新 captures 的分组列表
+        - 若第一组混入了前缀 captures，提取 merge_into timeline_id
+        """
+        if not combined_groups:
+            return [new_captures], None
+
+        prefix_ids = {c['id'] for c in context_prefix}
+        new_ids = {c['id'] for c in new_captures}
+        merge_into: Optional[int] = None
+        result_groups: list[list[dict]] = []
+
+        for i, group in enumerate(combined_groups):
+            group_ids = {c['id'] for c in group}
+            has_prefix = bool(group_ids & prefix_ids)
+            has_new = bool(group_ids & new_ids)
+
+            if has_prefix and has_new and i == 0:
+                # 第一组跨越了前缀和新 captures：新 captures 部分需合并到前缀 timeline
+                new_part = [c for c in group if c['id'] in new_ids]
+                if new_part:
+                    # 找前缀中对应的 timeline_id
+                    for c in reversed(context_prefix):
+                        if c.get('timeline_id') and c['id'] in group_ids:
+                            merge_into = c['timeline_id']
+                            break
+                    result_groups.append(new_part)
+            elif has_new:
+                result_groups.append([c for c in group if c['id'] in new_ids])
+            # 纯前缀的组直接丢弃
+
+        # 若分组结果为空（所有新 captures 都被归入前缀组且已提取），保留原始 new_captures
+        if not result_groups and new_captures:
+            result_groups = [new_captures]
+
+        return result_groups, merge_into
 
     async def _run_batch(self, limit_override: Optional[int] = None, force_finalize_tail: bool = False) -> dict:
         batch = await asyncio.to_thread(self._process_batch_sync, limit_override, force_finalize_tail)
@@ -593,9 +705,28 @@ class BackgroundProcessor:
         process_lock_fd = await asyncio.to_thread(self._acquire_process_file_lock)
         try:
             processed = 0
-            for group in groups_to_process:
-                if await self._process_capture_group(group):
-                    processed += 1
+            merge_into = batch.get('merge_first_group_into')
+            for i, group in enumerate(groups_to_process):
+                # 第一组且有跨批合并信号时，直接追加到已有 timeline
+                # —— 但需先过文档边界守卫：不能把不同文档/非文档内容并进文档 timeline，
+                #    也不能把文档内容并进非文档 timeline，否则"一份文档独占 timeline"被破坏。
+                if i == 0 and merge_into and not self._doc_compatible_with_timeline(group, merge_into):
+                    logger.info(
+                        "🚫 跨批合并被文档边界拦截: group 与 timeline_id=%d 文档不一致，改为独立提炼",
+                        merge_into,
+                    )
+                    merge_into = None
+                if i == 0 and merge_into:
+                    if await self._append_captures_to_timeline(group, merge_into):
+                        processed += 1
+                        logger.info("🔀 跨批合并: %d 条 captures → timeline_id=%d", len(group), merge_into)
+                    else:
+                        # 追加失败退化为正常提炼
+                        if await self._process_capture_group(group):
+                            processed += 1
+                else:
+                    if await self._process_capture_group(group):
+                        processed += 1
                 asyncio.create_task(self._process_vectorization_batch(group))
                 await asyncio.sleep(0.5)
         finally:
@@ -705,6 +836,83 @@ class BackgroundProcessor:
         )
         conn.commit()
 
+    def _doc_compatible_with_timeline(self, group: list[dict], timeline_id: int) -> bool:
+        """文档边界守卫：判断 group 是否可跨批合并进 timeline_id。
+
+        规则与 FragmentGrouper 一致——"一份文档独占一个 timeline"：
+        - 目标 timeline 是文档型(成员含文档)：仅当 group 不含其它文档、且不引入非文档主体时可并。
+          简化为：group 的文档标识集合 ⊆ {目标文档} 即可（group 可继续浏览同一文档）。
+        - 目标 timeline 非文档型：group 不得含文档型 capture（文档要独立成 timeline）。
+        无法判定(查不到/无 url)时放行，保持原行为。
+        """
+        from knowledge.fragment_grouper import _document_identity
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                row = conn.execute(
+                    "SELECT capture_ids FROM timelines WHERE id = ?", (timeline_id,)
+                ).fetchone()
+                if not row or not row[0]:
+                    return True
+                member_ids = json.loads(row[0])
+                if not member_ids:
+                    return True
+                placeholders = ','.join('?' * len(member_ids))
+                urls = conn.execute(
+                    f"SELECT url FROM captures WHERE id IN ({placeholders})", member_ids
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning("文档边界守卫查询失败 timeline_id=%d: %s，放行", timeline_id, e)
+            return True
+
+        tl_docs = {d for d in (_document_identity(u[0]) for u in urls) if d}
+        grp_docs = {d for d in (_document_identity(c.get('url')) for c in group) if d}
+
+        if tl_docs:
+            # 文档型 timeline：group 只能是同一份文档（或无文档的同主题续浏览由语义层把关，
+            # 但为保纯净，group 引入任何不同文档即拦截）
+            return grp_docs.issubset(tl_docs)
+        else:
+            # 非文档 timeline：group 不得带入文档型 capture
+            return len(grp_docs) == 0
+
+    async def _append_captures_to_timeline(self, group: list[dict], timeline_id: int) -> bool:
+        """跨批合并：把 group 里的新 captures 追加到已有 timeline（occurrence_count+1，更新 end_time）。
+        不调 LLM，直接标记 captures 已处理并更新 timeline 的时间范围。"""
+        try:
+            capture_ids = [c['id'] for c in group]
+            conn = sqlite3.connect(self.db_path)
+            try:
+                # 检查 timeline 仍存在
+                row = conn.execute(
+                    "SELECT id, capture_ids, end_time FROM timelines WHERE id = ?", (timeline_id,)
+                ).fetchone()
+                if not row:
+                    return False
+                # 合并 capture_ids JSON
+                existing_ids = json.loads(row[1] or '[]') if row[1] else []
+                merged_ids = existing_ids + [c for c in capture_ids if c not in existing_ids]
+                new_end_time = max((c['ts'] for c in group), default=row[2] or 0)
+                conn.execute(
+                    """UPDATE timelines SET
+                         capture_ids = ?,
+                         end_time = MAX(COALESCE(end_time, 0), ?),
+                         occurrence_count = occurrence_count + 1,
+                         updated_at_ms = ?
+                       WHERE id = ?""",
+                    (json.dumps(merged_ids), new_end_time, int(time.time() * 1000), timeline_id),
+                )
+                conn.commit()
+                self._mark_captures_processed(conn, capture_ids, timeline_id)
+            finally:
+                conn.close()
+            return True
+        except Exception as e:
+            logger.warning("跨批追加 timeline 失败 timeline_id=%d: %s", timeline_id, e)
+            return False
+
     def _group_idle_minutes(self, group: list[dict], now_ms: int) -> float:
         """计算片段距当前时间的静默分钟数"""
         if not group:
@@ -729,6 +937,11 @@ class BackgroundProcessor:
 
         if idle_minutes >= hard_window:
             return True, 'hard_timeout'
+
+        # 最老的 capture 已经等超过 hard_window，无论最新一条多新都应落库
+        oldest_age_minutes = max(0.0, (now_ms - group[0]['ts']) / 60000)
+        if oldest_age_minutes >= hard_window:
+            return True, 'oldest_capture_timeout'
 
         if group_size >= min_group_wait and idle_minutes >= soft_window:
             return True, 'idle_window_reached'
@@ -1153,7 +1366,10 @@ class BackgroundProcessor:
                       AND NOT EXISTS (
                           SELECT 1 FROM bake_documents bd
                           WHERE bd.deleted_at IS NULL
-                            AND bd.source_episode_ids LIKE '%' || t.id || '%'
+                            AND EXISTS (
+                                SELECT 1 FROM json_each(bd.source_episode_ids)
+                                WHERE json_each.value = CAST(t.id AS TEXT)
+                            )
                       )
                 """)
                 row = cursor.fetchone()

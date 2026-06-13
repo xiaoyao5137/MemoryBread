@@ -4,7 +4,7 @@ import sys
 import uvicorn
 
 # 添加项目根目录到 Python 路径
-sys.path.insert(0, '/Users/xianjiaqi/Documents/mygit/cy/gzdz/ai-sidecar')
+sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
 
 from creation.app import app
 

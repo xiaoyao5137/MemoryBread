@@ -1,8 +1,10 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::api::error::ApiError;
 use crate::storage::models::CaptureRecord;
@@ -335,6 +337,24 @@ pub struct BakeArtifactExtraction {
     pub accepted: bool,
     pub reason: Option<String>,
     pub payload: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BakeMergeDocumentRequest {
+    pub existing_document: Value,
+    pub candidate: BakeExtractCandidatePayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BakeMergeDocumentResponse {
+    pub title: String,
+    pub summary: Option<String>,
+    pub full_content: Option<String>,
+    pub evidence_summary: Option<String>,
+    pub match_score: Option<f64>,
+    pub match_level: Option<String>,
+    #[serde(default)]
+    pub no_change: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1201,16 +1221,16 @@ impl BakeService {
         started_at: i64,
         limit: usize,
     ) -> Result<BakeRunPayload, ApiError> {
+        // 并行化并发度上限：LLM extract 并行，persist 串行保持正确性
+        const EXTRACT_CONCURRENCY: usize = 3;
+
         tracing::info!("bake run {} execute_bake_pipeline start", run_id);
-        let existing_sops = self.storage.list_timelines_by_category(CATEGORY_BAKE_SOP)?;
-        let existing_knowledge = self.storage.list_bake_knowledge_paginated(None, 500, 0)?;
+
+        // document 去重仍需全量（需要 URL 去重 + source_episode_ids JSON 解析），沿用原逻辑
         let existing_documents = self.storage.list_bake_documents()?;
         let watermark = self
             .storage
             .get_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME)?;
-        let mut existing_sop_sources = collect_current_bake_source_timeline_ids(&existing_sops);
-        let mut existing_knowledge_sources =
-            collect_current_bake_source_timeline_ids(&existing_knowledge);
         let mut existing_document_sources =
             collect_current_document_source_timeline_ids(&existing_documents);
         let mut existing_document_urls: std::collections::HashSet<String> = existing_documents
@@ -1231,33 +1251,66 @@ impl BakeService {
                 MAX_BAKE_RETRY_FAILURES,
             )?;
 
+        // 增量查询：只针对本批候选的 timeline_id 集合查已有 knowledge/sop，
+        // 避免全量拉取 500 条导致随数据增长内存和时间开销膨胀。
+        let candidate_timeline_ids: Vec<i64> = candidates.iter().map(|c| c.timeline.id).collect();
+        let mut existing_knowledge_sources = self
+            .storage
+            .find_existing_knowledge_timeline_ids(&candidate_timeline_ids)
+            .map_err(|e| ApiError::Internal(format!("查询已有 knowledge 失败: {e}")))?;
+        let mut existing_sop_sources = self
+            .storage
+            .find_existing_sop_timeline_ids(&candidate_timeline_ids)
+            .map_err(|e| ApiError::Internal(format!("查询已有 sop 失败: {e}")))?;
+
         // Watermark 自动回退：如果 watermark 已超过所有现有 timeline 的 updated_at_ms，
         // 导致候选列表为空（真正有 pending 的情况下），则把 watermark 重置为 0 重新扫描全量。
-        // 这解决 watermark 过大导致历史积压的 timeline 永远被跳过的问题。
+        // 修复：同时检查 knowledge / sop / document 三类，避免 document 候选被误判为"无 pending"。
         let candidates = if candidates.is_empty() && max_processed_ts > 0 {
-            // 检查是否真的有 pending （不考虑 watermark ）
-            let any_pending = self
+            let probe = self
                 .storage
                 .list_bake_memory_init_candidates_with_max_failures(
                     0,
                     1,
                     MAX_BAKE_RETRY_FAILURES,
-                )?
-                .into_iter()
-                .any(|c| !existing_sop_sources.contains(&c.timeline.id)
-                      && !existing_knowledge_sources.contains(&c.timeline.id));
+                )?;
+            let probe_ids: Vec<i64> = probe.iter().map(|c| c.timeline.id).collect();
+            let probe_knowledge = self
+                .storage
+                .find_existing_knowledge_timeline_ids(&probe_ids)
+                .unwrap_or_default();
+            let probe_sop = self
+                .storage
+                .find_existing_sop_timeline_ids(&probe_ids)
+                .unwrap_or_default();
+            let any_pending = probe.iter().any(|c| {
+                !probe_sop.contains(&c.timeline.id)
+                    && !probe_knowledge.contains(&c.timeline.id)
+                    && !existing_document_sources.contains(&c.timeline.id)
+            });
             if any_pending {
                 tracing::info!(
                     "bake watermark reset: watermark={} 已超过所有候选，自动回退到 0 重新扫描",
                     max_processed_ts
                 );
                 max_processed_ts = 0;
-                self.storage
+                let full = self.storage
                     .list_bake_memory_init_candidates_with_max_failures(
                         0,
                         limit.saturating_mul(6).max(limit),
                         MAX_BAKE_RETRY_FAILURES,
-                    )?
+                    )?;
+                // 重新增量查询覆盖全量候选
+                let full_ids: Vec<i64> = full.iter().map(|c| c.timeline.id).collect();
+                existing_knowledge_sources = self
+                    .storage
+                    .find_existing_knowledge_timeline_ids(&full_ids)
+                    .unwrap_or_default();
+                existing_sop_sources = self
+                    .storage
+                    .find_existing_sop_timeline_ids(&full_ids)
+                    .unwrap_or_default();
+                full
             } else {
                 candidates
             }
@@ -1265,53 +1318,18 @@ impl BakeService {
             candidates
         };
 
-        // 实时更新 candidate_count，让监控页能展示"提炼中"数量
-        let initial_candidate_count = candidates.len() as i64;
-        let _ = self.storage.update_bake_run_progress(
-            run_id,
-            initial_candidate_count,
-            0,
-        );
-        let mut processed_episode_count = 0_i64;
-        let mut auto_created_count = 0_i64;
-        let mut candidate_count = 0_i64;
-        let mut discarded_count = 0_i64;
-        let mut knowledge_created_count = 0_i64;
-        let mut document_created_count = 0_i64;
-        let mut sop_created_count = 0_i64;
+        // 过滤出需要 LLM extract 的候选，跳过低价值和已超过 watermark 的
+        let mut skippable_ts_list: Vec<i64> = Vec::new();
+        let mut extract_queue: Vec<BakeMemorySourceRecord> = Vec::new();
 
-        // watermark 推进策略（Q2a "处理过即推进，不论成败"）：
-        // 每条 candidate 走完任一终态（skip / extract 失败 / persist 失败 / persist 成功），
-        // 都把 max_processed_ts 推到该 candidate.updated_at_ms 并立刻写库。
-        // 这样即便 LLM 慢、整轮 1800s 超时被外层强杀，已处理的进度也已落库，
-        // 下一轮不会再原地打转。毒丸 timeline（failure_count >= MAX_BAKE_RETRY_FAILURES）
-        // 由候选 SQL 自身过滤；watermark 跨过它们之后，要回头重试只需:
-        //     DELETE FROM bake_retry_state WHERE failure_count >= 3;
-        // 然后把 watermark 回退到目标位置即可重新入候选。
         for candidate in candidates {
-            if processed_episode_count >= limit as i64 {
+            if extract_queue.len() + skippable_ts_list.len() >= limit {
                 break;
             }
-
             let candidate_ts = candidate.timeline.updated_at_ms;
-            // 已被 watermark 跨过的（理论上 SQL 已过滤，这里是兜底），不重复处理也不退步推进。
             if candidate_ts <= max_processed_ts {
                 continue;
             }
-
-            // 所有终态共用的"推进 + 落库"工具。failure 路径也调用，保证 watermark 单调向前。
-            let advance = |ts: i64,
-                           current: &mut i64,
-                           storage: &StorageManager|
-             -> Result<(), ApiError> {
-                let next = (*current).max(ts);
-                if next != *current {
-                    *current = next;
-                }
-                storage.upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, next)?;
-                Ok(())
-            };
-
             if !is_high_value_candidate(&candidate.timeline) {
                 tracing::info!(
                     "bake skip: timeline_id={} importance={} evidence={:?} activity={:?} origin={:?} history_view={} self_generated={} reason=not_high_value",
@@ -1323,20 +1341,78 @@ impl BakeService {
                     candidate.timeline.history_view,
                     candidate.timeline.is_self_generated,
                 );
-                advance(candidate_ts, &mut max_processed_ts, &self.storage)?;
+                skippable_ts_list.push(candidate_ts);
                 continue;
             }
+            extract_queue.push(candidate);
+        }
 
-            tracing::info!(
-                "bake process: timeline_id={} importance={} evidence={:?} activity={:?} category={} summary_head={:?}",
-                candidate.timeline.id,
-                candidate.timeline.importance,
-                candidate.timeline.evidence_strength,
-                candidate.timeline.activity_type,
-                candidate.timeline.category,
-                candidate.timeline.summary.chars().take(40).collect::<String>(),
-            );
-            let extracted = match self.extract_candidate(trigger_reason, &candidate).await {
+        // 先推进所有跳过项的 watermark
+        for ts in skippable_ts_list {
+            let next = max_processed_ts.max(ts);
+            if next != max_processed_ts {
+                max_processed_ts = next;
+                self.storage.upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, next)?;
+            }
+        }
+
+        let initial_candidate_count = extract_queue.len() as i64;
+        let _ = self.storage.update_bake_run_progress(run_id, initial_candidate_count, 0);
+
+        // 并行 extract：用 tokio semaphore 限制并发度为 EXTRACT_CONCURRENCY
+        // persist 保持串行（按原始顺序），保证 existing_*_sources HashSet 的正确性
+        //
+        // 位点预推进策略：在 spawn extract task 前立即写 watermark，确保外层整轮超时
+        // kill 后下一轮不会重复处理同一批候选。失败时只记 retry_failure，watermark 已推进。
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(EXTRACT_CONCURRENCY));
+        let trigger_reason_owned = trigger_reason.to_string();
+
+        type ExtractResult = (BakeMemorySourceRecord, Result<BakeExtractResponse, ApiError>);
+        let mut extract_futures: Vec<tokio::task::JoinHandle<ExtractResult>> = Vec::new();
+
+        for candidate in extract_queue {
+            // 预推进 watermark：派出即视为已处理，超时后下一轮不重复
+            let next = max_processed_ts.max(candidate.timeline.updated_at_ms);
+            if next != max_processed_ts {
+                max_processed_ts = next;
+                self.storage.upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, next)?;
+            }
+            let sem = semaphore.clone();
+            let service = self.clone();
+            let reason = trigger_reason_owned.clone();
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                tracing::info!(
+                    "bake process: timeline_id={} importance={} evidence={:?} activity={:?} category={} summary_head={:?}",
+                    candidate.timeline.id,
+                    candidate.timeline.importance,
+                    candidate.timeline.evidence_strength,
+                    candidate.timeline.activity_type,
+                    candidate.timeline.category,
+                    candidate.timeline.summary.chars().take(40).collect::<String>(),
+                );
+                let result = service.extract_candidate(&reason, &candidate).await;
+                (candidate, result)
+            });
+            extract_futures.push(handle);
+        }
+
+        // 按顺序 await 并串行 persist（保证 HashSet 一致性 & watermark 单调）
+        let mut processed_episode_count = 0_i64;
+        let mut auto_created_count = 0_i64;
+        let mut candidate_count = 0_i64;
+        let mut discarded_count = 0_i64;
+        let mut knowledge_created_count = 0_i64;
+        let mut document_created_count = 0_i64;
+        let mut sop_created_count = 0_i64;
+
+        for handle in extract_futures {
+            let (candidate, extract_result) = handle.await.map_err(|e| {
+                ApiError::Internal(format!("bake extract task panicked: {e}"))
+            })?;
+            let candidate_ts = candidate.timeline.updated_at_ms;
+
+            let extracted = match extract_result {
                 Ok(v) => v,
                 Err(err) => {
                     let count = self
@@ -1345,17 +1421,13 @@ impl BakeService {
                         .unwrap_or(0);
                     tracing::warn!(
                         "bake extract failed: timeline_id={} failure_count={} err={}",
-                        candidate.timeline.id,
-                        count,
-                        err
+                        candidate.timeline.id, count, err
                     );
-                    advance(candidate_ts, &mut max_processed_ts, &self.storage)?;
+                    // watermark 已在 spawn 前预写，失败只记 retry_failure
                     continue;
                 }
             };
             processed_episode_count += 1;
-
-            // 实时更新进度，让监控页能看到提炼中的数字变化
             let _ = self.storage.update_bake_run_progress(
                 run_id,
                 initial_candidate_count,
@@ -1371,7 +1443,7 @@ impl BakeService {
                 &mut existing_document_sources,
                 &mut existing_document_urls,
                 &mut existing_sop_sources,
-            ) {
+            ).await {
                 Ok(r) => r,
                 Err(err) => {
                     let count = self
@@ -1380,11 +1452,8 @@ impl BakeService {
                         .unwrap_or(0);
                     tracing::warn!(
                         "bake persist failed: timeline_id={} failure_count={} err={}",
-                        candidate.timeline.id,
-                        count,
-                        err
+                        candidate.timeline.id, count, err
                     );
-                    advance(candidate_ts, &mut max_processed_ts, &self.storage)?;
                     continue;
                 }
             };
@@ -1395,8 +1464,7 @@ impl BakeService {
             knowledge_created_count += candidate_result.knowledge_created_count;
             document_created_count += candidate_result.document_created_count;
             sop_created_count += candidate_result.sop_created_count;
-
-            advance(candidate_ts, &mut max_processed_ts, &self.storage)?;
+            // watermark 已在 spawn 前预写，此处无需再推进
         }
 
         let completed_at = now_ms();
@@ -1460,7 +1528,7 @@ impl BakeService {
         }
     }
 
-    fn persist_extracted_candidate(
+    async fn persist_extracted_candidate(
         &self,
         memory_id: Option<i64>,
         candidate: &BakeMemorySourceRecord,
@@ -1486,7 +1554,7 @@ impl BakeService {
             &extracted.document,
             existing_document_sources,
             existing_document_urls,
-        )?);
+        ).await?);
         result.apply(self.persist_sop_artifact(
             memory_id,
             candidate,
@@ -1561,7 +1629,7 @@ impl BakeService {
         ))
     }
 
-    fn persist_document_artifact(
+    async fn persist_document_artifact(
         &self,
         memory_id: Option<i64>,
         candidate: &BakeMemorySourceRecord,
@@ -1581,16 +1649,29 @@ impl BakeService {
             .as_deref()
             .map(normalize_doc_url)
             .filter(|s| !s.is_empty());
+
+        // URL 已存在：查询数据库中是否有该 URL 的文档，尝试合并而不是丢弃
         if let Some(ref u) = candidate_url_norm {
-            if existing_urls.contains(u) {
-                tracing::info!(
-                    "bake document discard: timeline_id={} reason=url_already_has_document url={}",
-                    candidate.timeline.id,
-                    u,
-                );
-                return Ok(CandidatePersistResult::discarded());
+            if let Some(existing_doc) = self.storage.find_document_by_source_url(u)? {
+                if extraction.accepted {
+                    self.merge_document_with_sidecar(candidate, extraction, &existing_doc).await?;
+                    existing_sources.insert(candidate.timeline.id);
+                    existing_urls.insert(u.clone());
+                    tracing::info!(
+                        "bake document merged: timeline_id={} url={} doc_id={}",
+                        candidate.timeline.id, u, existing_doc.id,
+                    );
+                    return Ok(CandidatePersistResult::created_document(false));
+                } else {
+                    tracing::info!(
+                        "bake document discard: timeline_id={} reason=url_already_has_document_sidecar_rejected url={}",
+                        candidate.timeline.id, u,
+                    );
+                    return Ok(CandidatePersistResult::discarded());
+                }
             }
         }
+
         if !extraction.accepted {
             tracing::info!(
                 "bake document discard: timeline_id={} reason=sidecar_rejected reason_text={:?}",
@@ -1637,6 +1718,80 @@ impl BakeService {
         Ok(CandidatePersistResult::created_document(
             review_status == "auto_created",
         ))
+    }
+
+    async fn merge_document_with_sidecar(
+        &self,
+        candidate: &BakeMemorySourceRecord,
+        extraction: &BakeArtifactExtraction,
+        existing_doc: &BakeDocumentRecord,
+    ) -> Result<(), ApiError> {
+        let existing_json = serde_json::to_value(existing_doc)
+            .map_err(|e| ApiError::Internal(format!("序列化已有文档失败: {e}")))?;
+        let candidate_payload = map_extract_candidate_payload(candidate);
+        let request_body = BakeMergeDocumentRequest {
+            existing_document: existing_json,
+            candidate: candidate_payload,
+        };
+        let url = format!("{}/bake/merge_document", self.sidecar_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&request_body)
+            .timeout(Duration::from_secs(BAKE_SIDECAR_TIMEOUT_SECS))
+            .send()
+            .await
+            .map_err(map_sidecar_request_error)?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!("bake merge_document sidecar error status={} body={}", status, body);
+            // 合并失败不阻断流程，仅记录警告
+            return Ok(());
+        }
+
+        let merged: BakeMergeDocumentResponse = response
+            .json()
+            .await
+            .map_err(|e| ApiError::Internal(format!("解析 merge_document 响应失败: {e}")))?;
+
+        if merged.no_change {
+            tracing::info!(
+                "bake document no_change: timeline_id={} doc_id={} reason=content_already_covered",
+                candidate.timeline.id, existing_doc.id,
+            );
+            return Ok(());
+        }
+
+        // 追加当前 timeline_id 到 source_memory_ids
+        let mut source_ids = parse_json_vec_string(&existing_doc.source_memory_ids);
+        let tid = candidate.timeline.id.to_string();
+        if !source_ids.contains(&tid) {
+            source_ids.push(tid);
+        }
+
+        let mut update = bake_document_record_to_new(existing_doc.clone());
+        update.title = merged.title;
+        update.summary = merged.summary.or(update.summary);
+        update.full_content = merged.full_content.or(update.full_content);
+        update.evidence_summary = merged.evidence_summary.or(update.evidence_summary);
+        update.match_score = merged.match_score.or(update.match_score);
+        update.match_level = merged.match_level.or(update.match_level);
+        update.source_memory_ids = to_json_string(&source_ids)
+            .unwrap_or(existing_doc.source_memory_ids.clone());
+
+        // 更新 content_hash（若 full_content 有更新）
+        if update.full_content.is_some() {
+            update.content_hash = update.full_content.as_ref().map(|content| {
+                let mut hasher = Sha256::new();
+                hasher.update(content.as_bytes());
+                format!("{:x}", hasher.finalize())
+            });
+        }
+
+        self.storage.update_bake_document(existing_doc.id, &update)?;
+        Ok(())
     }
 
     fn persist_sop_artifact(
@@ -2122,6 +2277,13 @@ fn build_bake_document(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| payload.details.clone());
+
+    let content_hash = full_content.as_ref().map(|content| {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        format!("{:x}", hasher.finalize())
+    });
+
     let structured_content = json!({
         "sections": payload.sections,
         "style_phrases": payload.style_phrases,
@@ -2158,7 +2320,7 @@ fn build_bake_document(
         source_app_name: source.capture_app_name.clone(),
         source_win_title: source.capture_win_title.clone(),
         source_url: source.capture_url.clone(),
-        content_hash: None,
+        content_hash,
         language: None,
         usage_count: 0,
         match_score: payload.match_score,
@@ -2661,27 +2823,17 @@ fn resolve_linked_knowledge_summaries(
         .collect()
 }
 
-fn collect_current_bake_source_timeline_ids(
-    records: &[TimelineRecord],
-) -> std::collections::HashSet<i64> {
-    records
-        .iter()
-        .filter(|record| is_current_bake_entry(record))
-        .filter_map(|record| {
-            let details = parse_details(record.details.as_deref());
-            details
-                .get("source_timeline_id")
-                .or_else(|| details.get("source_knowledge_id"))
-                .and_then(Value::as_i64)
-        })
-        .collect()
-}
-
 fn is_high_value_candidate(record: &TimelineRecord) -> bool {
     if record.is_self_generated {
         return false;
     }
     if record.importance >= 4 || record.user_verified {
+        return true;
+    }
+
+    // 文档类候选（用户查看过某份文档）：直接通过，不要求 strong_evidence。
+    // 是否真有可提炼的文档内容由 design 提炼阶段判断。
+    if record.history_view {
         return true;
     }
 
@@ -2698,7 +2850,7 @@ fn is_high_value_candidate(record: &TimelineRecord) -> bool {
         Some("historical_content") | Some("live_interaction")
     );
 
-    strong_evidence && (record.history_view || preferred_activity || preferred_origin)
+    strong_evidence && (preferred_activity || preferred_origin)
 }
 
 fn parse_details(value: Option<&str>) -> Value {
