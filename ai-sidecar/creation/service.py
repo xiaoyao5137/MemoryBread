@@ -51,6 +51,7 @@ class ReferenceDocument:
     usage_count: int
     review_status: str
     updated_at: int
+    source_url: Optional[str]
     relevance_score: float
     quality_score: float
     completeness_score: float
@@ -100,6 +101,9 @@ class CreationService:
         timeline_context: Optional[str] = None,
         capture_context: Optional[str] = None,
         options: Optional[CreationOptions] = None,
+        creation_model: Optional[str] = None,
+        creation_api_key: Optional[str] = None,
+        creation_base_url: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """流式生成文档。"""
         options = options or CreationOptions()
@@ -122,10 +126,13 @@ class CreationService:
             web_results=web_results,
         )
 
-        logger.info("使用模型: %s", self.model)
+        logger.info("使用模型: %s", creation_model or self.model)
         logger.info("创作类型: %s, 参考资料: %s", parsed.get("doc_type") or "未指定", len(references))
-        logger.info("System prompt 长度: %s", len(system_prompt))
-        logger.info("User message 长度: %s", len(user_message))
+
+        if creation_model and creation_api_key:
+            async for chunk in self._generate_cloud(system_prompt, user_message, creation_model, creation_api_key, creation_base_url or ""):
+                yield chunk
+            return
 
         # Qwen3.5 在 Ollama chat 模式下有 thinking 解析 bug，导致长时间不输出内容。
         # 改用 /api/generate raw 模式，绕过有问题的 chat 解析器。
@@ -191,6 +198,116 @@ class CreationService:
                             yield content
 
         logger.info("生成完成，总共 %s 个块", chunk_count)
+
+    async def _generate_cloud(
+        self,
+        system_prompt: str,
+        user_message: str,
+        model: str,
+        api_key: str,
+        base_url: str,
+    ):
+        is_claude = "claude" in model.lower() or "anthropic.com" in base_url
+        if is_claude:
+            url = (base_url.rstrip('/') or "https://api.anthropic.com") + "/v1/messages"
+            headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+            payload = {"model": model, "max_tokens": 8192, "stream": True, "system": system_prompt,
+                       "messages": [{"role": "user", "content": user_message}]}
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            if data.get("type") == "content_block_delta":
+                                text = data.get("delta", {}).get("text", "")
+                                if text:
+                                    yield text
+                        except json.JSONDecodeError:
+                            continue
+        else:
+            default_urls = {
+                "gpt": "https://api.openai.com/v1",
+                "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "glm": "https://open.bigmodel.cn/api/paas/v4",
+                "moonshot": "https://api.moonshot.cn/v1",
+            }
+            if not base_url:
+                for key, url in default_urls.items():
+                    if key in model.lower():
+                        base_url = url
+                        break
+                else:
+                    base_url = "https://api.openai.com/v1"
+            url = base_url.rstrip('/') + "/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {"model": model, "stream": True,
+                       "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}]}
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if content:
+                                yield content
+                        except json.JSONDecodeError:
+                            continue
+
+    async def _chat_cloud(self, messages: list, model: str, api_key: str, base_url: str):
+        """多轮对话，供体验功能使用。"""
+        is_claude = "claude" in model.lower() or "anthropic.com" in base_url
+        if is_claude:
+            url = (base_url.rstrip('/') or "https://api.anthropic.com") + "/v1/messages"
+            headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+            system = next((m["content"] for m in messages if m["role"] == "system"), "You are a helpful assistant.")
+            chat_msgs = [m for m in messages if m["role"] != "system"]
+            payload = {"model": model, "max_tokens": 2048, "stream": True, "system": system, "messages": chat_msgs}
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "): continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]": break
+                        try:
+                            d = json.loads(data_str)
+                            if d.get("type") == "content_block_delta":
+                                text = d.get("delta", {}).get("text", "")
+                                if text: yield text
+                        except json.JSONDecodeError: continue
+        else:
+            default_urls = {"gpt": "https://api.openai.com/v1", "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1", "glm": "https://open.bigmodel.cn/api/paas/v4", "moonshot": "https://api.moonshot.cn/v1"}
+            if not base_url:
+                for key, url in default_urls.items():
+                    if key in model.lower(): base_url = url; break
+                else: base_url = "https://api.openai.com/v1"
+            url = base_url.rstrip('/') + "/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {"model": model, "stream": True, "messages": messages}
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "): continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]": break
+                        try:
+                            d = json.loads(data_str)
+                            content = d.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if content: yield content
+                        except json.JSONDecodeError: continue
 
     def analyze_requirement(self, user_prompt: str, options: CreationOptions) -> dict:
         """轻量需求解析，先用规则把创作任务结构化。"""
@@ -355,7 +472,7 @@ class CreationService:
 
         sql = f"""
             SELECT id, title, doc_type, summary, full_content, sections_json, style_phrases,
-                   prompt_hint, usage_count, review_status, updated_at
+                   prompt_hint, usage_count, review_status, updated_at, source_url
             FROM bake_documents
             WHERE {' AND '.join(clauses)}
             ORDER BY usage_count DESC, updated_at DESC, id DESC
@@ -374,7 +491,7 @@ class CreationService:
                 for row in conn.execute(
                     """
                     SELECT id, title, doc_type, summary, full_content, sections_json, style_phrases,
-                           prompt_hint, usage_count, review_status, updated_at
+                           prompt_hint, usage_count, review_status, updated_at, source_url
                     FROM bake_documents
                     WHERE deleted_at IS NULL
                     ORDER BY usage_count DESC, updated_at DESC, id DESC
@@ -406,7 +523,7 @@ class CreationService:
             rows = conn.execute(
                 """
                 SELECT id, title, doc_type, summary, full_content, sections_json, style_phrases,
-                       prompt_hint, usage_count, review_status, updated_at
+                       prompt_hint, usage_count, review_status, updated_at, source_url
                 FROM bake_documents
                 WHERE deleted_at IS NULL AND full_content IS NOT NULL
                 ORDER BY updated_at DESC
@@ -506,6 +623,8 @@ class CreationService:
 6. 技术架构图、流程图、关系图优先给出 Mermaid 图，不用纯文字替代。
 7. 章节结构要完整，标题层级清晰，语言正式、克制、专业。
 8. 根据用户输入的语言进行回复。如果用户使用中文提问，全文必须使用中文输出；如果用户使用英文提问，全文必须使用英文输出。
+9. 【强制要求】在正文中每次引用参考资料内容时，必须在引用处插入 Markdown 内联链接，格式严格为 [引用说明](#ref-数字ID)，数字ID 来自参考资料标注的 ref-id。示例：[参见分销诊断框架](#ref-42)。若未插入此格式的引用链接，视为未完成任务。
+10. 禁止输出原生 HTML 标签或空锚点，例如 <a id="..."></a>。标题锚点只使用 Markdown 链接引用已有标题。
 {template_hint}
 
 输出格式偏好：{options.output_format}"""
@@ -549,7 +668,7 @@ class CreationService:
                 style = self._clip(self._safe_json_summary(ref.style_phrases), 260)
                 blocks.extend(
                     [
-                        f"### R{index}. {ref.title}",
+                        f"### R{index}. {ref.title} (ref-id: {ref.id})",
                         f"- 文档类型：{ref.doc_type or '未知'}",
                         f"- 综合权重：{ref.final_weight:.2f}",
                         f"- 推荐原因：{ref.reason}",
@@ -579,7 +698,7 @@ class CreationService:
                     "",
                     "【互联网检索要求】",
                     "- 请列出建议检索的问题或关键词。",
-                    "- 对涉及最新政策、标准、价格、版本、日期的信息，用“待联网核验”标记，不要编造具体来源。",
+                    "- 对涉及最新政策、标准、价格、版本、日期的信息，用'待联网核验'标记，不要编造具体来源。",
                 ]
             )
 
@@ -600,9 +719,11 @@ class CreationService:
                 "【输出要求】",
                 "1. 先输出标题和简短摘要。",
                 "2. 再输出目录式章节正文，章节不少于 5 个。",
-                "3. 需要包含“参考资料使用说明”，列出哪些内容/格式来自高权重参考。",
-                "4. 需要包含“后续核验与补充清单”，列出联网检索、图片生成或人工审核事项。",
-                "5. 直接开始输出文档正文。",
+                "3. 在正文中引用参考资料时，必须在引用位置插入内联链接，格式为 [引用说明](#ref-{id})，其中 {id} 替换为对应参考资料括号内的 ref-id 数字。例如参考资料标注 (ref-id: 42)，则引用写作 [见参考方案](#ref-42)。",
+                "4. 需要包含'参考资料使用说明'，列出哪些内容/格式来自高权重参考。",
+                "5. 需要包含'后续核验与补充清单'，列出联网检索、图片生成或人工审核事项。",
+                "6. 不要输出任何原生 HTML 标签；尤其不要用 <a id=\"...\"></a> 为章节添加锚点。",
+                "7. 直接开始输出文档正文。",
             ]
         )
 
@@ -678,7 +799,7 @@ class CreationService:
         return "业务与技术相关人员"
 
     def _infer_topic(self, text: str) -> str:
-        match = re.search(r"[《“\"]([^》”\"]{2,60})[》”\"]", text)
+        match = re.search(r'[《“""]([^》”""]{2,60})[》”""]', text)
         if match:
             return match.group(1)
         compact = re.sub(r"\s+", "", text)
