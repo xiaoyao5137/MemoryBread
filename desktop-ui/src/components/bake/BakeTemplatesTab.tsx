@@ -203,7 +203,7 @@ const BakeTemplatesTab: React.FC<{
             <div className="bake-inline-meta">
               <div>
                 <div className="bake-title" style={{ fontSize: 18 }}>{selected.title}</div>
-                <div className="bake-muted" style={{ marginTop: 4 }}>{selected.docType} · 最近更新 {selected.updatedAt || '—'}</div>
+                <div className="bake-muted" style={{ marginTop: 4 }}>{selected.docType} · ID: {selected.id} · 最近更新 {selected.updatedAt || '—'}</div>
               </div>
               <div className="bake-inline-pills">
                 <BakePill text={formatTemplateStatus(selected.status)} />

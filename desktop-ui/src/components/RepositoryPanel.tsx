@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   useFetchBakeMemories,
   useFetchBakeCaptureDetail,
@@ -161,14 +161,20 @@ const RepositoryPanel: React.FC = () => {
 
   useEffect(() => {
     if (repositoryTab !== 'memory') return
-    if (memories.length === 0) {
-      setSelectedMemoryId(null)
-      return
-    }
-    if (!selectedMemoryId || !memories.some(item => item.id === selectedMemoryId)) {
+    if (memories.length === 0) return
+    if (!selectedMemoryId) {
       setSelectedMemoryId(memories[0].id)
     }
   }, [memories, repositoryTab, selectedMemoryId, setSelectedMemoryId])
+
+  const fetchedForIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!selectedMemoryId || repositoryTab !== 'memory') return
+    if (memories.some(m => m.id === selectedMemoryId)) return
+    if (fetchedForIdRef.current === selectedMemoryId) return
+    fetchedForIdRef.current = selectedMemoryId
+    void fetchMemories({ limit: 500, offset: 0 }).then(data => setMemories(data.items))
+  }, [selectedMemoryId, repositoryTab, memories, fetchMemories])
 
   useEffect(() => {
     if (repositoryTab !== 'capture') return
@@ -195,7 +201,7 @@ const RepositoryPanel: React.FC = () => {
 
   const resolvedMemoryId = selectedMemoryId ?? memories[0]?.id ?? null
   const resolvedCaptureId = selectedCaptureId ?? captureItems[0]?.id ?? null
-  const selectedMemory = memories.find(item => item.id === resolvedMemoryId) ?? memories[0] ?? null
+  const selectedMemory = memories.find(item => item.id === resolvedMemoryId) ?? (selectedMemoryId ? null : memories[0] ?? null)
   const memoryPage = Math.floor(bakeMemoryOffset / repositoryMemoryLimit) + 1
   const memoryTotalPages = Math.max(1, Math.ceil(memoryTotal / repositoryMemoryLimit))
   const memoryFilterPills = useMemo(() => {

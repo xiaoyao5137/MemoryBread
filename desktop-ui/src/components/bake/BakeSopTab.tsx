@@ -196,7 +196,7 @@ const BakeSopTab: React.FC<{
             <div className="bake-inline-meta">
               <div>
                 <div className="bake-title" style={{ fontSize: 18 }}>{selected.extractedProblem || selected.sourceTitle || '未命名问题'}</div>
-                <div className="bake-muted" style={{ marginTop: 4 }}>来源：{selected.sourceTitle || '—'} · 置信度：{confidenceLabel[selected.confidence]}</div>
+                <div className="bake-muted" style={{ marginTop: 4 }}>来源：{selected.sourceTitle || '—'} · ID: {selected.id} · 置信度：{confidenceLabel[selected.confidence]}</div>
               </div>
               <div className="bake-inline-pills">
                 <BakePill text={`置信度 ${confidenceLabel[selected.confidence]}`} />

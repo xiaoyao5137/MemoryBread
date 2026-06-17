@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import type { ModelEntry } from '../types'
+import { useAppStore } from '../store/useAppStore'
+import type { CreationModelConfig } from '../store/useAppStore'
 
 const SIDECAR = 'http://localhost:7071'
 
@@ -450,7 +452,7 @@ const ModelCard: React.FC<{
 }
 
 // ── 主组件 ────────────────────────────────────────────────────────────────────
-type TabType = 'llm' | 'embedding' | 'image'
+type TabType = 'llm' | 'embedding' | 'image' | 'creation'
 
 const ModelManager: React.FC = () => {
   const [tab, setTab] = useState<TabType>('llm')
@@ -468,7 +470,12 @@ const ModelManager: React.FC = () => {
   const [llmConcurrency, setLlmConcurrency] = useState<LlmConcurrencyConfig | null>(null)
   const [llmConcurrencySaving, setLlmConcurrencySaving] = useState(false)
   const [llmConcurrencyError, setLlmConcurrencyError] = useState('')
+  const [configuringCreationId, setConfiguringCreationId] = useState<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const { creationModelConfigs, setCreationModelConfig } = useAppStore(s => ({
+    creationModelConfigs: s.creationModelConfigs,
+    setCreationModelConfig: s.setCreationModelConfig,
+  }))
 
   const loadModels = async () => {
     setLoading(true)
@@ -745,6 +752,7 @@ const ModelManager: React.FC = () => {
           { key: 'llm', label: '对话模型' },
           { key: 'embedding', label: '向量模型' },
           { key: 'image', label: '生图模型' },
+          { key: 'creation', label: '创作模型' },
         ] as { key: TabType; label: string }[]).map(t => (
           <button key={t.key} onClick={() => setTab(t.key)} style={{
             fontSize: 12, padding: '5px 12px', borderRadius: 8, border: 'none', cursor: 'pointer',
@@ -811,6 +819,15 @@ const ModelManager: React.FC = () => {
 
       {/* 内容区 */}
       <div style={{ flex: 1, overflow: 'auto', padding: '10px 14px 14px' }}>
+        {tab === 'creation' ? (
+          <CreationModelPanel
+            configs={creationModelConfigs}
+            openId={configuringCreationId}
+            onToggleOpen={setConfiguringCreationId}
+            onChange={setCreationModelConfig}
+          />
+        ) : (
+          <>
         {loading && models.length === 0 && (
           <div style={{ textAlign: 'center', color: '#AEAEB2', fontSize: 13, padding: 40 }}>加载中...</div>
         )}
@@ -892,6 +909,8 @@ const ModelManager: React.FC = () => {
             暂无模型
           </div>
         )}
+          </>
+        )}
       </div>
 
       {configuringModel && (
@@ -907,6 +926,211 @@ const ModelManager: React.FC = () => {
           onClose={() => setChattingModel(null)}
         />
       )}
+    </div>
+  )
+}
+
+const CREATION_MODEL_DEFS = [
+  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8',    provider: 'anthropic', hasBaseUrl: true },
+  { id: 'gpt-5-5',         name: 'GPT 5.5',            provider: 'openai',    hasBaseUrl: false },
+  { id: 'qwen-3-7',        name: 'Qwen 3.7B',          provider: 'tongyi',    hasBaseUrl: false },
+  { id: 'qwen-3-5-4b',     name: 'Qwen 3.5 4B (本地)', provider: 'ollama',    hasBaseUrl: true },
+  { id: 'glm-latest',      name: 'GLM 最新版',          provider: 'doubao',    hasBaseUrl: false },
+  { id: 'kimi-latest',     name: 'Kimi 最新版',         provider: 'kimi',      hasBaseUrl: false },
+] as const
+
+const CREATION_MODEL_ID_TO_NAME: Record<string, string> = {
+  'claude-opus-4-8': 'claude-opus-4-8',
+  'gpt-5-5':         'gpt-5.5-turbo',
+  'qwen-3-7':        'qwen3-7b-instruct',
+  'qwen-3-5-4b':     'qwen3.5:4b',
+  'glm-latest':      'glm-4-plus',
+  'kimi-latest':     'moonshot-v1-128k',
+}
+
+const CREATION_SVC = 'http://127.0.0.1:8001'
+
+type CreationChatEntry = { def: typeof CREATION_MODEL_DEFS[number]; cfg: { id: string; apiKey: string; baseUrl?: string } }
+
+const CreationModelChatDialog: React.FC<{ entry: CreationChatEntry; onClose: () => void }> = ({ entry, onClose }) => {
+  const { def, cfg } = entry
+  const modelName = CREATION_MODEL_ID_TO_NAME[def.id] || def.id
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [chatError, setChatError] = useState('')
+  const endRef = useRef<HTMLDivElement>(null)
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+
+  const handleSend = async () => {
+    const q = input.trim()
+    if (!q || loading) return
+    setInput('')
+    setChatError('')
+    const userMsg: ChatMessage = { role: 'user', content: q }
+    setMessages(prev => [...prev, userMsg])
+    setLoading(true)
+    try {
+      const allMsgs = [...messages, userMsg].map(m => ({ role: m.role, content: m.content }))
+      const resp = await fetch(`${CREATION_SVC}/creation/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelName, api_key: cfg.apiKey, base_url: cfg.baseUrl || undefined, messages: allMsgs }),
+      })
+      if (!resp.ok) {
+        const d = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }))
+        setChatError(d.detail || '请求失败')
+        setLoading(false)
+        return
+      }
+      const reader = resp.body?.getReader()
+      if (!reader) { setChatError('无法读取响应流'); setLoading(false); return }
+      const decoder = new TextDecoder()
+      let content = ''
+      setMessages(prev => [...prev, { role: 'assistant', content: '' }])
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        for (const line of decoder.decode(value, { stream: true }).split('\n')) {
+          if (!line.startsWith('data: ')) continue
+          try {
+            const evt = JSON.parse(line.slice(6))
+            if (evt.content) { content += evt.content; setMessages(prev => { const u = [...prev]; u[u.length - 1] = { role: 'assistant', content }; return u }) }
+            if (evt.error) setChatError(evt.error)
+          } catch { /* ignore */ }
+        }
+      }
+    } catch (e: any) {
+      setChatError(e.message || '连接失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+      <div style={{ background: 'white', borderRadius: 16, width: 520, maxHeight: '80vh', boxShadow: '0 20px 60px rgba(0,0,0,0.2)', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid rgba(0,0,0,0.07)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span style={{ fontSize: 15, fontWeight: 700 }}>体验 {def.name}</span>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button onClick={() => { setMessages([]); setChatError('') }} style={btn('#F2F2F7', '#333', 11)}>重置</button>
+            <button onClick={onClose} style={btn('#F2F2F7', '#333', 11)}>关闭</button>
+          </div>
+        </div>
+        <div style={{ flex: 1, overflow: 'auto', padding: '12px 16px', minHeight: 300, maxHeight: 'calc(80vh - 120px)', background: '#F5F5F7' }}>
+          {messages.length === 0 && !loading && (
+            <div style={{ textAlign: 'center', color: '#AEAEB2', fontSize: 13, padding: 60 }}>
+              <div style={{ fontSize: 40, marginBottom: 8 }}>💬</div>
+              <div>和 {def.name} 开始对话</div>
+            </div>
+          )}
+          {messages.map((msg, idx) => (
+            <div key={idx} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start', marginBottom: 8 }}>
+              <div style={{ maxWidth: '75%', padding: '8px 12px', borderRadius: msg.role === 'user' ? '12px 12px 4px 12px' : '12px 12px 12px 4px', background: msg.role === 'user' ? '#007AFF' : 'white', color: msg.role === 'user' ? 'white' : '#1D1D1F', fontSize: 13, whiteSpace: 'pre-wrap', boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+                {msg.content || (msg.role === 'assistant' && loading ? '▌' : '')}
+              </div>
+            </div>
+          ))}
+          {chatError && <div style={{ fontSize: 11, color: '#FF3B30', textAlign: 'center', padding: 8 }}>{chatError}</div>}
+          <div ref={endRef} />
+        </div>
+        <div style={{ padding: '10px 16px', borderTop: '1px solid rgba(0,0,0,0.07)', display: 'flex', gap: 8 }}>
+          <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void handleSend() } }}
+            placeholder="输入消息…"
+            style={{ flex: 1, padding: '8px 10px', border: '1px solid #E5E5EA', borderRadius: 8, fontSize: 13, outline: 'none' }} />
+          <button onClick={handleSend} disabled={loading || !input.trim()} style={btn(loading || !input.trim() ? '#E5E5EA' : '#007AFF', loading || !input.trim() ? '#AEAEB2' : 'white', 12)}>
+            {loading ? '…' : '发送'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const CreationModelPanel: React.FC<{
+  configs: import('../store/useAppStore').CreationModelConfig[]
+  openId: string | null
+  onToggleOpen: (id: string | null) => void
+  onChange: (id: string, patch: Partial<import('../store/useAppStore').CreationModelConfig>) => void
+}> = ({ configs, openId, onToggleOpen, onChange }) => {
+  const [testState, setTestState] = React.useState<Record<string, { loading: boolean; result?: string; error?: string }>>({})
+  const [chattingModel, setChattingModel] = React.useState<CreationChatEntry | null>(null)
+
+  const handleTest = async (def: typeof CREATION_MODEL_DEFS[number], cfg: { id: string; enabled: boolean; apiKey: string; baseUrl?: string }) => {
+    if (!cfg.apiKey) return
+    setTestState(s => ({ ...s, [def.id]: { loading: true } }))
+    try {
+      const r = await fetch(`${CREATION_SVC}/creation/test_model`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: CREATION_MODEL_ID_TO_NAME[def.id] || def.id,
+          api_key: cfg.apiKey,
+          base_url: cfg.baseUrl || undefined,
+        }),
+      })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.detail || '请求失败')
+      setTestState(s => ({ ...s, [def.id]: { loading: false, result: data.message } }))
+    } catch (e: any) {
+      setTestState(s => ({ ...s, [def.id]: { loading: false, error: e.message } }))
+    }
+  }
+
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 10 }}>
+        启用后，创作页面将调用该模型代替本地模型生成文档。
+      </div>
+      {CREATION_MODEL_DEFS.map(def => {
+        const cfg = configs.find(c => c.id === def.id) || { id: def.id, enabled: false, apiKey: '' }
+        const isOpen = openId === def.id
+        const ts = testState[def.id]
+        return (
+          <div key={def.id} style={{ background: 'white', borderRadius: 10, padding: '10px 12px', border: '1px solid rgba(0,0,0,0.07)', marginBottom: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: PROVIDER_COLOR[def.provider] || '#AEAEB2', flexShrink: 0 }} />
+              <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: '#1D1D1F' }}>{def.name}</span>
+              {cfg.apiKey && (
+                <button onClick={() => handleTest(def, cfg)} disabled={ts?.loading} style={btn(ts?.result ? '#34C759' : ts?.error ? '#FF3B30' : '#F2F2F7', ts?.result || ts?.error ? 'white' : '#333', 11)}>
+                  {ts?.loading ? '验证中…' : ts?.result ? '已通' : ts?.error ? '失败' : '验证'}
+                </button>
+              )}
+              {cfg.apiKey && (
+                <button onClick={() => setChattingModel({ def, cfg })} style={btn('#AF52DE18', '#AF52DE', 11)}>💬 体验</button>
+              )}
+              <button onClick={() => onToggleOpen(isOpen ? null : def.id)} style={btn('#F2F2F7', '#333', 11)}>
+                {isOpen ? '收起' : '配置'}
+              </button>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+                <input type="checkbox" checked={cfg.enabled} onChange={e => onChange(def.id, { enabled: e.target.checked })} />
+                <span style={{ fontSize: 11, color: cfg.enabled ? '#007AFF' : '#AEAEB2' }}>{cfg.enabled ? '已启用' : '停用'}</span>
+              </label>
+            </div>
+            {ts?.error && <div style={{ fontSize: 11, color: '#FF3B30', marginTop: 6 }}>{ts.error}</div>}
+            {ts?.result && <div style={{ fontSize: 11, color: '#34C759', marginTop: 6 }}>回复：{ts.result}</div>}
+            {isOpen && (
+              <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+                <div>
+                  <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 4 }}>API Key</div>
+                  <input type="password" value={cfg.apiKey} onChange={e => onChange(def.id, { apiKey: e.target.value })}
+                    placeholder="请输入 API Key"
+                    style={{ width: '100%', padding: '6px 8px', border: '1px solid #E5E5EA', borderRadius: 6, fontSize: 12, outline: 'none', boxSizing: 'border-box' }} />
+                </div>
+                {def.hasBaseUrl && (
+                  <div>
+                    <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 4 }}>API URL（可选）</div>
+                    <input value={cfg.baseUrl || ''} onChange={e => onChange(def.id, { baseUrl: e.target.value })}
+                      placeholder={def.id === 'qwen-3-5-4b' ? 'http://localhost:11434/v1' : 'https://api.anthropic.com'}
+                      style={{ width: '100%', padding: '6px 8px', border: '1px solid #E5E5EA', borderRadius: 6, fontSize: 12, outline: 'none', boxSizing: 'border-box' }} />
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )
+      })}
+      {chattingModel && <CreationModelChatDialog entry={chattingModel} onClose={() => setChattingModel(null)} />}
     </div>
   )
 }

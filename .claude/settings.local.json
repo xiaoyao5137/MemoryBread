@@ -36,7 +36,8 @@
       "Bash(cargo build *)",
       "Bash(sleep 8 *)",
       "Read(//Users/xianjiaqi/.memory-bread/logs/**)",
-      "Bash(cargo check *)"
+      "Bash(cargo check *)",
+      "Bash(sqlite3 ~/.memory-bread/memory-bread.db \"SELECT status FROM bake_runs WHERE id=643;\")"
     ]
   }
 }

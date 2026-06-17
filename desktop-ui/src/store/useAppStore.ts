@@ -13,6 +13,13 @@ interface CaptureBackTarget {
   repositoryCaptureSourceCaptureId?: string | null
 }
 
+export interface CreationModelConfig {
+  id: string
+  enabled: boolean
+  apiKey: string
+  baseUrl?: string
+}
+
 export interface CreationReferenceItem {
   id: number
   title: string
@@ -27,6 +34,7 @@ export interface CreationReferenceItem {
   usage_count: number
   reason: string
   summary?: string
+  source_url?: string
 }
 
 export interface CreationReferencePreview {
@@ -116,6 +124,7 @@ export interface AppState {
   // ── 首次引导 ─────────────────────────────────────────────────────────────────
   hasCompletedSetup: boolean
   setupSkipped:      boolean
+  creationModelConfigs: CreationModelConfig[]
 
   // ── 操作方法 ─────────────────────────────────────────────────────────────────
   setWindowMode:         (mode: WindowMode) => void
@@ -163,15 +172,34 @@ export interface AppState {
   setSidecarVersion:     (v: string) => void
   setHasCompletedSetup:  (v: boolean) => void
   setSetupSkipped:       (v: boolean) => void
+  setCreationModelConfig: (id: string, patch: Partial<CreationModelConfig>) => void
   reset:                 () => void
 }
 
 const SETUP_KEY = 'memory-bread_setup_done'
 const SKIP_KEY  = 'memory-bread_setup_skipped'
+const CREATION_MODEL_KEY = 'memory-bread_creation_models'
 
 const safeLocalStorage = typeof window !== 'undefined' && typeof window.localStorage?.getItem === 'function'
   ? window.localStorage
   : null
+
+const DEFAULT_CREATION_MODELS: CreationModelConfig[] = [
+  { id: 'claude-opus-4-8', enabled: false, apiKey: '', baseUrl: 'https://api.anthropic.com' },
+  { id: 'gpt-5-5',         enabled: false, apiKey: '' },
+  { id: 'qwen-3-7',        enabled: false, apiKey: '' },
+  { id: 'qwen-3-5-4b',     enabled: false, apiKey: 'ollama', baseUrl: 'http://localhost:11434/v1' },
+  { id: 'glm-latest',      enabled: false, apiKey: '' },
+  { id: 'kimi-latest',     enabled: false, apiKey: '' },
+]
+
+function loadCreationModels(): CreationModelConfig[] {
+  try {
+    const raw = safeLocalStorage?.getItem(CREATION_MODEL_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch { /* ignore */ }
+  return DEFAULT_CREATION_MODELS
+}
 
 const initialCreationDraft: CreationDraft = {
   prompt: '',
@@ -234,6 +262,7 @@ const initialState = {
   sidecarVersion:      '0.1.0',
   hasCompletedSetup:   safeLocalStorage?.getItem(SETUP_KEY) === 'true',
   setupSkipped:        safeLocalStorage?.getItem(SKIP_KEY)  === 'true',
+  creationModelConfigs: loadCreationModels(),
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -346,6 +375,16 @@ export const useAppStore = create<AppState>((set) => ({
   setSetupSkipped: (v) => {
     safeLocalStorage?.setItem(SKIP_KEY, String(v))
     set({ setupSkipped: v })
+  },
+
+  setCreationModelConfig: (id, patch) => {
+    set((state) => {
+      const updated = state.creationModelConfigs.map(c =>
+        c.id === id ? { ...c, ...patch } : c
+      )
+      safeLocalStorage?.setItem(CREATION_MODEL_KEY, JSON.stringify(updated))
+      return { creationModelConfigs: updated }
+    })
   },
 
   reset: () => set(initialState),

@@ -45,6 +45,9 @@ class GenerateRequest(BaseModel):
     format_weight: float = 0.10
     freshness_weight: float = 0.05
     max_references: int = 6
+    creation_model: Optional[str] = None
+    creation_api_key: Optional[str] = None
+    creation_base_url: Optional[str] = None
 
 
 class ReferenceRequest(BaseModel):
@@ -75,6 +78,9 @@ async def generate_document(request: GenerateRequest):
                 timeline_context=request.timeline_context,
                 capture_context=request.capture_context,
                 options=options,
+                creation_model=request.creation_model,
+                creation_api_key=request.creation_api_key,
+                creation_base_url=request.creation_base_url,
             ):
                 import json
                 yield f"data: {json.dumps(chunk)}\n\n"
@@ -113,6 +119,7 @@ async def preview_references(request: ReferenceRequest):
                     "usage_count": ref.usage_count,
                     "reason": ref.reason,
                     "summary": ref.summary,
+                    "source_url": ref.source_url,
                 }
                 for ref in references
             ],
@@ -125,6 +132,52 @@ async def preview_references(request: ReferenceRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+class TestModelRequest(BaseModel):
+    model: str
+    api_key: str
+    base_url: Optional[str] = None
+
+
+@app.post("/creation/test_model")
+async def test_creation_model(request: TestModelRequest):
+    """验证创作模型连通性"""
+    try:
+        chunks = []
+        async for chunk in creation_service._generate_cloud(
+            "You are a helpful assistant.", "Reply with just 'OK'.",
+            request.model, request.api_key, request.base_url or "",
+        ):
+            chunks.append(chunk)
+            if len("".join(chunks)) >= 20:
+                break
+        return {"status": "ok", "message": "".join(chunks)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class ChatRequest(BaseModel):
+    model: str
+    api_key: str
+    base_url: Optional[str] = None
+    messages: list
+
+
+@app.post("/creation/chat")
+async def chat_with_model(request: ChatRequest):
+    """与创作模型流式对话"""
+    import json as _json
+    async def event_stream():
+        try:
+            async for chunk in creation_service._chat_cloud(
+                request.messages, request.model, request.api_key, request.base_url or ""
+            ):
+                yield f"data: {_json.dumps({'content': chunk})}\n\n"
+            yield f"data: {_json.dumps({'done': True})}\n\n"
+        except Exception as e:
+            yield f"data: {_json.dumps({'error': str(e)})}\n\n"
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 def _options_from_request(request) -> CreationOptions:

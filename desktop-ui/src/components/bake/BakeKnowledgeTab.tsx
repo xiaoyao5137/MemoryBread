@@ -185,7 +185,7 @@ const BakeKnowledgeTab: React.FC<{
               <div>
                 <div className="bake-title" style={{ fontSize: 18 }}>{selected.summary}</div>
                 <div className="bake-muted" style={{ marginTop: 4 }}>
-                  分类：{selected.category || '—'} · 片段 #{selected.captureId}
+                  分类：{selected.category || '—'} · ID: {selected.id} · 片段 #{selected.captureId}
                 </div>
               </div>
               <div className="bake-inline-pills">
