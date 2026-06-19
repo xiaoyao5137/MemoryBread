@@ -17,6 +17,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
+
 
 @dataclass
 class CreationOptions:
@@ -209,13 +211,13 @@ class CreationService:
     ):
         is_claude = "claude" in model.lower() or "anthropic.com" in base_url
         if is_claude:
-            url = (base_url.rstrip('/') or "https://api.anthropic.com") + "/v1/messages"
+            url = self._anthropic_messages_url(base_url)
             headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
             payload = {"model": model, "max_tokens": 8192, "stream": True, "system": system_prompt,
                        "messages": [{"role": "user", "content": user_message}]}
             async with httpx.AsyncClient(timeout=300.0) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
-                    resp.raise_for_status()
+                    await self._raise_for_cloud_error(resp)
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "):
                             continue
@@ -250,7 +252,7 @@ class CreationService:
                        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}]}
             async with httpx.AsyncClient(timeout=300.0) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
-                    resp.raise_for_status()
+                    await self._raise_for_cloud_error(resp)
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "):
                             continue
@@ -269,14 +271,13 @@ class CreationService:
         """多轮对话，供体验功能使用。"""
         is_claude = "claude" in model.lower() or "anthropic.com" in base_url
         if is_claude:
-            url = (base_url.rstrip('/') or "https://api.anthropic.com") + "/v1/messages"
+            url = self._anthropic_messages_url(base_url)
             headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-            system = next((m["content"] for m in messages if m["role"] == "system"), "You are a helpful assistant.")
-            chat_msgs = [m for m in messages if m["role"] != "system"]
+            system, chat_msgs = self._normalize_anthropic_messages(messages)
             payload = {"model": model, "max_tokens": 2048, "stream": True, "system": system, "messages": chat_msgs}
             async with httpx.AsyncClient(timeout=120.0) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
-                    resp.raise_for_status()
+                    await self._raise_for_cloud_error(resp)
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "): continue
                         data_str = line[6:]
@@ -298,7 +299,7 @@ class CreationService:
             payload = {"model": model, "stream": True, "messages": messages}
             async with httpx.AsyncClient(timeout=120.0) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as resp:
-                    resp.raise_for_status()
+                    await self._raise_for_cloud_error(resp)
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "): continue
                         data_str = line[6:]
@@ -308,6 +309,67 @@ class CreationService:
                             content = d.get("choices", [{}])[0].get("delta", {}).get("content", "")
                             if content: yield content
                         except json.JSONDecodeError: continue
+
+    @staticmethod
+    def _anthropic_messages_url(base_url: str) -> str:
+        """兼容用户填写根地址、/v1 或 /v1/messages 的 Anthropic API URL。"""
+        url = (base_url or ANTHROPIC_DEFAULT_BASE_URL).strip().rstrip("/")
+        if url.endswith("/v1/messages"):
+            return url
+        if url.endswith("/v1"):
+            return f"{url}/messages"
+        return f"{url}/v1/messages"
+
+    @staticmethod
+    def _normalize_anthropic_messages(messages: list) -> tuple[str, list[dict]]:
+        """把体验对话清洗成 Anthropic Messages API 接受的结构。"""
+        system_parts: list[str] = []
+        chat_msgs: list[dict] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content = str(msg.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "system":
+                system_parts.append(content)
+                continue
+            if role not in {"user", "assistant"}:
+                continue
+            if chat_msgs and chat_msgs[-1]["role"] == role:
+                chat_msgs[-1]["content"] += f"\n\n{content}"
+            else:
+                chat_msgs.append({"role": role, "content": content})
+
+        if not chat_msgs:
+            chat_msgs.append({"role": "user", "content": "Hello"})
+        if chat_msgs[0]["role"] != "user":
+            chat_msgs.insert(0, {"role": "user", "content": "Continue the conversation."})
+
+        system = "\n\n".join(system_parts) or "You are a helpful assistant."
+        return system, chat_msgs
+
+    @staticmethod
+    async def _raise_for_cloud_error(resp: httpx.Response) -> None:
+        """把云模型服务返回的 JSON 错误转换为前端可读的异常文本。"""
+        if resp.status_code < 400:
+            return
+
+        body = await resp.aread()
+        detail = body.decode("utf-8", errors="replace").strip()
+        try:
+            parsed = json.loads(detail) if detail else {}
+            if isinstance(parsed, dict):
+                error = parsed.get("error")
+                if isinstance(error, dict):
+                    detail = error.get("message") or error.get("type") or detail
+                else:
+                    detail = parsed.get("detail") or parsed.get("message") or detail
+        except json.JSONDecodeError:
+            pass
+
+        raise RuntimeError(f"模型请求失败 ({resp.status_code}): {detail or resp.reason_phrase}")
 
     def analyze_requirement(self, user_prompt: str, options: CreationOptions) -> dict:
         """轻量需求解析，先用规则把创作任务结构化。"""

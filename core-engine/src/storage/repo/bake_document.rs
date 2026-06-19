@@ -25,7 +25,10 @@ impl StorageManager {
 
     pub fn get_bake_document(&self, id: i64) -> Result<Option<BakeDocumentRecord>, StorageError> {
         self.with_conn(|conn| {
-            let sql = format!("SELECT {} FROM bake_documents WHERE id = ?1", SELECT_COLUMNS);
+            let sql = format!(
+                "SELECT {} FROM bake_documents WHERE id = ?1",
+                SELECT_COLUMNS
+            );
             let mut stmt = conn.prepare(&sql)?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {

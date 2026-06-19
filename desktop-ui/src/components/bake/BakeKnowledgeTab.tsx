@@ -2,6 +2,19 @@ import React, { useMemo, useState } from 'react'
 import type { BakeKnowledgeItem } from '../../types'
 import { BakeButton, BakeCard, BakeMarkdown, BakePill, BakeSectionHeader } from './BakeShared'
 
+const formatCreatedTime = (item: Pick<BakeKnowledgeItem, 'createdAt' | 'createdAtMs'>) => {
+  if (item.createdAtMs > 0) {
+    return new Date(item.createdAtMs).toLocaleString('zh-CN', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+  }
+  return item.createdAt || '创建时间未知'
+}
+
 const BakeKnowledgeTab: React.FC<{
   items: BakeKnowledgeItem[]
   total: number
@@ -18,6 +31,7 @@ const BakeKnowledgeTab: React.FC<{
   onClearFilters: () => void
   onDeleteKnowledge: (id: string) => void
   onOpenCapture: (captureId?: string) => void
+  onViewSourceTimeline: (timelineId?: string) => void
   onCreateKnowledge?: (knowledge: Partial<BakeKnowledgeItem>) => void
 }> = ({
   items,
@@ -35,6 +49,7 @@ const BakeKnowledgeTab: React.FC<{
   onClearFilters,
   onDeleteKnowledge,
   onOpenCapture,
+  onViewSourceTimeline,
   onCreateKnowledge,
 }) => {
   const selected = items.find(item => item.id === selectedKnowledgeId) ?? items[0]
@@ -67,6 +82,8 @@ const BakeKnowledgeTab: React.FC<{
       reviewStatus: 'confirmed',
       updatedAt: new Date().toLocaleString('zh-CN', { hour12: false }),
       updatedAtMs: Date.now(),
+      createdAt: new Date().toLocaleString('zh-CN', { hour12: false }),
+      createdAtMs: Date.now(),
     })
     setShowCreateDialog(false)
     setNewKnowledge({
@@ -127,6 +144,7 @@ const BakeKnowledgeTab: React.FC<{
                 <div className="bake-muted bake-line-clamp-2">{item.overview || '暂无概述'}</div>
                 <div className="bake-memory-list-item__meta">
                   <span>{item.category || '未分类'}</span>
+                  <span>创建 {formatCreatedTime(item)}</span>
                   <span>重要度 {item.importance}</span>
                   <span>重复观察 {item.occurrenceCount} 次</span>
                   {item.matchLevel && <span>{item.matchLevel}</span>}
@@ -185,7 +203,7 @@ const BakeKnowledgeTab: React.FC<{
               <div>
                 <div className="bake-title" style={{ fontSize: 18 }}>{selected.summary}</div>
                 <div className="bake-muted" style={{ marginTop: 4 }}>
-                  分类：{selected.category || '—'} · ID: {selected.id} · 片段 #{selected.captureId}
+                  分类：{selected.category || '—'} · ID: {selected.id} · 创建：{formatCreatedTime(selected)}
                 </div>
               </div>
               <div className="bake-inline-pills">
@@ -234,6 +252,7 @@ const BakeKnowledgeTab: React.FC<{
               </div>
             </div>
             <div className="bake-actions--primary">
+              <BakeButton onClick={() => onViewSourceTimeline(selected.sourceTimelineId || selected.id)}>关联时间线</BakeButton>
               <BakeButton onClick={() => onOpenCapture(selected.captureId)}>来源采集记录</BakeButton>
               <BakeButton onClick={() => onDeleteKnowledge(selected.id)}>删除知识</BakeButton>
             </div>

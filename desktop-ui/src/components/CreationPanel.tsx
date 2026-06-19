@@ -201,6 +201,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const creationModelConfigs = useAppStore((s) => s.creationModelConfigs)
 
   const buildPayload = () => {
+    const LOCAL_MODEL_ID = 'qwen-3-5-4b'
     const MODEL_NAMES: Record<string, string> = {
       'claude-opus-4-8': 'claude-opus-4-8',
       'gpt-5-5': 'gpt-5.5-turbo',
@@ -209,7 +210,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       'glm-latest': 'glm-4-plus',
       'kimi-latest': 'moonshot-v1-128k',
     }
-    const activeModel = creationModelConfigs.find(c => c.enabled && c.apiKey)
+    const activeModel = creationModelConfigs.find(c => c.id !== LOCAL_MODEL_ID && c.enabled && c.apiKey)
     return {
       user_prompt: prompt,
       design_templates: [],

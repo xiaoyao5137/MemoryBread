@@ -25,6 +25,9 @@ def log_llm_usage(
     caller_id: Optional[str] = None,
     status: str = "success",
     error_msg: Optional[str] = None,
+    raw_preview: Optional[str] = None,
+    response_preview: Optional[str] = None,
+    done_reason: Optional[str] = None,
     db_path: str = DB_PATH,
 ):
     """
@@ -42,11 +45,12 @@ def log_llm_usage(
     """
     try:
         conn = sqlite3.connect(db_path)
+        _ensure_llm_usage_trace_columns(conn)
         conn.execute(
             """INSERT INTO llm_usage_logs
                (ts, caller, caller_id, model_name, prompt_tokens, completion_tokens,
-                total_tokens, latency_ms, status, error_msg)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                total_tokens, latency_ms, status, error_msg, raw_preview, response_preview, done_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(time.time() * 1000),
                 caller,
@@ -58,6 +62,9 @@ def log_llm_usage(
                 latency_ms,
                 status,
                 error_msg,
+                _truncate_trace(raw_preview),
+                _truncate_trace(response_preview),
+                done_reason,
             ),
         )
         conn.commit()
@@ -65,6 +72,27 @@ def log_llm_usage(
     except Exception as e:
         # 埋点失败不影响主流程
         logger.warning(f"LLM 用量埋点失败: {e}")
+
+
+def _truncate_trace(value: Optional[str], limit: int = 4000) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n...(truncated)"
+
+
+def _ensure_llm_usage_trace_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(llm_usage_logs)")}
+    columns = {
+        "raw_preview": "TEXT",
+        "response_preview": "TEXT",
+        "done_reason": "TEXT",
+    }
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE llm_usage_logs ADD COLUMN {name} {definition}")
 
 
 def estimate_tokens(text: str) -> int:
@@ -94,6 +122,9 @@ class LLMCallTracker:
         self._completion_tokens = 0
         self._status = "success"
         self._error_msg = None
+        self._raw_preview = None
+        self._response_preview = None
+        self._done_reason = None
 
     def __enter__(self):
         self._start_ms = int(time.time() * 1000)
@@ -121,6 +152,18 @@ class LLMCallTracker:
             if not content:
                 content = msg.get("thinking", "")
             self._completion_tokens = estimate_tokens(content)
+        self._done_reason = response.get("done_reason")
+
+    def set_trace(
+        self,
+        raw_preview: Optional[str] = None,
+        response_preview: Optional[str] = None,
+        done_reason: Optional[str] = None,
+    ):
+        self._raw_preview = raw_preview
+        self._response_preview = response_preview
+        if done_reason:
+            self._done_reason = done_reason
 
     def set_error(self, error_msg: str):
         self._status = "failed"
@@ -144,6 +187,9 @@ class LLMCallTracker:
             caller_id=self.caller_id,
             status=self._status,
             error_msg=self._error_msg,
+            raw_preview=self._raw_preview,
+            response_preview=self._response_preview,
+            done_reason=self._done_reason,
             db_path=self.db_path,
         )
         return False  # 不吞异常

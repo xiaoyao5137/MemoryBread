@@ -5,12 +5,12 @@
 //!
 //! 其他平台：返回 None，由调用方降级到 OCR。
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{OnceLock, Mutex};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-const EXTRACTED_TEXT_MAX_CHARS: usize = 5_000;
+const EXTRACTED_TEXT_MAX_CHARS: usize = 500_000;
 const GENERIC_FOCUS_MIN_CHARS: usize = 24;
 const GENERIC_WINDOW_MIN_CHARS: usize = 48;
 const GENERIC_STATIC_ITEM_LIMIT: usize = 80;
@@ -43,7 +43,11 @@ pub struct AXInfo {
     pub focused_role: Option<String>,
     /// 当前焦点元素的标识符（用于执行器精确定位）
     pub focused_id: Option<String>,
-    /// 从 AX Tree 提取的文本内容（最优路径，失败则降级 OCR）
+    /// OCR 之前通过程序化通道提取的文本。
+    ///
+    /// 历史上命名为 AX 文本，但实际可能来自 macOS Accessibility Tree、
+    /// 浏览器 AppleScript fallback 执行的 DOM `innerText`，或应用专用提取器。
+    /// 如果为空，调用方会降级到 OCR。
     pub extracted_text: Option<String>,
 }
 
@@ -150,19 +154,26 @@ fn is_code_symbol(ch: char) -> bool {
 }
 
 fn sanitize_extracted_text(raw: &str, win_title: Option<&str>) -> Option<String> {
+    sanitize_extracted_text_with_reason(raw, win_title).ok()
+}
+
+fn sanitize_extracted_text_with_reason(
+    raw: &str,
+    win_title: Option<&str>,
+) -> Result<String, &'static str> {
     let normalized = normalize_whitespace(raw);
     if normalized.is_empty() {
-        return None;
+        return Err("empty_after_normalize");
     }
 
     let char_count = normalized.chars().count();
     if char_count < 12 {
-        return None;
+        return Err("too_short");
     }
 
     let non_whitespace_count = normalized.chars().filter(|ch| !ch.is_whitespace()).count();
     if non_whitespace_count == 0 {
-        return None;
+        return Err("no_non_whitespace");
     }
 
     let meaningful_count = normalized
@@ -170,7 +181,7 @@ fn sanitize_extracted_text(raw: &str, win_title: Option<&str>) -> Option<String>
         .filter(|ch| !ch.is_whitespace() && (ch.is_alphanumeric() || is_code_symbol(*ch)))
         .count();
     if (meaningful_count as f32 / non_whitespace_count as f32) < 0.55 {
-        return None;
+        return Err("low_meaningful_char_ratio");
     }
 
     let normalized_cmp = normalize_for_comparison(&normalized);
@@ -178,12 +189,12 @@ fn sanitize_extracted_text(raw: &str, win_title: Option<&str>) -> Option<String>
         let title_cmp = normalize_for_comparison(title);
         if !title_cmp.is_empty() {
             if normalized_cmp == title_cmp {
-                return None;
+                return Err("same_as_window_title");
             }
 
             if let Some(remaining) = normalized_cmp.strip_prefix(&title_cmp) {
                 if remaining.trim().chars().count() < 8 {
-                    return None;
+                    return Err("only_window_title_plus_tiny_tail");
                 }
             }
         }
@@ -196,11 +207,11 @@ fn sanitize_extracted_text(raw: &str, win_title: Option<&str>) -> Option<String>
             .filter(|token| token.chars().count() <= 4)
             .count();
         if tokens.len() <= 6 && short_token_count == tokens.len() && char_count < 24 {
-            return None;
+            return Err("short_fragment_only");
         }
     }
 
-    Some(normalized)
+    Ok(normalized)
 }
 
 /// 获取当前前台应用的 AX 信息（同步版本，已废弃）。
@@ -226,7 +237,8 @@ pub fn is_circuit_breaker_tripped() -> bool {
     if TIMEOUT_COUNTER.load(Ordering::Relaxed) < MAX_CONSECUTIVE_TIMEOUTS {
         return false;
     }
-    let last_reset = LAST_RESET_TIME.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+    let last_reset =
+        LAST_RESET_TIME.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
     match last_reset.lock() {
         Ok(guard) => guard.elapsed().as_secs() < CIRCUIT_BREAKER_COOLDOWN_SECS,
         Err(_) => false,
@@ -245,7 +257,8 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
         // 熔断检查：如果连续超时次数过多，进入冷却期
         let timeout_count = TIMEOUT_COUNTER.load(Ordering::Relaxed);
         if timeout_count >= MAX_CONSECUTIVE_TIMEOUTS {
-            let last_reset = LAST_RESET_TIME.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+            let last_reset =
+                LAST_RESET_TIME.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
             let mut guard = last_reset.lock().unwrap();
 
             if guard.elapsed().as_secs() < CIRCUIT_BREAKER_COOLDOWN_SECS {
@@ -348,10 +361,10 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
 #[cfg(all(target_os = "macos", not(test)))]
 mod macos_impl {
     use super::{
-        fallback_extractor_for_context, parse_keyed_quoted_value, sanitize_extracted_text, AXInfo,
-        ExtractedText, TextExtractor, EXTRACTED_TEXT_MAX_CHARS, GENERIC_ALL_UI_ITEM_LIMIT,
+        fallback_extractor_for_context, parse_keyed_quoted_value,
+        sanitize_extracted_text_with_reason, AXInfo, ExtractedText, TextExtractor,
+        AX_CACHE_TTL_SECS, AX_SUPPORT_CACHE, EXTRACTED_TEXT_MAX_CHARS, GENERIC_ALL_UI_ITEM_LIMIT,
         GENERIC_FOCUS_MIN_CHARS, GENERIC_STATIC_ITEM_LIMIT, GENERIC_WINDOW_MIN_CHARS,
-        AX_SUPPORT_CACHE, AX_CACHE_TTL_SECS,
     };
     use std::{
         collections::HashMap,
@@ -649,7 +662,12 @@ end tell"#,
                 let elapsed_ms = started.elapsed().as_millis();
                 match parse_page_metadata(&raw) {
                     Some((url, title)) => {
-                        debug!(stage, elapsed_ms, url_len = url.len(), "浏览器 URL 提取成功");
+                        debug!(
+                            stage,
+                            elapsed_ms,
+                            url_len = url.len(),
+                            "浏览器 URL 提取成功"
+                        );
                         Some((url, title))
                     }
                     None => {
@@ -703,17 +721,44 @@ end tell"#,
         }
 
         // 尝试 generic 提取
-        if let Some(text) =
-            extract_generic_text().and_then(|raw| sanitize_extracted_text(&raw, win_title))
-        {
-            return Some(ExtractedText {
-                source: TextExtractor::Generic,
-                text,
-            });
+        match extract_generic_text() {
+            Some(raw) => match sanitize_extracted_text_with_reason(&raw, win_title) {
+                Ok(text) => {
+                    return Some(ExtractedText {
+                        source: TextExtractor::Generic,
+                        text,
+                    });
+                }
+                Err(reason) => {
+                    debug!(
+                        app = ?app_name,
+                        bundle_id = ?bundle_id,
+                        raw_len = raw.chars().count(),
+                        reason,
+                        "generic AX 文本未通过质量门槛，继续尝试 fallback"
+                    );
+                }
+            },
+            None => {
+                debug!(
+                    app = ?app_name,
+                    bundle_id = ?bundle_id,
+                    reason = "generic_empty_or_failed",
+                    "generic AX 文本提取为空，继续尝试 fallback"
+                );
+            }
         }
 
         // generic 失败，尝试专用提取器
-        let fallback = fallback_extractor_for_context(bundle_id, app_name)?;
+        let Some(fallback) = fallback_extractor_for_context(bundle_id, app_name) else {
+            debug!(
+                app = ?app_name,
+                bundle_id = ?bundle_id,
+                reason = "no_fallback_extractor",
+                "AX 文本提取为空，将降级 OCR"
+            );
+            return None;
+        };
         debug!(
             app = ?app_name,
             bundle_id = ?bundle_id,
@@ -726,9 +771,32 @@ end tell"#,
             TextExtractor::Chrome => extract_chrome_text(),
             TextExtractor::Safari => extract_safari_text(),
             TextExtractor::WeChat => extract_wechat_text(),
-        }?;
+        };
+        let Some(fallback_text) = fallback_text else {
+            debug!(
+                app = ?app_name,
+                bundle_id = ?bundle_id,
+                fallback = fallback.as_str(),
+                reason = "fallback_empty_or_failed",
+                "fallback 文本提取为空，将降级 OCR"
+            );
+            return None;
+        };
 
-        let text = sanitize_extracted_text(&fallback_text, win_title)?;
+        let text = match sanitize_extracted_text_with_reason(&fallback_text, win_title) {
+            Ok(text) => text,
+            Err(reason) => {
+                debug!(
+                    app = ?app_name,
+                    bundle_id = ?bundle_id,
+                    fallback = fallback.as_str(),
+                    raw_len = fallback_text.chars().count(),
+                    reason,
+                    "fallback 文本未通过质量门槛，将降级 OCR"
+                );
+                return None;
+            }
+        };
         Some(ExtractedText {
             source: fallback,
             text,

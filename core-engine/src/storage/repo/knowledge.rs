@@ -5,8 +5,8 @@ use crate::storage::{
     error::StorageError,
     models_bake::{
         BakeDocumentRecord, BakeKnowledgeRecord, BakeMemorySourceRecord, BakeSopRecord,
-        EpisodicMemoryRecord, TimelineRecord, NewBakeKnowledge, NewBakeSop,
-        NewEpisodicMemory, NewTimeline,
+        EpisodicMemoryRecord, NewBakeKnowledge, NewBakeSop, NewEpisodicMemory, NewTimeline,
+        TimelineRecord,
     },
     StorageManager,
 };
@@ -18,9 +18,19 @@ fn extract_document_identity(url: &str) -> String {
     }
 
     let doc_markers = [
-        "docs.corp", "/docs/", "docs.google", "/document/", "yuque.com",
-        "feishu.cn/docx", "feishu.cn/wiki", "notion.so", "confluence",
-        "/wiki/", "shimo.im", "/d/home/", "/s/home/",
+        "docs.corp",
+        "/docs/",
+        "docs.google",
+        "/document/",
+        "yuque.com",
+        "feishu.cn/docx",
+        "feishu.cn/wiki",
+        "notion.so",
+        "confluence",
+        "/wiki/",
+        "shimo.im",
+        "/d/home/",
+        "/s/home/",
     ];
 
     let lowered = url.to_lowercase();
@@ -53,7 +63,10 @@ fn extract_document_identity(url: &str) -> String {
 }
 
 impl StorageManager {
-    pub fn get_document_templates(&self, limit: Option<usize>) -> Result<Vec<BakeDocumentRecord>, StorageError> {
+    pub fn get_document_templates(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<BakeDocumentRecord>, StorageError> {
         self.with_conn(|conn| {
             let lim = limit.unwrap_or(10);
             let mut stmt = conn.prepare(
@@ -68,7 +81,7 @@ impl StorageManager {
                  FROM bake_documents
                  WHERE deleted_at IS NULL AND status IN ('active', 'enabled')
                  ORDER BY COALESCE(match_score, 0) DESC, updated_at DESC
-                 LIMIT ?1"
+                 LIMIT ?1",
             )?;
             let rows = stmt.query_map([lim], |row| {
                 Ok(BakeDocumentRecord {
@@ -340,16 +353,16 @@ impl StorageManager {
                         updated_at: m.updated_at,
                         created_at_ms: m.created_at_ms,
                         updated_at_ms: m.updated_at_ms,
-                capture_ids: None,
-                start_time: None,
-                end_time: None,
-                duration_minutes: None,
-                frag_app_name: None,
-                frag_win_title: None,
-                time_range_start: None,
-                time_range_end: None,
-                key_timestamps: None,
-            })
+                        capture_ids: None,
+                        start_time: None,
+                        end_time: None,
+                        duration_minutes: None,
+                        frag_app_name: None,
+                        frag_win_title: None,
+                        time_range_start: None,
+                        time_range_end: None,
+                        key_timestamps: None,
+                    })
                     .collect())
             }
         }
@@ -486,7 +499,10 @@ impl StorageManager {
             .collect())
     }
 
-    pub fn find_document_by_source_url(&self, url: &str) -> Result<Option<BakeDocumentRecord>, StorageError> {
+    pub fn find_document_by_source_url(
+        &self,
+        url: &str,
+    ) -> Result<Option<BakeDocumentRecord>, StorageError> {
         if url.trim().is_empty() {
             return Ok(None);
         }
@@ -504,7 +520,7 @@ impl StorageManager {
                  FROM bake_documents
                  WHERE deleted_at IS NULL AND source_url IS NOT NULL
                    AND (source_url = ?1 OR instr(source_url, ?2) > 0)
-                 LIMIT 1"
+                 LIMIT 1",
             )?;
             let mut rows = stmt.query(rusqlite::params![url, &doc_id])?;
             if let Some(row) = rows.next()? {
@@ -801,10 +817,7 @@ impl StorageManager {
         })
     }
 
-    pub fn get_timeline_entry(
-        &self,
-        id: i64,
-    ) -> Result<Option<TimelineRecord>, StorageError> {
+    pub fn get_timeline_entry(&self, id: i64) -> Result<Option<TimelineRecord>, StorageError> {
         if let Some(knowledge) = self.get_bake_knowledge(id)? {
             return Ok(Some(TimelineRecord {
                 id: knowledge.id,
@@ -1090,8 +1103,10 @@ fn aggregate_member_capture_text(
          LIMIT {MEMBER_AGGREGATION_MAX_CAPTURES}"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params_vec: Vec<&dyn rusqlite::ToSql> =
-        capture_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let params_vec: Vec<&dyn rusqlite::ToSql> = capture_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
     let rows = stmt.query_map(params_vec.as_slice(), |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -1120,11 +1135,13 @@ fn aggregate_member_capture_text(
         if combined.is_empty() {
             continue;
         }
-        let is_doc = url
-            .as_deref()
-            .map(is_document_url)
-            .unwrap_or(false);
-        members.push(Member { cap_id, ts, text: combined, is_doc });
+        let is_doc = url.as_deref().map(is_document_url).unwrap_or(false);
+        members.push(Member {
+            cap_id,
+            ts,
+            text: combined,
+            is_doc,
+        });
     }
 
     if members.len() <= 1 {
@@ -1154,7 +1171,11 @@ fn aggregate_member_capture_text(
         let truncated: String = m.text.chars().take(allowed).collect();
         let used = truncated.chars().count();
         let tag = if m.is_doc { "doc" } else { "ctx" };
-        let primary_mark = if m.cap_id == primary_capture_id { " primary" } else { "" };
+        let primary_mark = if m.cap_id == primary_capture_id {
+            " primary"
+        } else {
+            ""
+        };
         buf.push_str(&format!(
             "--- capture#{} ts={} [{}{}] ---\n",
             m.cap_id, m.ts, tag, primary_mark
@@ -1220,7 +1241,6 @@ fn parse_capture_ids(raw: Option<&str>) -> Vec<i64> {
     }
 }
 
-
 fn aggregate_url_capture_text(
     conn: &Connection,
     url: &str,
@@ -1263,7 +1283,10 @@ fn aggregate_url_capture_text(
         if combined.is_empty() {
             continue;
         }
-        let head: String = combined.chars().take(URL_AGGREGATION_DEDUP_HEAD_CHARS).collect();
+        let head: String = combined
+            .chars()
+            .take(URL_AGGREGATION_DEDUP_HEAD_CHARS)
+            .collect();
         if !last_head.is_empty() && head == last_head {
             continue;
         }
@@ -1377,9 +1400,7 @@ fn row_to_timeline_entry(row: &rusqlite::Row<'_>) -> Result<TimelineRecord, Stor
 }
 
 /// 将 episodic_memory 行转换为 TimelineRecord（用于向后兼容）
-fn row_to_timeline_record(
-    row: &rusqlite::Row<'_>,
-) -> Result<TimelineRecord, StorageError> {
+fn row_to_timeline_record(row: &rusqlite::Row<'_>) -> Result<TimelineRecord, StorageError> {
     Ok(TimelineRecord {
         id: row.get(0)?,
         capture_id: row.get(1)?,
@@ -1554,8 +1575,7 @@ impl StorageManager {
     /// 删除情节记忆
     pub fn delete_episodic_memory(&self, id: i64) -> Result<bool, StorageError> {
         self.with_conn(|conn| {
-            let affected =
-                conn.execute("DELETE FROM timelines WHERE id = ?1", params![id])?;
+            let affected = conn.execute("DELETE FROM timelines WHERE id = ?1", params![id])?;
             Ok(affected > 0)
         })
     }
@@ -1563,9 +1583,7 @@ impl StorageManager {
     /// 获取时间线关联的Capture IDs
     pub fn get_timeline_capture_ids(&self, timeline_id: i64) -> Result<Vec<i64>, StorageError> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT capture_ids FROM timelines WHERE id = ?1"
-            )?;
+            let mut stmt = conn.prepare("SELECT capture_ids FROM timelines WHERE id = ?1")?;
             match stmt.query_row(params![timeline_id], |row| {
                 let json_str: Option<String> = row.get(0)?;
                 Ok(json_str)
@@ -1582,7 +1600,11 @@ impl StorageManager {
     }
 
     /// 更新时间线的关联Capture IDs
-    pub fn update_timeline_capture_ids(&self, timeline_id: i64, capture_ids: &[i64]) -> Result<bool, StorageError> {
+    pub fn update_timeline_capture_ids(
+        &self,
+        timeline_id: i64,
+        capture_ids: &[i64],
+    ) -> Result<bool, StorageError> {
         self.with_conn(|conn| {
             let json = serde_json::to_string(capture_ids).unwrap_or_else(|_| "[]".to_string());
             let affected = conn.execute(
@@ -1628,7 +1650,7 @@ fn insert_episodic_memory_inner(
             entry.activity_type,
             entry.is_self_generated,
             entry.evidence_strength,
-            now,  // ?17: 用于 created_at, updated_at, created_at_ms, updated_at_ms
+            now, // ?17: 用于 created_at, updated_at, created_at_ms, updated_at_ms
             entry.capture_ids,
             entry.start_time,
             entry.end_time,
@@ -1858,12 +1880,23 @@ impl StorageManager {
             return Ok(std::collections::HashSet::new());
         }
         self.with_conn(|conn| {
-            let placeholders = candidate_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!("SELECT timeline_id FROM bake_knowledge WHERE timeline_id IN ({})", placeholders);
+            let placeholders = candidate_ids
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT timeline_id FROM bake_knowledge WHERE timeline_id IN ({})",
+                placeholders
+            );
             let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let params: Vec<&dyn rusqlite::ToSql> = candidate_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
             let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
-            rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<std::collections::HashSet<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
@@ -1876,12 +1909,23 @@ impl StorageManager {
             return Ok(std::collections::HashSet::new());
         }
         self.with_conn(|conn| {
-            let placeholders = candidate_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!("SELECT timeline_id FROM bake_sops WHERE timeline_id IN ({})", placeholders);
+            let placeholders = candidate_ids
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT timeline_id FROM bake_sops WHERE timeline_id IN ({})",
+                placeholders
+            );
             let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let params: Vec<&dyn rusqlite::ToSql> = candidate_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
             let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
-            rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(StorageError::Sqlite)
+            rows.collect::<Result<std::collections::HashSet<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })
     }
 
@@ -1939,9 +1983,13 @@ fn row_to_bake_sop(row: &rusqlite::Row<'_>) -> Result<BakeSopRecord, StorageErro
         summary: row.get("summary")?,
         content: row.get("content")?,
         detailed_content: row.get("detailed_content")?,
-        entities: row.get::<_, Option<String>>("entities")?.unwrap_or_default(),
+        entities: row
+            .get::<_, Option<String>>("entities")?
+            .unwrap_or_default(),
         importance: row.get::<_, Option<i64>>("importance")?.unwrap_or(3),
-        user_verified: row.get::<_, Option<bool>>("user_verified")?.unwrap_or(false),
+        user_verified: row
+            .get::<_, Option<bool>>("user_verified")?
+            .unwrap_or(false),
         user_edited: row.get::<_, Option<bool>>("user_edited")?.unwrap_or(false),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -1976,6 +2024,9 @@ mod tests {
             screenshot_source: None,
             input_text: None,
             is_sensitive: false,
+            pii_scrubbed: false,
+            url: None,
+            webpage_title: None,
         })
         .expect("插入 capture 失败")
     }
@@ -2080,7 +2131,9 @@ mod tests {
     #[test]
     fn test_update_bake_sop_details_system_works() {
         let mgr = make_mgr();
-        let source_id = mgr.insert_episodic_memory(&sample_entry(&mgr, "meeting")).unwrap();
+        let source_id = mgr
+            .insert_episodic_memory(&sample_entry(&mgr, "meeting"))
+            .unwrap();
         let id = mgr
             .insert_bake_sop(&NewBakeSop {
                 timeline_id: source_id,

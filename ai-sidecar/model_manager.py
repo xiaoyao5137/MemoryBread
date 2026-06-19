@@ -203,6 +203,7 @@ class ModelManager:
         return {
             "active_llm": "qwen3.5-4b",
             "active_embedding": "bge-small-zh",
+            "active_image": None,
             "llm_max_concurrency": 1,
             "api_keys": {}
         }
@@ -728,7 +729,8 @@ class ModelManager:
         """获取当前激活的模型"""
         return {
             "llm": self.config.get('active_llm'),
-            "embedding": self.config.get('active_embedding')
+            "embedding": self.config.get('active_embedding'),
+            "image": self.config.get('active_image'),
         }
 
     def get_all_status(self) -> Dict[str, dict]:
@@ -736,8 +738,13 @@ class ModelManager:
         result = {}
         active_llm = self.config.get('active_llm')
         active_emb = self.config.get('active_embedding')
+        active_image = self.config.get('active_image')
+        from model_registry import AVAILABLE_MODELS as REGISTRY_MODELS
+        all_models = list(AVAILABLE_MODELS.items()) + [
+            (meta.id, meta) for meta in REGISTRY_MODELS if meta.id not in AVAILABLE_MODELS
+        ]
 
-        for model_id, info in AVAILABLE_MODELS.items():
+        for model_id, info in all_models:
             error_msg = None
             # 检查是否正在下载
             with self._download_lock:
@@ -761,7 +768,7 @@ class ModelManager:
                     status = 'not_installed'
                     progress = 0
 
-            is_active = (model_id == active_llm or model_id == active_emb)
+            is_active = (model_id == active_llm or model_id == active_emb or model_id == active_image)
             if is_active and status == 'installed':
                 status = 'active'
 
@@ -784,7 +791,12 @@ class ModelManager:
         self.config['model_configs'][model_id][field_key] = value
         # 同时更新 api_keys 以保持向后兼容
         if field_key == 'api_key':
-            provider = AVAILABLE_MODELS[model_id].provider if model_id in AVAILABLE_MODELS else model_id
+            if model_id in AVAILABLE_MODELS:
+                provider = AVAILABLE_MODELS[model_id].provider
+            else:
+                from model_registry import get_model as registry_get_model
+                meta = registry_get_model(model_id)
+                provider = meta.provider if meta else model_id
             if 'api_keys' not in self.config:
                 self.config['api_keys'] = {}
             self.config['api_keys'][provider] = value
@@ -795,10 +807,13 @@ class ModelManager:
         验证模型的 API Key 是否有效。
         Returns: (ok: bool, message: str)
         """
-        if model_id not in AVAILABLE_MODELS:
+        info = AVAILABLE_MODELS.get(model_id)
+        if info is None:
+            from model_registry import get_model as registry_get_model
+            info = registry_get_model(model_id)
+        if info is None:
             return False, f"未知模型 {model_id}"
 
-        info = AVAILABLE_MODELS[model_id]
         cfg = self.config.get('model_configs', {}).get(model_id, {})
         api_key = cfg.get('api_key') or self.config.get('api_keys', {}).get(info.provider, '')
 
@@ -913,6 +928,11 @@ class ModelManager:
             self.config['active_llm'] = model_id
         elif meta.category == 'embedding':
             self.config['active_embedding'] = model_id
+        elif meta.category == 'image':
+            self.config['active_image'] = model_id
+        else:
+            logger.error(f"activate_model: 不支持激活类型 {meta.category}")
+            return False
         self._save_config()
         logger.info(f"已切换激活模型: {model_id}")
         return True

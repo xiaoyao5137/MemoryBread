@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -14,26 +14,31 @@ use super::{
         action::execute_action,
         bake::{
             create_bake_document, delete_bake_document, delete_bake_knowledge, delete_bake_sop,
-            get_bake_capture, get_bake_capture_screenshot,
-            get_bake_memory_preview, get_bake_overview, get_bake_style_config,
-            ignore_bake_memory, initialize_bake_memories, list_bake_captures,
-            list_bake_documents, list_bake_knowledge, list_bake_memories, list_bake_sops,
-            promote_bake_memory_to_document, promote_bake_memory_to_sop, run_bake_pipeline,
-            toggle_bake_document_status, update_bake_document, update_bake_style_config,
+            get_bake_capture, get_bake_capture_screenshot, get_bake_memory_preview,
+            get_bake_overview, get_bake_style_config, ignore_bake_memory, initialize_bake_memories,
+            list_bake_captures, list_bake_documents, list_bake_knowledge, list_bake_memories,
+            list_bake_sops, promote_bake_memory_to_document, promote_bake_memory_to_sop,
+            run_bake_pipeline, toggle_bake_document_status, update_bake_document,
+            update_bake_style_config,
         },
         captures::list_captures,
+        config_checks::{
+            delete_config_check, install_config_check, list_config_checks, run_config_check,
+        },
         creation::{generate_document, list_history, preview_references, save_history},
         debug::{
             clear_extraction_queue, debug_log_content, debug_log_files, system_stats, vector_status,
         },
         health::health_handler,
         knowledge::{delete_knowledge, extract_knowledge, list_knowledge, verify_knowledge},
-        monitor::{monitor_extraction_live, monitor_overview, monitor_pipeline_dag, monitor_system},
+        monitor::{
+            monitor_extraction_live, monitor_overview, monitor_pipeline_dag, monitor_system,
+        },
         pii::pii_scrub,
         preferences::{list_preferences, run_screenshot_cleanup_now, update_preference},
         privacy::{
-            add_blacklist, delete_blacklist, list_blacklist, list_filters, update_blacklist_enabled,
-            update_filter_config, update_filter_enabled,
+            add_blacklist, delete_blacklist, list_blacklist, list_filters,
+            update_blacklist_enabled, update_filter_config, update_filter_enabled,
         },
         profile::{get_latest_profile, get_profile, list_profiles, update_profile},
         query::rag_query,
@@ -66,6 +71,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             post(run_screenshot_cleanup_now),
         )
         .route("/preferences/:key", put(update_preference))
+        .route("/api/config-checks", get(list_config_checks))
+        .route("/api/config-checks/:id/verify", post(run_config_check))
+        .route("/api/config-checks/:id/install", post(install_config_check))
+        .route("/api/config-checks/:id", delete(delete_config_check))
         .route("/pii/scrub", post(pii_scrub))
         .route("/api/creation/generate", post(generate_document))
         .route("/api/creation/references", post(preview_references))
@@ -104,7 +113,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/profiles/latest", get(get_latest_profile))
         .route("/api/profiles/:id", get(get_profile).put(update_profile))
         // 隐私设置
-        .route("/api/privacy/blacklist", get(list_blacklist).post(add_blacklist))
+        .route(
+            "/api/privacy/blacklist",
+            get(list_blacklist).post(add_blacklist),
+        )
         .route(
             "/api/privacy/blacklist/:id/enabled",
             axum::routing::patch(update_blacklist_enabled),
@@ -131,7 +143,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/bake/sops", get(list_bake_sops))
         .route("/api/bake/sops/:id", axum::routing::delete(delete_bake_sop))
-        .route("/api/bake/documents", get(list_bake_documents).post(create_bake_document))
+        .route(
+            "/api/bake/documents",
+            get(list_bake_documents).post(create_bake_document),
+        )
         .route(
             "/api/bake/documents/:id",
             put(update_bake_document).delete(delete_bake_document),

@@ -10,8 +10,14 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
-import { useFetchPreferences, useRunScreenshotCleanup, useUpdatePreference } from '../hooks/useApi'
-import type { PreferenceRecord } from '../types'
+import {
+  useFetchConfigChecks,
+  useFetchPreferences,
+  useRunConfigCheckAction,
+  useRunScreenshotCleanup,
+  useUpdatePreference,
+} from '../hooks/useApi'
+import type { ConfigCheckItem, ConfigCheckStatus, PreferenceRecord } from '../types'
 import './Settings.v2.css'
 
 interface SettingsProps {
@@ -39,8 +45,13 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const [identityInput, setIdentityInput] = useState('')
   const [identitySaved, setIdentitySaved] = useState(false)
   const [cleanupRunning, setCleanupRunning] = useState(false)
+  const [configChecks, setConfigChecks] = useState<ConfigCheckItem[]>([])
+  const [configChecksLoading, setConfigChecksLoading] = useState(false)
+  const [configActionRunning, setConfigActionRunning] = useState<string | null>(null)
 
   const fetchPrefs = useFetchPreferences()
+  const fetchConfigChecks = useFetchConfigChecks()
+  const runConfigCheckAction = useRunConfigCheckAction()
   const updatePref = useUpdatePreference()
   const runScreenshotCleanup = useRunScreenshotCleanup()
 
@@ -65,6 +76,23 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false))
   }, [fetchPrefs])
+
+  const refreshConfigChecks = useCallback(async () => {
+    setConfigChecksLoading(true)
+    setError(null)
+    try {
+      const items = await fetchConfigChecks()
+      setConfigChecks(items)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setConfigChecksLoading(false)
+    }
+  }, [fetchConfigChecks])
+
+  useEffect(() => {
+    void refreshConfigChecks()
+  }, [refreshConfigChecks])
 
   const handleSaveApiUrl = useCallback(() => {
     const trimmed = apiUrlInput.trim()
@@ -131,6 +159,25 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
     }
   }, [fetchPrefs, runScreenshotCleanup])
 
+  const handleConfigCheckAction = useCallback(async (
+    id: string,
+    action: 'verify' | 'install' | 'delete',
+  ) => {
+    const actionKey = `${id}:${action}`
+    setConfigActionRunning(actionKey)
+    setError(null)
+    try {
+      const result = await runConfigCheckAction(id, action)
+      setSaveMsg(result.message)
+      setTimeout(() => setSaveMsg(null), 5000)
+      await refreshConfigChecks()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setConfigActionRunning(null)
+    }
+  }, [refreshConfigChecks, runConfigCheckAction])
+
   const handleClose = () => setWindowMode('buddy')
 
   const handleSaveIdentity = useCallback(async () => {
@@ -144,6 +191,21 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
       setError(e instanceof Error ? e.message : String(e))
     }
   }, [identityInput, updatePref, USER_IDENTITY_KEY])
+
+  const statusLabel = (status: ConfigCheckStatus) => {
+    switch (status) {
+      case 'ok':
+        return '可用'
+      case 'warning':
+        return '需确认'
+      case 'failed':
+        return '不可用'
+      case 'unsupported':
+        return '不支持'
+      default:
+        return status
+    }
+  }
 
   return (
     <div className={`settings-v2 ${className}`} data-testid="settings-page">
@@ -242,6 +304,94 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
               <div className="settings-v2__identity-hint">
                 ⚠️ 尚未设置身份信息，建议在使用前先完成设置
               </div>
+            )}
+          </div>
+        </section>
+
+        {/* 配置检测 */}
+        <section className="settings-v2__card" data-testid="settings-config-checks-section">
+          <div className="settings-v2__card-header">
+            <div className="settings-v2__card-icon settings-v2__card-icon--blue">
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M20 6 9 17l-5-5" />
+              </svg>
+            </div>
+            <div>
+              <h2 className="settings-v2__card-title">配置检测</h2>
+              <p className="settings-v2__card-desc">检查采集、浏览器文本提取和 OCR 兜底依赖的本机配置</p>
+            </div>
+          </div>
+
+          <div className="settings-v2__config-toolbar">
+            <button
+              type="button"
+              className="settings-v2__btn settings-v2__btn--secondary"
+              onClick={() => void refreshConfigChecks()}
+              disabled={configChecksLoading}
+            >
+              {configChecksLoading ? '检测中...' : '全部验证'}
+            </button>
+          </div>
+
+          <div className="settings-v2__check-list">
+            {configChecks.map((item) => (
+              <div className="settings-v2__check-item" key={item.id} data-testid={`config-check-${item.id}`}>
+                <div className="settings-v2__check-main">
+                  <div className="settings-v2__check-title-row">
+                    <span className="settings-v2__check-name">{item.name}</span>
+                    <span className={`settings-v2__check-status settings-v2__check-status--${item.status}`}>
+                      {statusLabel(item.status)}
+                    </span>
+                  </div>
+                  <div className="settings-v2__check-desc">{item.description}</div>
+                  <div className="settings-v2__check-message">{item.message}</div>
+                  {item.details.length > 0 && (
+                    <ul className="settings-v2__check-details">
+                      {item.details.map((detail, index) => (
+                        <li key={`${item.id}-${index}`}>{detail}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <div className="settings-v2__check-actions">
+                  <button
+                    type="button"
+                    className="settings-v2__btn settings-v2__btn--secondary"
+                    onClick={() => void handleConfigCheckAction(item.id, 'verify')}
+                    disabled={configActionRunning === `${item.id}:verify`}
+                  >
+                    验证
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-v2__btn settings-v2__btn--secondary"
+                    onClick={() => void handleConfigCheckAction(item.id, 'install')}
+                    disabled={!item.can_install || configActionRunning === `${item.id}:install`}
+                  >
+                    配置
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-v2__btn settings-v2__btn--secondary"
+                    onClick={() => void handleConfigCheckAction(item.id, 'delete')}
+                    disabled={!item.can_delete || configActionRunning === `${item.id}:delete`}
+                  >
+                    移除
+                  </button>
+                </div>
+              </div>
+            ))}
+            {!configChecksLoading && configChecks.length === 0 && (
+              <div className="settings-v2__loading">暂无检测项</div>
             )}
           </div>
         </section>

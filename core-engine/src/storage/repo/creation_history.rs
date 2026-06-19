@@ -13,7 +13,14 @@ pub struct CreationHistory {
     pub updated_at: i64,
 }
 
-pub fn insert(conn: &Connection, prompt: &str, content: &str, doc_type: Option<&str>, audience: Option<&str>, ref_count: i64) -> Result<i64> {
+pub fn insert(
+    conn: &Connection,
+    prompt: &str,
+    content: &str,
+    doc_type: Option<&str>,
+    audience: Option<&str>,
+    ref_count: i64,
+) -> Result<i64> {
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
         "INSERT INTO creation_history (prompt, generated_content, doc_type, audience, reference_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",

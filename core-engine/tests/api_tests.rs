@@ -161,6 +161,10 @@ fn seed_capture(sm: &StorageManager) -> i64 {
         screenshot_path: None,
         input_text: None,
         is_sensitive: false,
+        pii_scrubbed: false,
+        screenshot_source: None,
+        url: None,
+        webpage_title: None,
     })
     .unwrap()
 }
@@ -937,6 +941,10 @@ async fn test_bake_captures_search_matches_win_title() {
         screenshot_path: None,
         input_text: None,
         is_sensitive: false,
+        pii_scrubbed: false,
+        screenshot_source: None,
+        url: None,
+        webpage_title: None,
     })
     .unwrap();
 

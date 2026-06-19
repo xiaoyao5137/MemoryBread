@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS captures (
                                                 --   'key_pause'    键盘停顿(>2s)
                                                 --   'manual'       用户手动唤醒
                                                 --   'auto'         定时兜底采集
-    ax_text         TEXT,                       -- Accessibility Tree 提取的结构化文本（优先）
+    ax_text         TEXT,                       -- OCR 前程序化提取文本（历史名 ax_text；可能来自 AX Tree、浏览器 DOM innerText 或专用提取器，优先）
     ax_focused_role TEXT,                       -- 当前焦点元素的 AX role，如 "AXTextField"
     ax_focused_id   TEXT,                       -- 当前焦点元素的标识符（用于执行器定位）
     ocr_text        TEXT,                       -- OCR 降级识别文本（ax_text 失败时使用）

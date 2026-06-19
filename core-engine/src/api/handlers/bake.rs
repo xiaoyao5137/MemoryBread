@@ -10,11 +10,10 @@ use axum::{
 use crate::{
     api::{error::ApiError, state::AppState},
     services::bake_service::{
-        BakeBucket, BakeCaptureFilter, BakeCapturePayload, BakeExtractResponse,
-        BakeKnowledgePayload, BakeListFilter, BakeMemoryFilter, BakeMemoryPayload,
-        BakeOverviewPayload, BakePagedResponse, BakeService, BakeSopPayload,
-        BakeStyleConfig, BakeDocumentPayload, CreateOrUpdateDocumentRequest,
-        InitializeBakeMemoriesResponse,
+        BakeBucket, BakeCaptureFilter, BakeCapturePayload, BakeDocumentPayload,
+        BakeExtractResponse, BakeKnowledgePayload, BakeListFilter, BakeMemoryFilter,
+        BakeMemoryPayload, BakeOverviewPayload, BakePagedResponse, BakeService, BakeSopPayload,
+        BakeStyleConfig, CreateOrUpdateDocumentRequest, InitializeBakeMemoriesResponse,
     },
 };
 
@@ -262,7 +261,7 @@ pub async fn list_bake_knowledge(
             total: response.total,
             limit: response.limit,
             offset: response.offset,
-        })
+        }),
     ))
 }
 
@@ -404,10 +403,7 @@ pub async fn run_bake_pipeline(
     // 统一 bake pipeline 使用全局 watermark，多个 run 并发会重复扫描同一段历史候选，
     // 让监控页出现多个长期“生成中”占位，并拖慢队列收敛。
     const MAX_CONCURRENT_BAKE_RUNS: i64 = 1;
-    let running_count = state
-        .storage
-        .count_running_bake_runs()
-        .unwrap_or(0);
+    let running_count = state.storage.count_running_bake_runs().unwrap_or(0);
     if running_count >= MAX_CONCURRENT_BAKE_RUNS {
         return Ok(Json(serde_json::json!({
             "id": null,

@@ -19,7 +19,10 @@ CREATE TABLE IF NOT EXISTS llm_usage_logs (
     total_tokens      INTEGER NOT NULL DEFAULT 0,
     latency_ms        INTEGER,                    -- 调用耗时（毫秒）
     status            TEXT    NOT NULL DEFAULT 'success', -- 'success' | 'failed'
-    error_msg         TEXT
+    error_msg         TEXT,
+    raw_preview       TEXT,                       -- LLM 原始响应截断预览
+    response_preview  TEXT,                       -- Provider/Ollama 响应截断预览
+    done_reason       TEXT                        -- 如 Ollama length/stop
 );
 
 CREATE INDEX IF NOT EXISTS idx_llm_usage_ts     ON llm_usage_logs(ts);

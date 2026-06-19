@@ -8,9 +8,9 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use image::{imageops::FilterType, DynamicImage};
@@ -117,11 +117,9 @@ pub async fn capture_and_save_async(
     quality: u8,
 ) -> Result<Option<ScreenshotResult>, CaptureError> {
     // 使用 spawn_blocking 避免阻塞 tokio runtime
-    tokio::task::spawn_blocking(move || {
-        capture_and_save(&captures_dir, quality)
-    })
-    .await
-    .map_err(|e| CaptureError::ScreenshotFailed(format!("截图任务 panic: {}", e)))?
+    tokio::task::spawn_blocking(move || capture_and_save(&captures_dir, quality))
+        .await
+        .map_err(|e| CaptureError::ScreenshotFailed(format!("截图任务 panic: {}", e)))?
 }
 
 /// 采集主显示器截图并以 JPEG 格式存储。

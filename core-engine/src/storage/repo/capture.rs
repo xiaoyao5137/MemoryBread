@@ -74,8 +74,8 @@ fn insert_capture_inner(conn: &Connection, c: &NewCapture) -> Result<i64, Storag
             (ts, app_name, app_bundle_id, win_title, event_type,
              ax_text, ax_focused_role, ax_focused_id,
              ocr_text, screenshot_path, screenshot_source, input_text, is_sensitive,
-             url, webpage_title)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             pii_scrubbed, url, webpage_title)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             c.ts,
             c.app_name,
@@ -90,6 +90,7 @@ fn insert_capture_inner(conn: &Connection, c: &NewCapture) -> Result<i64, Storag
             c.screenshot_source,
             c.input_text,
             c.is_sensitive as i64,
+            c.pii_scrubbed as i64,
             c.url,
             c.webpage_title,
         ],
@@ -472,6 +473,9 @@ mod tests {
             screenshot_source: Some("window".into()),
             input_text: Some("你好".into()),
             is_sensitive: false,
+            pii_scrubbed: false,
+            url: None,
+            webpage_title: None,
         }
     }
 

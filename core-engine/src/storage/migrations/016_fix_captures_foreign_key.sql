@@ -12,7 +12,7 @@ CREATE TABLE captures_new (
     app_bundle_id   TEXT,
     win_title       TEXT,
     event_type      TEXT NOT NULL DEFAULT 'auto',
-    ax_text         TEXT,
+    ax_text         TEXT,                       -- OCR 前程序化提取文本（历史名 ax_text；可能来自 AX Tree、浏览器 DOM innerText 或专用提取器）
     ax_focused_role TEXT,
     ax_focused_id   TEXT,
     ocr_text        TEXT,

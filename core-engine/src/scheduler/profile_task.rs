@@ -3,10 +3,10 @@
 //! 每日凌晨 2 点自动分析前一天的时间线数据，生成/更新用户画像。
 
 use chrono::{Datelike, Duration, Utc, Weekday};
-use tracing::{error, info};
 use memory_bread_ipc::{
     IpcRequest, IpcResponse, ProfileAnalysisRequest, ResultPayload, TaskRequest,
 };
+use tracing::{error, info};
 
 use crate::storage::{models::NewUserProfile, StorageManager};
 
@@ -144,10 +144,7 @@ impl ProfileAnalyzer {
     }
 
     /// 发送 IPC 请求到 ai-sidecar
-    async fn send_ipc_request(
-        &self,
-        request: IpcRequest,
-    ) -> anyhow::Result<IpcResponse> {
+    async fn send_ipc_request(&self, request: IpcRequest) -> anyhow::Result<IpcResponse> {
         // TODO: 实现真实的 IPC 通信
         // 这里需要通过 Unix Domain Socket 或 TCP 与 ai-sidecar 通信
         // 暂时返回模拟响应

@@ -12,7 +12,10 @@ CREATE TABLE IF NOT EXISTS llm_usage_logs (
     total_tokens    INTEGER DEFAULT 0,
     latency_ms  INTEGER,
     status      TEXT DEFAULT 'success',
-    error_msg   TEXT
+    error_msg   TEXT,
+    raw_preview TEXT,
+    response_preview TEXT,
+    done_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage_logs(ts);
 

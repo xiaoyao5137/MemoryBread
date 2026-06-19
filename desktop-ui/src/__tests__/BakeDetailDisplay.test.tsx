@@ -14,6 +14,8 @@ const template: ArticleTemplate = {
   tags: ['周报'],
   applicableTasks: ['creation'],
   sourceMemoryIds: ['m-1'],
+  sourceCaptureIds: ['c-1'],
+  sourceEpisodeIds: ['m-1'],
   linkedKnowledgeIds: ['k-1'],
   sections: [
     { title: '背景', keywords: ['背景'] },
@@ -81,6 +83,7 @@ describe('Bake 详情展示优化', () => {
         onSelectSop={noop}
         onDeleteSop={noop}
         onViewLinkedKnowledge={noop}
+        onViewSourceTimeline={noop}
         onCopySteps={noop}
         onPageChange={noop}
         onLimitChange={noop}
@@ -111,6 +114,7 @@ describe('Bake 详情展示优化', () => {
         onSelectSop={noop}
         onDeleteSop={noop}
         onViewLinkedKnowledge={onViewLinkedKnowledge}
+        onViewSourceTimeline={noop}
         onCopySteps={noop}
         onPageChange={noop}
         onLimitChange={noop}

@@ -48,6 +48,12 @@ pub struct GenerateRequest {
     pub freshness_weight: f64,
     #[serde(default = "default_max_references")]
     pub max_references: i64,
+    #[serde(default)]
+    pub creation_model: Option<String>,
+    #[serde(default)]
+    pub creation_api_key: Option<String>,
+    #[serde(default)]
+    pub creation_base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,6 +76,9 @@ struct CreationPayload {
     format_weight: f64,
     freshness_weight: f64,
     max_references: i64,
+    creation_model: Option<String>,
+    creation_api_key: Option<String>,
+    creation_base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,13 +104,12 @@ pub async fn generate_document(
     info!("创作请求: prompt={}", req.user_prompt);
 
     // 1. 查询文档模板
-    let templates = state
-        .storage
-        .get_document_templates(Some(5))
-        .map_err(|e: crate::storage::error::StorageError| {
+    let templates = state.storage.get_document_templates(Some(5)).map_err(
+        |e: crate::storage::error::StorageError| {
             error!("查询文档模板失败: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        },
+    )?;
 
     let design_templates: Vec<serde_json::Value> = templates
         .into_iter()
@@ -149,6 +157,9 @@ pub async fn generate_document(
         format_weight: req.format_weight,
         freshness_weight: req.freshness_weight,
         max_references: req.max_references,
+        creation_model: req.creation_model,
+        creation_api_key: req.creation_api_key,
+        creation_base_url: req.creation_base_url,
     };
 
     let client = reqwest::Client::new();
@@ -159,20 +170,14 @@ pub async fn generate_document(
         .await
         .map_err(|e| {
             error!("调用 ai-sidecar 失败: {}", e);
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("AI 服务不可用: {}", e),
-            )
+            (StatusCode::BAD_GATEWAY, format!("AI 服务不可用: {}", e))
         })?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         error!("ai-sidecar 返回错误: {} - {}", status, body);
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("AI 服务错误: {}", body),
-        ));
+        return Err((StatusCode::BAD_GATEWAY, format!("AI 服务错误: {}", body)));
     }
 
     // 5. 转发 SSE 流
@@ -245,7 +250,10 @@ pub async fn preview_references(
 
     let body = response.json::<serde_json::Value>().await.map_err(|e| {
         error!("解析参考资料预览响应失败: {}", e);
-        (StatusCode::BAD_GATEWAY, format!("AI 服务响应格式错误: {}", e))
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("AI 服务响应格式错误: {}", e),
+        )
     })?;
 
     Ok(Json(body))
@@ -305,32 +313,40 @@ pub async fn save_history(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SaveHistoryRequest>,
 ) -> Result<Json<SaveHistoryResponse>, (StatusCode, String)> {
-    let id = state.storage.with_conn(|conn| {
-        crate::storage::repo::creation_history::insert(
-            conn,
-            &req.prompt,
-            &req.generated_content,
-            req.doc_type.as_deref(),
-            req.audience.as_deref(),
-            req.reference_count,
-        ).map_err(Into::into)
-    }).map_err(|e| {
-        error!("保存创作记录失败: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
+    let id = state
+        .storage
+        .with_conn(|conn| {
+            crate::storage::repo::creation_history::insert(
+                conn,
+                &req.prompt,
+                &req.generated_content,
+                req.doc_type.as_deref(),
+                req.audience.as_deref(),
+                req.reference_count,
+            )
+            .map_err(Into::into)
+        })
+        .map_err(|e| {
+            error!("保存创作记录失败: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     Ok(Json(SaveHistoryResponse { id }))
 }
 
 pub async fn list_history(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<crate::storage::repo::creation_history::CreationHistory>>, (StatusCode, String)> {
-    let histories = state.storage.with_conn(|conn| {
-        crate::storage::repo::creation_history::list_recent(conn, 50).map_err(Into::into)
-    }).map_err(|e| {
-        error!("查询创作记录失败: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
+) -> Result<Json<Vec<crate::storage::repo::creation_history::CreationHistory>>, (StatusCode, String)>
+{
+    let histories = state
+        .storage
+        .with_conn(|conn| {
+            crate::storage::repo::creation_history::list_recent(conn, 50).map_err(Into::into)
+        })
+        .map_err(|e| {
+            error!("查询创作记录失败: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     Ok(Json(histories))
 }

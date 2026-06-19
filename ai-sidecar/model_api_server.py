@@ -325,6 +325,7 @@ def health():
             'pipeline_ready': pipeline_ready,
             'active_llm': model_manager.config.get('active_llm'),
             'active_embedding': model_manager.config.get('active_embedding'),
+            'active_image': model_manager.config.get('active_image'),
         })
     except Exception as e:
         logger.error(f"健康检查失败: {e}")
@@ -408,10 +409,11 @@ def get_hardware():
 
 @app.route('/api/models/active', methods=['GET'])
 def get_active_models():
-    """返回当前激活的 LLM 和 Embedding 模型"""
+    """返回当前激活的 LLM、Embedding 和 Image 模型"""
     try:
         active_llm_id  = model_manager.config.get('active_llm')
         active_emb_id  = model_manager.config.get('active_embedding')
+        active_image_id = model_manager.config.get('active_image')
         runtime        = model_manager.get_all_status()
         if runtime.get('qwen2.5-3b', {}).get('status') in ('installed', 'active') and not active_llm_id:
             active_llm_id = 'qwen2.5-3b'
@@ -430,6 +432,7 @@ def get_active_models():
             'status': 'ok',
             'llm':       _build(active_llm_id),
             'embedding': _build(active_emb_id),
+            'image':     _build(active_image_id),
         })
     except Exception as e:
         logger.error(f"获取激活模型失败: {e}")

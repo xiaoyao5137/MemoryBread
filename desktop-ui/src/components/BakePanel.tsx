@@ -42,6 +42,8 @@ const createDraftTemplate = (): ArticleTemplate => ({
   tags: [],
   applicableTasks: ['creation'],
   sourceMemoryIds: [],
+  sourceCaptureIds: [],
+  sourceEpisodeIds: [],
   linkedKnowledgeIds: [],
   sections: [],
   stylePhrases: [],
@@ -505,6 +507,7 @@ const BakePanel: React.FC = () => {
             onSearch={handleSearchKnowledge}
             onClearFilters={handleClearKnowledgeFilters}
             onDeleteKnowledge={handleDeleteKnowledge}
+            onViewSourceTimeline={handleViewSourceMemory}
             onCreateKnowledge={(knowledge) => {
               setStatusMessage('手工录入功能需要后端API支持，当前仅为UI演示')
             }}
@@ -559,6 +562,7 @@ const BakePanel: React.FC = () => {
             onSelectSop={setSelectedSopId}
             onDeleteSop={handleDeleteSop}
             onViewLinkedKnowledge={handleViewLinkedKnowledge}
+            onViewSourceTimeline={handleViewSourceMemory}
             onCopySteps={(candidate: SopCandidate) => handleCopy(candidate.steps.map((step, idx) => `${idx + 1}. ${step}`).join('\n'), '已复制流程步骤')}
             onCreateSop={(sop) => {
               setStatusMessage('手工录入功能需要后端API支持，当前仅为UI演示')

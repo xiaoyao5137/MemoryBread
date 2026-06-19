@@ -6,6 +6,8 @@ import type {
   BakeCaptureItem,
   BakeKnowledgeItem,
   CaptureRecord,
+  ConfigCheckActionResult,
+  ConfigCheckItem,
   DebugLogContent,
   DebugLogFile,
   TimelineItem,
@@ -202,6 +204,35 @@ export function useRunScreenshotCleanup() {
       method: 'POST',
     })
     if (!resp.ok) throw new Error(`run screenshot cleanup failed: ${resp.status}`)
+    return resp.json()
+  }, [apiBaseUrl])
+}
+
+export function useFetchConfigChecks() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (): Promise<ConfigCheckItem[]> => {
+    const resp = await fetch(`${apiBaseUrl}/api/config-checks`)
+    if (!resp.ok) throw new Error(`config checks fetch failed: ${resp.status}`)
+    const data = await resp.json()
+    return data.items ?? []
+  }, [apiBaseUrl])
+}
+
+export function useRunConfigCheckAction() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (
+    id: string,
+    action: 'verify' | 'install' | 'delete',
+  ): Promise<ConfigCheckActionResult> => {
+    const path = action === 'delete'
+      ? `${apiBaseUrl}/api/config-checks/${encodeURIComponent(id)}`
+      : `${apiBaseUrl}/api/config-checks/${encodeURIComponent(id)}/${action}`
+    const resp = await fetch(path, {
+      method: action === 'delete' ? 'DELETE' : 'POST',
+    })
+    if (!resp.ok) throw new Error(`config check ${action} failed: ${resp.status}`)
     return resp.json()
   }, [apiBaseUrl])
 }
@@ -596,6 +627,7 @@ function mapBakeKnowledge(item: any): BakeKnowledgeItem {
   return {
     id: String(item.id),
     captureId: String(item.capture_id),
+    sourceTimelineId: item.source_timeline_id != null ? String(item.source_timeline_id) : String(item.id),
     summary: item.summary,
     overview: item.overview,
     details: item.details,
@@ -609,6 +641,8 @@ function mapBakeKnowledge(item: any): BakeKnowledgeItem {
     reviewStatus: item.review_status ?? item.status ?? '',
     matchScore: item.match_score ?? undefined,
     matchLevel: item.match_level ?? undefined,
+    createdAt: item.created_at ?? '',
+    createdAtMs: item.created_at_ms ?? 0,
     updatedAt: item.updated_at ?? '',
     updatedAtMs: item.updated_at_ms ?? 0,
   }
@@ -652,12 +686,15 @@ function mapBakeTemplate(item: any): ArticleTemplate {
     tags: item.tags ?? [],
     applicableTasks: item.applicable_tasks ?? [],
     sourceMemoryIds: item.source_memory_ids ?? [],
+    sourceCaptureIds: item.source_capture_ids ?? [],
+    sourceEpisodeIds: item.source_episode_ids ?? [],
     linkedKnowledgeIds: item.linked_knowledge_ids ?? [],
     sections: item.sections ?? [],
     stylePhrases: item.style_phrases ?? [],
     replacementRules: item.replacement_rules ?? [],
     summary: item.summary,
     fullContent: item.full_content,
+    sourceUrl: item.source_url,
     promptHint: item.prompt_hint,
     diagramCode: item.diagram_code,
     imageAssets: item.image_assets ?? [],
@@ -677,12 +714,15 @@ function serializeBakeTemplate(template: ArticleTemplate) {
     tags: template.tags,
     applicable_tasks: template.applicableTasks,
     source_memory_ids: template.sourceMemoryIds,
+    source_capture_ids: template.sourceCaptureIds,
+    source_episode_ids: template.sourceEpisodeIds,
     linked_knowledge_ids: template.linkedKnowledgeIds,
     sections: template.sections,
     style_phrases: template.stylePhrases,
     replacement_rules: template.replacementRules,
     summary: template.summary ?? null,
     full_content: template.fullContent ?? null,
+    source_url: template.sourceUrl ?? null,
     prompt_hint: template.promptHint,
     diagram_code: template.diagramCode,
     image_assets: template.imageAssets ?? [],
@@ -697,6 +737,7 @@ function mapBakeSop(item: any): SopCandidate {
   return {
     id: String(item.id),
     sourceCaptureId: item.source_capture_id ?? '',
+    sourceTimelineId: item.source_timeline_id != null ? String(item.source_timeline_id) : String(item.id),
     sourceTitle: item.source_title,
     triggerKeywords: item.trigger_keywords ?? [],
     confidence: item.confidence,
@@ -706,5 +747,9 @@ function mapBakeSop(item: any): SopCandidate {
     linkedKnowledgeIds: item.linked_knowledge_ids ?? [],
     linkedKnowledgeSummaries: item.linked_knowledge_summaries ?? [],
     status: item.status,
+    createdAt: item.created_at ?? '',
+    createdAtMs: item.created_at_ms ?? 0,
+    updatedAt: item.updated_at ?? '',
+    updatedAtMs: item.updated_at_ms ?? 0,
   }
 }

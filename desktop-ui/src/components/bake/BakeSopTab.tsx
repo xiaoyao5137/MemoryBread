@@ -8,6 +8,19 @@ const confidenceLabel: Record<SopCandidate['confidence'], string> = {
   high: '高',
 }
 
+const formatCreatedTime = (item: Pick<SopCandidate, 'createdAt' | 'createdAtMs'>) => {
+  if ((item.createdAtMs ?? 0) > 0) {
+    return new Date(item.createdAtMs ?? 0).toLocaleString('zh-CN', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+  }
+  return item.createdAt || '创建时间未知'
+}
+
 const BakeSopTab: React.FC<{
   candidates: SopCandidate[]
   total: number
@@ -19,6 +32,7 @@ const BakeSopTab: React.FC<{
   onDeleteSop: (id: string) => void
   onCopySteps: (candidate: SopCandidate) => void
   onViewLinkedKnowledge: (knowledgeId: string) => void
+  onViewSourceTimeline: (timelineId?: string) => void
   onPageChange: (offset: number) => void
   onLimitChange: (limit: number) => void
   onQueryChange: (query: string) => void
@@ -34,6 +48,7 @@ const BakeSopTab: React.FC<{
   onDeleteSop,
   onCopySteps,
   onViewLinkedKnowledge,
+  onViewSourceTimeline,
   onPageChange,
   onLimitChange,
   onQueryChange,
@@ -69,6 +84,8 @@ const BakeSopTab: React.FC<{
       linkedKnowledgeIds: [],
       linkedKnowledgeSummaries: [],
       status: 'confirmed',
+      createdAt: new Date().toLocaleString('zh-CN', { hour12: false }),
+      createdAtMs: Date.now(),
     })
     setShowCreateDialog(false)
     setNewSop({
@@ -143,6 +160,7 @@ const BakeSopTab: React.FC<{
                 <div style={{ minWidth: 0 }}>
                   <div className="bake-list-item__title bake-line-clamp-2">{item.extractedProblem || item.sourceTitle || '未命名问题'}</div>
                   <div className="bake-muted bake-line-clamp-1">关键词：{item.triggerKeywords.join(' / ') || '暂无'}</div>
+                  <div className="bake-muted bake-line-clamp-1">创建：{formatCreatedTime(item)}</div>
                 </div>
               </div>
               <div className="bake-inline-pills">
@@ -196,7 +214,7 @@ const BakeSopTab: React.FC<{
             <div className="bake-inline-meta">
               <div>
                 <div className="bake-title" style={{ fontSize: 18 }}>{selected.extractedProblem || selected.sourceTitle || '未命名问题'}</div>
-                <div className="bake-muted" style={{ marginTop: 4 }}>来源：{selected.sourceTitle || '—'} · ID: {selected.id} · 置信度：{confidenceLabel[selected.confidence]}</div>
+                <div className="bake-muted" style={{ marginTop: 4 }}>来源：{selected.sourceTitle || '—'} · ID: {selected.id} · 创建：{formatCreatedTime(selected)}</div>
               </div>
               <div className="bake-inline-pills">
                 <BakePill text={`置信度 ${confidenceLabel[selected.confidence]}`} />
@@ -247,6 +265,7 @@ const BakeSopTab: React.FC<{
               )}
             </div>
             <div className="bake-actions--primary">
+              <BakeButton onClick={() => onViewSourceTimeline(selected.sourceTimelineId || selected.id)}>关联时间线</BakeButton>
               <BakeButton onClick={() => onDeleteSop(selected.id)}>删除操作手册</BakeButton>
               <BakeButton compact onClick={() => onCopySteps(selected)}>复制流程</BakeButton>
             </div>

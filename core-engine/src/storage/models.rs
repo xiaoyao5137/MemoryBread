@@ -59,6 +59,11 @@ pub struct CaptureRecord {
     pub app_bundle_id: Option<String>,
     pub win_title: Option<String>,
     pub event_type: String,
+    /// OCR 之前通过程序化通道提取到的文本。
+    ///
+    /// 历史字段名为 `ax_text`，但实际语义更接近 `programmatic_text`：
+    /// 可能来自 macOS Accessibility Tree，也可能来自浏览器 AppleScript
+    /// fallback 执行的 DOM `innerText`，或其他应用专用文本提取器。
     pub ax_text: Option<String>,
     pub ax_focused_role: Option<String>,
     pub ax_focused_id: Option<String>,
@@ -74,7 +79,7 @@ pub struct CaptureRecord {
 }
 
 impl CaptureRecord {
-    /// 返回最佳文本（ax_text 优先，fallback 到 ocr_text）
+    /// 返回最佳文本（programmatic/ax_text 优先，fallback 到 ocr_text）
     pub fn best_text(&self) -> Option<&str> {
         self.ax_text.as_deref().or(self.ocr_text.as_deref())
     }
@@ -88,6 +93,7 @@ pub struct NewCapture {
     pub app_bundle_id: Option<String>,
     pub win_title: Option<String>,
     pub event_type: EventType,
+    /// OCR 之前通过程序化通道提取到的文本；字段名沿用历史命名 `ax_text`。
     pub ax_text: Option<String>,
     pub ax_focused_role: Option<String>,
     pub ax_focused_id: Option<String>,
@@ -96,6 +102,7 @@ pub struct NewCapture {
     pub screenshot_source: Option<String>,
     pub input_text: Option<String>,
     pub is_sensitive: bool,
+    pub pii_scrubbed: bool,
     pub url: Option<String>,
     pub webpage_title: Option<String>,
 }

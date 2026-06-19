@@ -1,7 +1,6 @@
 /// 隐私设置 API 处理器
 ///
 /// 提供应用黑名单和敏感内容过滤配置的 HTTP 接口
-
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -14,7 +13,7 @@ use std::sync::Arc;
 use crate::{
     api::{error::ApiError, state::AppState},
     storage::{
-        models::{NewAppBlacklist, AppBlacklistRecord, PrivacyFilterRecord},
+        models::{AppBlacklistRecord, NewAppBlacklist, PrivacyFilterRecord},
         repo::privacy,
     },
 };
@@ -214,7 +213,9 @@ pub async fn update_filter_enabled(
 ) -> Result<impl IntoResponse, ApiError> {
     let storage = state.storage.clone();
     tokio::task::spawn_blocking(move || {
-        storage.with_conn(|conn| privacy::update_privacy_filter_enabled(conn, &filter_type, req.enabled))
+        storage.with_conn(|conn| {
+            privacy::update_privacy_filter_enabled(conn, &filter_type, req.enabled)
+        })
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))??;
@@ -230,7 +231,9 @@ pub async fn update_filter_config(
 ) -> Result<impl IntoResponse, ApiError> {
     let storage = state.storage.clone();
     tokio::task::spawn_blocking(move || {
-        storage.with_conn(|conn| privacy::update_privacy_filter_config(conn, &filter_type, &req.config_json))
+        storage.with_conn(|conn| {
+            privacy::update_privacy_filter_config(conn, &filter_type, &req.config_json)
+        })
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))??;

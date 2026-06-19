@@ -172,13 +172,15 @@ export interface AppState {
   setSidecarVersion:     (v: string) => void
   setHasCompletedSetup:  (v: boolean) => void
   setSetupSkipped:       (v: boolean) => void
+  setCreationModelConfigs: (configs: CreationModelConfig[]) => void
   setCreationModelConfig: (id: string, patch: Partial<CreationModelConfig>) => void
   reset:                 () => void
 }
 
 const SETUP_KEY = 'memory-bread_setup_done'
 const SKIP_KEY  = 'memory-bread_setup_skipped'
-const CREATION_MODEL_KEY = 'memory-bread_creation_models'
+export const CREATION_MODEL_KEY = 'memory-bread_creation_models'
+export const CREATION_MODEL_PREFERENCE_KEY = 'creation.models'
 
 const safeLocalStorage = typeof window !== 'undefined' && typeof window.localStorage?.getItem === 'function'
   ? window.localStorage
@@ -188,17 +190,29 @@ const DEFAULT_CREATION_MODELS: CreationModelConfig[] = [
   { id: 'claude-opus-4-8', enabled: false, apiKey: '', baseUrl: 'https://api.anthropic.com' },
   { id: 'gpt-5-5',         enabled: false, apiKey: '' },
   { id: 'qwen-3-7',        enabled: false, apiKey: '' },
-  { id: 'qwen-3-5-4b',     enabled: false, apiKey: 'ollama', baseUrl: 'http://localhost:11434/v1' },
+  { id: 'qwen-3-5-4b',     enabled: false, apiKey: '' },
   { id: 'glm-latest',      enabled: false, apiKey: '' },
   { id: 'kimi-latest',     enabled: false, apiKey: '' },
 ]
 
-function loadCreationModels(): CreationModelConfig[] {
+export function normalizeCreationModels(models: CreationModelConfig[]): CreationModelConfig[] {
+  const byId = new Map(models.map(model => [model.id, model]))
+  let hasEnabled = false
+  return DEFAULT_CREATION_MODELS.map(defaultModel => {
+    const model = { ...defaultModel, ...byId.get(defaultModel.id) }
+    if (!model.enabled) return model
+    if (hasEnabled) return { ...model, enabled: false }
+    hasEnabled = true
+    return model
+  })
+}
+
+export function loadCreationModels(): CreationModelConfig[] {
   try {
     const raw = safeLocalStorage?.getItem(CREATION_MODEL_KEY)
-    if (raw) return JSON.parse(raw)
+    if (raw) return normalizeCreationModels(JSON.parse(raw))
   } catch { /* ignore */ }
-  return DEFAULT_CREATION_MODELS
+  return normalizeCreationModels(DEFAULT_CREATION_MODELS)
 }
 
 const initialCreationDraft: CreationDraft = {
@@ -377,11 +391,21 @@ export const useAppStore = create<AppState>((set) => ({
     set({ setupSkipped: v })
   },
 
+  setCreationModelConfigs: (configs) => {
+    const normalized = normalizeCreationModels(configs)
+    safeLocalStorage?.setItem(CREATION_MODEL_KEY, JSON.stringify(normalized))
+    set({ creationModelConfigs: normalized })
+  },
+
   setCreationModelConfig: (id, patch) => {
     set((state) => {
-      const updated = state.creationModelConfigs.map(c =>
-        c.id === id ? { ...c, ...patch } : c
-      )
+      const updated = normalizeCreationModels(state.creationModelConfigs.map(c =>
+        c.id === id
+          ? { ...c, ...patch }
+          : patch.enabled === true
+            ? { ...c, enabled: false }
+            : c
+      ))
       safeLocalStorage?.setItem(CREATION_MODEL_KEY, JSON.stringify(updated))
       return { creationModelConfigs: updated }
     })

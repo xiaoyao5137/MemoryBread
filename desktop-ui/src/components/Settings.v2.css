@@ -324,6 +324,105 @@
   font-family: 'SF Mono', Monaco, monospace;
 }
 
+/* 配置检测 */
+.settings-v2__config-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}
+
+.settings-v2__check-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-v2__check-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+  background: #FAFAFA;
+}
+
+.settings-v2__check-main {
+  min-width: 0;
+}
+
+.settings-v2__check-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.settings-v2__check-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #000000;
+}
+
+.settings-v2__check-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-v2__check-status--ok {
+  background: rgba(52, 199, 89, 0.12);
+  color: #248A3D;
+}
+
+.settings-v2__check-status--warning {
+  background: rgba(255, 149, 0, 0.14);
+  color: #B25E00;
+}
+
+.settings-v2__check-status--failed {
+  background: rgba(255, 59, 48, 0.12);
+  color: #C41E3A;
+}
+
+.settings-v2__check-status--unsupported {
+  background: rgba(142, 142, 147, 0.14);
+  color: #6E6E73;
+}
+
+.settings-v2__check-desc,
+.settings-v2__check-message {
+  font-size: 13px;
+  line-height: 1.5;
+  color: #6E6E73;
+}
+
+.settings-v2__check-message {
+  color: #3A3A3C;
+  margin-top: 4px;
+}
+
+.settings-v2__check-details {
+  margin: 8px 0 0 0;
+  padding-left: 18px;
+  color: #6E6E73;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-v2__check-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 /* 版本信息 */
 .settings-v2__version-item {
   display: flex;
@@ -401,6 +500,14 @@
     align-items: flex-start;
     flex-direction: column;
     gap: 4px;
+  }
+
+  .settings-v2__check-item {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-v2__check-actions {
+    justify-content: flex-start;
   }
 }
 
@@ -488,6 +595,24 @@
 
   .settings-v2__pref-item {
     border-bottom-color: rgba(255, 255, 255, 0.06);
+  }
+
+  .settings-v2__check-item {
+    background: #1C1C1E;
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .settings-v2__check-name {
+    color: #FFFFFF;
+  }
+
+  .settings-v2__check-message {
+    color: #D1D1D6;
+  }
+
+  .settings-v2__check-desc,
+  .settings-v2__check-details {
+    color: #AEAEB2;
   }
 
   .settings-v2__version-item {

@@ -220,6 +220,20 @@ const BakeTemplatesTab: React.FC<{
               </div>
             </div>
 
+            {selected.sourceUrl && (
+              <div className="bake-knowledge-detail__section">
+                <div className="bake-kv__title">来源网址</div>
+                <a
+                  href={selected.sourceUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: '#2563EB', textDecoration: 'underline', wordBreak: 'break-all' }}
+                >
+                  {selected.sourceUrl}
+                </a>
+              </div>
+            )}
+
             {isEditing ? (
               <div className="bake-grid-2">
                 <label className="bake-form-field">

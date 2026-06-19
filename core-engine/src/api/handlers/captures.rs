@@ -49,17 +49,24 @@ pub async fn list_captures(
     let storage = state.storage.clone();
 
     if let Some(ids_str) = params.ids {
-        let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let ids: Vec<i64> = ids_str
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
         if ids.is_empty() {
-            return Ok(Json(CapturesResponse { total: 0, captures: vec![] }));
+            return Ok(Json(CapturesResponse {
+                total: 0,
+                captures: vec![],
+            }));
         }
-        let rows = tokio::task::spawn_blocking(move || {
-            storage.get_captures_by_ids(&ids)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))??;
+        let rows = tokio::task::spawn_blocking(move || storage.get_captures_by_ids(&ids))
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))??;
         let total = rows.len();
-        return Ok(Json(CapturesResponse { total, captures: rows }));
+        return Ok(Json(CapturesResponse {
+            total,
+            captures: rows,
+        }));
     }
 
     if let Some(q) = params.q.filter(|s| !s.is_empty()) {

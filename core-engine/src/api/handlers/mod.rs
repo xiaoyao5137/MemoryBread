@@ -3,6 +3,7 @@
 pub mod action;
 pub mod bake;
 pub mod captures;
+pub mod config_checks;
 pub mod creation;
 pub mod debug;
 pub mod health;

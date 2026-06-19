@@ -308,6 +308,7 @@ mod tests {
             screenshot_source: None,
             input_text: None,
             is_sensitive: false,
+            pii_scrubbed: false,
             url: None,
             webpage_title: None,
         };

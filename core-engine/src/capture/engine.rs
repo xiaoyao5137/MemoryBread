@@ -25,6 +25,7 @@ use crate::storage::{
 use super::{
     ax::{get_frontmost_info_async, AXInfo},
     blacklist::BlacklistChecker,
+    content_filter::ContentFilter,
     filter::PrivacyFilter,
     screenshot::{capture_and_save, hamming_distance},
     CaptureError,
@@ -291,7 +292,11 @@ impl CaptureEngine {
                 let bundle_id = bundle_id.clone();
                 tokio::spawn(async move {
                     let _ = storage.with_conn(|conn| {
-                        crate::storage::repo::privacy::increment_block_stat(conn, "blacklist", &bundle_id)
+                        crate::storage::repo::privacy::increment_block_stat(
+                            conn,
+                            "blacklist",
+                            &bundle_id,
+                        )
                     });
                 });
                 return Ok(None);
@@ -603,6 +608,17 @@ impl CaptureEngine {
         ocr_text: Option<String>,
         is_sensitive: bool,
     ) -> Result<i64, CaptureError> {
+        let content_filter = if is_sensitive {
+            None
+        } else {
+            Some(ContentFilter::from_storage(&self.storage))
+        };
+        let ax_text = self.filter_optional_text(&content_filter, ax.extracted_text.clone())?;
+        let input_text =
+            self.filter_optional_text(&content_filter, event.input_text().map(str::to_string))?;
+        let ocr_text = self.filter_optional_text(&content_filter, ocr_text)?;
+        let pii_scrubbed = ax_text.1 || input_text.1 || ocr_text.1;
+
         let new_capture = NewCapture {
             ts,
             app_name: ax.app_name.clone(),
@@ -615,11 +631,7 @@ impl CaptureEngine {
             },
             event_type: event.to_event_type(),
             // 敏感记录不保存文本
-            ax_text: if is_sensitive {
-                None
-            } else {
-                ax.extracted_text.clone()
-            },
+            ax_text: if is_sensitive { None } else { ax_text.0 },
             ax_focused_role: if is_sensitive {
                 None
             } else {
@@ -630,15 +642,12 @@ impl CaptureEngine {
             } else {
                 ax.focused_id.clone()
             },
-            ocr_text: if is_sensitive { None } else { ocr_text },
+            ocr_text: if is_sensitive { None } else { ocr_text.0 },
             screenshot_path,
             screenshot_source,
-            input_text: if is_sensitive {
-                None
-            } else {
-                event.input_text().map(str::to_string)
-            },
+            input_text: if is_sensitive { None } else { input_text.0 },
             is_sensitive,
+            pii_scrubbed,
             url: if is_sensitive { None } else { ax.url.clone() },
             webpage_title: if is_sensitive {
                 None
@@ -647,6 +656,32 @@ impl CaptureEngine {
             },
         };
         Ok(self.storage.insert_capture(&new_capture)?)
+    }
+
+    fn filter_optional_text(
+        &self,
+        content_filter: &Option<ContentFilter>,
+        text: Option<String>,
+    ) -> Result<(Option<String>, bool), CaptureError> {
+        let Some(text) = text else {
+            return Ok((None, false));
+        };
+        let Some(content_filter) = content_filter else {
+            return Ok((Some(text), false));
+        };
+
+        let result = content_filter.filter_text(&text);
+        if result.redacted_count == 0 {
+            return Ok((Some(text), false));
+        }
+
+        for filter_type in &result.hit_types {
+            self.storage.with_conn(|conn| {
+                crate::storage::repo::privacy::increment_block_stat(conn, "filter", filter_type)
+            })?;
+        }
+
+        Ok((Some(result.text), true))
     }
 }
 
@@ -775,8 +810,10 @@ mod tests {
     use crate::storage::repo::capture::CaptureFilter;
     use crate::storage::StorageManager;
     use image::{DynamicImage, GrayImage, Luma};
+    use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn make_test_captures_dir() -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -807,6 +844,76 @@ mod tests {
         let config = CaptureConfig {
             captures_dir: make_test_captures_dir(),
             enable_screenshot: true,
+            enable_ax: false,
+            ..Default::default()
+        };
+        CaptureEngine::new(storage, config)
+    }
+
+    fn make_minimal_privacy_engine() -> CaptureEngine {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE captures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                app_name TEXT,
+                app_bundle_id TEXT,
+                win_title TEXT,
+                event_type TEXT NOT NULL DEFAULT 'auto',
+                ax_text TEXT,
+                ax_focused_role TEXT,
+                ax_focused_id TEXT,
+                ocr_text TEXT,
+                screenshot_path TEXT,
+                audio_text TEXT,
+                input_text TEXT,
+                is_sensitive INTEGER NOT NULL DEFAULT 0,
+                pii_scrubbed INTEGER NOT NULL DEFAULT 0,
+                screenshot_source TEXT,
+                url TEXT,
+                webpage_title TEXT
+            );
+            CREATE TABLE privacy_filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filter_type TEXT NOT NULL UNIQUE,
+                filter_name TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                config_json TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE app_blacklist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bundle_id TEXT NOT NULL UNIQUE,
+                app_name TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE privacy_block_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stat_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                block_count INTEGER NOT NULL DEFAULT 0,
+                week_start TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(stat_type, target_id, week_start)
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute_batch(include_str!(
+            "../storage/migrations/035_seed_privacy_defaults.sql"
+        ))
+        .unwrap();
+
+        let storage = StorageManager {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        let config = CaptureConfig {
+            captures_dir: make_test_captures_dir(),
+            enable_screenshot: false,
             enable_ax: false,
             ..Default::default()
         };
@@ -853,6 +960,50 @@ mod tests {
         let rec = engine.storage.get_capture(id).unwrap().unwrap();
         assert_eq!(rec.event_type, "key_pause");
         assert_eq!(rec.input_text.as_deref(), Some("你好世界"));
+    }
+
+    #[test]
+    fn test_save_capture_redacts_configured_sensitive_text() {
+        let engine = make_minimal_privacy_engine();
+        let ax = AXInfo {
+            app_name: Some("Chrome".into()),
+            app_bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("普通网页".into()),
+            extracted_text: Some("客户手机号 13800138000".into()),
+            ..Default::default()
+        };
+        let event = CaptureEvent::KeyPause {
+            input_buffer: "验证码: 123456".into(),
+        };
+
+        let id = engine
+            .save_capture(
+                current_ts_ms(),
+                &ax,
+                &event,
+                None,
+                None,
+                Some("备用手机号 13900139000".into()),
+                false,
+            )
+            .unwrap();
+
+        let rec = engine.storage.get_capture(id).unwrap().unwrap();
+        assert_eq!(rec.ax_text.as_deref(), Some("客户手机号 [已过滤]"));
+        assert_eq!(rec.input_text.as_deref(), Some("[已过滤]"));
+        assert_eq!(rec.ocr_text.as_deref(), Some("备用手机号 [已过滤]"));
+        assert!(rec.pii_scrubbed);
+
+        let stats = engine
+            .storage
+            .with_conn(crate::storage::repo::privacy::get_week_block_stats)
+            .unwrap();
+        assert!(stats
+            .iter()
+            .any(|stat| stat.stat_type == "filter" && stat.target_id == "pii"));
+        assert!(stats
+            .iter()
+            .any(|stat| stat.stat_type == "filter" && stat.target_id == "chat"));
     }
 
     #[tokio::test]

@@ -15,8 +15,8 @@ use super::CaptureEvent;
 /// 内存压力等级
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemoryPressure {
-    Normal,  // < 70%
-    High,    // 70-85%
+    Normal,   // < 70%
+    High,     // 70-85%
     Critical, // > 85%
 }
 
@@ -74,12 +74,16 @@ pub async fn start_listener(config: ListenerConfig, tx: mpsc::Sender<CaptureEven
         // ── 三联门禁 ──────────────────────────────────────────────────────────
         let asleep = is_display_asleep_async().await;
         let avail_mb = get_available_memory_mb_async().await;
-        let mem_blocked = avail_mb.map(|mb| mb < LOW_MEMORY_THRESHOLD_MB).unwrap_or(false);
+        let mem_blocked = avail_mb
+            .map(|mb| mb < LOW_MEMORY_THRESHOLD_MB)
+            .unwrap_or(false);
         let ax_tripped = super::ax::is_circuit_breaker_tripped();
 
         if asleep || mem_blocked || ax_tripped {
-            let new_interval =
-                current_interval.saturating_mul(2).min(MAX_BACKOFF_SECS).max(base_interval);
+            let new_interval = current_interval
+                .saturating_mul(2)
+                .min(MAX_BACKOFF_SECS)
+                .max(base_interval);
             warn!(
                 asleep,
                 avail_mb = ?avail_mb,
@@ -129,7 +133,10 @@ pub async fn start_listener(config: ListenerConfig, tx: mpsc::Sender<CaptureEven
             }
         }
 
-        debug!("触发定时采集事件 (内存压力: {:?}, interval: {}s)", pressure, current_interval);
+        debug!(
+            "触发定时采集事件 (内存压力: {:?}, interval: {}s)",
+            pressure, current_interval
+        );
 
         match tokio::time::timeout(Duration::from_secs(5), tx.send(CaptureEvent::Periodic)).await {
             Ok(Ok(_)) => {}
@@ -201,7 +208,7 @@ fn get_memory_pressure() -> MemoryPressure {
     let mut pages_active = 0u64;
     let mut pages_inactive = 0u64;
     let mut pages_wired = 0u64;
-    let mut pages_compressed = 0u64;  // 压缩内存
+    let mut pages_compressed = 0u64; // 压缩内存
     let mut page_size = 4096u64;
 
     for line in stdout.lines() {
@@ -237,9 +244,9 @@ fn get_memory_pressure() -> MemoryPressure {
     let usage_percent = (used_pages * 100) / total_pages;
 
     match usage_percent {
-        0..=69 => MemoryPressure::Normal,   // < 70%
-        70..=84 => MemoryPressure::High,    // 70-85%
-        _ => MemoryPressure::Critical,      // >= 85%
+        0..=69 => MemoryPressure::Normal, // < 70%
+        70..=84 => MemoryPressure::High,  // 70-85%
+        _ => MemoryPressure::Critical,    // >= 85%
     }
 }
 
@@ -339,7 +346,15 @@ fn is_display_asleep() -> bool {
     use std::process::Command;
 
     let output = match Command::new("ioreg")
-        .args(["-r", "-k", "IOPowerManagement", "-n", "IODisplayWrangler", "-d", "1"])
+        .args([
+            "-r",
+            "-k",
+            "IOPowerManagement",
+            "-n",
+            "IODisplayWrangler",
+            "-d",
+            "1",
+        ])
         .output()
     {
         Ok(o) => o,

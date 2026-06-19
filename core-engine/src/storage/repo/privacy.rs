@@ -4,7 +4,10 @@
 
 use crate::storage::{
     error::StorageError,
-    models::{AppBlacklistRecord, NewAppBlacklist, PrivacyFilterRecord, NewPrivacyFilter, PrivacyBlockStat},
+    models::{
+        AppBlacklistRecord, NewAppBlacklist, NewPrivacyFilter, PrivacyBlockStat,
+        PrivacyFilterRecord,
+    },
 };
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
@@ -25,9 +28,7 @@ fn get_week_start() -> String {
 
 /// 获取所有启用的黑名单 Bundle ID（用于内存缓存）
 pub fn get_enabled_blacklist_bundle_ids(conn: &Connection) -> Result<HashSet<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT bundle_id FROM app_blacklist WHERE enabled = 1"
-    )?;
+    let mut stmt = conn.prepare("SELECT bundle_id FROM app_blacklist WHERE enabled = 1")?;
 
     let bundle_ids = stmt
         .query_map([], |row| row.get::<_, String>(0))?
@@ -51,7 +52,7 @@ pub fn list_app_blacklist(conn: &Connection) -> Result<Vec<AppBlacklistRecord>> 
     let mut stmt = conn.prepare(
         "SELECT id, bundle_id, app_name, enabled, reason, created_at, updated_at
          FROM app_blacklist
-         ORDER BY created_at DESC"
+         ORDER BY created_at DESC",
     )?;
 
     let records = stmt
@@ -94,7 +95,10 @@ pub fn update_app_blacklist_enabled(conn: &Connection, id: i64, enabled: bool) -
     )?;
 
     if rows == 0 {
-        return Err(StorageError::NotFound(format!("黑名单记录 id={} 不存在", id)));
+        return Err(StorageError::NotFound(format!(
+            "黑名单记录 id={} 不存在",
+            id
+        )));
     }
     Ok(())
 }
@@ -103,7 +107,10 @@ pub fn update_app_blacklist_enabled(conn: &Connection, id: i64, enabled: bool) -
 pub fn delete_app_blacklist(conn: &Connection, id: i64) -> Result<()> {
     let rows = conn.execute("DELETE FROM app_blacklist WHERE id = ?1", params![id])?;
     if rows == 0 {
-        return Err(StorageError::NotFound(format!("黑名单记录 id={} 不存在", id)));
+        return Err(StorageError::NotFound(format!(
+            "黑名单记录 id={} 不存在",
+            id
+        )));
     }
     Ok(())
 }
@@ -117,7 +124,7 @@ pub fn list_privacy_filters(conn: &Connection) -> Result<Vec<PrivacyFilterRecord
     let mut stmt = conn.prepare(
         "SELECT id, filter_type, filter_name, enabled, config_json, updated_at
          FROM privacy_filters
-         ORDER BY id"
+         ORDER BY id",
     )?;
 
     let records = stmt
@@ -141,7 +148,7 @@ pub fn get_enabled_privacy_filters(conn: &Connection) -> Result<Vec<PrivacyFilte
     let mut stmt = conn.prepare(
         "SELECT id, filter_type, filter_name, enabled, config_json, updated_at
          FROM privacy_filters
-         WHERE enabled = 1"
+         WHERE enabled = 1",
     )?;
 
     let records = stmt
@@ -161,27 +168,41 @@ pub fn get_enabled_privacy_filters(conn: &Connection) -> Result<Vec<PrivacyFilte
 }
 
 /// 更新过滤规则启用状态
-pub fn update_privacy_filter_enabled(conn: &Connection, filter_type: &str, enabled: bool) -> Result<()> {
+pub fn update_privacy_filter_enabled(
+    conn: &Connection,
+    filter_type: &str,
+    enabled: bool,
+) -> Result<()> {
     let rows = conn.execute(
         "UPDATE privacy_filters SET enabled = ?1, updated_at = datetime('now') WHERE filter_type = ?2",
         params![if enabled { 1 } else { 0 }, filter_type],
     )?;
 
     if rows == 0 {
-        return Err(StorageError::NotFound(format!("过滤规则 {} 不存在", filter_type)));
+        return Err(StorageError::NotFound(format!(
+            "过滤规则 {} 不存在",
+            filter_type
+        )));
     }
     Ok(())
 }
 
 /// 更新过滤规则配置
-pub fn update_privacy_filter_config(conn: &Connection, filter_type: &str, config_json: &str) -> Result<()> {
+pub fn update_privacy_filter_config(
+    conn: &Connection,
+    filter_type: &str,
+    config_json: &str,
+) -> Result<()> {
     let rows = conn.execute(
         "UPDATE privacy_filters SET config_json = ?1, updated_at = datetime('now') WHERE filter_type = ?2",
         params![config_json, filter_type],
     )?;
 
     if rows == 0 {
-        return Err(StorageError::NotFound(format!("过滤规则 {} 不存在", filter_type)));
+        return Err(StorageError::NotFound(format!(
+            "过滤规则 {} 不存在",
+            filter_type
+        )));
     }
     Ok(())
 }
@@ -195,8 +216,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
 
         // 创建表
-        conn.execute_batch(include_str!("../../../shared/db-schema/migrations/009_privacy_settings.sql"))
-            .unwrap();
+        conn.execute_batch(include_str!(
+            "../../../../shared/db-schema/migrations/009_privacy_settings.sql"
+        ))
+        .unwrap();
 
         conn
     }

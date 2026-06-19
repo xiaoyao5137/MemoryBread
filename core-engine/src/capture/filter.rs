@@ -10,9 +10,6 @@ use std::collections::HashSet;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_BLOCKED_APPS: &[&str] = &[
-    "1Password",
-    "Keychain Access",
-    "FaceTime",
     "System Preferences",
     "System Settings",
     "memory-bread",
@@ -20,12 +17,7 @@ const DEFAULT_BLOCKED_APPS: &[&str] = &[
     "记忆面包",
 ];
 
-const DEFAULT_BLOCKED_BUNDLE_IDS: &[&str] = &[
-    "com.agilebits.onepassword7",
-    "com.apple.keychainaccess",
-    "com.apple.FaceTime",
-    "com.apple.systempreferences",
-];
+const DEFAULT_BLOCKED_BUNDLE_IDS: &[&str] = &["com.apple.systempreferences"];
 
 /// 窗口标题中出现这些关键词时判定为敏感
 const SENSITIVE_WIN_KEYWORDS: &[&str] = &[
@@ -152,15 +144,17 @@ mod tests {
 
     #[test]
     fn test_blocked_app_name() {
-        assert!(f().is_sensitive(Some("1Password"), None, None, None));
-        assert!(f().is_sensitive(Some("Keychain Access"), None, None, None));
+        assert!(f().is_sensitive(Some("System Settings"), None, None, None));
+        assert!(f().is_sensitive(Some("memory-bread"), None, None, None));
         assert!(!f().is_sensitive(Some("Feishu"), None, None, None));
     }
 
     #[test]
     fn test_blocked_bundle_id() {
-        assert!(f().is_sensitive(None, Some("com.agilebits.onepassword7"), None, None));
+        assert!(f().is_sensitive(None, Some("com.apple.systempreferences"), None, None));
         assert!(!f().is_sensitive(None, Some("com.tencent.xinWeChat"), None, None));
+        assert!(!f().is_sensitive(None, Some("com.apple.Photos"), None, None));
+        assert!(!f().is_sensitive(None, Some("com.google.Chrome"), None, None));
     }
 
     #[test]

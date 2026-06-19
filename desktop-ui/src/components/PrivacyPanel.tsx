@@ -4,6 +4,12 @@ import './PrivacyPanel.css'
 
 const API_BASE = 'http://127.0.0.1:7070'
 
+const FILTER_DESCRIPTIONS: Record<string, string> = {
+  chat: '检测密码、验证码、账号等聊天敏感内容',
+  pii: '检测身份证、银行卡、手机号、邮箱等身份信息',
+  policy: '检测涉密、机密、内部文件等政策敏感信息'
+}
+
 const PrivacyPanel: React.FC = () => {
   const [blacklist, setBlacklist] = useState<AppBlacklistRecord[]>([])
   const [filters, setFilters] = useState<PrivacyFilterRecord[]>([])
@@ -144,9 +150,7 @@ const PrivacyPanel: React.FC = () => {
                 <div className="filter-info">
                   <div className="filter-name">{filter.filter_name}</div>
                   <div className="filter-desc">
-                    {filter.filter_type === 'chat' && '检测密码、验证码等聊天敏感内容'}
-                    {filter.filter_type === 'pii' && '检测身份证、银行卡、手机号等个人信息'}
-                    {filter.filter_type === 'policy' && '检测涉密、机密等政策敏感信息'}
+                    {FILTER_DESCRIPTIONS[filter.filter_type] || '使用配置规则检测并过滤敏感内容'}
                     {filter.week_blocked !== undefined && filter.week_blocked > 0 && (
                       <span className="stat-badge"> · 本周已拦截 {filter.week_blocked} 条</span>
                     )}

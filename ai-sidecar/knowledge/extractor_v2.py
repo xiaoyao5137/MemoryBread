@@ -9,11 +9,15 @@ import logging
 import re
 import time
 import urllib.request
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Callable
 from datetime import datetime
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+BAKE_NUM_PREDICT = 65536
+BAKE_ERROR_LOG_PATH = Path.home() / ".memory-bread" / "logs" / "bake_extract_errors.log"
 
 # RAG 查询优先锁:model_api_server 在 RAG 调用期间持有此文件锁。
 # 时间线提炼在调 LLM 前非阻塞 acquire；拿不到则跳过本轮，让 RAG 优先完成。
@@ -170,6 +174,21 @@ def _preview_text(value: Any, limit: int = 500) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + " ...(已截断)"
+
+
+def _append_bake_error_log(message: str, **fields: Any) -> None:
+    try:
+        BAKE_ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "ts_ms": int(time.time() * 1000),
+            "message": message,
+            **fields,
+        }
+        with BAKE_ERROR_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, ensure_ascii=False, default=str))
+            fh.write("\n")
+    except Exception as exc:
+        logger.warning("写入 bake 提炼错误日志失败: %s", exc)
 
 
 UI_NOISE_LINE_PATTERNS = (
@@ -1120,10 +1139,15 @@ class KnowledgeExtractorV2:
                     {"role": "user", "content": user_prompt},
                 ],
                 format=BAKE_RESPONSE_SCHEMA,
-                options={"temperature": 0.0, "num_predict": 1024},
+                options={"temperature": 0.0, "num_predict": BAKE_NUM_PREDICT},
             )
             raw_content = _extract_ollama_response_text(response)
             tracker.set_response(response)
+            tracker.set_trace(
+                raw_preview=_preview_text(raw_content, 4000),
+                response_preview=_preview_text(response, 4000),
+                done_reason=response.get("done_reason"),
+            )
             if tracker._prompt_tokens == 0:
                 tracker.set_tokens(
                     prompt=estimate_tokens(system_prompt + user_prompt),
@@ -1131,6 +1155,29 @@ class KnowledgeExtractorV2:
                 )
 
         elapsed_ms = int((time.time() - started_at) * 1000)
+        done_reason = response.get("done_reason")
+        if done_reason == "length":
+            _append_bake_error_log(
+                "bake LLM output exceeded num_predict",
+                caller_id=caller_id,
+                model=self.model,
+                num_predict=BAKE_NUM_PREDICT,
+                prompt_chars=len(system_prompt) + len(user_prompt),
+                raw_len=len(raw_content),
+                prompt_tokens=(response.get("usage") or {}).get("prompt_tokens") or response.get("prompt_eval_count"),
+                completion_tokens=(response.get("usage") or {}).get("completion_tokens") or response.get("eval_count"),
+                elapsed_ms=elapsed_ms,
+                done_reason=done_reason,
+                raw_head=_preview_text(raw_content, 2000),
+                raw_tail=raw_content[-2000:] if raw_content else "",
+                response_preview=_preview_text(response, 4000),
+            )
+            logger.error(
+                "bake LLM output exceeded num_predict caller=%s num_predict=%s raw_len=%s",
+                caller_id,
+                BAKE_NUM_PREDICT,
+                len(raw_content),
+            )
         logger.info(
             "bake llm done caller=%s elapsed_ms=%s raw_len=%s",
             caller_id,
@@ -1157,6 +1204,7 @@ class KnowledgeExtractorV2:
             'raw_content': raw_content,
             'raw_preview': _preview_text(raw_content),
             'response_preview': _preview_text(response),
+            'done_reason': response.get('done_reason'),
             'empty_content': not bool(raw_content.strip()),
             'elapsed_ms': elapsed_ms,
         }
@@ -1188,7 +1236,9 @@ class KnowledgeExtractorV2:
         elapsed_ms = int((time.time() - started_at) * 1000)
 
         if not parsed:
-            reason = 'empty_content' if meta.get('empty_content') else 'invalid_json'
+            reason = 'empty_content' if meta.get('empty_content') else (
+                'truncated_json' if meta.get('done_reason') == 'length' else 'invalid_json'
+            )
             logger.warning(
                 "bake %s 提炼响应不可解析 caller=%s reason=%s elapsed_ms=%s raw=%s response=%s",
                 artifact_type,

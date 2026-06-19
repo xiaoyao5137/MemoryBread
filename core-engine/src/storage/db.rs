@@ -148,6 +148,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "034_create_creation_history",
         include_str!("migrations/034_create_creation_history.sql"),
     ),
+    (
+        "035_seed_privacy_defaults",
+        include_str!("migrations/035_seed_privacy_defaults.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -349,8 +353,18 @@ impl StorageManager {
         Self::add_column_if_missing(conn, "bake_knowledge", "detailed_content", "TEXT")?;
         Self::add_column_if_missing(conn, "bake_knowledge", "document_id", "INTEGER")?;
         Self::add_column_if_missing(conn, "bake_knowledge", "section_ids", "TEXT DEFAULT '[]'")?;
-        Self::add_column_if_missing(conn, "bake_knowledge", "source_timeline_ids", "TEXT DEFAULT '[]'")?;
-        Self::add_column_if_missing(conn, "bake_knowledge", "source_capture_ids", "TEXT NOT NULL DEFAULT '[]'")?;
+        Self::add_column_if_missing(
+            conn,
+            "bake_knowledge",
+            "source_timeline_ids",
+            "TEXT DEFAULT '[]'",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "bake_knowledge",
+            "source_capture_ids",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
         // 023 迁移可能未真正执行：episodic_memory_id → timeline_id
         if Self::has_column(conn, "bake_knowledge", "episodic_memory_id")?
             && !Self::has_column(conn, "bake_knowledge", "timeline_id")?

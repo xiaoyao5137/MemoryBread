@@ -39,6 +39,27 @@ export interface PreferenceRecord {
   updated_at: number
 }
 
+export type ConfigCheckStatus = 'ok' | 'warning' | 'failed' | 'unsupported'
+
+export interface ConfigCheckItem {
+  id: string
+  name: string
+  description: string
+  status: ConfigCheckStatus
+  message: string
+  details: string[]
+  can_install: boolean
+  can_delete: boolean
+}
+
+export interface ConfigCheckActionResult {
+  id: string
+  action: 'verify' | 'install' | 'delete' | string
+  status: ConfigCheckStatus
+  message: string
+  details: string[]
+}
+
 export interface RagQueryResponse {
   answer:   string
   contexts: RagContext[]
@@ -144,6 +165,7 @@ export interface TimelineItem {
 export interface BakeKnowledgeItem {
   id: string
   captureId: string
+  sourceTimelineId?: string
   summary: string
   overview?: string
   details?: string
@@ -157,6 +179,8 @@ export interface BakeKnowledgeItem {
   reviewStatus: string
   matchScore?: number
   matchLevel?: string
+  createdAt: string
+  createdAtMs: number
   updatedAt: string
   updatedAtMs: number
 }
@@ -214,12 +238,15 @@ export interface ArticleTemplate {
   tags: string[]
   applicableTasks: Array<'qa' | 'creation' | 'work_tip'>
   sourceMemoryIds: string[]
+  sourceCaptureIds: string[]
+  sourceEpisodeIds: string[]
   linkedKnowledgeIds: string[]
   sections: TemplateSection[]
   stylePhrases: string[]
   replacementRules: ReplacementRule[]
   summary?: string
   fullContent?: string
+  sourceUrl?: string
   diagramCode?: string
   imageAssets?: string[]
   promptHint?: string
@@ -246,6 +273,7 @@ export interface LinkedKnowledgeSummary {
 export interface SopCandidate {
   id: string
   sourceCaptureId: string
+  sourceTimelineId?: string
   sourceTitle?: string
   triggerKeywords: string[]
   confidence: 'low' | 'medium' | 'high'
@@ -255,6 +283,10 @@ export interface SopCandidate {
   linkedKnowledgeIds: string[]
   linkedKnowledgeSummaries: LinkedKnowledgeSummary[]
   status: 'candidate' | 'confirmed' | 'auto_created' | 'ignored'
+  createdAt?: string
+  createdAtMs?: number
+  updatedAt?: string
+  updatedAtMs?: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

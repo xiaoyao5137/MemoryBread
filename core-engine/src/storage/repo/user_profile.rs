@@ -97,7 +97,10 @@ impl StorageManager {
         Ok(())
     }
 
-    pub fn get_latest_profile(&self, snapshot_type: &str) -> Result<Option<UserProfileRecord>, StorageError> {
+    pub fn get_latest_profile(
+        &self,
+        snapshot_type: &str,
+    ) -> Result<Option<UserProfileRecord>, StorageError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, snapshot_type, snapshot_date, content, is_system_generated, created_at, updated_at

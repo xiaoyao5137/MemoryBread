@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import type { ModelEntry } from '../types'
-import { useAppStore } from '../store/useAppStore'
+import { CREATION_MODEL_PREFERENCE_KEY, useAppStore } from '../store/useAppStore'
 import type { CreationModelConfig } from '../store/useAppStore'
 
 const SIDECAR = 'http://localhost:7071'
@@ -429,7 +429,7 @@ const ModelCard: React.FC<{
               <button onClick={onDownload} style={btn('#007AFF', 'white', 11)}>下载</button>
             )}
             {isInstalled && !isActive && !isLoading && !isInferenceEngine && (
-              <button onClick={onActivate} style={btn('#34C759', 'white', 11)}>激活</button>
+              <button onClick={onActivate} style={btn('#34C759', 'white', 11)}>启用</button>
             )}
             {isActive && (
               <span style={{ fontSize: 11, color: '#007AFF', fontWeight: 600 }}>使用中</span>
@@ -472,10 +472,25 @@ const ModelManager: React.FC = () => {
   const [llmConcurrencyError, setLlmConcurrencyError] = useState('')
   const [configuringCreationId, setConfiguringCreationId] = useState<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const { creationModelConfigs, setCreationModelConfig } = useAppStore(s => ({
+  const { apiBaseUrl, creationModelConfigs, setCreationModelConfig } = useAppStore(s => ({
+    apiBaseUrl: s.apiBaseUrl,
     creationModelConfigs: s.creationModelConfigs,
     setCreationModelConfig: s.setCreationModelConfig,
   }))
+
+  const persistCreationModelConfigs = async () => {
+    const configs = useAppStore.getState().creationModelConfigs
+    await fetch(`${apiBaseUrl}/preferences/${encodeURIComponent(CREATION_MODEL_PREFERENCE_KEY)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: JSON.stringify(configs) }),
+    })
+  }
+
+  const handleCreationModelChange = (id: string, patch: Partial<CreationModelConfig>) => {
+    setCreationModelConfig(id, patch)
+    void persistCreationModelConfigs()
+  }
 
   const loadModels = async () => {
     setLoading(true)
@@ -824,7 +839,7 @@ const ModelManager: React.FC = () => {
             configs={creationModelConfigs}
             openId={configuringCreationId}
             onToggleOpen={setConfiguringCreationId}
-            onChange={setCreationModelConfig}
+            onChange={handleCreationModelChange}
           />
         ) : (
           <>
@@ -949,6 +964,7 @@ const CREATION_MODEL_ID_TO_NAME: Record<string, string> = {
 }
 
 const CREATION_SVC = 'http://127.0.0.1:8001'
+const LOCAL_CREATION_MODEL_ID = 'qwen-3-5-4b'
 
 type CreationChatEntry = { def: typeof CREATION_MODEL_DEFS[number]; cfg: { id: string; apiKey: string; baseUrl?: string } }
 
@@ -1085,31 +1101,34 @@ const CreationModelPanel: React.FC<{
       {CREATION_MODEL_DEFS.map(def => {
         const cfg = configs.find(c => c.id === def.id) || { id: def.id, enabled: false, apiKey: '' }
         const isOpen = openId === def.id
+        const isLocalModel = def.id === LOCAL_CREATION_MODEL_ID
         const ts = testState[def.id]
         return (
           <div key={def.id} style={{ background: 'white', borderRadius: 10, padding: '10px 12px', border: '1px solid rgba(0,0,0,0.07)', marginBottom: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ width: 8, height: 8, borderRadius: '50%', background: PROVIDER_COLOR[def.provider] || '#AEAEB2', flexShrink: 0 }} />
               <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: '#1D1D1F' }}>{def.name}</span>
-              {cfg.apiKey && (
+              {!isLocalModel && cfg.apiKey && (
                 <button onClick={() => handleTest(def, cfg)} disabled={ts?.loading} style={btn(ts?.result ? '#34C759' : ts?.error ? '#FF3B30' : '#F2F2F7', ts?.result || ts?.error ? 'white' : '#333', 11)}>
                   {ts?.loading ? '验证中…' : ts?.result ? '已通' : ts?.error ? '失败' : '验证'}
                 </button>
               )}
-              {cfg.apiKey && (
+              {!isLocalModel && cfg.apiKey && (
                 <button onClick={() => setChattingModel({ def, cfg })} style={btn('#AF52DE18', '#AF52DE', 11)}>💬 体验</button>
               )}
-              <button onClick={() => onToggleOpen(isOpen ? null : def.id)} style={btn('#F2F2F7', '#333', 11)}>
-                {isOpen ? '收起' : '配置'}
-              </button>
+              {!isLocalModel && (
+                <button onClick={() => onToggleOpen(isOpen ? null : def.id)} style={btn('#F2F2F7', '#333', 11)}>
+                  {isOpen ? '收起' : '配置'}
+                </button>
+              )}
               <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
-                <input type="checkbox" checked={cfg.enabled} onChange={e => onChange(def.id, { enabled: e.target.checked })} />
-                <span style={{ fontSize: 11, color: cfg.enabled ? '#007AFF' : '#AEAEB2' }}>{cfg.enabled ? '已启用' : '停用'}</span>
+                <input type="checkbox" checked={cfg.enabled} onChange={() => onChange(def.id, { enabled: !cfg.enabled })} />
+                <span style={{ fontSize: 11, color: cfg.enabled ? '#007AFF' : '#AEAEB2' }}>启用</span>
               </label>
             </div>
             {ts?.error && <div style={{ fontSize: 11, color: '#FF3B30', marginTop: 6 }}>{ts.error}</div>}
             {ts?.result && <div style={{ fontSize: 11, color: '#34C759', marginTop: 6 }}>回复：{ts.result}</div>}
-            {isOpen && (
+            {isOpen && !isLocalModel && (
               <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
                 <div>
                   <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 4 }}>API Key</div>
@@ -1121,7 +1140,7 @@ const CreationModelPanel: React.FC<{
                   <div>
                     <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 4 }}>API URL（可选）</div>
                     <input value={cfg.baseUrl || ''} onChange={e => onChange(def.id, { baseUrl: e.target.value })}
-                      placeholder={def.id === 'qwen-3-5-4b' ? 'http://localhost:11434/v1' : 'https://api.anthropic.com'}
+                      placeholder="https://api.anthropic.com"
                       style={{ width: '100%', padding: '6px 8px', border: '1px solid #E5E5EA', borderRadius: 6, fontSize: 12, outline: 'none', boxSizing: 'border-box' }} />
                   </div>
                 )}

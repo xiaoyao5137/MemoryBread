@@ -1,7 +1,6 @@
 /// 应用黑名单检测模块
 ///
 /// 提供快速的应用黑名单检测，支持内存缓存和定期刷新
-
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -64,9 +63,9 @@ impl BlacklistChecker {
 
     /// 从数据库刷新缓存
     fn refresh_cache(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let bundle_ids = self.storage.with_conn(|conn| {
-            privacy::get_enabled_blacklist_bundle_ids(conn)
-        })?;
+        let bundle_ids = self
+            .storage
+            .with_conn(|conn| privacy::get_enabled_blacklist_bundle_ids(conn))?;
 
         let mut cache = self.cache.write().unwrap();
         cache.bundle_ids = bundle_ids;
@@ -89,14 +88,7 @@ mod tests {
 
     #[test]
     fn test_blacklist_checker() {
-        let storage = StorageManager::new_in_memory().unwrap();
-
-        // 执行迁移
-        storage
-            .conn()
-            .unwrap()
-            .execute_batch(include_str!("../../../shared/db-schema/migrations/009_privacy_settings.sql"))
-            .unwrap();
+        let storage = StorageManager::open_in_memory().unwrap();
 
         let checker = BlacklistChecker::new(storage);
 

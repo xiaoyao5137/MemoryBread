@@ -382,8 +382,11 @@ pub async fn list_knowledge(
     }).await?;
 
     Ok((
-        [(axum::http::header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")],
-        Json(result)
+        [(
+            axum::http::header::CACHE_CONTROL,
+            "no-cache, no-store, must-revalidate",
+        )],
+        Json(result),
     ))
 }
 

@@ -8,6 +8,7 @@
 
 pub mod ax;
 pub mod blacklist;
+pub mod content_filter;
 pub mod engine;
 pub mod filter;
 pub mod listener;

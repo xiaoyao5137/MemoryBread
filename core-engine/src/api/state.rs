@@ -55,6 +55,12 @@ fn default_debug_log_specs() -> Vec<DebugLogSpec> {
             log_dir.clone(),
             "model_api.log",
         ),
+        DebugLogSpec::new(
+            "bake_extract_errors",
+            "bake_extract_errors.log · Bake 提炼错误",
+            log_dir.clone(),
+            "bake_extract_errors.log",
+        ),
         DebugLogSpec::new("ui", "ui.log · Desktop UI", log_dir, "ui.log"),
     ]
 }

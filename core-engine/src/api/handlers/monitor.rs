@@ -713,7 +713,11 @@ async fn read_sidecar_runtime_health(now_ms: i64) -> ServiceHealth {
 
     ServiceHealth {
         status: status.to_string(),
-        mode: if body.mode.is_empty() { "unknown".to_string() } else { body.mode },
+        mode: if body.mode.is_empty() {
+            "unknown".to_string()
+        } else {
+            body.mode
+        },
         full_dispatch_ready: body.full_dispatch_ready,
         background_processor_running: body.background_processor_running,
         critical_checks_passed: body.critical_checks_passed,
@@ -2460,7 +2464,7 @@ fn load_candidate_stage(
 ) -> Result<(i64, Vec<DagItem>, i64), crate::storage::error::StorageError> {
     let (table, kind) = match stage {
         "bake_knowledge" => ("bake_knowledge", "bake_knowledge"),
-        "bake_sop"       => ("bake_sops",      "bake_sop"),
+        "bake_sop" => ("bake_sops", "bake_sop"),
         other => {
             tracing::warn!("load_candidate_stage: 未知 stage {}", other);
             return Ok((0, Vec::new(), 0));
@@ -2497,8 +2501,16 @@ fn load_candidate_stage(
                 kind: kind_owned.clone(),
                 id,
                 ts,
-                title: if title.is_empty() { format!("#{}", id) } else { title },
-                subtitle: if summary.is_empty() { None } else { Some(summary) },
+                title: if title.is_empty() {
+                    format!("#{}", id)
+                } else {
+                    title
+                },
+                subtitle: if summary.is_empty() {
+                    None
+                } else {
+                    Some(summary)
+                },
                 started_at_ms: None,
             })
         })?
