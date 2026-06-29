@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useAppStore }  from '../store/useAppStore'
+import type { CreationModelConfig } from '../store/useAppStore'
 import type {
   ArticleTemplate,
   BakeBucket,
@@ -13,11 +14,94 @@ import type {
   TimelineItem,
   PaginatedBakeResponse,
   PreferenceRecord,
+  RagHistoryItem,
   RagQueryResponse,
   ActionResult,
   SopCandidate,
   WritingStyleConfig,
 } from '../types'
+
+const LOCAL_CORE_API = 'http://127.0.0.1:7070'
+const LOCAL_MODEL_API = 'http://127.0.0.1:7071'
+
+const normalizeLocalApiBaseUrl = (baseUrl: string) =>
+  baseUrl.replace(/^http:\/\/localhost(?::7070)?$/i, LOCAL_CORE_API)
+
+const isNetworkLoadFailure = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error)
+  return message === 'Load failed' || message.includes('Failed to fetch') || message.includes('NetworkError')
+}
+
+const fetchWithLocalhostFallback = async (input: string, init?: RequestInit) => {
+  try {
+    return await fetch(input, init)
+  } catch (error) {
+    if (!isNetworkLoadFailure(error)) throw error
+    const fallbackInput = input.replace(/^http:\/\/localhost(?=:7070\/|\/)/i, 'http://127.0.0.1')
+    if (fallbackInput === input) throw error
+    return fetch(fallbackInput, init)
+  }
+}
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+const parseApiErrorMessage = async (resp: Response, fallback: string) => {
+  let errMsg = fallback
+  try {
+    const errJson = await resp.json()
+    if (errJson.error === 'MODEL_NOT_READY') {
+      errMsg = '向量模型或推理模型尚未就绪，请前往「模型」界面检查模型状态'
+    } else if (errJson.error || errJson.message) {
+      errMsg = errJson.message || errJson.error
+    }
+  } catch {
+    const errText = await resp.text()
+    if (errText) errMsg += ` ${errText}`
+  }
+  if ((resp.status === 503 || resp.status === 504) && errMsg.startsWith(fallback) && !errMsg.includes('模型')) {
+    errMsg = 'AI 正在处理其他任务，请稍候 1-2 分钟再试'
+  }
+  return errMsg
+}
+
+interface RagJobCreateResponse {
+  job_id: string
+  status: string
+}
+
+interface RagJobStatusResponse {
+  id: string
+  status: 'pending' | 'running' | 'succeeded' | 'failed' | string
+  result?: RagQueryResponse | null
+  error?: string | null
+  created_at_ms: number
+  updated_at_ms: number
+}
+
+const LOCAL_CREATION_MODEL_ID = 'mbcd-std-v1'
+const CREATION_MODEL_NAMES: Record<string, string> = {
+  'mbcd-plus-v1': 'claude-opus-4-8',
+  'mbcd-std-v1': 'qwen3.5:4b',
+  'claude-opus-4-8': 'claude-opus-4-8',
+  'qwen-3-5-4b': 'qwen3.5:4b',
+}
+
+const getActiveCreationModelPayload = (configs: CreationModelConfig[]) => {
+  const active = configs.find(config =>
+    config.enabled && (config.id === LOCAL_CREATION_MODEL_ID || config.apiKey)
+  )
+  if (!active) return {}
+  const payload: Record<string, string> = {
+    creation_model: CREATION_MODEL_NAMES[active.id] || active.id,
+  }
+  if (active.id !== LOCAL_CREATION_MODEL_ID && active.apiKey) {
+    payload.creation_api_key = active.apiKey
+  }
+  if (active.baseUrl) {
+    payload.creation_base_url = active.baseUrl
+  }
+  return payload
+}
 
 export interface ModelStatus {
   llm: boolean
@@ -32,7 +116,7 @@ export function useModelStatus() {
   useEffect(() => {
     const check = async () => {
       try {
-        const resp = await fetch('http://localhost:7071/api/models')
+        const resp = await fetch(`${LOCAL_MODEL_API}/api/models`)
         if (!resp.ok) {
           setStatus({ llm: false, embedding: false, ollama: false })
           return
@@ -61,7 +145,7 @@ export function useHealthCheck() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
   return useCallback(async (): Promise<{ status: string; version: string }> => {
-    const resp = await fetch(`${apiBaseUrl}/health`)
+    const resp = await fetch(`${normalizeLocalApiBaseUrl(apiBaseUrl)}/health`)
     if (!resp.ok) throw new Error(`health check failed: ${resp.status}`)
     return resp.json()
   }, [apiBaseUrl])
@@ -100,7 +184,8 @@ export function useFetchCaptures() {
 }
 
 export function useRagQuery() {
-  const apiBaseUrl   = useAppStore((s) => s.apiBaseUrl)
+  const apiBaseUrl   = useAppStore((s) => normalizeLocalApiBaseUrl(s.apiBaseUrl))
+  const creationModelConfigs = useAppStore((s) => s.creationModelConfigs)
   const setLoading   = useAppStore((s) => s.setRagLoading)
   const setResult    = useAppStore((s) => s.setRagResult)
   const setError     = useAppStore((s) => s.setRagError)
@@ -108,40 +193,67 @@ export function useRagQuery() {
   return useCallback(async (query: string, topK = 5): Promise<RagQueryResponse> => {
     setLoading(true)
     try {
-      const resp = await fetch(`${apiBaseUrl}/query`, {
+      const createResp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/rag/jobs`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ query, top_k: topK }),
+        body:    JSON.stringify({
+          query,
+          top_k: topK,
+          ...getActiveCreationModelPayload(creationModelConfigs),
+        }),
       })
-      if (!resp.ok) {
-        let errMsg = `query failed: ${resp.status}`
-        try {
-          const errJson = await resp.json()
-          if (errJson.error === 'MODEL_NOT_READY') {
-            errMsg = '向量模型或推理模型尚未就绪，请前往「模型」界面检查模型状态'
-          } else if (errJson.error || errJson.message) {
-            errMsg = errJson.message || errJson.error
-          }
-        } catch {
-          const errText = await resp.text()
-          if (errText) errMsg += ` ${errText}`
-        }
-        if (resp.status === 503 || resp.status === 504) {
-          if (!errMsg.includes('模型')) {
-            errMsg = 'AI 正在处理其他任务，请稍候 1-2 分钟再试'
-          }
-        }
-        throw new Error(errMsg)
+      if (!createResp.ok) {
+        throw new Error(await parseApiErrorMessage(createResp, `query job create failed: ${createResp.status}`))
       }
-      const data: RagQueryResponse = await resp.json()
+
+      const created: RagJobCreateResponse = await createResp.json()
+      const deadline = Date.now() + 10 * 60 * 1000
+      let data: RagQueryResponse | null = null
+
+      while (Date.now() < deadline) {
+        await sleep(2000)
+        const statusResp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/rag/jobs/${encodeURIComponent(created.job_id)}`)
+        if (!statusResp.ok) {
+          throw new Error(await parseApiErrorMessage(statusResp, `query job status failed: ${statusResp.status}`))
+        }
+
+        const job: RagJobStatusResponse = await statusResp.json()
+        if (job.status === 'succeeded') {
+          data = job.result ?? null
+          break
+        }
+        if (job.status === 'failed') {
+          throw new Error(job.error || '咨询生成失败，请稍后重试')
+        }
+      }
+
+      if (!data) {
+        throw new Error('咨询生成等待超时，请稍后在「咨询记录」中查看是否已完成')
+      }
+
       setResult(data.answer, data.contexts ?? [])
       return data
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
+      const rawMsg = err instanceof Error ? err.message : String(err)
+      const msg = rawMsg === 'Load failed'
+        ? '咨询请求连接失败，请确认 MemoryBread 后端已启动，并稍后重试'
+        : rawMsg
       setError(msg)
       throw err
     }
-  }, [apiBaseUrl, setLoading, setResult, setError])
+  }, [apiBaseUrl, creationModelConfigs, setLoading, setResult, setError])
+}
+
+export function useFetchRagHistory() {
+  const apiBaseUrl = useAppStore((s) => normalizeLocalApiBaseUrl(s.apiBaseUrl))
+
+  return useCallback(async (limit = 20): Promise<RagHistoryItem[]> => {
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/rag/history?limit=${encodeURIComponent(String(limit))}`)
+    if (resp.status === 404) return []
+    if (!resp.ok) throw new Error(`rag history fetch failed: ${resp.status}`)
+    const data = await resp.json()
+    return data.items ?? []
+  }, [apiBaseUrl])
 }
 
 export function useFetchPreferences() {
@@ -316,6 +428,8 @@ export function useFetchBakeKnowledge() {
     const url = new URL(`${apiBaseUrl}/api/bake/knowledge`)
     if (params.q) url.searchParams.set('q', params.q)
     if (params.bucket) url.searchParams.set('bucket', params.bucket)
+    if (params.from != null) url.searchParams.set('from', String(params.from))
+    if (params.to != null) url.searchParams.set('to', String(params.to))
     if (params.limit != null) url.searchParams.set('limit', String(params.limit))
     if (params.offset != null) url.searchParams.set('offset', String(params.offset))
 
@@ -432,6 +546,8 @@ export function useFetchBakeTemplates() {
     const url = new URL(`${apiBaseUrl}/api/bake/documents`)
     if (params.q) url.searchParams.set('q', params.q)
     if (params.bucket) url.searchParams.set('bucket', params.bucket)
+    if (params.from != null) url.searchParams.set('from', String(params.from))
+    if (params.to != null) url.searchParams.set('to', String(params.to))
     if (params.limit != null) url.searchParams.set('limit', String(params.limit))
     if (params.offset != null) url.searchParams.set('offset', String(params.offset))
 
@@ -444,6 +560,16 @@ export function useFetchBakeTemplates() {
       limit: data.limit ?? params.limit ?? 20,
       offset: data.offset ?? params.offset ?? 0,
     }
+  }, [apiBaseUrl])
+}
+
+export function useFetchBakeTemplate() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (id: string): Promise<ArticleTemplate> => {
+    const resp = await fetch(`${apiBaseUrl}/api/bake/documents/${encodeURIComponent(id)}`)
+    if (!resp.ok) throw new Error(`bake document fetch failed: ${resp.status}`)
+    return mapBakeTemplate(await resp.json())
   }, [apiBaseUrl])
 }
 
@@ -501,6 +627,8 @@ export function useFetchBakeSops() {
     const url = new URL(`${apiBaseUrl}/api/bake/sops`)
     if (params.q) url.searchParams.set('q', params.q)
     if (params.bucket) url.searchParams.set('bucket', params.bucket)
+    if (params.from != null) url.searchParams.set('from', String(params.from))
+    if (params.to != null) url.searchParams.set('to', String(params.to))
     if (params.limit != null) url.searchParams.set('limit', String(params.limit))
     if (params.offset != null) url.searchParams.set('offset', String(params.offset))
 
@@ -624,9 +752,21 @@ function mapBakeMemory(item: any): TimelineItem {
 }
 
 function mapBakeKnowledge(item: any): BakeKnowledgeItem {
+  const details = parseMaybeJsonObject(item.details)
+  const sourceCaptureIds = Array.isArray(item.source_capture_ids)
+    ? item.source_capture_ids.map(String)
+    : Array.isArray(details?.source_capture_ids)
+      ? details.source_capture_ids.map(String)
+      : []
+  const captureId = String(item.capture_id)
+  if (captureId && !sourceCaptureIds.includes(captureId)) {
+    sourceCaptureIds.unshift(captureId)
+  }
+
   return {
     id: String(item.id),
-    captureId: String(item.capture_id),
+    captureId,
+    sourceCaptureIds,
     sourceTimelineId: item.source_timeline_id != null ? String(item.source_timeline_id) : String(item.id),
     summary: item.summary,
     overview: item.overview,
@@ -645,6 +785,16 @@ function mapBakeKnowledge(item: any): BakeKnowledgeItem {
     createdAtMs: item.created_at_ms ?? 0,
     updatedAt: item.updated_at ?? '',
     updatedAtMs: item.updated_at_ms ?? 0,
+  }
+}
+
+function parseMaybeJsonObject(raw: unknown): Record<string, any> | null {
+  if (!raw || typeof raw !== 'string') return null
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
   }
 }
 

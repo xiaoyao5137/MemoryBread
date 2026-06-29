@@ -54,6 +54,7 @@ pub struct KnowledgeQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    pub q: Option<String>,
     pub category: Option<String>,
     pub from: Option<i64>,
     pub to: Option<i64>,
@@ -324,6 +325,27 @@ pub async fn list_knowledge(
                  FROM timelines WHERE summary NOT LIKE ?"
             );
             let mut bind: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(noise_prefix.clone())];
+            let query_terms = params
+                .q
+                .as_deref()
+                .map(keyword_terms)
+                .unwrap_or_default();
+            if !query_terms.is_empty() {
+                let query_clause = query_terms
+                    .iter()
+                    .map(|_| "(COALESCE(summary, '') LIKE ? OR COALESCE(overview, '') LIKE ? OR COALESCE(details, '') LIKE ? OR COALESCE(category, '') LIKE ?)".to_string())
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                sql.push_str(" AND (");
+                sql.push_str(&query_clause);
+                sql.push(')');
+                for term in &query_terms {
+                    let pattern = format!("%{}%", term);
+                    for _ in 0..4 {
+                        bind.push(Box::new(pattern.clone()));
+                    }
+                }
+            }
             if let Some(f) = params.from { sql.push_str(" AND created_at_ms >= ?"); bind.push(Box::new(f)); }
             if let Some(t) = params.to   { sql.push_str(" AND created_at_ms <= ?"); bind.push(Box::new(t)); }
             sql.push_str(" ORDER BY updated_at_ms DESC LIMIT ? OFFSET ?");
@@ -369,6 +391,22 @@ pub async fn list_knowledge(
 
             let mut count_sql = String::from("SELECT COUNT(*) FROM timelines WHERE summary NOT LIKE ?");
             let mut count_bind: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(noise_prefix)];
+            if !query_terms.is_empty() {
+                let query_clause = query_terms
+                    .iter()
+                    .map(|_| "(COALESCE(summary, '') LIKE ? OR COALESCE(overview, '') LIKE ? OR COALESCE(details, '') LIKE ? OR COALESCE(category, '') LIKE ?)".to_string())
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                count_sql.push_str(" AND (");
+                count_sql.push_str(&query_clause);
+                count_sql.push(')');
+                for term in &query_terms {
+                    let pattern = format!("%{}%", term);
+                    for _ in 0..4 {
+                        count_bind.push(Box::new(pattern.clone()));
+                    }
+                }
+            }
             if let Some(f) = params.from { count_sql.push_str(" AND created_at_ms >= ?"); count_bind.push(Box::new(f)); }
             if let Some(t) = params.to   { count_sql.push_str(" AND created_at_ms <= ?"); count_bind.push(Box::new(t)); }
             let cp: Vec<&dyn rusqlite::ToSql> = count_bind.iter().map(|b| b.as_ref()).collect();
@@ -388,6 +426,15 @@ pub async fn list_knowledge(
         )],
         Json(result),
     ))
+}
+
+fn keyword_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// POST /api/knowledge/:id/verify - 验证知识条目

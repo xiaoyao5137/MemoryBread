@@ -2,16 +2,32 @@
 //!
 //! 通过 HTTP 调用 ai-sidecar 的 RAG 服务进行智能问答
 
-use crate::api::{error::ApiError, state::AppState};
-use axum::{extract::State, http::StatusCode, Json};
+use crate::api::{
+    error::ApiError,
+    state::{AppState, RagJobRecord},
+};
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct RagQueryRequest {
     pub query: String,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    #[serde(default)]
+    pub creation_model: Option<String>,
+    #[serde(default)]
+    pub creation_api_key: Option<String>,
+    #[serde(default)]
+    pub creation_base_url: Option<String>,
 }
 
 fn default_top_k() -> usize {
@@ -21,16 +37,377 @@ fn default_top_k() -> usize {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RagContext {
     pub capture_id: i64,
+    #[serde(default)]
+    pub doc_key: Option<String>,
     pub text: String,
     pub score: f64,
     pub source: String,
+    #[serde(default)]
+    pub source_type: Option<String>,
+    #[serde(default)]
+    pub knowledge_id: Option<i64>,
+    #[serde(default)]
+    pub artifact_id: Option<i64>,
+    #[serde(default)]
+    pub document_id: Option<i64>,
+    #[serde(default)]
+    pub app_name: Option<String>,
+    #[serde(default)]
+    pub win_title: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub doc_type: Option<String>,
+    #[serde(default)]
+    pub time: Option<serde_json::Value>,
+    #[serde(default)]
+    pub observed_at: Option<serde_json::Value>,
+    #[serde(default)]
+    pub event_time_start: Option<serde_json::Value>,
+    #[serde(default)]
+    pub event_time_end: Option<serde_json::Value>,
+    #[serde(default)]
+    pub start_time: Option<serde_json::Value>,
+    #[serde(default)]
+    pub end_time: Option<serde_json::Value>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub overview: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub activity_type: Option<String>,
+    #[serde(default)]
+    pub content_origin: Option<String>,
+    #[serde(default)]
+    pub history_view: Option<bool>,
+    #[serde(default)]
+    pub evidence_strength: Option<String>,
+    #[serde(default)]
+    pub importance: Option<i64>,
+    #[serde(default)]
+    pub source_timeline_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub linked_knowledge_ids: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RagQueryResponse {
     pub answer: String,
     pub contexts: Vec<RagContext>,
     pub model: String,
+}
+
+#[derive(Serialize)]
+pub struct RagJobCreateResponse {
+    pub job_id: String,
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct RagJobStatusResponse {
+    pub id: String,
+    pub status: String,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn api_error_message(error: &ApiError) -> String {
+    match error {
+        ApiError::Upstream { message, .. } => message.clone(),
+        ApiError::BadRequest(message) => message.clone(),
+        ApiError::NotFound(message) => message.clone(),
+        ApiError::Internal(message) => message.clone(),
+        ApiError::Storage(_) => "数据库操作失败".to_string(),
+    }
+}
+
+fn set_rag_job(
+    state: &Arc<AppState>,
+    job_id: &str,
+    status: &str,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+) {
+    if let Ok(mut jobs) = state.rag_jobs.lock() {
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.status = status.to_string();
+            job.result = result;
+            job.error = error;
+            job.updated_at_ms = now_ms();
+        }
+    }
+}
+
+fn creation_model_name(id: &str) -> &str {
+    match id {
+        "mbcd-plus-v1" => "claude-opus-4-8",
+        "mbcd-std-v1" => "qwen3.5:4b",
+        "claude-opus-4-8" => "claude-opus-4-8",
+        "qwen-3-5-4b" => "qwen3.5:4b",
+        _ => id,
+    }
+}
+
+fn enrich_creation_model_from_preferences(
+    state: &Arc<AppState>,
+    mut body: RagQueryRequest,
+) -> RagQueryRequest {
+    if body.creation_model.is_some() {
+        return body;
+    }
+
+    let pref = state
+        .storage
+        .get_preference_value("creation.models")
+        .ok()
+        .flatten();
+    let Some(raw) = pref else {
+        return body;
+    };
+
+    let Ok(models) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return body;
+    };
+    let Some(items) = models.as_array() else {
+        return body;
+    };
+
+    let selected = items.iter().find(|item| {
+        item.get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    });
+    let Some(selected) = selected else {
+        return body;
+    };
+
+    let Some(id) = selected.get("id").and_then(|value| value.as_str()) else {
+        return body;
+    };
+
+    body.creation_model = Some(creation_model_name(id).to_string());
+    body.creation_api_key = selected
+        .get("apiKey")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_string());
+    body.creation_base_url = selected
+        .get("baseUrl")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_string());
+    body
+}
+
+/// 创建异步 RAG 查询任务，避免前端长连接等待时被 WebView 中断。
+pub async fn create_rag_job(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RagQueryRequest>,
+) -> Result<Json<RagJobCreateResponse>, ApiError> {
+    if body.query.trim().is_empty() {
+        return Err(ApiError::BadRequest("缺少 query 参数".to_string()));
+    }
+    let body = enrich_creation_model_from_preferences(&state, body);
+
+    let seq = state.rag_job_seq.fetch_add(1, Ordering::Relaxed);
+    let job_id = format!("rag-{}-{}", now_ms(), seq);
+    let created_at_ms = now_ms();
+    let record = RagJobRecord {
+        id: job_id.clone(),
+        status: "pending".to_string(),
+        result: None,
+        error: None,
+        created_at_ms,
+        updated_at_ms: created_at_ms,
+    };
+
+    {
+        let mut jobs = state
+            .rag_jobs
+            .lock()
+            .map_err(|_| ApiError::Internal("RAG 任务状态锁异常".to_string()))?;
+        jobs.insert(job_id.clone(), record);
+    }
+
+    let state_for_task = state.clone();
+    let job_id_for_task = job_id.clone();
+    let sidecar_url = state.sidecar_url.clone();
+    tokio::spawn(async move {
+        set_rag_job(&state_for_task, &job_id_for_task, "running", None, None);
+        match call_rag_service(&sidecar_url, body).await {
+            Ok(result) => {
+                let value = serde_json::to_value(result).ok();
+                set_rag_job(&state_for_task, &job_id_for_task, "succeeded", value, None);
+            }
+            Err(error) => {
+                set_rag_job(
+                    &state_for_task,
+                    &job_id_for_task,
+                    "failed",
+                    None,
+                    Some(api_error_message(&error)),
+                );
+            }
+        }
+    });
+
+    Ok(Json(RagJobCreateResponse {
+        job_id,
+        status: "pending".to_string(),
+    }))
+}
+
+/// 查询异步 RAG 任务状态。
+pub async fn get_rag_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<RagJobStatusResponse>, ApiError> {
+    let jobs = state
+        .rag_jobs
+        .lock()
+        .map_err(|_| ApiError::Internal("RAG 任务状态锁异常".to_string()))?;
+    let job = jobs
+        .get(&job_id)
+        .ok_or_else(|| ApiError::NotFound("咨询任务不存在或已过期".to_string()))?;
+
+    Ok(Json(RagJobStatusResponse {
+        id: job.id.clone(),
+        status: job.status.clone(),
+        result: job.result.clone(),
+        error: job.error.clone(),
+        created_at_ms: job.created_at_ms,
+        updated_at_ms: job.updated_at_ms,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct RagHistoryParams {
+    #[serde(default = "default_history_limit")]
+    pub limit: usize,
+}
+
+fn default_history_limit() -> usize {
+    20
+}
+
+fn legacy_capture_context(capture_id: i64) -> RagContext {
+    RagContext {
+        capture_id,
+        doc_key: Some(format!("capture:{capture_id}")),
+        text: format!("历史咨询关联的采集记录 #{capture_id}"),
+        score: 0.0,
+        source: "capture".to_string(),
+        source_type: Some("capture".to_string()),
+        knowledge_id: None,
+        artifact_id: None,
+        document_id: None,
+        app_name: None,
+        win_title: None,
+        url: None,
+        source_url: None,
+        title: None,
+        doc_type: None,
+        time: None,
+        observed_at: None,
+        event_time_start: None,
+        event_time_end: None,
+        start_time: None,
+        end_time: None,
+        summary: None,
+        overview: None,
+        category: None,
+        activity_type: None,
+        content_origin: None,
+        history_view: None,
+        evidence_strength: None,
+        importance: None,
+        source_timeline_ids: None,
+        linked_knowledge_ids: None,
+    }
+}
+
+fn parse_saved_contexts(raw: Option<&str>) -> Vec<RagContext> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            if item.is_object() {
+                serde_json::from_value::<RagContext>(item.clone()).ok()
+            } else {
+                item.as_i64().map(legacy_capture_context)
+            }
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+pub struct RagHistoryResponse {
+    pub items: Vec<RagHistoryItem>,
+}
+
+#[derive(Serialize)]
+pub struct RagHistoryItem {
+    pub id: i64,
+    pub ts: i64,
+    pub query: String,
+    pub answer: String,
+    pub contexts: Vec<RagContext>,
+    pub context_count: usize,
+    pub latency_ms: Option<i64>,
+}
+
+/// 最近咨询记录：供咨询页回看历史问答。
+pub async fn rag_history(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RagHistoryParams>,
+) -> Result<Json<RagHistoryResponse>, ApiError> {
+    let limit = params.limit.clamp(1, 100);
+    let storage = state.storage.clone();
+    let records = tokio::task::spawn_blocking(move || storage.list_rag_sessions(limit, 0))
+        .await
+        .map_err(|e| ApiError::Internal(format!("读取咨询记录失败: {e}")))??;
+
+    let items = records
+        .into_iter()
+        .map(|record| {
+            let contexts = parse_saved_contexts(record.retrieved_ids.as_deref());
+            let context_count = contexts.len();
+            RagHistoryItem {
+                id: record.id,
+                ts: record.ts,
+                query: record.user_query,
+                answer: record.llm_response.unwrap_or_default(),
+                contexts,
+                context_count,
+                latency_ms: record.latency_ms,
+            }
+        })
+        .collect();
+
+    Ok(Json(RagHistoryResponse { items }))
 }
 
 /// RAG 查询实现：调用 ai-sidecar 的 RAG 服务
@@ -38,21 +415,30 @@ pub async fn rag_query(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RagQueryRequest>,
 ) -> Result<Json<RagQueryResponse>, ApiError> {
-    let query = body.query.clone();
-    let top_k = body.top_k;
+    let body = enrich_creation_model_from_preferences(&state, body);
+    let rag_response = call_rag_service(&state.sidecar_url, body).await?;
+    Ok(Json(rag_response))
+}
 
+async fn call_rag_service(
+    sidecar_url: &str,
+    body: RagQueryRequest,
+) -> Result<RagQueryResponse, ApiError> {
     let client = reqwest::Client::new();
-    let rag_service_url = format!("{}/query", state.sidecar_url);
+    let rag_service_url = format!("{}/query", sidecar_url);
 
     let request_body = serde_json::json!({
-        "query": query,
-        "top_k": top_k,
+        "query": body.query,
+        "top_k": body.top_k,
+        "creation_model": body.creation_model,
+        "creation_api_key": body.creation_api_key,
+        "creation_base_url": body.creation_base_url,
     });
 
     let response = client
         .post(&rag_service_url)
         .json(&request_body)
-        .timeout(std::time::Duration::from_secs(180))
+        .timeout(std::time::Duration::from_secs(360))
         .send()
         .await
         .map_err(|e| {
@@ -79,7 +465,7 @@ pub async fn rag_query(
             .json::<RagQueryResponse>()
             .await
             .map_err(|e| ApiError::Internal(format!("解析 RAG 响应失败: {}", e)))?;
-        Ok(Json(rag_response))
+        Ok(rag_response)
     } else {
         let status = response.status();
         let body_text = response.text().await.unwrap_or_default();

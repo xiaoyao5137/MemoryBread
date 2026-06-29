@@ -72,18 +72,24 @@ async def generate_document(request: GenerateRequest):
         options = _options_from_request(request)
 
         async def event_stream():
-            async for chunk in creation_service.generate_document(
-                user_prompt=request.user_prompt,
-                design_templates=request.design_templates,
-                timeline_context=request.timeline_context,
-                capture_context=request.capture_context,
-                options=options,
-                creation_model=request.creation_model,
-                creation_api_key=request.creation_api_key,
-                creation_base_url=request.creation_base_url,
-            ):
-                import json
-                yield f"data: {json.dumps(chunk)}\n\n"
+            import json
+            yield f"data: {json.dumps({'status': 'started'})}\n\n"
+            try:
+                async for chunk in creation_service.generate_document(
+                    user_prompt=request.user_prompt,
+                    design_templates=request.design_templates,
+                    timeline_context=request.timeline_context,
+                    capture_context=request.capture_context,
+                    options=options,
+                    creation_model=request.creation_model,
+                    creation_api_key=request.creation_api_key,
+                    creation_base_url=request.creation_base_url,
+                ):
+                    yield f"data: {json.dumps({'content': chunk})}\n\n"
+                yield f"data: {json.dumps({'done': True})}\n\n"
+            except Exception as e:
+                logger.error(f"Streaming generation error: {e}")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
     except Exception as e:

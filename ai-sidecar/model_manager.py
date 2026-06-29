@@ -26,6 +26,19 @@ logger = logging.getLogger(__name__)
 
 MIN_MACOS_MAJOR_FOR_OLLAMA = 13
 OLLAMA_API_BASE = "http://localhost:11434"
+MODEL_ID_ALIASES = {
+    "qwen3.5-4b": "mbem-v1-local",
+    "qwen2.5-3b": "mbem-v1-local",
+    "qwen2.5-7b": "mbem-v1-local",
+    "qwen3.5-7b": "mbem-v1-local",
+    "deepseek-r1-7b": "mbem-v1-local",
+    "gemma4-e4b": "mbem-v1-local",
+    "llama3.2-3b": "mbem-v1-local",
+    "gemma2-2b": "mbem-v1-local",
+    "bge-m3": "bge-small-zh",
+    "bge-small": "bge-small-zh",
+    "text-embedding-3-small": "bge-small-zh",
+}
 
 
 class ModelType(str, Enum):
@@ -60,72 +73,15 @@ class ModelInfo:
 # 预定义的模型列表
 AVAILABLE_MODELS = {
     # ========== 文本推理模型（LLM） ==========
-    "qwen2.5-3b": ModelInfo(
-        id="qwen2.5-3b",
-        name="Qwen 2.5 (3B)",
-        type=ModelType.LLM,
-        provider="ollama",
-        model_id="qwen2.5:3b",
-        size_gb=2.0,
-        description="阿里通义千问 2.5，3B 参数，轻量高效，适合本地运行",
-        is_default=False
-    ),
-    "qwen3.5-4b": ModelInfo(
-        id="qwen3.5-4b",
-        name="Qwen 3.5 (4B)",
+    "mbem-v1-local": ModelInfo(
+        id="mbem-v1-local",
+        name="MBEM v1.0",
         type=ModelType.LLM,
         provider="ollama",
         model_id="qwen3.5:4b",
         size_gb=2.3,
-        description="阿里通义千问 3.5，4B 参数，原生多模态，推理更强",
+        description="MemoryBread Extract Model Local 1.0，本地提炼模型 v1",
         is_default=True
-    ),
-    "gemma4-e4b": ModelInfo(
-        id="gemma4-e4b",
-        name="Gemma 4 (E4B)",
-        type=ModelType.LLM,
-        provider="ollama",
-        model_id="gemma4:e4b",
-        size_gb=3.3,
-        description="Google Gemma 4，4B 有效参数，原生多模态，Apache 2.0 开源",
-        is_default=False
-    ),
-    "qwen3.5-7b": ModelInfo(
-        id="qwen3.5-7b",
-        name="Qwen 3.5 (7B)",
-        type=ModelType.LLM,
-        provider="ollama",
-        model_id="qwen3.5:7b",
-        size_gb=4.1,
-        description="阿里通义千问 3.5，7B 参数，更强的推理能力"
-    ),
-    "llama3.2-3b": ModelInfo(
-        id="llama3.2-3b",
-        name="Llama 3.2 (3B)",
-        type=ModelType.LLM,
-        provider="ollama",
-        model_id="llama3.2:3b",
-        size_gb=2.0,
-        description="Meta Llama 3.2，3B 参数，轻量高效"
-    ),
-    "gemma2-2b": ModelInfo(
-        id="gemma2-2b",
-        name="Gemma 2 (2B)",
-        type=ModelType.LLM,
-        provider="ollama",
-        model_id="gemma2:2b",
-        size_gb=1.6,
-        description="Google Gemma 2，2B 参数，最轻量"
-    ),
-    "openai-gpt4": ModelInfo(
-        id="openai-gpt4",
-        name="OpenAI GPT-4",
-        type=ModelType.LLM,
-        provider="openai",
-        model_id="gpt-4",
-        size_gb=0,
-        description="OpenAI GPT-4，云端 API（需要 API Key）",
-        requires_api_key=True
     ),
 
     # ========== 向量模型（Embedding） ==========
@@ -138,35 +94,6 @@ AVAILABLE_MODELS = {
         size_gb=0.05,
         description="BAAI BGE-Small 中文版，512 维，量化版本，内存占用低",
         is_default=True
-    ),
-    "bge-m3": ModelInfo(
-        id="bge-m3",
-        name="BGE-M3",
-        type=ModelType.EMBEDDING,
-        provider="ollama",
-        model_id="BAAI/bge-m3",
-        size_gb=0.6,
-        description="BAAI BGE-M3，多语言向量模型，中英文效果优秀",
-        is_default=False
-    ),
-    "bge-small": ModelInfo(
-        id="bge-small",
-        name="BGE-Small-ZH",
-        type=ModelType.EMBEDDING,
-        provider="ollama",
-        model_id="BAAI/bge-small-zh-v1.5",
-        size_gb=0.1,
-        description="BAAI BGE-Small 中文版，极小体积，适合低配机器"
-    ),
-    "text-embedding-3-small": ModelInfo(
-        id="text-embedding-3-small",
-        name="OpenAI Embedding (Small)",
-        type=ModelType.EMBEDDING,
-        provider="openai",
-        model_id="text-embedding-3-small",
-        size_gb=0,
-        description="OpenAI 向量模型，云端 API（需要 API Key）",
-        requires_api_key=True
     ),
 }
 
@@ -197,11 +124,16 @@ class ModelManager:
         """加载模型配置"""
         if self.config_path.exists():
             with open(self.config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                config = json.load(f)
+            active_llm = MODEL_ID_ALIASES.get(config.get('active_llm'), config.get('active_llm', 'mbem-v1-local'))
+            active_embedding = MODEL_ID_ALIASES.get(config.get('active_embedding'), config.get('active_embedding', 'bge-small-zh'))
+            config['active_llm'] = active_llm if active_llm in AVAILABLE_MODELS else 'mbem-v1-local'
+            config['active_embedding'] = active_embedding if active_embedding in AVAILABLE_MODELS else 'bge-small-zh'
+            return config
 
         # 默认配置
         return {
-            "active_llm": "qwen3.5-4b",
+            "active_llm": "mbem-v1-local",
             "active_embedding": "bge-small-zh",
             "active_image": None,
             "llm_max_concurrency": 1,
@@ -561,6 +493,7 @@ class ModelManager:
         Returns:
             下载任务信息
         """
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         if model_id not in AVAILABLE_MODELS:
             raise ValueError(f"未知的模型 ID: {model_id}")
 
@@ -675,6 +608,7 @@ class ModelManager:
         Returns:
             操作结果
         """
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         if model_id not in AVAILABLE_MODELS:
             raise ValueError(f"未知的模型 ID: {model_id}")
 
@@ -736,7 +670,7 @@ class ModelManager:
     def get_all_status(self) -> Dict[str, dict]:
         """返回所有模型的运行时状态 {model_id: {status, download_progress, is_active, error}}"""
         result = {}
-        active_llm = self.config.get('active_llm')
+        active_llm = MODEL_ID_ALIASES.get(self.config.get('active_llm'), self.config.get('active_llm'))
         active_emb = self.config.get('active_embedding')
         active_image = self.config.get('active_image')
         from model_registry import AVAILABLE_MODELS as REGISTRY_MODELS
@@ -784,6 +718,7 @@ class ModelManager:
 
     def set_config_field(self, model_id: str, field_key: str, value: str) -> None:
         """保存模型的某个配置字段（如 api_key、base_url）"""
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         if 'model_configs' not in self.config:
             self.config['model_configs'] = {}
         if model_id not in self.config['model_configs']:
@@ -807,6 +742,7 @@ class ModelManager:
         验证模型的 API Key 是否有效。
         Returns: (ok: bool, message: str)
         """
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         info = AVAILABLE_MODELS.get(model_id)
         if info is None:
             from model_registry import get_model as registry_get_model
@@ -871,6 +807,7 @@ class ModelManager:
             return False, f"验证失败: {err}"
 
     def _ollama_names_for_model(self, model_id: str) -> list[str]:
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         # 优先使用 AVAILABLE_MODELS 中的 model_id
         if model_id in AVAILABLE_MODELS:
             info = AVAILABLE_MODELS[model_id]
@@ -894,6 +831,7 @@ class ModelManager:
 
     def _is_installed(self, model_id: str, info) -> bool:
         """检查模型是否已安装"""
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         if info.provider == 'ollama':
             try:
                 import urllib.request
@@ -916,6 +854,7 @@ class ModelManager:
 
     def activate_model(self, model_id: str) -> bool:
         """激活指定模型，供 API server 调用"""
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         from model_registry import get_model as registry_get_model
         meta = registry_get_model(model_id)
         if not meta:
@@ -939,6 +878,7 @@ class ModelManager:
 
     def delete_model(self, model_id: str) -> bool:
         """删除（卸载）指定 Ollama 模型"""
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         from model_registry import get_model as registry_get_model
         meta = registry_get_model(model_id)
         if not meta or meta.provider != 'ollama':

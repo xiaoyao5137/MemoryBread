@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen } from '@testing-library/react'
 import BakeTemplatesTab from '../components/bake/BakeTemplatesTab'
 import BakeSopTab from '../components/bake/BakeSopTab'
 import type { ArticleTemplate, SopCandidate } from '../types'
@@ -53,6 +53,11 @@ describe('Bake 详情展示优化', () => {
         limit={20}
         offset={0}
         query=""
+        from=""
+        to=""
+        draftQuery=""
+        draftFrom=""
+        draftTo=""
         selectedTemplateId={template.id}
         onSelectTemplate={noop}
         onCreateTemplate={noop}
@@ -62,7 +67,11 @@ describe('Bake 详情展示优化', () => {
         onViewSourceMemory={noop}
         onPageChange={noop}
         onLimitChange={noop}
-        onQueryChange={noop}
+        onDraftQueryChange={noop}
+        onDraftFromChange={noop}
+        onDraftToChange={noop}
+        onSearch={noop}
+        onClearFilters={noop}
       />,
     )
 
@@ -79,50 +88,31 @@ describe('Bake 详情展示优化', () => {
         limit={20}
         offset={0}
         query=""
+        from=""
+        to=""
+        draftQuery=""
+        draftFrom=""
+        draftTo=""
         selectedSopId={sop.id}
         onSelectSop={noop}
         onDeleteSop={noop}
-        onViewLinkedKnowledge={noop}
         onViewSourceTimeline={noop}
-        onCopySteps={noop}
         onPageChange={noop}
         onLimitChange={noop}
-        onQueryChange={noop}
+        onDraftQueryChange={noop}
+        onDraftFromChange={noop}
+        onDraftToChange={noop}
+        onSearch={noop}
+        onClearFilters={noop}
       />,
     )
 
-    expect(screen.getByText('关联知识')).toBeInTheDocument()
-    expect(screen.getByText('已关联 2 条知识（用于补充背景和术语）')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '排查服务健康检查失败' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '启动端口冲突的处理步骤' })).toBeInTheDocument()
+    expect(screen.queryByText('关联知识')).not.toBeInTheDocument()
+    expect(screen.queryByText('已关联 2 条知识（用于补充背景和术语）')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '排查服务健康检查失败' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '启动端口冲突的处理步骤' })).not.toBeInTheDocument()
     expect(screen.queryByText('101、202')).not.toBeInTheDocument()
     expect(screen.queryByText('工作提示预览')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '复制工作提示' })).not.toBeInTheDocument()
-  })
-
-  it('SOP关联知识摘要支持点击查看', () => {
-    const onViewLinkedKnowledge = vi.fn()
-
-    render(
-      <BakeSopTab
-        candidates={[sop]}
-        total={1}
-        limit={20}
-        offset={0}
-        query=""
-        selectedSopId={sop.id}
-        onSelectSop={noop}
-        onDeleteSop={noop}
-        onViewLinkedKnowledge={onViewLinkedKnowledge}
-        onViewSourceTimeline={noop}
-        onCopySteps={noop}
-        onPageChange={noop}
-        onLimitChange={noop}
-        onQueryChange={noop}
-      />,
-    )
-
-    fireEvent.click(screen.getByRole('button', { name: '排查服务健康检查失败' }))
-    expect(onViewLinkedKnowledge).toHaveBeenCalledWith('101')
   })
 })

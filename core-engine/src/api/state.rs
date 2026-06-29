@@ -1,8 +1,14 @@
 //! 共享应用状态（通过 axum State extractor 注入每个 handler）
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{atomic::AtomicU64, Arc, Mutex},
+};
 
 use crate::storage::StorageManager;
+use serde::Serialize;
+use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct DebugLogSpec {
@@ -65,6 +71,16 @@ fn default_debug_log_specs() -> Vec<DebugLogSpec> {
     ]
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RagJobRecord {
+    pub id: String,
+    pub status: String,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 /// 所有 Handler 共享的应用状态。
 ///
 /// 使用 `Arc<AppState>` 确保零拷贝跨线程共享。
@@ -73,6 +89,8 @@ pub struct AppState {
     pub storage: StorageManager,
     pub sidecar_url: String,
     pub debug_log_specs: Vec<DebugLogSpec>,
+    pub rag_jobs: Arc<Mutex<HashMap<String, RagJobRecord>>>,
+    pub rag_job_seq: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -83,6 +101,8 @@ impl AppState {
             storage,
             sidecar_url,
             debug_log_specs: default_debug_log_specs(),
+            rag_jobs: Arc::new(Mutex::new(HashMap::new())),
+            rag_job_seq: Arc::new(AtomicU64::new(1)),
         })
     }
 }

@@ -289,7 +289,7 @@ const OnboardingWizard: React.FC = () => {
 
     const model = [...llmModels, ...embModels].find(m => m.id === modelId)
     if (model?.provider === 'ollama' && !ollamaSetup?.ollama_running) {
-      setError('请先完成 Ollama 安装并启动服务，再下载本地模型')
+      setError('请先完成 Ollama 安装并启动服务，再下载分析模型')
       return
     }
 
@@ -451,9 +451,9 @@ const OnboardingWizard: React.FC = () => {
                 )}
               </div>
 
-              {/* 本地模型 */}
+              {/* 分析模型 */}
               <div style={{ fontSize: 11, fontWeight: 600, color: '#AEAEB2', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                本地模型（Ollama）
+                分析模型
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
                 {llmModels.filter(m => m.provider === 'ollama').map(m => (
@@ -498,7 +498,7 @@ const OnboardingWizard: React.FC = () => {
                 </div>
               )}
 
-              {/* 下载按钮（本地模型未安装时） */}
+              {/* 下载按钮（分析模型未安装时） */}
               {needsDownloadLlm && !downloadingId && (
                 <button
                   onClick={() => handleDownload(selectedLlm)}

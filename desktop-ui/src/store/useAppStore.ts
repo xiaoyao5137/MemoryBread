@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import type { ActionCommand, BakeTab, RagContext, RepositoryTab, WindowMode } from '../types'
 
-interface CaptureBackTarget {
+export interface BakeNavigationTarget {
   windowMode: WindowMode
   bakeTab?: BakeTab
   repositoryTab?: RepositoryTab
@@ -12,6 +12,8 @@ interface CaptureBackTarget {
   selectedCaptureId?: string | null
   repositoryCaptureSourceCaptureId?: string | null
 }
+
+type CaptureBackTarget = BakeNavigationTarget
 
 export interface CreationModelConfig {
   id: string
@@ -85,12 +87,18 @@ export interface AppState {
   bakeMemoryOffset: number
   bakeKnowledgeOffset: number
   bakeKnowledgeQuery: string
+  bakeKnowledgeFrom: string
+  bakeKnowledgeTo: string
   bakeKnowledgeLimit: number
   bakeTemplateOffset: number
   bakeTemplateQuery: string
+  bakeTemplateFrom: string
+  bakeTemplateTo: string
   bakeTemplateLimit: number
   bakeSopOffset: number
   bakeSopQuery: string
+  bakeSopFrom: string
+  bakeSopTo: string
   bakeSopLimit: number
   bakeCaptureOffset: number
   repositoryMemoryQuery: string
@@ -103,6 +111,7 @@ export interface AppState {
   repositoryCaptureLimit: number
   repositoryCaptureSourceCaptureId: string | null
   captureBackTarget: CaptureBackTarget | null
+  bakeNavigationStack: BakeNavigationTarget[]
   creationDraft: CreationDraft
   creationBackTarget: CreationBackTarget | null
 
@@ -138,12 +147,18 @@ export interface AppState {
   setBakeMemoryOffset:  (offset: number) => void
   setBakeKnowledgeOffset:(offset: number) => void
   setBakeKnowledgeQuery: (query: string) => void
+  setBakeKnowledgeFrom:  (value: string) => void
+  setBakeKnowledgeTo:    (value: string) => void
   setBakeKnowledgeLimit: (limit: number) => void
   setBakeTemplateOffset: (offset: number) => void
   setBakeTemplateQuery:  (query: string) => void
+  setBakeTemplateFrom:   (value: string) => void
+  setBakeTemplateTo:     (value: string) => void
   setBakeTemplateLimit:  (limit: number) => void
   setBakeSopOffset:      (offset: number) => void
   setBakeSopQuery:       (query: string) => void
+  setBakeSopFrom:        (value: string) => void
+  setBakeSopTo:          (value: string) => void
   setBakeSopLimit:       (limit: number) => void
   setBakeCaptureOffset:  (offset: number) => void
   setRepositoryMemoryQuery: (query: string) => void
@@ -157,6 +172,9 @@ export interface AppState {
   setRepositoryCaptureSourceCaptureId: (id: string | null) => void
   setCaptureBackTarget: (target: CaptureBackTarget | null) => void
   clearCaptureBackTarget: () => void
+  pushBakeNavigationTarget: (target: BakeNavigationTarget) => void
+  popBakeNavigationTarget: () => BakeNavigationTarget | null
+  clearBakeNavigationStack: () => void
   setCreationDraft: (patch: Partial<CreationDraft>) => void
   resetCreationDraft: () => void
   setCreationBackTarget: (target: CreationBackTarget | null) => void
@@ -187,24 +205,33 @@ const safeLocalStorage = typeof window !== 'undefined' && typeof window.localSto
   : null
 
 const DEFAULT_CREATION_MODELS: CreationModelConfig[] = [
-  { id: 'claude-opus-4-8', enabled: false, apiKey: '', baseUrl: 'https://api.anthropic.com' },
-  { id: 'gpt-5-5',         enabled: false, apiKey: '' },
-  { id: 'qwen-3-7',        enabled: false, apiKey: '' },
-  { id: 'qwen-3-5-4b',     enabled: false, apiKey: '' },
-  { id: 'glm-latest',      enabled: false, apiKey: '' },
-  { id: 'kimi-latest',     enabled: false, apiKey: '' },
+  { id: 'mbcd-plus-v1', enabled: false, apiKey: '', baseUrl: 'https://api.anthropic.com' },
+  { id: 'mbcd-std-v1',  enabled: true,  apiKey: '' },
 ]
 
 export function normalizeCreationModels(models: CreationModelConfig[]): CreationModelConfig[] {
-  const byId = new Map(models.map(model => [model.id, model]))
+  const aliases: Record<string, string> = {
+    'claude-opus-4-8': 'mbcd-plus-v1',
+    'qwen-3-5-4b': 'mbcd-std-v1',
+  }
+  const byId = new Map<string, CreationModelConfig>()
+  for (const model of models) {
+    const id = aliases[model.id] || model.id
+    if (!DEFAULT_CREATION_MODELS.some(defaultModel => defaultModel.id === id)) continue
+    byId.set(id, { ...model, id })
+  }
   let hasEnabled = false
-  return DEFAULT_CREATION_MODELS.map(defaultModel => {
+  const normalized = DEFAULT_CREATION_MODELS.map(defaultModel => {
     const model = { ...defaultModel, ...byId.get(defaultModel.id) }
     if (!model.enabled) return model
     if (hasEnabled) return { ...model, enabled: false }
     hasEnabled = true
     return model
   })
+  if (hasEnabled) return normalized
+  return normalized.map(model =>
+    model.id === 'mbcd-std-v1' ? { ...model, enabled: true } : model
+  )
 }
 
 export function loadCreationModels(): CreationModelConfig[] {
@@ -245,12 +272,18 @@ const initialState = {
   bakeMemoryOffset:   0,
   bakeKnowledgeOffset: 0,
   bakeKnowledgeQuery:  '',
+  bakeKnowledgeFrom:   '',
+  bakeKnowledgeTo:     '',
   bakeKnowledgeLimit:  20,
   bakeTemplateOffset:  0,
   bakeTemplateQuery:   '',
+  bakeTemplateFrom:    '',
+  bakeTemplateTo:      '',
   bakeTemplateLimit:   20,
   bakeSopOffset:       0,
   bakeSopQuery:        '',
+  bakeSopFrom:         '',
+  bakeSopTo:           '',
   bakeSopLimit:        20,
   bakeCaptureOffset:   0,
   repositoryMemoryQuery: '',
@@ -263,6 +296,7 @@ const initialState = {
   repositoryCaptureLimit: 20,
   repositoryCaptureSourceCaptureId: null,
   captureBackTarget: null,
+  bakeNavigationStack: [] as BakeNavigationTarget[],
   creationDraft: initialCreationDraft,
   creationBackTarget: null,
   ragQuery:            '',
@@ -272,7 +306,7 @@ const initialState = {
   ragError:            null,
   pendingAction:       null,
   actionConfirmed:     false,
-  apiBaseUrl:          'http://localhost:7070',
+  apiBaseUrl:          'http://127.0.0.1:7070',
   sidecarVersion:      '0.1.0',
   hasCompletedSetup:   safeLocalStorage?.getItem(SETUP_KEY) === 'true',
   setupSkipped:        safeLocalStorage?.getItem(SKIP_KEY)  === 'true',
@@ -304,17 +338,29 @@ export const useAppStore = create<AppState>((set) => ({
 
   setBakeKnowledgeQuery: (query) => set({ bakeKnowledgeQuery: query, bakeKnowledgeOffset: 0 }),
 
+  setBakeKnowledgeFrom: (value) => set({ bakeKnowledgeFrom: value, bakeKnowledgeOffset: 0 }),
+
+  setBakeKnowledgeTo: (value) => set({ bakeKnowledgeTo: value, bakeKnowledgeOffset: 0 }),
+
   setBakeKnowledgeLimit: (limit) => set({ bakeKnowledgeLimit: limit, bakeKnowledgeOffset: 0 }),
 
   setBakeTemplateOffset: (offset) => set({ bakeTemplateOffset: offset }),
 
   setBakeTemplateQuery: (query) => set({ bakeTemplateQuery: query, bakeTemplateOffset: 0 }),
 
+  setBakeTemplateFrom: (value) => set({ bakeTemplateFrom: value, bakeTemplateOffset: 0 }),
+
+  setBakeTemplateTo: (value) => set({ bakeTemplateTo: value, bakeTemplateOffset: 0 }),
+
   setBakeTemplateLimit: (limit) => set({ bakeTemplateLimit: limit, bakeTemplateOffset: 0 }),
 
   setBakeSopOffset: (offset) => set({ bakeSopOffset: offset }),
 
   setBakeSopQuery: (query) => set({ bakeSopQuery: query, bakeSopOffset: 0 }),
+
+  setBakeSopFrom: (value) => set({ bakeSopFrom: value, bakeSopOffset: 0 }),
+
+  setBakeSopTo: (value) => set({ bakeSopTo: value, bakeSopOffset: 0 }),
 
   setBakeSopLimit: (limit) => set({ bakeSopLimit: limit, bakeSopOffset: 0 }),
 
@@ -341,6 +387,29 @@ export const useAppStore = create<AppState>((set) => ({
   setCaptureBackTarget: (target) => set({ captureBackTarget: target }),
 
   clearCaptureBackTarget: () => set({ captureBackTarget: null }),
+
+  pushBakeNavigationTarget: (target) => set((state) => ({
+    bakeNavigationStack: [...state.bakeNavigationStack, target].slice(-20),
+    captureBackTarget: target,
+  })),
+
+  popBakeNavigationTarget: () => {
+    let popped: BakeNavigationTarget | null = null
+    set((state) => {
+      const next = [...state.bakeNavigationStack]
+      popped = next.pop() ?? null
+      return {
+        bakeNavigationStack: next,
+        captureBackTarget: next[next.length - 1] ?? null,
+      }
+    })
+    return popped
+  },
+
+  clearBakeNavigationStack: () => set({
+    bakeNavigationStack: [],
+    captureBackTarget: null,
+  }),
 
   setCreationDraft: (patch) => set((state) => ({
     creationDraft: { ...state.creationDraft, ...patch },

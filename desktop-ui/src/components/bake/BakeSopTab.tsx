@@ -27,15 +27,23 @@ const BakeSopTab: React.FC<{
   limit: number
   offset: number
   query: string
+  from: string
+  to: string
+  draftQuery: string
+  draftFrom: string
+  draftTo: string
   selectedSopId: string | null
   onSelectSop: (id: string | null) => void
   onDeleteSop: (id: string) => void
-  onCopySteps: (candidate: SopCandidate) => void
-  onViewLinkedKnowledge: (knowledgeId: string) => void
   onViewSourceTimeline: (timelineId?: string) => void
+  sourceTimelineTitle?: string
   onPageChange: (offset: number) => void
   onLimitChange: (limit: number) => void
-  onQueryChange: (query: string) => void
+  onDraftQueryChange: (query: string) => void
+  onDraftFromChange: (value: string) => void
+  onDraftToChange: (value: string) => void
+  onSearch: () => void
+  onClearFilters: () => void
   onCreateSop?: (sop: Partial<SopCandidate>) => void
 }> = ({
   candidates,
@@ -43,20 +51,29 @@ const BakeSopTab: React.FC<{
   limit,
   offset,
   query,
+  from,
+  to,
+  draftQuery,
+  draftFrom,
+  draftTo,
   selectedSopId,
   onSelectSop,
   onDeleteSop,
-  onCopySteps,
-  onViewLinkedKnowledge,
   onViewSourceTimeline,
+  sourceTimelineTitle,
   onPageChange,
   onLimitChange,
-  onQueryChange,
+  onDraftQueryChange,
+  onDraftFromChange,
+  onDraftToChange,
+  onSearch,
+  onClearFilters,
   onCreateSop,
 }) => {
   const selected = candidates.find(item => item.id === selectedSopId) ?? candidates[0]
   const [pageInput, setPageInput] = useState('')
   const [showCreateDialog, setShowCreateDialog] = useState(false)
+  const hasActiveFilters = Boolean(query.trim() || from || to)
   const [newSop, setNewSop] = useState<{
     extractedProblem: string
     detailedContent: string
@@ -127,28 +144,61 @@ const BakeSopTab: React.FC<{
           subtitle="管理可复用的操作流程和最佳实践"
           right={onCreateSop && <BakeButton primary onClick={() => setShowCreateDialog(true)}>新建</BakeButton>}
         />
-        <div className="bake-list-toolbar">
-          <div className="bake-list-toolbar__filters">
-            <label className="bake-form-field bake-filter-field bake-filter-field--search">
-              <span className="bake-filter-label">关键词</span>
-              <input
-                className="bake-input"
-                value={query}
-                onChange={(event) => onQueryChange(event.target.value)}
-                placeholder="搜索问题、来源或关键词"
-              />
-            </label>
+        <form
+          className="bake-list-toolbar bake-list-toolbar--repository"
+          onSubmit={(event) => {
+            event.preventDefault()
+            onSearch()
+          }}
+        >
+          <div className="bake-list-toolbar__repository">
+            <div className="bake-list-toolbar__repository-row bake-list-toolbar__repository-row--search">
+              <label className="bake-form-field bake-filter-field bake-filter-field--search">
+                <span className="bake-filter-label">关键词</span>
+                <input
+                  className="bake-input"
+                  value={draftQuery}
+                  onChange={(event) => onDraftQueryChange(event.target.value)}
+                  placeholder="搜索问题、来源或关键词"
+                />
+              </label>
+              <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--search">
+                <BakeButton compact primary type="submit">搜索</BakeButton>
+              </div>
+            </div>
+            <div className="bake-list-toolbar__repository-row bake-list-toolbar__repository-row--dates">
+              <label className="bake-form-field bake-filter-field">
+                <span className="bake-filter-label">开始日期</span>
+                <input
+                  className="bake-input"
+                  type="date"
+                  value={draftFrom}
+                  onChange={(event) => onDraftFromChange(event.target.value)}
+                />
+              </label>
+              <label className="bake-form-field bake-filter-field">
+                <span className="bake-filter-label">结束日期</span>
+                <input
+                  className="bake-input"
+                  type="date"
+                  value={draftTo}
+                  onChange={(event) => onDraftToChange(event.target.value)}
+                />
+              </label>
+              {(draftQuery || query || draftFrom || from || draftTo || to) && (
+                <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--secondary">
+                  <BakeButton compact type="button" onClick={onClearFilters}>清除筛选</BakeButton>
+                </div>
+              )}
+            </div>
           </div>
-          <div className="bake-list-toolbar__actions">
-            {query && <BakeButton compact onClick={() => onQueryChange('')}>清除筛选</BakeButton>}
-          </div>
-        </div>
+        </form>
       </BakeCard>
       <div className="bake-split-list-detail bake-split-list-detail--sop">
         <BakeCard className="bake-knowledge-list-card">
         <div className="bake-list bake-knowledge-list">
           {candidates.length === 0 ? (
-            <div className="bake-muted">{query.trim() ? '当前筛选条件下没有操作手册。' : '当前还没有操作手册。'}</div>
+            <div className="bake-muted">{hasActiveFilters ? '当前筛选条件下没有操作手册。' : '当前还没有操作手册。'}</div>
           ) : candidates.map(item => (
             <button
               key={item.id}
@@ -165,7 +215,6 @@ const BakeSopTab: React.FC<{
               </div>
               <div className="bake-inline-pills">
                 <BakePill text={`置信度 ${confidenceLabel[item.confidence]}`} />
-                <BakePill text={`关联知识 ${item.linkedKnowledgeIds.length}`} />
               </div>
             </button>
           ))}
@@ -242,32 +291,17 @@ const BakeSopTab: React.FC<{
               <div className="bake-kv__title">详细描述</div>
               <BakeMarkdown content={selected.detailedContent} />
             </div>
-            <div className="bake-knowledge-detail__section">
-              <div className="bake-kv__title">关联知识</div>
-              <div className="bake-muted">
-                {selected.linkedKnowledgeIds.length > 0
-                  ? `已关联 ${selected.linkedKnowledgeIds.length} 条知识（用于补充背景和术语）`
-                  : '暂无关联知识'}
-              </div>
-              {selected.linkedKnowledgeSummaries.length > 0 && (
-                <div className="bake-memory-detail__stats" style={{ marginTop: 10 }}>
-                  {selected.linkedKnowledgeSummaries.map((knowledge) => (
-                    <button
-                      key={knowledge.id}
-                      type="button"
-                      className="bake-stat-chip bake-stat-chip--button"
-                      onClick={() => onViewLinkedKnowledge(knowledge.id)}
-                    >
-                      {knowledge.summary}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
             <div className="bake-actions--primary">
               <BakeButton onClick={() => onViewSourceTimeline(selected.sourceTimelineId || selected.id)}>关联时间线</BakeButton>
               <BakeButton onClick={() => onDeleteSop(selected.id)}>删除操作手册</BakeButton>
-              <BakeButton compact onClick={() => onCopySteps(selected)}>复制流程</BakeButton>
+            </div>
+            <div className="bake-related-summary">
+              <div className="bake-related-row">
+                <span className="bake-related-row__label">关联时间线</span>
+                <span className="bake-related-row__value">
+                  {sourceTimelineTitle || (selected.sourceTimelineId ? `时间线 #${selected.sourceTimelineId}` : '暂无')}
+                </span>
+              </div>
             </div>
           </div>
         ) : (

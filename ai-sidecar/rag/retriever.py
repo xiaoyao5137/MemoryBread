@@ -130,6 +130,60 @@ def _knowledge_doc_key(knowledge_id: int) -> str:
     return f"knowledge:{knowledge_id}"
 
 
+def _artifact_doc_key(source_type: str, artifact_id: int) -> str:
+    return f"{source_type}:{artifact_id}"
+
+
+def _is_link_lookup_query(query: str) -> bool:
+    lowered = query.lower()
+    return any(term in lowered for term in ("url", "链接", "地址", "网址", "文档地址", "页面"))
+
+
+def _merge_chunks(chunks: list["RetrievedChunk"], limit: int, prefer_url: bool = False) -> list["RetrievedChunk"]:
+    unique: list[RetrievedChunk] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        key = chunk.doc_key or f"{chunk.source}:{chunk.capture_id}:{len(unique)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(chunk)
+
+    if prefer_url:
+        unique.sort(
+            key=lambda chunk: (
+                bool((chunk.metadata or {}).get("url") or "URL：" in chunk.text),
+                1 if (chunk.metadata or {}).get("source_type") == "document" else 0,
+                chunk.score,
+            ),
+            reverse=True,
+        )
+
+    return unique[:limit]
+
+
+def _rank_keyword_chunks(chunks: list["RetrievedChunk"], terms: list[str], prefer_url: bool) -> list["RetrievedChunk"]:
+    lowered_terms = [term.lower() for term in terms if term]
+
+    def _score(chunk: RetrievedChunk) -> tuple[int, float, int]:
+        text = chunk.text.lower()
+        metadata = chunk.metadata or {}
+        url = str(metadata.get("url") or "")
+        score = sum(1 for term in lowered_terms if term in text)
+        if prefer_url and url:
+            score += 5
+        if prefer_url and metadata.get("source_type") == "document":
+            score += 4
+        if metadata.get("source_type") in {"document", "operation", "bake_knowledge"}:
+            score += 2
+        if "docs.corp.kuaishou.com" in url:
+            score += 3
+        time_value = int(metadata.get("time") or metadata.get("ts") or 0)
+        return score, chunk.score, time_value
+
+    return sorted(chunks, key=_score, reverse=True)
+
+
 @dataclass
 class RetrievedChunk:
     """检索到的文本片段"""
@@ -398,12 +452,7 @@ class Fts5Retriever:
                 end_ts=end_ts,
                 entity_terms=entity_terms,
             )
-            if chunks:
-                conn.close()
-                logger.debug(f"FTS5 检索返回 {len(chunks)} 条结果")
-                return chunks
-
-            chunks = self._search_by_app_fields(
+            fallback_chunks = self._search_by_app_fields(
                 cursor,
                 query=query,
                 top_k=top_k,
@@ -412,6 +461,7 @@ class Fts5Retriever:
                 entity_terms=entity_terms,
             )
             conn.close()
+            chunks = _merge_chunks([*chunks, *fallback_chunks], top_k, prefer_url=_is_link_lookup_query(query))
             logger.debug(f"Capture 字段回退检索返回 {len(chunks)} 条结果")
             return chunks
         except Exception as e:
@@ -433,8 +483,12 @@ class Fts5Retriever:
                 c.ts,
                 c.app_name,
                 c.win_title,
+                c.url,
+                c.webpage_title,
                 c.ocr_text,
                 c.ax_text,
+                c.input_text,
+                c.audio_text,
                 fts.rank as score
             FROM captures_fts fts
             JOIN captures c ON fts.rowid = c.id
@@ -450,7 +504,7 @@ class Fts5Retriever:
             params.append(end_ts)
         if entity_terms:
             clause, clause_params = _build_like_clauses(
-                "LOWER(COALESCE(c.app_name, '') || ' ' || COALESCE(c.win_title, '') || ' ' || COALESCE(c.ocr_text, '') || ' ' || COALESCE(c.ax_text, ''))",
+                "LOWER(COALESCE(c.app_name, '') || ' ' || COALESCE(c.win_title, '') || ' ' || COALESCE(c.webpage_title, '') || ' ' || COALESCE(c.url, '') || ' ' || COALESCE(c.ocr_text, '') || ' ' || COALESCE(c.ax_text, '') || ' ' || COALESCE(c.input_text, '') || ' ' || COALESCE(c.audio_text, ''))",
                 entity_terms,
             )
             sql += f" AND {clause}"
@@ -481,8 +535,12 @@ class Fts5Retriever:
                 c.ts,
                 c.app_name,
                 c.win_title,
+                c.url,
+                c.webpage_title,
                 c.ocr_text,
-                c.ax_text
+                c.ax_text,
+                c.input_text,
+                c.audio_text
             FROM captures c
             WHERE 1=1
         """
@@ -496,17 +554,19 @@ class Fts5Retriever:
             params.append(end_ts)
 
         clause, clause_params = _build_like_clauses(
-            "LOWER(COALESCE(c.app_name, '') || ' ' || COALESCE(c.win_title, '') || ' ' || COALESCE(c.ocr_text, '') || ' ' || COALESCE(c.ax_text, ''))",
+            "LOWER(COALESCE(c.app_name, '') || ' ' || COALESCE(c.win_title, '') || ' ' || COALESCE(c.webpage_title, '') || ' ' || COALESCE(c.url, '') || ' ' || COALESCE(c.ocr_text, '') || ' ' || COALESCE(c.ax_text, '') || ' ' || COALESCE(c.input_text, '') || ' ' || COALESCE(c.audio_text, ''))",
             terms,
         )
         sql += f" AND {clause}"
         params.extend(clause_params)
         sql += " ORDER BY c.ts DESC LIMIT ?"
-        params.append(top_k)
+        candidate_limit = max(top_k * 50, 200)
+        params.append(candidate_limit)
         cursor.execute(sql, params)
 
         rows = cursor.fetchall()
-        return [self._row_to_chunk(row, float(len(terms)), source="fts5") for row in rows]
+        chunks = [self._row_to_chunk(row, float(len(terms)), source="fts5") for row in rows]
+        return _rank_keyword_chunks(chunks, terms, prefer_url=_is_link_lookup_query(query))[:top_k]
 
     def _row_to_chunk(self, row: sqlite3.Row, score: float, source: str = "fts5") -> RetrievedChunk:
         doc_key = _capture_doc_key(row["capture_id"])
@@ -524,6 +584,8 @@ class Fts5Retriever:
                 "ts": row["ts"],
                 "app_name": row["app_name"],
                 "win_title": row["win_title"],
+                "url": row["url"] if "url" in row.keys() else None,
+                "webpage_title": row["webpage_title"] if "webpage_title" in row.keys() else None,
             },
         )
 
@@ -537,10 +599,18 @@ class Fts5Retriever:
             parts.append(f"应用：{row['app_name']}")
         if row["win_title"]:
             parts.append(f"窗口：{row['win_title']}")
+        if "webpage_title" in row.keys() and row["webpage_title"]:
+            parts.append(f"页面：{row['webpage_title']}")
+        if "url" in row.keys() and row["url"]:
+            parts.append(f"URL：{row['url']}")
         if row["ocr_text"]:
             parts.append(f"OCR：{row['ocr_text']}")
         if row["ax_text"]:
             parts.append(f"AX：{row['ax_text']}")
+        if "input_text" in row.keys() and row["input_text"]:
+            parts.append(f"输入：{row['input_text']}")
+        if "audio_text" in row.keys() and row["audio_text"]:
+            parts.append(f"音频：{row['audio_text']}")
         return "\n".join(parts)
 
 
@@ -583,6 +653,13 @@ class KnowledgeFts5Retriever:
                 conn.close()
                 return []
 
+            prefer_url = _is_link_lookup_query(query)
+            artifact_chunks = self._search_artifacts(
+                cursor,
+                query=query,
+                top_k=top_k,
+                entity_terms=entity_terms,
+            )
             chunks = self._search_by_fts(
                 cursor,
                 query=query,
@@ -603,32 +680,28 @@ class KnowledgeFts5Retriever:
                 created_start_ts=created_start_ts,
                 created_end_ts=created_end_ts,
             )
-            if chunks:
-                conn.close()
-                logger.debug(f"知识库检索返回 {len(chunks)} 条结果")
-                return chunks
-
-            chunks = self._search_by_app_fields(
-                cursor,
-                query=query,
-                top_k=top_k,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                entity_terms=entity_terms,
-                observed_start_ts=observed_start_ts,
-                observed_end_ts=observed_end_ts,
-                event_start_ts=event_start_ts,
-                event_end_ts=event_end_ts,
-                activity_types=activity_types,
-                content_origins=content_origins,
-                history_view=history_view,
-                is_self_generated=is_self_generated,
-                evidence_strengths=evidence_strengths,
-                query_mode=query_mode,
-                created_start_ts=created_start_ts,
-                created_end_ts=created_end_ts,
-            )
+            fallback_chunks = [] if prefer_url and artifact_chunks else self._search_by_app_fields(
+                    cursor,
+                    query=query,
+                    top_k=top_k,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    entity_terms=entity_terms,
+                    observed_start_ts=observed_start_ts,
+                    observed_end_ts=observed_end_ts,
+                    event_start_ts=event_start_ts,
+                    event_end_ts=event_end_ts,
+                    activity_types=activity_types,
+                    content_origins=content_origins,
+                    history_view=history_view,
+                    is_self_generated=is_self_generated,
+                    evidence_strengths=evidence_strengths,
+                    query_mode=query_mode,
+                    created_start_ts=created_start_ts,
+                    created_end_ts=created_end_ts,
+                )
             conn.close()
+            chunks = _merge_chunks([*artifact_chunks, *chunks, *fallback_chunks], top_k, prefer_url=prefer_url)
             logger.debug(f"知识库字段回退检索返回 {len(chunks)} 条结果")
             return chunks
         except Exception as e:
@@ -684,6 +757,22 @@ class KnowledgeFts5Retriever:
                 k.is_self_generated,
                 k.evidence_strength,
                 k.importance,
+                (
+                    SELECT c.url
+                    FROM captures c
+                    WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
+                      AND COALESCE(c.url, '') != ''
+                    ORDER BY c.ts DESC
+                    LIMIT 1
+                ) AS linked_url,
+                (
+                    SELECT c.webpage_title
+                    FROM captures c
+                    WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
+                      AND COALESCE(c.webpage_title, '') != ''
+                    ORDER BY c.ts DESC
+                    LIMIT 1
+                ) AS linked_webpage_title,
                 fts.rank as score
             FROM knowledge_fts fts
             JOIN timelines k ON fts.rowid = k.id
@@ -739,7 +828,7 @@ class KnowledgeFts5Retriever:
         sql, params = _apply_noise_filters(sql, params)
         if entity_terms:
             clause, clause_params = _build_like_clauses(
-                "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, ''))",
+                "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, '') || ' ' || COALESCE((SELECT group_concat(COALESCE(c.webpage_title, '') || ' ' || COALESCE(c.url, ''), ' ') FROM captures c WHERE c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%')), ''))",
                 entity_terms,
             )
             sql += f" AND {clause}"
@@ -804,7 +893,23 @@ class KnowledgeFts5Retriever:
                 k.activity_type,
                 k.is_self_generated,
                 k.evidence_strength,
-                k.importance
+                k.importance,
+                (
+                    SELECT c.url
+                    FROM captures c
+                    WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
+                      AND COALESCE(c.url, '') != ''
+                    ORDER BY c.ts DESC
+                    LIMIT 1
+                ) AS linked_url,
+                (
+                    SELECT c.webpage_title
+                    FROM captures c
+                    WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
+                      AND COALESCE(c.webpage_title, '') != ''
+                    ORDER BY c.ts DESC
+                    LIMIT 1
+                ) AS linked_webpage_title
             FROM timelines k
             WHERE 1=1
         """
@@ -859,7 +964,7 @@ class KnowledgeFts5Retriever:
         sql, params = _apply_noise_filters(sql, params)
         if terms:
             clause, clause_params = _build_like_clauses(
-                "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, ''))",
+                "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, '') || ' ' || COALESCE((SELECT group_concat(COALESCE(c.webpage_title, '') || ' ' || COALESCE(c.url, ''), ' ') FROM captures c WHERE c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%')), ''))",
                 terms,
             )
             sql += f" AND {clause}"
@@ -869,11 +974,13 @@ class KnowledgeFts5Retriever:
             sql += " ORDER BY k.created_at_ms DESC LIMIT ?"
         else:
             sql += " ORDER BY COALESCE(k.observed_at, k.end_time, k.start_time, 0) DESC LIMIT ?"
-        params.append(top_k)
+        candidate_limit = max(top_k * 50, 200)
+        params.append(candidate_limit)
         cursor.execute(sql, params)
 
         rows = cursor.fetchall()
-        return [self._row_to_chunk(row, float(len(terms)) if terms else 1.0) for row in rows]
+        chunks = [self._row_to_chunk(row, float(len(terms)) if terms else 1.0) for row in rows]
+        return _rank_keyword_chunks(chunks, terms, prefer_url=_is_link_lookup_query(query))[:top_k]
 
     def _row_to_chunk(self, row: sqlite3.Row, score: float) -> RetrievedChunk:
         knowledge_id = row["id"]
@@ -906,10 +1013,254 @@ class KnowledgeFts5Retriever:
                 "time": time_value,
                 "app_name": row["frag_app_name"],
                 "win_title": row["frag_win_title"],
+                "url": row["linked_url"] if "linked_url" in row.keys() else None,
+                "webpage_title": row["linked_webpage_title"] if "linked_webpage_title" in row.keys() else None,
                 "category": row["category"],
                 "user_verified": row["user_verified"],
             },
         )
+
+    def _search_artifacts(
+        self,
+        cursor: sqlite3.Cursor,
+        query: str,
+        top_k: int,
+        entity_terms: list[str] | None,
+    ) -> list[RetrievedChunk]:
+        terms = list(dict.fromkeys([*(entity_terms or []), *_extract_query_terms(query)]))
+        if not terms:
+            return []
+
+        chunks: list[RetrievedChunk] = []
+        chunks.extend(self._search_document_artifacts(cursor, terms, top_k))
+        chunks.extend(self._search_knowledge_artifacts(cursor, terms, top_k))
+        chunks.extend(self._search_operation_artifacts(cursor, terms, top_k))
+        return _rank_keyword_chunks(chunks, terms, prefer_url=_is_link_lookup_query(query))[:top_k]
+
+    def _search_document_artifacts(
+        self,
+        cursor: sqlite3.Cursor,
+        terms: list[str],
+        top_k: int,
+    ) -> list[RetrievedChunk]:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bake_documents'")
+        if not cursor.fetchone():
+            return []
+
+        clause, params = _build_like_clauses(
+            "LOWER(COALESCE(title, '') || ' ' || COALESCE(doc_type, '') || ' ' || COALESCE(summary, '') || ' ' || COALESCE(full_content, '') || ' ' || COALESCE(sections_json, '') || ' ' || COALESCE(source_url, ''))",
+            terms,
+        )
+        if not clause:
+            return []
+
+        sql = f"""
+            SELECT
+                id, title, doc_type, summary, full_content, sections_json, source_url,
+                source_memory_ids, linked_knowledge_ids, updated_at
+            FROM bake_documents
+            WHERE deleted_at IS NULL AND {clause}
+            ORDER BY updated_at DESC
+            LIMIT ?
+        """
+        cursor.execute(sql, [*params, max(top_k * 10, 50)])
+        rows = cursor.fetchall()
+        chunks = [self._document_row_to_chunk(row, terms) for row in rows]
+        return chunks[:top_k]
+
+    def _search_knowledge_artifacts(
+        self,
+        cursor: sqlite3.Cursor,
+        terms: list[str],
+        top_k: int,
+    ) -> list[RetrievedChunk]:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bake_knowledge'")
+        if not cursor.fetchone():
+            return []
+
+        clause, params = _build_like_clauses(
+            "LOWER(COALESCE(title, '') || ' ' || COALESCE(summary, '') || ' ' || COALESCE(content, '') || ' ' || COALESCE(detailed_content, '') || ' ' || COALESCE(entities, ''))",
+            terms,
+        )
+        if not clause:
+            return []
+
+        sql = f"""
+            SELECT
+                id, title, summary, content, detailed_content, timeline_id,
+                source_timeline_ids, source_capture_ids, importance, user_verified, updated_at_ms
+            FROM bake_knowledge
+            WHERE {clause}
+            ORDER BY COALESCE(updated_at_ms, 0) DESC
+            LIMIT ?
+        """
+        cursor.execute(sql, [*params, max(top_k * 10, 50)])
+        rows = cursor.fetchall()
+        return [self._knowledge_artifact_row_to_chunk(row, terms) for row in rows[:top_k]]
+
+    def _search_operation_artifacts(
+        self,
+        cursor: sqlite3.Cursor,
+        terms: list[str],
+        top_k: int,
+    ) -> list[RetrievedChunk]:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bake_sops'")
+        if not cursor.fetchone():
+            return []
+
+        clause, params = _build_like_clauses(
+            "LOWER(COALESCE(title, '') || ' ' || COALESCE(summary, '') || ' ' || COALESCE(content, '') || ' ' || COALESCE(detailed_content, '') || ' ' || COALESCE(entities, ''))",
+            terms,
+        )
+        if not clause:
+            return []
+
+        sql = f"""
+            SELECT
+                id, title, summary, content, detailed_content, timeline_id,
+                source_capture_ids, importance, user_verified, updated_at_ms
+            FROM bake_sops
+            WHERE {clause}
+            ORDER BY COALESCE(updated_at_ms, 0) DESC
+            LIMIT ?
+        """
+        cursor.execute(sql, [*params, max(top_k * 10, 50)])
+        rows = cursor.fetchall()
+        return [self._operation_artifact_row_to_chunk(row, terms) for row in rows[:top_k]]
+
+    @staticmethod
+    def _json_ids(value: str | None) -> list[str]:
+        if not value:
+            return []
+        try:
+            import json
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if item is not None]
+        except Exception:
+            return re.findall(r"\d+", value)
+        return []
+
+    @staticmethod
+    def _keyword_score(text: str, terms: list[str]) -> float:
+        lowered = text.lower()
+        return float(sum(1 for term in terms if term.lower() in lowered))
+
+    def _document_row_to_chunk(self, row: sqlite3.Row, terms: list[str]) -> RetrievedChunk:
+        artifact_id = int(row["id"])
+        doc_key = _artifact_doc_key("document", artifact_id)
+        source_timeline_ids = self._json_ids(row["source_memory_ids"])
+        linked_knowledge_ids = self._json_ids(row["linked_knowledge_ids"])
+        text = self._build_document_text(row)
+        return RetrievedChunk(
+            capture_id=0,
+            text=text,
+            score=self._keyword_score(text, terms) + 50.0,
+            source="document",
+            doc_key=doc_key,
+            metadata={
+                "doc_key": doc_key,
+                "source_type": "document",
+                "retrieval_method": "artifact",
+                "artifact_id": artifact_id,
+                "document_id": artifact_id,
+                "title": row["title"],
+                "summary": row["summary"],
+                "overview": row["summary"],
+                "category": row["doc_type"],
+                "doc_type": row["doc_type"],
+                "url": row["source_url"],
+                "source_url": row["source_url"],
+                "time": row["updated_at"],
+                "updated_at": row["updated_at"],
+                "source_timeline_ids": source_timeline_ids,
+                "linked_knowledge_ids": linked_knowledge_ids,
+            },
+        )
+
+    def _knowledge_artifact_row_to_chunk(self, row: sqlite3.Row, terms: list[str]) -> RetrievedChunk:
+        artifact_id = int(row["id"])
+        doc_key = _artifact_doc_key("bake_knowledge", artifact_id)
+        source_timeline_ids = self._json_ids(row["source_timeline_ids"])
+        if row["timeline_id"] and str(row["timeline_id"]) not in source_timeline_ids:
+            source_timeline_ids.insert(0, str(row["timeline_id"]))
+        text = self._build_bake_artifact_text(row, "知识")
+        return RetrievedChunk(
+            capture_id=0,
+            text=text,
+            score=self._keyword_score(text, terms) + 20.0,
+            source="bake_knowledge",
+            doc_key=doc_key,
+            metadata={
+                "doc_key": doc_key,
+                "source_type": "bake_knowledge",
+                "retrieval_method": "artifact",
+                "artifact_id": artifact_id,
+                "title": row["title"],
+                "summary": row["summary"],
+                "overview": row["summary"],
+                "source_timeline_ids": source_timeline_ids,
+                "source_capture_ids": self._json_ids(row["source_capture_ids"]),
+                "importance": row["importance"],
+                "user_verified": bool(row["user_verified"]),
+                "time": row["updated_at_ms"],
+                "updated_at": row["updated_at_ms"],
+            },
+        )
+
+    def _operation_artifact_row_to_chunk(self, row: sqlite3.Row, terms: list[str]) -> RetrievedChunk:
+        artifact_id = int(row["id"])
+        doc_key = _artifact_doc_key("operation", artifact_id)
+        source_timeline_ids = [str(row["timeline_id"])] if row["timeline_id"] else []
+        text = self._build_bake_artifact_text(row, "操作")
+        return RetrievedChunk(
+            capture_id=0,
+            text=text,
+            score=self._keyword_score(text, terms) + 20.0,
+            source="operation",
+            doc_key=doc_key,
+            metadata={
+                "doc_key": doc_key,
+                "source_type": "operation",
+                "retrieval_method": "artifact",
+                "artifact_id": artifact_id,
+                "title": row["title"],
+                "summary": row["summary"],
+                "overview": row["summary"],
+                "source_timeline_ids": source_timeline_ids,
+                "source_capture_ids": self._json_ids(row["source_capture_ids"]),
+                "importance": row["importance"],
+                "user_verified": bool(row["user_verified"]),
+                "time": row["updated_at_ms"],
+                "updated_at": row["updated_at_ms"],
+            },
+        )
+
+    @staticmethod
+    def _build_document_text(row: sqlite3.Row) -> str:
+        parts: list[str] = [f"文档：{row['title']}"]
+        if row["doc_type"]:
+            parts.append(f"类型：{row['doc_type']}")
+        if row["summary"]:
+            parts.append(f"摘要：{row['summary']}")
+        if row["source_url"]:
+            parts.append(f"URL：{row['source_url']}")
+        if row["full_content"]:
+            parts.append(f"正文：{str(row['full_content'])[:1200]}")
+        elif row["sections_json"]:
+            parts.append(f"结构：{str(row['sections_json'])[:800]}")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _build_bake_artifact_text(row: sqlite3.Row, label: str) -> str:
+        parts: list[str] = [f"{label}：{row['title']}"]
+        if row["summary"]:
+            parts.append(f"摘要：{row['summary']}")
+        if row["detailed_content"]:
+            parts.append(f"详情：{str(row['detailed_content'])[:1000]}")
+        elif row["content"]:
+            parts.append(f"内容：{str(row['content'])[:800]}")
+        return "\n".join(parts)
 
     @staticmethod
     def _build_knowledge_text(row: sqlite3.Row) -> str:
@@ -937,6 +1288,10 @@ class KnowledgeFts5Retriever:
             parts.append(f"应用：{row['frag_app_name']}")
         if row["frag_win_title"]:
             parts.append(f"窗口：{row['frag_win_title']}")
+        if "linked_webpage_title" in row.keys() and row["linked_webpage_title"]:
+            parts.append(f"页面：{row['linked_webpage_title']}")
+        if "linked_url" in row.keys() and row["linked_url"]:
+            parts.append(f"URL：{row['linked_url']}")
         if "activity_type" in row.keys() and row["activity_type"]:
             parts.append(f"活动类型：{row['activity_type']}")
         if "content_origin" in row.keys() and row["content_origin"]:

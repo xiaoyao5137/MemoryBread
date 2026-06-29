@@ -24,6 +24,7 @@ const EMPTY_OVERVIEW: MonitorOverview = {
     by_model: [],
     by_caller: [],
     trend: [],
+    trend_by_model: [],
   },
   capture_flow: {
     today_count: 0,
@@ -65,10 +66,10 @@ const EMPTY_OVERVIEW: MonitorOverview = {
 }
 
 const CALLER_LABELS: Record<string, string> = {
-  rag: 'RAG 问答', task: '定时任务', knowledge: '知识提炼',
+  rag: 'RAG 问答', task: '定时任务', knowledge: '知识提炼', creation: '内容创作',
 }
 const CALLER_COLORS: Record<string, string> = {
-  rag: '#007AFF', task: '#34C759', knowledge: '#AF52DE',
+  rag: '#007AFF', task: '#34C759', knowledge: '#AF52DE', creation: '#FF9500',
 }
 const STATUS_COLOR: Record<string, string> = {
   success: '#34C759', failed: '#FF3B30', running: '#FF9500',
@@ -78,6 +79,15 @@ const EVENT_COLOR: Record<string, string> = {
 }
 const EVENT_LABEL: Record<string, string> = {
   load_done: '加载完成', load_start: '加载中', unload: '已卸载', load_failed: '加载失败',
+}
+
+function formatLlmModelName(model?: string | null): string {
+  const name = (model || '').trim()
+  if (!name) return '模型未记录'
+  if (name === 'unavailable') return '模型不可用/未记录'
+  if (name === 'qwen3.5:4b' || name === 'mbem-v1-local') return 'MBEM v1.0 / MBCD Std v1.0'
+  if (name === 'claude-opus-4-8' || name.startsWith('claude-opus-4')) return 'MBCD Plus v1.0'
+  return name
 }
 
 function fmt(n: number): string {
@@ -112,27 +122,68 @@ function fmtAxisTs(ms: number): string {
   })
 }
 
-type OverviewRange = '1d' | '7d' | '30d'
+type TimeUnit = 'minute' | 'hour' | 'day'
+type OverviewRange = { amount: number; unit: TimeUnit }
 type SystemRange = '1h' | '6h' | '24h' | '1d'
 
-function getOverviewBucketLabel(range: OverviewRange): string {
-  if (range === '1d') return '约 1 分钟'
-  if (range === '7d') return '约 6 小时'
-  return '约 1 天'
+const UNIT_TO_MS: Record<TimeUnit, number> = {
+  minute: 60 * 1000,
+  hour: 60 * 60 * 1000,
+  day: 24 * 60 * 60 * 1000,
 }
 
-function getKnowledgeBucketLabel(range: OverviewRange): string {
-  if (range === '1d') return '约 1 分钟'
-  if (range === '7d') return '约 1 小时'
-  return '约 1 天'
+const OVERVIEW_QUICK_RANGES: { label: string; range: OverviewRange }[] = [
+  { label: '1小时', range: { amount: 1, unit: 'hour' } },
+  { label: '6小时', range: { amount: 6, unit: 'hour' } },
+  { label: '24小时', range: { amount: 24, unit: 'hour' } },
+  { label: '7天', range: { amount: 7, unit: 'day' } },
+  { label: '30天', range: { amount: 30, unit: 'day' } },
+]
+
+function overviewRangeToMs(range: OverviewRange): number {
+  const safeAmount = Number.isFinite(range.amount) ? range.amount : 6
+  return Math.max(1, safeAmount) * UNIT_TO_MS[range.unit]
+}
+
+function isSameOverviewRange(a: OverviewRange, b: OverviewRange): boolean {
+  return a.amount === b.amount && a.unit === b.unit
+}
+
+function getNiceBucketMs(rangeMs: number): number {
+  const buckets = [
+    60 * 1000,
+    5 * 60 * 1000,
+    15 * 60 * 1000,
+    60 * 60 * 1000,
+    3 * 60 * 60 * 1000,
+    6 * 60 * 60 * 1000,
+    12 * 60 * 60 * 1000,
+    24 * 60 * 60 * 1000,
+  ]
+  const wanted = Math.max(60 * 1000, rangeMs / 80)
+  return buckets.find((bucket) => bucket >= wanted) ?? buckets[buckets.length - 1]
+}
+
+function fmtDuration(ms: number): string {
+  const minute = 60 * 1000
+  const hour = 60 * minute
+  const day = 24 * hour
+  if (ms % day === 0) return `${ms / day} 天`
+  if (ms % hour === 0) return `${ms / hour} 小时`
+  if (ms % minute === 0) return `${ms / minute} 分钟`
+  return `${Math.round(ms / minute)} 分钟`
+}
+
+function getOverviewBucketLabel(range: OverviewRange): string {
+  return `约 ${fmtDuration(getNiceBucketMs(overviewRangeToMs(range)))}`
+}
+
+function getOverviewRangeLabel(range: OverviewRange): string {
+  return `最近 ${fmtDuration(overviewRangeToMs(range))}`
 }
 
 function getTrendTitle(title: string, bucketLabel: string): string {
   return `${title}（${bucketLabel}）`
-}
-
-function getKnowledgeTrendLabel(range: OverviewRange): string {
-  return getTrendTitle('知识提炼趋势', getKnowledgeBucketLabel(range))
 }
 
 function getSystemBucketLabel(range: SystemRange): string {
@@ -145,7 +196,7 @@ function getSystemBucketLabel(range: SystemRange): string {
 function fmtOverviewAxisTs(ms: number, range: OverviewRange): string {
   const date = new Date(Number(ms))
   if (Number.isNaN(date.getTime())) return '—'
-  if (range === '1d') {
+  if (overviewRangeToMs(range) <= 24 * 60 * 60 * 1000) {
     return date.toLocaleTimeString('zh-CN', {
       hour: '2-digit',
       minute: '2-digit',
@@ -225,6 +276,7 @@ const SparkLine: React.FC<{
   height?: number
   valueFormatter?: (value: number) => string
   axisFormatter?: (ts: number) => string
+  xDomain?: { start: number; end: number }
   detailFormatter?: (point: LinePoint) => string
 }> = ({
   data,
@@ -233,6 +285,7 @@ const SparkLine: React.FC<{
   height = 40,
   valueFormatter = (value) => String(value),
   axisFormatter = fmtAxisTs,
+  xDomain,
   detailFormatter,
 }) => {
   const normalizedSeries = (series && series.length > 0)
@@ -253,10 +306,16 @@ const SparkLine: React.FC<{
   const min = Math.min(...allValues, 0)
   const range = Math.max(max - min, 1)
   const axisValueFormatter = normalizedSeries[0].valueFormatter || valueFormatter
+  const rawDomainStart = xDomain?.start ?? baseData[0].ts
+  const rawDomainEnd = xDomain?.end ?? baseData[baseData.length - 1].ts
+  const domainStart = Math.min(rawDomainStart, rawDomainEnd)
+  const domainEnd = Math.max(rawDomainStart, rawDomainEnd)
+  const domainRange = Math.max(domainEnd - domainStart, 1)
+  const xForTs = (ts: number) => pad + ((ts - domainStart) / domainRange) * (w - pad * 2)
 
   const seriesPoints = normalizedSeries.map(item => {
-    const points = item.data.map((d, i) => {
-      const x = pad + (i / Math.max(item.data.length - 1, 1)) * (w - pad * 2)
+    const points = item.data.map((d) => {
+      const x = xForTs(d.ts)
       const y = h - pad - ((d.value - min) / range) * (h - pad * 2)
       return { ...d, x, y }
     })
@@ -306,7 +365,7 @@ const SparkLine: React.FC<{
               </g>
             ))}
             {baseData.map((_, i) => {
-              const x = pad + (i / Math.max(baseData.length - 1, 1)) * (w - pad * 2)
+              const x = xForTs(baseData[i].ts)
               return (
                 <rect
                   key={i}
@@ -327,9 +386,9 @@ const SparkLine: React.FC<{
             ))}
           </svg>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: 10, color: '#AEAEB2' }}>
-            <span>{axisFormatter(baseData[0].ts)}</span>
-            <span>{axisFormatter(baseData[Math.floor(baseData.length / 2)].ts)}</span>
-            <span>{axisFormatter(baseData[baseData.length - 1].ts)}</span>
+            <span>{axisFormatter(domainStart)}</span>
+            <span>{axisFormatter(domainStart + domainRange / 2)}</span>
+            <span>{axisFormatter(domainEnd)}</span>
           </div>
         </div>
       </div>
@@ -397,6 +456,33 @@ const BarChart: React.FC<{
       <div style={{ fontSize: 11, color: '#6E6E73', marginTop: 6, minHeight: 16 }}>
         {hoverItem ? `${hoverItem.label || '当前'} · ${valueFormatter(hoverItem.value)}` : '悬停柱子可查看具体值'}
       </div>
+    </div>
+  )
+}
+
+const TrendHeader: React.FC<{
+  title: string
+  rangeLabel: string
+  bucketLabel: string
+}> = ({ title, rangeLabel, bucketLabel }) => (
+  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+    <span style={{ ...sectionTitle, marginBottom: 0 }}>{title}（{rangeLabel}）</span>
+    <span style={{ fontSize: 11, color: '#AEAEB2' }}>采样粒度 {bucketLabel}</span>
+  </div>
+)
+
+const ChartLegend: React.FC<{
+  items: { label: string; color: string }[]
+}> = ({ items }) => {
+  if (!items.length) return null
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+      {items.map((item) => (
+        <span key={`${item.color}-${item.label}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#6E6E73' }}>
+          <span style={{ width: 8, height: 8, borderRadius: '50%', background: item.color, display: 'inline-block' }} />
+          {item.label}
+        </span>
+      ))}
     </div>
   )
 }
@@ -548,6 +634,7 @@ const OverviewContent: React.FC<{
     by_model: data?.token_usage?.by_model ?? [],
     by_caller: data?.token_usage?.by_caller ?? [],
     trend: data?.token_usage?.trend ?? [],
+    trend_by_model: data?.token_usage?.trend_by_model ?? [],
   }
   const capture_flow = {
     ...EMPTY_OVERVIEW.capture_flow,
@@ -561,13 +648,12 @@ const OverviewContent: React.FC<{
     ...(data?.rag_sessions ?? {}),
     recent: data?.rag_sessions?.recent ?? [],
   }
-  // 实时区域优先采用 3s 轮询的 liveData，fallback 到 15s overview，再 fallback 到空值
-  // 注意：by_time/today/period_count 这类聚合字段不在 live 中，必须沿用 data
+  // 实时状态采用 3s 轮询的 liveData；范围内聚合和最近记录沿用 overview，保持筛选口径一致。
   const knowledge_flow = {
     ...EMPTY_OVERVIEW.knowledge_flow,
     ...(data?.knowledge_flow ?? {}),
     by_time: data?.knowledge_flow?.by_time ?? [],
-    recent: liveData?.recent ?? data?.knowledge_flow?.recent ?? [],
+    recent: data?.knowledge_flow?.recent ?? liveData?.recent ?? [],
     extracting: liveData?.extracting ?? data?.knowledge_flow?.extracting ?? [],
     last_extraction_at_ms: liveData?.last_extraction_at_ms
       ?? data?.knowledge_flow?.last_extraction_at_ms
@@ -585,6 +671,24 @@ const OverviewContent: React.FC<{
     recent: data?.task_executions?.recent ?? [],
   }
   const serviceHealth = liveData?.service_health ?? data?.service_health ?? EMPTY_OVERVIEW.service_health
+  const tokenTrendSeries = token_usage.trend_by_model.length > 0
+    ? token_usage.trend_by_model.map((item, index) => ({
+        label: formatLlmModelName(item.model),
+        color: getStableSeriesColor(`token-${item.model}`, index),
+        data: item.trend.map((point) => ({ ts: point.ts, value: point.tokens })),
+        valueFormatter: (value: number) => `${fmt(value)} tokens`,
+      }))
+    : [{
+        label: '总量',
+        color: '#007AFF',
+        data: token_usage.trend.map((point) => ({ ts: point.ts, value: point.tokens })),
+        valueFormatter: (value: number) => `${fmt(value)} tokens`,
+      }]
+  const hasTokenTrend = tokenTrendSeries.some((item) => item.data.length > 0)
+  const overviewRangeMs = overviewRangeToMs(range)
+  const chartDomain = { start: nowMs - overviewRangeMs, end: nowMs }
+  const rangeLabel = getOverviewRangeLabel(range)
+  const bucketLabel = getOverviewBucketLabel(range)
   return (
     <>
       <ServiceHealthBanner health={serviceHealth} />
@@ -612,21 +716,25 @@ const OverviewContent: React.FC<{
       </div>
 
       <div style={cardStyle}>
-        <div style={sectionTitle}>{getTrendTitle('Token 用量趋势', getOverviewBucketLabel(range))}</div>
-        {token_usage.trend.length > 0 ? (
+        <TrendHeader title="Token 用量趋势" rangeLabel={rangeLabel} bucketLabel={bucketLabel} />
+        {hasTokenTrend ? (
           <>
+            <ChartLegend items={tokenTrendSeries.filter((item) => item.data.length > 0).map((item) => ({
+              label: item.label,
+              color: item.color,
+            }))} />
             <SparkLine
-              data={token_usage.trend.map((t) => ({ ts: t.ts, value: t.tokens }))}
-              color="#007AFF"
+              series={tokenTrendSeries}
               height={50}
               valueFormatter={(value) => `${fmt(value)} tokens`}
               axisFormatter={(ts) => fmtOverviewAxisTs(ts, range)}
+              xDomain={chartDomain}
               detailFormatter={(point) => {
                 const item = token_usage.trend.find((entry) => entry.ts === point.ts)
                 return item ? `${fmtTs(item.ts)} · ${fmt(item.tokens)} tokens · ${item.calls} 次` : ''
               }}
             />
-            {token_usage.trend.length === 1 && (
+            {tokenTrendSeries.filter((item) => item.data.length > 0).every((item) => item.data.length === 1) && (
               <div style={{ color: '#AEAEB2', fontSize: 11, marginTop: 6 }}>当前时间范围内仅 1 个统计点，已按真实数据展示。</div>
             )}
           </>
@@ -634,9 +742,13 @@ const OverviewContent: React.FC<{
       </div>
 
       <div style={cardStyle}>
-        <div style={sectionTitle}>{getKnowledgeTrendLabel(range)}</div>
+        <TrendHeader title="知识提炼趋势" rangeLabel={rangeLabel} bucketLabel={bucketLabel} />
         {knowledge_flow.by_time.length > 0 ? (
           <>
+            <ChartLegend items={[
+              { label: '已提炼', color: '#BF5AF2' },
+              { label: '等待队列', color: '#FF9500' },
+            ]} />
             <SparkLine
               series={[
                 {
@@ -654,6 +766,7 @@ const OverviewContent: React.FC<{
               ]}
               height={50}
               axisFormatter={(ts) => fmtOverviewAxisTs(ts, range)}
+              xDomain={chartDomain}
               detailFormatter={(point) => `${fmtTs(point.ts)} · ${point.value} 条知识`}
             />
             {knowledge_flow.by_time.length === 1 && (
@@ -669,19 +782,28 @@ const OverviewContent: React.FC<{
           {token_usage.by_model.length === 0
             ? <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无数据</div>
             : token_usage.by_model.map((m, i) => {
+              const color = getStableSeriesColor(`token-${m.model}`, i)
               const pct = token_usage.total_period > 0 ? (m.total / token_usage.total_period * 100).toFixed(0) : '0'
               return (
                 <div key={i} style={{ marginBottom: 8 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
-                    <span style={{ color: '#333', fontWeight: 500 }}>{m.model}</span>
-                    <span style={{ color: '#6E6E73' }}>{fmt(m.total)} ({pct}%)</span>
+                    <span style={{ color, fontWeight: 500 }}>{formatLlmModelName(m.model)}</span>
+                    <span style={{ color: '#6E6E73' }}>{fmt(m.total)} · {m.calls}次 ({pct}%)</span>
+                  </div>
+                  <div style={{ color: '#8E8E93', fontSize: 10, marginBottom: 4 }}>
+                    Prompt {fmt(m.prompt)} · Completion {fmt(m.completion)}
                   </div>
                   <div style={{ height: 4, borderRadius: 2, background: '#E5E5EA' }}>
-                    <div style={{ height: '100%', borderRadius: 2, background: '#007AFF', width: `${pct}%` }} />
+                    <div style={{ height: '100%', borderRadius: 2, background: color, width: `${pct}%` }} />
                   </div>
                 </div>
               )
             })}
+          {token_usage.by_model.some((m) => m.model === 'unavailable') && (
+            <div style={{ color: '#AEAEB2', fontSize: 10, lineHeight: 1.4 }}>
+              “模型不可用/未记录”表示调用失败或记录时未拿到具体模型名。
+            </div>
+          )}
         </div>
         <div style={{ ...cardStyle, flex: 1 }}>
           <div style={sectionTitle}>按来源分布</div>
@@ -955,12 +1077,13 @@ const getModelTypeMeta = (type?: string | null) => MODEL_TYPE_META[type || ''] |
 
 const normalizeModelName = (rawName?: string | null) => {
   if (!rawName) return ''
-  return rawName
+  const name = rawName
     .replace(/^RAG Embedding · /, '')
     .replace(/^RAG LLM · /, '')
     .replace(/^Sidecar Embedding · /, '')
     .replace(/^Knowledge Extractor · /, '')
     .trim()
+  return formatLlmModelName(name)
 }
 
 const getLatestModelStates = (events: SystemResources['model_events']) => {
@@ -1076,7 +1199,7 @@ const SystemContent: React.FC<{ data: SystemResources | null; range: SystemRange
   const [eventPage, setEventPage] = useState(1)
   const [selectedModelName, setSelectedModelName] = useState<string | null>(null)
   const filteredModelEvents = selectedModelName
-    ? model_events.filter((event) => event.model_name === selectedModelName)
+    ? model_events.filter((event) => event.model_name === selectedModelName || normalizeModelName(event.model_name) === selectedModelName)
     : model_events
   const totalEventPages = Math.max(1, Math.ceil(filteredModelEvents.length / eventPageSize))
   const pagedModelEvents = filteredModelEvents.slice((eventPage - 1) * eventPageSize, eventPage * eventPageSize)
@@ -1346,7 +1469,7 @@ const SystemContent: React.FC<{ data: SystemResources | null; range: SystemRange
         {filteredModelEvents.length === 0
           ? <div style={{ color: '#AEAEB2', fontSize: 12 }}>暂无事件</div>
           : pagedModelEvents.map((e, i) => {
-            const active = selectedModelName === e.model_name
+            const active = selectedModelName === e.model_name || selectedModelName === normalizeModelName(e.model_name)
             const meta = getModelTypeMeta(e.model_type)
             return (
               <div key={`${e.ts}-${e.model_name}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0',
@@ -1361,7 +1484,7 @@ const SystemContent: React.FC<{ data: SystemResources | null; range: SystemRange
                   {EVENT_LABEL[e.event_type] || e.event_type}
                 </span>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <span style={{ fontSize: 12, color: '#333' }}>{e.model_name}</span>
+                  <span style={{ fontSize: 12, color: '#333' }}>{normalizeModelName(e.model_name) || e.model_name}</span>
                   <span style={{ fontSize: 11, color: meta.color, marginLeft: 6 }}>{meta.label}</span>
                 </div>
                 <div style={{ flexShrink: 0, fontSize: 11, color: '#6E6E73', textAlign: 'right' }}>
@@ -1392,6 +1515,63 @@ const ErrorNotice: React.FC<{ message: string }> = ({ message }) => (
   </div>
 )
 
+const OverviewRangeControl: React.FC<{
+  value: OverviewRange
+  onChange: (next: OverviewRange) => void
+}> = ({ value, onChange }) => {
+  const updateAmount = (raw: string) => {
+    const parsed = Math.max(1, Math.min(90, Math.round(Number(raw) || 1)))
+    onChange({ ...value, amount: parsed })
+  }
+  return (
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+      <span style={{ fontSize: 11, color: '#6E6E73' }}>最近</span>
+      <input
+        type="number"
+        min={1}
+        max={90}
+        value={value.amount}
+        onChange={(event) => updateAmount(event.target.value)}
+        style={{
+          width: 54,
+          fontSize: 11,
+          padding: '3px 6px',
+          borderRadius: 6,
+          border: '1px solid rgba(0,0,0,0.12)',
+          background: 'white',
+          color: '#1D1D1F',
+        }}
+      />
+      <select
+        value={value.unit}
+        onChange={(event) => onChange({ ...value, unit: event.target.value as TimeUnit })}
+        style={{
+          fontSize: 11,
+          padding: '3px 6px',
+          borderRadius: 6,
+          border: '1px solid rgba(0,0,0,0.12)',
+          background: 'white',
+          color: '#1D1D1F',
+        }}
+      >
+        <option value="minute">分钟</option>
+        <option value="hour">小时</option>
+        <option value="day">天</option>
+      </select>
+      {OVERVIEW_QUICK_RANGES.map(({ label, range }) => {
+        const active = isSameOverviewRange(value, range)
+        return (
+          <button key={label} onClick={() => onChange(range)} style={{
+            fontSize: 11, padding: '3px 8px', borderRadius: 6, border: 'none', cursor: 'pointer',
+            background: active ? '#007AFF' : 'white',
+            color: active ? 'white' : '#6E6E73',
+          }}>{label}</button>
+        )
+      })}
+    </div>
+  )
+}
+
 // ── 主组件 ──────────────────────────────────────────────────────────────────
 const MonitorPanel: React.FC = () => {
   const { apiBaseUrl } = useAppStore()
@@ -1404,7 +1584,7 @@ const MonitorPanel: React.FC = () => {
   const [liveData, setLiveData] = useState<ExtractionLive | null>(null)
   const [nowMs, setNowMs] = useState<number>(() => Date.now())
   const [sysData, setSysData] = useState<SystemResources | null>(null)
-  const [range, setRange] = useState<OverviewRange>('7d')
+  const [range, setRange] = useState<OverviewRange>({ amount: 6, unit: 'hour' })
   const [sysRange, setSysRange] = useState<SystemRange>('6h')
   const [loadingOverview, setLoadingOverview] = useState(false)
   const [loadingSystem, setLoadingSystem] = useState(false)
@@ -1415,12 +1595,13 @@ const MonitorPanel: React.FC = () => {
     setLoadingOverview(true)
     setOverviewError(null)
     try {
-      const res = await fetch(`${base}/api/monitor/overview?range=${range}`)
+      const res = await fetch(`${base}/api/monitor/overview?range_ms=${overviewRangeToMs(range)}`)
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`)
       }
       const json = await res.json()
       setData(json)
+      setNowMs(Date.now())
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
       setData(null)
@@ -1433,7 +1614,7 @@ const MonitorPanel: React.FC = () => {
 
   const loadLive = async () => {
     try {
-      const res = await fetch(`${base}/api/monitor/extraction_live`)
+      const res = await fetch(`${base}/api/monitor/extraction_live?range_ms=${overviewRangeToMs(range)}`)
       if (!res.ok) return
       const json = (await res.json()) as ExtractionLive
       setLiveData(json)
@@ -1507,7 +1688,7 @@ const MonitorPanel: React.FC = () => {
       loadLive()
     }, 3000)
     return () => window.clearInterval(timer)
-  }, [tab, base, isVisible])
+  }, [tab, base, range, isVisible])
 
   // 1s 计时器：让「提炼中」行的「已提炼 Xs」逐秒跳。
   // 仅在 overview tab 可见 且 当前确实有提炼中条目时启用，避免空转。
@@ -1544,13 +1725,7 @@ const MonitorPanel: React.FC = () => {
           ))}
         </div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-          {tab === 'overview' && (['1d', '7d', '30d'] as const).map(r => (
-            <button key={r} onClick={() => setRange(r)} style={{
-              fontSize: 11, padding: '3px 8px', borderRadius: 6, border: 'none', cursor: 'pointer',
-              background: range === r ? '#007AFF' : 'white',
-              color: range === r ? 'white' : '#6E6E73',
-            }}>{r === '1d' ? '今天' : r === '7d' ? '7天' : '30天'}</button>
-          ))}
+          {tab === 'overview' && <OverviewRangeControl value={range} onChange={setRange} />}
           {tab === 'system' && ([
             { value: '1h', label: '1h' },
             { value: '6h', label: '6h' },

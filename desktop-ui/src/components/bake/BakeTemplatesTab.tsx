@@ -16,6 +16,11 @@ const BakeTemplatesTab: React.FC<{
   limit: number
   offset: number
   query: string
+  from: string
+  to: string
+  draftQuery: string
+  draftFrom: string
+  draftTo: string
   selectedTemplateId: string | null
   onSelectTemplate: (id: string | null) => void
   onCreateTemplate: () => void
@@ -23,15 +28,25 @@ const BakeTemplatesTab: React.FC<{
   onToggleTemplateStatus: (templateId: string) => void
   onDeleteTemplate: (templateId: string) => void
   onViewSourceMemory: (memoryId?: string) => void
+  memoryTitleById?: Map<string, string>
   onPageChange: (offset: number) => void
   onLimitChange: (limit: number) => void
-  onQueryChange: (query: string) => void
+  onDraftQueryChange: (query: string) => void
+  onDraftFromChange: (value: string) => void
+  onDraftToChange: (value: string) => void
+  onSearch: () => void
+  onClearFilters: () => void
 }> = ({
   templates,
   total,
   limit,
   offset,
   query,
+  from,
+  to,
+  draftQuery,
+  draftFrom,
+  draftTo,
   selectedTemplateId,
   onSelectTemplate,
   onCreateTemplate,
@@ -39,13 +54,19 @@ const BakeTemplatesTab: React.FC<{
   onToggleTemplateStatus,
   onDeleteTemplate,
   onViewSourceMemory,
+  memoryTitleById = new Map(),
   onPageChange,
   onLimitChange,
-  onQueryChange,
+  onDraftQueryChange,
+  onDraftFromChange,
+  onDraftToChange,
+  onSearch,
+  onClearFilters,
 }) => {
   const selected = templates.find(item => item.id === selectedTemplateId) ?? templates[0]
   const [isEditing, setIsEditing] = useState(false)
   const [pageInput, setPageInput] = useState('')
+  const hasActiveFilters = Boolean(query.trim() || from || to)
   const page = Math.floor(offset / limit) + 1
   const totalPages = Math.max(1, Math.ceil(total / limit))
 
@@ -112,28 +133,61 @@ const BakeTemplatesTab: React.FC<{
           subtitle="管理可复用的文档模板"
           right={<BakeButton primary onClick={onCreateTemplate}>新建模板</BakeButton>}
         />
-        <div className="bake-list-toolbar">
-          <div className="bake-list-toolbar__filters">
-            <label className="bake-form-field bake-filter-field bake-filter-field--search">
-              <span className="bake-filter-label">关键词</span>
-              <input
-                className="bake-input"
-                value={query}
-                onChange={(event) => onQueryChange(event.target.value)}
-                placeholder="搜索模板名称、分类或提示词"
-              />
-            </label>
+        <form
+          className="bake-list-toolbar bake-list-toolbar--repository"
+          onSubmit={(event) => {
+            event.preventDefault()
+            onSearch()
+          }}
+        >
+          <div className="bake-list-toolbar__repository">
+            <div className="bake-list-toolbar__repository-row bake-list-toolbar__repository-row--search">
+              <label className="bake-form-field bake-filter-field bake-filter-field--search">
+                <span className="bake-filter-label">关键词</span>
+                <input
+                  className="bake-input"
+                  value={draftQuery}
+                  onChange={(event) => onDraftQueryChange(event.target.value)}
+                  placeholder="搜索模板名称、分类或提示词"
+                />
+              </label>
+              <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--search">
+                <BakeButton compact primary type="submit">搜索</BakeButton>
+              </div>
+            </div>
+            <div className="bake-list-toolbar__repository-row bake-list-toolbar__repository-row--dates">
+              <label className="bake-form-field bake-filter-field">
+                <span className="bake-filter-label">开始日期</span>
+                <input
+                  className="bake-input"
+                  type="date"
+                  value={draftFrom}
+                  onChange={(event) => onDraftFromChange(event.target.value)}
+                />
+              </label>
+              <label className="bake-form-field bake-filter-field">
+                <span className="bake-filter-label">结束日期</span>
+                <input
+                  className="bake-input"
+                  type="date"
+                  value={draftTo}
+                  onChange={(event) => onDraftToChange(event.target.value)}
+                />
+              </label>
+              {(draftQuery || query || draftFrom || from || draftTo || to) && (
+                <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--secondary">
+                  <BakeButton compact type="button" onClick={onClearFilters}>清除筛选</BakeButton>
+                </div>
+              )}
+            </div>
           </div>
-          <div className="bake-list-toolbar__actions">
-            {query && <BakeButton compact onClick={() => onQueryChange('')}>清除筛选</BakeButton>}
-          </div>
-        </div>
+        </form>
       </BakeCard>
       <div className="bake-split-list-detail bake-split-list-detail--templates">
         <BakeCard className="bake-knowledge-list-card">
         <div className="bake-list bake-knowledge-list">
           {templates.length === 0 ? (
-            <div className="bake-muted">{query.trim() ? '当前筛选条件下没有文档。' : '当前还没有文档。'}</div>
+            <div className="bake-muted">{hasActiveFilters ? '当前筛选条件下没有文档。' : '当前还没有文档。'}</div>
           ) : templates.map(item => {
             const active = item.id === selected?.id
             return (
@@ -216,7 +270,6 @@ const BakeTemplatesTab: React.FC<{
                 {selected.matchScore != null && <span className="bake-stat-chip">匹配分：{selected.matchScore.toFixed(2)}</span>}
                 {selected.matchLevel && <span className="bake-stat-chip">匹配等级：{selected.matchLevel}</span>}
                 <span className="bake-stat-chip">来源记忆：{selected.sourceMemoryIds.length}</span>
-                <span className="bake-stat-chip">关联知识：{selected.linkedKnowledgeIds.length}</span>
               </div>
             </div>
 
@@ -291,11 +344,6 @@ const BakeTemplatesTab: React.FC<{
               </>
             )}
 
-            <div className="bake-knowledge-detail__section">
-              <div className="bake-kv__title">关联资产</div>
-              <div className="bake-muted">来源时间线 {selected.sourceMemoryIds.length} 条 · 关联 Knowledge {selected.linkedKnowledgeIds.length} 条</div>
-            </div>
-
             <div className="bake-actions--primary">
               {isEditing ? (
                 <>
@@ -310,6 +358,16 @@ const BakeTemplatesTab: React.FC<{
                   <BakeButton compact onClick={() => onViewSourceMemory(selected.sourceMemoryIds[0])}>查看来源时间线</BakeButton>
                 </>
               )}
+            </div>
+            <div className="bake-related-summary">
+              <div className="bake-related-row">
+                <span className="bake-related-row__label">来源时间线</span>
+                <span className="bake-related-row__value">
+                  {selected.sourceMemoryIds.length > 0
+                    ? selected.sourceMemoryIds.map(id => memoryTitleById.get(id) ?? `时间线 #${id}`).join('、')
+                    : '暂无'}
+                </span>
+              </div>
             </div>
           </div>
         ) : (

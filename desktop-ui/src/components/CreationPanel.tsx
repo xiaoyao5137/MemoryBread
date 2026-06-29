@@ -19,6 +19,27 @@ const defaultPrompt = '请生成一份“数据治理平台建设方案”，参
 const sanitizeGeneratedContent = (content: string) =>
   content.replace(/<a\s+(?:id|name)=["'][^"']+["']\s*>\s*<\/a>/gi, '')
 
+const readApiErrorMessage = async (response: Response, fallback: string) => {
+  try {
+    const text = await response.text()
+    if (!text.trim()) return fallback
+
+    try {
+      const data = JSON.parse(text)
+      if (typeof data === 'string') return data
+      if (data?.detail) return typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)
+      if (data?.message) return data.message
+      if (data?.error) return typeof data.error === 'string' ? data.error : JSON.stringify(data.error)
+    } catch {
+      return text
+    }
+
+    return text
+  } catch {
+    return fallback
+  }
+}
+
 const mapCreationHistory = (histories: any[]) => histories.map((h: any) => {
   const fullContent = sanitizeGeneratedContent(h.generated_content)
   return {
@@ -109,7 +130,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const setWindowMode = useAppStore((s) => s.setWindowMode)
   const setBakeTab = useAppStore((s) => s.setBakeTab)
   const setSelectedTemplateId = useAppStore((s) => s.setSelectedTemplateId)
-  const setCreationBackTarget = useAppStore((s) => s.setCreationBackTarget)
+  const setBakeTemplateOffset = useAppStore((s) => s.setBakeTemplateOffset)
+  const setBakeTemplateQuery = useAppStore((s) => s.setBakeTemplateQuery)
+  const setBakeTemplateLimit = useAppStore((s) => s.setBakeTemplateLimit)
+  const pushBakeNavigationTarget = useAppStore((s) => s.pushBakeNavigationTarget)
 
   const {
     prompt,
@@ -179,20 +203,23 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     }
   }
 
-  const handleOpenReferenceSource = (item: ReferenceItem) => {
-    setCreationBackTarget({
-      windowMode: 'creation',
-      bakeTab: 'templates',
-      selectedTemplateId: String(item.id),
-    })
+  useEffect(() => () => stopTimer(), [])
+
+  const handleOpenReferenceSource = (item: Pick<ReferenceItem, 'id'>) => {
+    const templateId = String(item.id)
+    pushBakeNavigationTarget({ windowMode: 'creation' })
+    setBakeTemplateQuery('')
+    setBakeTemplateOffset(0)
+    setBakeTemplateLimit(100)
     setBakeTab('templates')
-    setSelectedTemplateId(String(item.id))
+    setSelectedTemplateId(templateId)
     setWindowMode('bake')
   }
 
   const handleRestoreHistory = (item: typeof creationHistory[0]) => {
     setPrompt(item.prompt)
     setGeneratedContent(item.fullContent)
+    setReferencePreview(null)
     if (contentRef.current) {
       setTimeout(() => contentRef.current?.scrollTo({ top: 0, behavior: 'smooth' }), 100)
     }
@@ -201,16 +228,14 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const creationModelConfigs = useAppStore((s) => s.creationModelConfigs)
 
   const buildPayload = () => {
-    const LOCAL_MODEL_ID = 'qwen-3-5-4b'
+    const LOCAL_MODEL_ID = 'mbcd-std-v1'
     const MODEL_NAMES: Record<string, string> = {
+      'mbcd-plus-v1': 'claude-opus-4-8',
+      'mbcd-std-v1': 'qwen3.5:4b',
       'claude-opus-4-8': 'claude-opus-4-8',
-      'gpt-5-5': 'gpt-5.5-turbo',
-      'qwen-3-7': 'qwen3-7b-instruct',
       'qwen-3-5-4b': 'qwen3.5:4b',
-      'glm-latest': 'glm-4-plus',
-      'kimi-latest': 'moonshot-v1-128k',
     }
-    const activeModel = creationModelConfigs.find(c => c.id !== LOCAL_MODEL_ID && c.enabled && c.apiKey)
+    const activeModel = creationModelConfigs.find(c => c.enabled && (c.id === LOCAL_MODEL_ID || c.apiKey))
     return {
       user_prompt: prompt,
       design_templates: [],
@@ -233,7 +258,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       max_references: 6,
       ...(activeModel ? {
         creation_model: MODEL_NAMES[activeModel.id] || activeModel.id,
-        creation_api_key: activeModel.apiKey,
+        ...(activeModel.id !== LOCAL_MODEL_ID && activeModel.apiKey ? { creation_api_key: activeModel.apiKey } : {}),
         creation_base_url: activeModel.baseUrl || undefined,
       } : {}),
     }
@@ -263,7 +288,9 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     setError(null)
     try {
       const response = await postReferencePreview()
-      if (!response.ok) throw new Error(`参考资料预览失败: ${response.status}`)
+      if (!response.ok) {
+        throw new Error(await readApiErrorMessage(response, `参考资料预览失败: ${response.status}`))
+      }
       const data = await response.json()
       setReferencePreview(data)
     } catch (err) {
@@ -302,7 +329,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         body: JSON.stringify(buildPayload()),
       })
 
-      if (!response.ok) throw new Error(`生成失败: ${response.statusText}`)
+      if (!response.ok) {
+        const message = await readApiErrorMessage(response, `生成失败: ${response.status}`)
+        throw new Error(message.startsWith('生成失败') ? message : `生成失败: ${message}`)
+      }
 
       const reader = response.body?.getReader()
       const decoder = new TextDecoder()
@@ -321,17 +351,36 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue
           const jsonStr = line.slice(6)
+          let event: any
           try {
-            const content = JSON.parse(jsonStr)
-            finalContent += content
-            setGeneratedContent(prev => prev + content)
-            stopTimer()
+            event = JSON.parse(jsonStr)
           } catch {
             finalContent += jsonStr
             setGeneratedContent(prev => prev + jsonStr)
-            stopTimer()
+            continue
+          }
+
+          if (typeof event === 'string') {
+            finalContent += event
+            setGeneratedContent(prev => prev + event)
+            continue
+          }
+          if (event?.error) {
+            throw new Error(`生成失败: ${event.error}`)
+          }
+          if (event?.done) {
+            continue
+          }
+          const content = typeof event?.content === 'string' ? event.content : ''
+          if (content) {
+            finalContent += content
+            setGeneratedContent(prev => prev + content)
           }
         }
+      }
+
+      if (!finalContent.trim()) {
+        throw new Error('生成结束但没有返回内容，请检查本地 Ollama 是否运行、当前创作模型是否已安装')
       }
 
       if (finalContent) {
@@ -405,15 +454,16 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   }, [generatedContent])
 
   const totalWeight = contentWeight + qualityWeight + completenessWeight + usageWeight + formatWeight + freshnessWeight
+  const generationProgress = isGenerating
+    ? Math.min(95, Math.max(5, Math.round((elapsedSeconds / 90) * 100)))
+    : generatedContent
+      ? 100
+      : 0
 
   const handleReferenceClick = (refId: string) => {
-    const ref = referencePreview?.references.find(r => String(r.id) === refId)
-    if (!ref) return
-    if (ref.source_url) {
-      window.open(ref.source_url, '_blank', 'noopener,noreferrer')
-    } else {
-      handleOpenReferenceSource(ref)
-    }
+    const normalizedId = Number(refId)
+    if (!Number.isFinite(normalizedId) || normalizedId <= 0) return
+    handleOpenReferenceSource({ id: normalizedId })
   }
 
   const headingId = (node: any) =>
@@ -534,6 +584,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                 {isGenerating ? '生成中' : '开始创作'}
               </button>
             </div>
+            {isGenerating && (
+              <ProgressStrip
+                label={`已思考 ${elapsedSeconds} 秒`}
+                percent={generationProgress}
+              />
+            )}
             {error && <div style={{ marginTop: 12, color: '#b42318', fontSize: 13 }}>{error}</div>}
           </section>
 
@@ -541,10 +597,17 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             <div style={{ height: '100%', border: '1px solid #e1e5ea', borderRadius: 8, background: '#fff', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
               <div style={{ height: 48, padding: '0 16px', borderBottom: '1px solid #e1e5ea', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
                 <span style={{ fontSize: 14, fontWeight: 650 }}>创作文档</span>
-                <button onClick={handleCopy} disabled={!generatedContent} style={compactButtonStyle}>
-                  <Copy size={15} />
-                  {copySuccess ? '已复制' : '复制'}
-                </button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  {isGenerating && (
+                    <span style={{ fontSize: 12, color: '#0f766e', fontWeight: 650 }}>
+                      {generationProgress}% · {elapsedSeconds} 秒
+                    </span>
+                  )}
+                  <button onClick={handleCopy} disabled={!generatedContent} style={compactButtonStyle}>
+                    <Copy size={15} />
+                    {copySuccess ? '已复制' : '复制'}
+                  </button>
+                </div>
               </div>
               <div ref={contentRef} style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
                 {generatedContent ? (
@@ -554,7 +617,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                     <Loader2 size={28} className="spin" color="#0f766e" />
                     <div style={{ textAlign: 'center', lineHeight: 1.6 }}>
                       <div style={{ fontWeight: 600, color: '#0f766e', marginBottom: 4 }}>模型正在深度推理中</div>
-                      <div>请稍候，正式内容即将开始输出...（已等待 {elapsedSeconds} 秒）</div>
+                      <div>已思考 {elapsedSeconds} 秒，预计进度 {generationProgress}%</div>
                     </div>
                   </div>
                 ) : (
@@ -726,6 +789,18 @@ const WeightSlider = ({ label, value, onChange }: { label: string; value: number
     </span>
     <input type="range" min={0} max={70} value={value} onChange={(e) => onChange(Number(e.target.value))} />
   </label>
+)
+
+const ProgressStrip = ({ label, percent }: { label: string; percent: number }) => (
+  <div style={{ marginTop: 12, display: 'grid', gap: 6, maxWidth: 360 }}>
+    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#475467' }}>
+      <span>{label}</span>
+      <span>{percent}%</span>
+    </div>
+    <div style={{ height: 6, borderRadius: 999, background: '#e4e7ec', overflow: 'hidden' }}>
+      <div style={{ width: `${percent}%`, height: '100%', borderRadius: 999, background: '#0f766e', transition: 'width 0.25s ease' }} />
+    </div>
+  </div>
 )
 
 const ReferenceRow = ({ item, onOpenSource }: { item: ReferenceItem; onOpenSource: (item: ReferenceItem) => void }) => (

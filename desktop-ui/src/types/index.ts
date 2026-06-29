@@ -68,10 +68,46 @@ export interface RagQueryResponse {
 
 export interface RagContext {
   capture_id: number
+  doc_key?:    string | null
   text:       string
   score:      number
-  source:     'fts5' | 'vector' | 'merged'
+  source:     'fts5' | 'vector' | 'merged' | string
+  source_type?: string | null
+  knowledge_id?: number | null
+  artifact_id?: number | null
+  document_id?: number | null
   app_name?:  string | null
+  win_title?: string | null
+  url?: string | null
+  source_url?: string | null
+  title?: string | null
+  doc_type?: string | null
+  time?:      number | string | null
+  observed_at?: number | string | null
+  event_time_start?: number | string | null
+  event_time_end?: number | string | null
+  start_time?: number | string | null
+  end_time?: number | string | null
+  summary?: string | null
+  overview?: string | null
+  category?: string | null
+  activity_type?: string | null
+  content_origin?: string | null
+  history_view?: boolean | null
+  evidence_strength?: string | null
+  importance?: number | null
+  source_timeline_ids?: string[] | null
+  linked_knowledge_ids?: string[] | null
+}
+
+export interface RagHistoryItem {
+  id: number
+  ts: number
+  query: string
+  answer: string
+  contexts: RagContext[]
+  context_count: number
+  latency_ms: number | null
 }
 
 export interface DebugLogFile {
@@ -165,6 +201,7 @@ export interface TimelineItem {
 export interface BakeKnowledgeItem {
   id: string
   captureId: string
+  sourceCaptureIds: string[]
   sourceTimelineId?: string
   summary: string
   overview?: string
@@ -300,9 +337,10 @@ export interface MonitorOverview {
   token_usage: {
     total_period:  number
     total_today:   number
-    by_model:      { model: string; total: number; calls: number }[]
+    by_model:      { model: string; total: number; prompt: number; completion: number; calls: number }[]
     by_caller:     { caller: string; total: number; calls: number }[]
     trend:         { ts: number; date: string; tokens: number; calls: number }[]
+    trend_by_model:{ model: string; total: number; calls: number; trend: { ts: number; date: string; tokens: number; calls: number }[] }[]
   }
   capture_flow: {
     today_count:              number

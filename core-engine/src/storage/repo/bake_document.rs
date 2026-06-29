@@ -116,6 +116,39 @@ impl StorageManager {
         })
     }
 
+    pub fn find_bake_document_by_source_memory_id(
+        &self,
+        memory_id: i64,
+    ) -> Result<Option<BakeDocumentRecord>, StorageError> {
+        let memory_id = memory_id.to_string();
+        self.with_conn(|conn| {
+            let sql = format!(
+                "SELECT {} FROM bake_documents
+                 WHERE deleted_at IS NULL
+                   AND (
+                     source_memory_ids = ?1
+                     OR source_memory_ids LIKE ?2
+                     OR source_memory_ids LIKE ?3
+                     OR source_memory_ids LIKE ?4
+                   )
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT 1",
+                SELECT_COLUMNS
+            );
+            let exact = format!("[\"{}\"]", memory_id);
+            let start = format!("[\"{}\",%", memory_id);
+            let middle = format!("%,\"{}\",%", memory_id);
+            let end = format!("%,\"{}\"]", memory_id);
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(params![exact, start, middle, end])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row_to_bake_document(row)?))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
     pub fn update_bake_document(
         &self,
         id: i64,

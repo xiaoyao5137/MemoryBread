@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::api::error::ApiError;
 use crate::storage::models::CaptureRecord;
 use crate::storage::{
-    now_ms, BakeActivityRecord, BakeDocumentRecord, BakeMemorySourceRecord, BakeOverviewRecord,
-    BakeRunRecord, NewBakeDocument, NewBakeKnowledge, NewBakeRun, NewBakeSop, NewTimeline,
-    StorageError, StorageManager, TimelineRecord,
+    now_ms, BakeActivityRecord, BakeDocumentRecord, BakeKnowledgeRecord, BakeMemorySourceRecord,
+    BakeOverviewRecord, BakeRunRecord, NewBakeDocument, NewBakeKnowledge, NewBakeRun, NewBakeSop,
+    NewTimeline, StorageError, StorageManager, TimelineRecord,
 };
 
 const BAKE_STYLE_CONFIG_KEY: &str = "bake.style.config";
@@ -72,6 +72,8 @@ pub struct BakeMemoryFilter {
 pub struct BakeListFilter {
     pub q: Option<String>,
     pub bucket: Option<BakeBucket>,
+    pub from_ts: Option<i64>,
+    pub to_ts: Option<i64>,
     pub limit: usize,
     pub offset: usize,
 }
@@ -553,6 +555,12 @@ impl BakeService {
             .into_iter()
             .filter(is_current_bake_document)
             .filter(|record| matches_document_bucket(record, filter.bucket))
+            .filter(|record| {
+                filter
+                    .from_ts
+                    .map_or(true, |from| record.updated_at >= from)
+            })
+            .filter(|record| filter.to_ts.map_or(true, |to| record.updated_at <= to))
             .map(map_document_record)
             .collect::<Vec<_>>();
 
@@ -595,6 +603,15 @@ impl BakeService {
             .get_bake_document(id)?
             .ok_or_else(|| ApiError::NotFound(format!("document {id} not found after insert")))?;
         Ok(map_document_record(created))
+    }
+
+    pub fn get_document(&self, id: i64) -> Result<BakeDocumentPayload, ApiError> {
+        let record = self
+            .storage
+            .get_bake_document(id)?
+            .filter(is_current_bake_document)
+            .ok_or_else(|| ApiError::NotFound(format!("document {id} not found")))?;
+        Ok(map_document_record(record))
     }
 
     pub fn adopt_document(&self, id: i64) -> Result<BakeDocumentPayload, ApiError> {
@@ -668,6 +685,10 @@ impl BakeService {
                 .filter(|record| {
                     is_current_bake_entry(record)
                         && matches_entry_bucket(record, filter.bucket)
+                        && filter
+                            .from_ts
+                            .map_or(true, |from| record.created_at_ms >= from)
+                        && filter.to_ts.map_or(true, |to| record.created_at_ms <= to)
                         && (record.summary.to_lowercase().contains(&query_lower)
                             || record
                                 .overview
@@ -689,6 +710,12 @@ impl BakeService {
                 .into_iter()
                 .filter(is_current_bake_entry)
                 .filter(|record| matches_entry_bucket(record, filter.bucket))
+                .filter(|record| {
+                    filter
+                        .from_ts
+                        .map_or(true, |from| record.created_at_ms >= from)
+                })
+                .filter(|record| filter.to_ts.map_or(true, |to| record.created_at_ms <= to))
                 .collect::<Vec<_>>()
         };
         let total = filtered_records.len() as i64;
@@ -796,6 +823,12 @@ impl BakeService {
             .into_iter()
             .filter(is_current_bake_entry)
             .filter(|record| matches_entry_bucket(record, filter.bucket))
+            .filter(|record| {
+                filter
+                    .from_ts
+                    .map_or(true, |from| record.created_at_ms >= from)
+            })
+            .filter(|record| filter.to_ts.map_or(true, |to| record.created_at_ms <= to))
             .map(map_bake_knowledge_record)
             .collect::<Vec<_>>();
         let total = filtered.len() as i64;
@@ -1606,12 +1639,76 @@ impl BakeService {
         extraction: &BakeArtifactExtraction,
         existing_sources: &mut std::collections::HashSet<i64>,
     ) -> Result<CandidatePersistResult, ApiError> {
+        let source_capture_ids = collect_source_capture_id_strings(&self.storage, candidate)?;
         if existing_sources.contains(&candidate.timeline.id) {
-            tracing::info!(
-                "bake knowledge discard: timeline_id={} reason=already_has_knowledge",
-                candidate.timeline.id,
+            let existing = self
+                .storage
+                .find_bake_knowledge_by_timeline_id(candidate.timeline.id)?;
+            let Some(existing) = existing else {
+                tracing::warn!(
+                    "bake knowledge existing set contained timeline_id={} but no row was found",
+                    candidate.timeline.id,
+                );
+                existing_sources.remove(&candidate.timeline.id);
+                return self.persist_knowledge_artifact(
+                    memory_id,
+                    candidate,
+                    trigger_reason,
+                    extraction,
+                    existing_sources,
+                );
+            };
+            if !extraction.accepted {
+                self.merge_existing_knowledge_source_captures(&existing, &source_capture_ids)?;
+                tracing::info!(
+                    "bake knowledge source captures merged: timeline_id={} knowledge_id={} reason=already_has_knowledge_sidecar_rejected reason_text={:?}",
+                    candidate.timeline.id,
+                    existing.id,
+                    extraction.reason,
+                );
+                return Ok(CandidatePersistResult::discarded());
+            }
+
+            let payload = extraction.payload.clone().ok_or_else(|| {
+                ApiError::Internal(
+                    "bake sidecar 返回 knowledge.accepted=true 但缺少 payload".to_string(),
+                )
+            })?;
+            let payload: BakeKnowledgeArtifactPayload =
+                serde_json::from_value(payload).map_err(|err| {
+                    ApiError::Internal(format!("解析 bake knowledge payload 失败: {err}"))
+                })?;
+            if let Some(memory_id) = memory_id {
+                self.update_memory_match_metadata(
+                    memory_id,
+                    "knowledge",
+                    payload.match_score,
+                    payload.match_level.as_deref(),
+                )?;
+            }
+            let review_status = resolve_review_status(
+                payload.review_status.as_deref(),
+                payload.match_score,
+                payload.match_level.as_deref(),
             );
-            return Ok(CandidatePersistResult::discarded());
+            self.merge_existing_knowledge_artifact(
+                &existing,
+                candidate,
+                trigger_reason,
+                &payload,
+                &review_status,
+                &source_capture_ids,
+            )?;
+            tracing::info!(
+                "bake knowledge merged: timeline_id={} knowledge_id={} sidecar_review_status={:?} match_score={:?} match_level={:?} resolved_review_status={}",
+                candidate.timeline.id,
+                existing.id,
+                payload.review_status,
+                payload.match_score,
+                payload.match_level,
+                review_status,
+            );
+            return Ok(CandidatePersistResult::default());
         }
         if !extraction.accepted {
             tracing::info!(
@@ -1652,13 +1749,127 @@ impl BakeService {
             payload.match_level,
             review_status,
         );
-        let record =
-            build_bake_knowledge_entry(candidate, &payload, &review_status, trigger_reason)?;
+        let record = build_bake_knowledge_entry(
+            candidate,
+            &payload,
+            &review_status,
+            trigger_reason,
+            &source_capture_ids,
+        )?;
         self.storage.insert_bake_knowledge(&record)?;
         existing_sources.insert(candidate.timeline.id);
         Ok(CandidatePersistResult::created_knowledge(
             review_status == "auto_created",
         ))
+    }
+
+    fn merge_existing_knowledge_source_captures(
+        &self,
+        existing: &BakeKnowledgeRecord,
+        source_capture_ids: &[String],
+    ) -> Result<(), ApiError> {
+        let merged_capture_ids = merge_string_lists(
+            parse_optional_json_vec_string(&existing.source_capture_ids),
+            source_capture_ids,
+        );
+        let source_capture_ids_json = to_json_string(&merged_capture_ids)?;
+        self.storage.update_bake_knowledge_system(
+            existing.id,
+            &existing.title,
+            &existing.summary,
+            existing.content.as_deref(),
+            existing.detailed_content.as_deref(),
+            &existing.entities,
+            existing.importance,
+            Some(&source_capture_ids_json),
+        )?;
+        Ok(())
+    }
+
+    fn merge_existing_knowledge_artifact(
+        &self,
+        existing: &BakeKnowledgeRecord,
+        candidate: &BakeMemorySourceRecord,
+        trigger_reason: &str,
+        payload: &BakeKnowledgeArtifactPayload,
+        review_status: &str,
+        source_capture_ids: &[String],
+    ) -> Result<(), ApiError> {
+        let merged_capture_ids = merge_string_lists(
+            parse_optional_json_vec_string(&existing.source_capture_ids),
+            source_capture_ids,
+        );
+        let merged_entities =
+            merge_string_lists(parse_json_vec_string(&existing.entities), &payload.entities);
+        let source_capture_ids_json = to_json_string(&merged_capture_ids)?;
+        let entities_json = to_json_string(&merged_entities)?;
+        let merged_details = merge_optional_text(
+            existing.detailed_content.as_deref(),
+            payload.details.as_deref(),
+        );
+        let mut next_content = parse_details(existing.content.as_deref());
+        if !next_content.is_object() {
+            next_content = json!({});
+        }
+        let next_details = next_content.as_object_mut().expect("object checked");
+        next_details.insert(
+            "source_timeline_id".to_string(),
+            json!(candidate.timeline.id),
+        );
+        next_details.insert(
+            "source_memory_ids".to_string(),
+            json!([candidate.timeline.id.to_string()]),
+        );
+        next_details.insert("source_capture_ids".to_string(), json!(merged_capture_ids));
+        next_details.insert(
+            "source_timeline_ids".to_string(),
+            json!([candidate.timeline.id.to_string()]),
+        );
+        next_details.insert(
+            "match_score".to_string(),
+            option_f64_json(payload.match_score),
+        );
+        next_details.insert(
+            "match_level".to_string(),
+            option_string_json(payload.match_level.as_deref()),
+        );
+        next_details.insert("creation_mode".to_string(), json!("llm_bake"));
+        next_details.insert("review_status".to_string(), json!(review_status));
+        next_details.insert(
+            "evidence_summary".to_string(),
+            option_string_json(payload.evidence_summary.as_deref()),
+        );
+        next_details.insert(
+            "generation_version".to_string(),
+            json!(BAKE_GENERATION_VERSION),
+        );
+        next_details.insert("trigger_reason".to_string(), json!(trigger_reason));
+        next_details.insert("status".to_string(), json!(review_status));
+        next_details.insert(
+            "source_title".to_string(),
+            json!(candidate.timeline.summary.clone()),
+        );
+        next_details.insert("merged_from_knowledge_id".to_string(), json!(existing.id));
+        next_details.insert("merged_at_ms".to_string(), json!(now_ms()));
+
+        let title = knowledge_title_from_payload(payload);
+        let summary = knowledge_summary_from_payload(payload);
+        let importance = payload
+            .importance
+            .unwrap_or(existing.importance)
+            .max(existing.importance)
+            .max(1);
+        self.storage.update_bake_knowledge_system(
+            existing.id,
+            &title,
+            &summary,
+            Some(&next_content.to_string()),
+            merged_details.as_deref(),
+            &entities_json,
+            importance,
+            Some(&source_capture_ids_json),
+        )?;
+        Ok(())
     }
 
     async fn persist_document_artifact(
@@ -1670,6 +1881,21 @@ impl BakeService {
         existing_urls: &mut std::collections::HashSet<String>,
     ) -> Result<CandidatePersistResult, ApiError> {
         if existing_sources.contains(&candidate.timeline.id) {
+            if extraction.accepted {
+                if let Some(existing_doc) = self
+                    .storage
+                    .find_bake_document_by_source_memory_id(candidate.timeline.id)?
+                {
+                    self.merge_document_with_sidecar(candidate, extraction, &existing_doc)
+                        .await?;
+                    tracing::info!(
+                        "bake document merged: timeline_id={} doc_id={} reason=already_has_document_source",
+                        candidate.timeline.id,
+                        existing_doc.id,
+                    );
+                    return Ok(CandidatePersistResult::created_document(false));
+                }
+            }
             tracing::info!(
                 "bake document discard: timeline_id={} reason=already_has_document",
                 candidate.timeline.id,
@@ -1742,7 +1968,9 @@ impl BakeService {
             payload.match_level,
             review_status,
         );
-        let document = build_bake_document(candidate, &payload, &review_status)?;
+        let source_capture_ids = collect_source_capture_id_strings(&self.storage, candidate)?;
+        let document =
+            build_bake_document(candidate, &payload, &review_status, &source_capture_ids)?;
         self.storage.insert_bake_document(&document)?;
         existing_sources.insert(candidate.timeline.id);
         if let Some(u) = candidate_url_norm {
@@ -1793,31 +2021,52 @@ impl BakeService {
             .await
             .map_err(|e| ApiError::Internal(format!("解析 merge_document 响应失败: {e}")))?;
 
-        if merged.no_change {
+        // 追加当前 timeline_id 到 source_memory_ids
+        let mut source_ids = parse_json_vec_string(&existing_doc.source_memory_ids);
+        let tid = candidate.timeline.id.to_string();
+        if !source_ids.contains(&tid) {
+            source_ids.push(tid.clone());
+        }
+        let mut source_capture_ids = parse_json_vec_string(&existing_doc.source_capture_ids);
+        for cid in collect_source_capture_id_strings(&self.storage, candidate)? {
+            if !source_capture_ids.contains(&cid) {
+                source_capture_ids.push(cid);
+            }
+        }
+        let mut source_episode_ids = parse_json_vec_string(&existing_doc.source_episode_ids);
+        for sid in &source_ids {
+            if !source_episode_ids.contains(sid) {
+                source_episode_ids.push(sid.clone());
+            }
+        }
+        let mut linked_knowledge_ids = parse_json_vec_string(&existing_doc.linked_knowledge_ids);
+        if !linked_knowledge_ids.contains(&tid) {
+            linked_knowledge_ids.push(tid);
+        }
+
+        let mut update = bake_document_record_to_new(existing_doc.clone());
+        if !merged.no_change {
+            update.title = merged.title;
+            update.summary = merged.summary.or(update.summary);
+            update.full_content = merged.full_content.or(update.full_content);
+            update.evidence_summary = merged.evidence_summary.or(update.evidence_summary);
+            update.match_score = merged.match_score.or(update.match_score);
+            update.match_level = merged.match_level.or(update.match_level);
+        } else {
             tracing::info!(
                 "bake document no_change: timeline_id={} doc_id={} reason=content_already_covered",
                 candidate.timeline.id,
                 existing_doc.id,
             );
-            return Ok(());
         }
-
-        // 追加当前 timeline_id 到 source_memory_ids
-        let mut source_ids = parse_json_vec_string(&existing_doc.source_memory_ids);
-        let tid = candidate.timeline.id.to_string();
-        if !source_ids.contains(&tid) {
-            source_ids.push(tid);
-        }
-
-        let mut update = bake_document_record_to_new(existing_doc.clone());
-        update.title = merged.title;
-        update.summary = merged.summary.or(update.summary);
-        update.full_content = merged.full_content.or(update.full_content);
-        update.evidence_summary = merged.evidence_summary.or(update.evidence_summary);
-        update.match_score = merged.match_score.or(update.match_score);
-        update.match_level = merged.match_level.or(update.match_level);
         update.source_memory_ids =
             to_json_string(&source_ids).unwrap_or(existing_doc.source_memory_ids.clone());
+        update.source_capture_ids =
+            to_json_string(&source_capture_ids).unwrap_or(existing_doc.source_capture_ids.clone());
+        update.source_episode_ids =
+            to_json_string(&source_episode_ids).unwrap_or(existing_doc.source_episode_ids.clone());
+        update.linked_knowledge_ids = to_json_string(&linked_knowledge_ids)
+            .unwrap_or(existing_doc.linked_knowledge_ids.clone());
 
         // 更新 content_hash（若 full_content 有更新）
         if update.full_content.is_some() {
@@ -1883,7 +2132,14 @@ impl BakeService {
             payload.match_level,
             review_status,
         );
-        let sop = build_bake_sop_entry(candidate, &payload, &review_status, trigger_reason)?;
+        let source_capture_ids = collect_source_capture_id_strings(&self.storage, candidate)?;
+        let sop = build_bake_sop_entry(
+            candidate,
+            &payload,
+            &review_status,
+            trigger_reason,
+            &source_capture_ids,
+        )?;
         self.storage.insert_bake_sop(&sop)?;
         existing_sources.insert(candidate.timeline.id);
         Ok(CandidatePersistResult::created_sop(
@@ -2253,11 +2509,40 @@ fn normalize_optional_url(url: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn collect_source_capture_id_strings(
+    storage: &StorageManager,
+    source: &BakeMemorySourceRecord,
+) -> Result<Vec<String>, ApiError> {
+    let timeline_capture_ids = storage.get_timeline_capture_ids(source.timeline.id)?;
+    Ok(merge_string_lists(
+        source_capture_id_strings(source),
+        &timeline_capture_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn source_capture_id_strings(source: &BakeMemorySourceRecord) -> Vec<String> {
+    let mut ids = source
+        .timeline
+        .capture_ids
+        .as_deref()
+        .map(parse_json_vec_string_lossy)
+        .unwrap_or_default();
+    let primary = source.timeline.capture_id.to_string();
+    if !ids.contains(&primary) {
+        ids.insert(0, primary);
+    }
+    ids
+}
+
 fn build_bake_knowledge_entry(
     source: &BakeMemorySourceRecord,
     payload: &BakeKnowledgeArtifactPayload,
     review_status: &str,
     trigger_reason: &str,
+    source_capture_ids: &[String],
 ) -> Result<NewBakeKnowledge, ApiError> {
     let entities = if payload.entities.is_empty() {
         parse_json_vec_string(&source.timeline.entities)
@@ -2267,7 +2552,7 @@ fn build_bake_knowledge_entry(
     let details = json!({
         "source_timeline_id": source.timeline.id,
         "source_memory_ids": [source.timeline.id.to_string()],
-        "source_capture_ids": [source.timeline.capture_id.to_string()],
+        "source_capture_ids": source_capture_ids,
         "source_timeline_ids": [source.timeline.id.to_string()],
         "episode_cluster_id": source.timeline.capture_id.to_string(),
         "match_score": payload.match_score,
@@ -2282,12 +2567,8 @@ fn build_bake_knowledge_entry(
     });
     Ok(NewBakeKnowledge {
         timeline_id: source.timeline.id,
-        title: payload.summary.clone(),
-        summary: payload
-            .overview
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| payload.summary.clone()),
+        title: knowledge_title_from_payload(payload),
+        summary: knowledge_summary_from_payload(payload),
         content: Some(details.to_string()),
         detailed_content: payload.details.clone(),
         entities: to_json_string(&entities)?,
@@ -2295,7 +2576,7 @@ fn build_bake_knowledge_entry(
             .importance
             .unwrap_or(source.timeline.importance)
             .max(1),
-        source_capture_ids: None,
+        source_capture_ids: Some(to_json_string(&source_capture_ids)?),
     })
 }
 
@@ -2303,6 +2584,7 @@ fn build_bake_document(
     source: &BakeMemorySourceRecord,
     payload: &BakeDocumentArtifactPayload,
     review_status: &str,
+    source_capture_ids: &[String],
 ) -> Result<NewBakeDocument, ApiError> {
     let tags = if payload.tags.is_empty() {
         parse_json_vec_string(&source.timeline.entities)
@@ -2310,7 +2592,6 @@ fn build_bake_document(
         payload.tags.clone()
     };
     let source_memory_ids = vec![source.timeline.id.to_string()];
-    let source_capture_ids = vec![source.timeline.capture_id.to_string()];
     let full_content = payload
         .full_content
         .clone()
@@ -2377,6 +2658,7 @@ fn build_bake_sop_entry(
     payload: &BakeSopArtifactPayload,
     review_status: &str,
     trigger_reason: &str,
+    source_capture_ids: &[String],
 ) -> Result<NewBakeSop, ApiError> {
     let trigger_keywords = if payload.trigger_keywords.is_empty() {
         parse_json_vec_string(&source.timeline.entities)
@@ -2391,7 +2673,7 @@ fn build_bake_sop_entry(
     let details = json!({
         "source_timeline_id": source.timeline.id,
         "source_memory_ids": [source.timeline.id.to_string()],
-        "source_capture_ids": [source.timeline.capture_id.to_string()],
+        "source_capture_ids": source_capture_ids,
         "match_score": payload.match_score,
         "match_level": payload.match_level.clone(),
         "creation_mode": "llm_bake",
@@ -2419,7 +2701,7 @@ fn build_bake_sop_entry(
         detailed_content: payload.details.clone(),
         entities: source.timeline.entities.clone(),
         importance: source.timeline.importance.max(3),
-        source_capture_ids: None,
+        source_capture_ids: Some(to_json_string(&source_capture_ids)?),
     })
 }
 
@@ -3077,6 +3359,80 @@ fn parse_json_vec_string(value: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
 }
 
+fn parse_json_vec_string_lossy(value: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<Value>>(value)
+        .map(|values| {
+            values
+                .into_iter()
+                .filter_map(|value| match value {
+                    Value::String(item) => Some(item),
+                    Value::Number(item) => Some(item.to_string()),
+                    Value::Bool(item) => Some(item.to_string()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_optional_json_vec_string(value: &Option<String>) -> Vec<String> {
+    value
+        .as_deref()
+        .map(parse_json_vec_string_lossy)
+        .unwrap_or_default()
+}
+
+fn merge_string_lists(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
+    for item in extra {
+        let item = item.trim();
+        if !item.is_empty() && !base.iter().any(|value| value == item) {
+            base.push(item.to_string());
+        }
+    }
+    base
+}
+
+fn option_f64_json(value: Option<f64>) -> Value {
+    value.map_or(Value::Null, Value::from)
+}
+
+fn option_string_json(value: Option<&str>) -> Value {
+    value
+        .map(|item| Value::String(item.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+fn merge_optional_text(existing: Option<&str>, incoming: Option<&str>) -> Option<String> {
+    let existing = existing.map(str::trim).filter(|value| !value.is_empty());
+    let incoming = incoming.map(str::trim).filter(|value| !value.is_empty());
+    match (existing, incoming) {
+        (Some(old), Some(new)) if old == new || old.contains(new) => Some(old.to_string()),
+        (Some(old), Some(new)) if new.contains(old) => Some(new.to_string()),
+        (Some(old), Some(new)) => Some(format!("{old}\n\n---\n\n{new}")),
+        (Some(old), None) => Some(old.to_string()),
+        (None, Some(new)) => Some(new.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn knowledge_title_from_payload(payload: &BakeKnowledgeArtifactPayload) -> String {
+    payload
+        .overview
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| payload.summary.trim())
+        .to_string()
+}
+
+fn knowledge_summary_from_payload(payload: &BakeKnowledgeArtifactPayload) -> String {
+    payload
+        .overview
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| payload.summary.clone())
+}
+
 fn parse_json_value<T>(value: &str) -> Vec<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -3227,6 +3583,44 @@ mod tests {
             .expect("插入 knowledge 失败")
     }
 
+    fn link_captures_to_timeline(service: &BakeService, timeline_id: i64, capture_ids: &[i64]) {
+        service
+            .storage
+            .with_conn(|conn| {
+                for capture_id in capture_ids {
+                    conn.execute(
+                        "UPDATE captures SET timeline_id = ?1 WHERE id = ?2",
+                        rusqlite::params![timeline_id, capture_id],
+                    )
+                    .map_err(StorageError::Sqlite)?;
+                }
+                Ok(())
+            })
+            .expect("关联 capture 到 timeline 失败");
+    }
+
+    fn make_candidate(service: &BakeService, timeline_id: i64) -> BakeMemorySourceRecord {
+        let timeline = service
+            .storage
+            .get_timeline_entry(timeline_id)
+            .expect("查询 timeline 失败")
+            .expect("timeline 不存在");
+        BakeMemorySourceRecord {
+            timeline,
+            capture_ts: 1_710_000_000_000,
+            capture_app_name: Some("Code".to_string()),
+            capture_win_title: Some("知识来源".to_string()),
+            capture_ax_text: Some("候选文本".to_string()),
+            capture_ocr_text: None,
+            capture_input_text: None,
+            capture_audio_text: None,
+            capture_url: None,
+            capture_webpage_title: None,
+            url_aggregated_text: None,
+            url_aggregated_capture_count: 0,
+        }
+    }
+
     #[test]
     fn test_initialize_memories_is_idempotent() {
         let service = make_service();
@@ -3234,13 +3628,13 @@ mod tests {
         seed_knowledge(&service, "meeting", capture_id, 4, 3);
 
         let first = service.initialize_memories(10).expect("首次初始化失败");
-        assert_eq!(first.created_count, 1);
-        assert_eq!(first.articles.len(), 1);
-        assert_eq!(first.articles[0].open_count, 0);
-        assert!(first.articles[0].last_visited_at.is_some());
+        assert_eq!(first.created_count, 0);
+        assert_eq!(first.skipped_count, 1);
+        assert!(first.articles.is_empty());
 
         let second = service.initialize_memories(10).expect("二次初始化失败");
         assert_eq!(second.created_count, 0);
+        assert_eq!(second.skipped_count, 1);
     }
 
     #[test]
@@ -3277,5 +3671,132 @@ mod tests {
             resolve_review_status(Some("auto_created"), Some(0.95), Some("low")),
             "auto_created"
         );
+    }
+
+    #[test]
+    fn test_collect_source_capture_ids_includes_new_captures_on_same_timeline() {
+        let service = make_service();
+        let primary = seed_capture(&service, 1_710_000_000_000, "Code", "主采集");
+        let appended = seed_capture(&service, 1_710_000_010_000, "Code", "新增采集");
+        let timeline_id = seed_knowledge(&service, "meeting", primary, 4, 2);
+        link_captures_to_timeline(&service, timeline_id, &[primary, appended]);
+
+        let candidate = make_candidate(&service, timeline_id);
+        let ids = collect_source_capture_id_strings(&service.storage, &candidate)
+            .expect("收集 source_capture_ids 失败");
+
+        assert!(ids.contains(&primary.to_string()));
+        assert!(ids.contains(&appended.to_string()));
+    }
+
+    #[test]
+    fn test_build_knowledge_title_uses_overview_and_source_capture_ids() {
+        let service = make_service();
+        let primary = seed_capture(&service, 1_710_000_000_000, "Code", "主采集");
+        let timeline_id = seed_knowledge(&service, "meeting", primary, 4, 2);
+        link_captures_to_timeline(&service, timeline_id, &[primary]);
+        let candidate = make_candidate(&service, timeline_id);
+        let source_capture_ids = collect_source_capture_id_strings(&service.storage, &candidate)
+            .expect("收集 source_capture_ids 失败");
+
+        let payload = BakeKnowledgeArtifactPayload {
+            summary: "时间线式标题".to_string(),
+            overview: Some("这是提炼后的知识概述".to_string()),
+            details: Some("知识详情".to_string()),
+            entities: vec!["SGLang".to_string()],
+            importance: Some(4),
+            occurrence_count: None,
+            observed_at: None,
+            event_time_start: None,
+            event_time_end: None,
+            history_view: None,
+            content_origin: None,
+            activity_type: None,
+            evidence_strength: None,
+            evidence_summary: None,
+            match_score: Some(0.9),
+            match_level: Some("high".to_string()),
+            review_status: Some("auto_created".to_string()),
+        };
+
+        let record = build_bake_knowledge_entry(
+            &candidate,
+            &payload,
+            "auto_created",
+            "test",
+            &source_capture_ids,
+        )
+        .expect("构建知识失败");
+
+        assert_eq!(record.title, "这是提炼后的知识概述");
+        assert_eq!(record.summary, "这是提炼后的知识概述");
+        assert_eq!(
+            parse_optional_json_vec_string(&record.source_capture_ids),
+            vec![primary.to_string()]
+        );
+    }
+
+    #[test]
+    fn test_existing_knowledge_is_merged_with_new_timeline_captures() {
+        let service = make_service();
+        let primary = seed_capture(&service, 1_710_000_000_000, "Code", "主采集");
+        let appended = seed_capture(&service, 1_710_000_010_000, "Code", "新增采集");
+        let timeline_id = seed_knowledge(&service, "meeting", primary, 4, 2);
+        link_captures_to_timeline(&service, timeline_id, &[primary, appended]);
+        let existing_id = service
+            .storage
+            .insert_bake_knowledge(&NewBakeKnowledge {
+                timeline_id,
+                title: "旧知识".to_string(),
+                summary: "旧摘要".to_string(),
+                content: Some(r#"{"status":"auto_created"}"#.to_string()),
+                detailed_content: Some("旧详情".to_string()),
+                entities: r#"["旧实体"]"#.to_string(),
+                importance: 3,
+                source_capture_ids: Some(to_json_string(&vec![primary.to_string()]).unwrap()),
+            })
+            .expect("插入旧知识失败");
+        let candidate = make_candidate(&service, timeline_id);
+        let extraction = BakeArtifactExtraction {
+            accepted: true,
+            reason: None,
+            payload: Some(json!({
+                "summary": "新知识标题",
+                "overview": "新知识概述",
+                "details": "新详情",
+                "entities": ["新实体"],
+                "importance": 5,
+                "match_score": 0.91,
+                "match_level": "high",
+                "review_status": "auto_created"
+            })),
+        };
+        let mut existing_sources = std::collections::HashSet::from([timeline_id]);
+
+        let result = service
+            .persist_knowledge_artifact(
+                None,
+                &candidate,
+                "test",
+                &extraction,
+                &mut existing_sources,
+            )
+            .expect("合并知识失败");
+
+        assert_eq!(result.knowledge_created_count, 0);
+        assert_eq!(service.storage.count_bake_knowledge().unwrap(), 1);
+        let updated = service
+            .storage
+            .get_bake_knowledge(existing_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.title, "新知识概述");
+        assert_eq!(updated.importance, 5);
+        let source_ids = parse_optional_json_vec_string(&updated.source_capture_ids);
+        assert!(source_ids.contains(&primary.to_string()));
+        assert!(source_ids.contains(&appended.to_string()));
+        let details = updated.detailed_content.unwrap();
+        assert!(details.contains("旧详情"));
+        assert!(details.contains("新详情"));
     }
 }

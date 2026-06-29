@@ -196,6 +196,10 @@ async fn get_available_memory_mb_async() -> Option<u64> {
 fn get_memory_pressure() -> MemoryPressure {
     use std::process::Command;
 
+    if let Some(pressure) = get_memory_pressure_from_memory_pressure() {
+        return pressure;
+    }
+
     let output = match Command::new("vm_stat").output() {
         Ok(o) => o,
         Err(_) => return MemoryPressure::Normal,
@@ -209,19 +213,17 @@ fn get_memory_pressure() -> MemoryPressure {
     let mut pages_inactive = 0u64;
     let mut pages_wired = 0u64;
     let mut pages_compressed = 0u64; // 压缩内存
-    let mut page_size = 4096u64;
+    let mut pages_speculative = 0u64;
 
     for line in stdout.lines() {
-        if line.contains("page size of") {
-            if let Some(size_str) = line.split_whitespace().last() {
-                page_size = size_str.parse().unwrap_or(4096);
-            }
-        } else if line.starts_with("Pages free:") {
+        if line.starts_with("Pages free:") {
             pages_free = parse_vm_stat_value(line);
         } else if line.starts_with("Pages active:") {
             pages_active = parse_vm_stat_value(line);
         } else if line.starts_with("Pages inactive:") {
             pages_inactive = parse_vm_stat_value(line);
+        } else if line.starts_with("Pages speculative:") {
+            pages_speculative = parse_vm_stat_value(line);
         } else if line.starts_with("Pages wired down:") {
             pages_wired = parse_vm_stat_value(line);
         } else if line.starts_with("Pages occupied by compressor:") {
@@ -232,10 +234,14 @@ fn get_memory_pressure() -> MemoryPressure {
         }
     }
 
-    // macOS 内存模型：total = free + active + inactive + wired
-    // 真实压力 = active + wired + compressed（compressed 是 inactive 中被压缩的部分，
-    // 必须计入，否则在 jetsam 已开始杀进程时仍会判定为 Normal）。
-    let total_pages = pages_free + pages_active + pages_inactive + pages_wired;
+    // vm_stat 不直接给出物理总页数；compressor 会占用真实物理页，必须进入分母，
+    // 否则 used_pages 可能大于 total_pages，导致长期误判为 Critical。
+    let total_pages = pages_free
+        + pages_speculative
+        + pages_active
+        + pages_inactive
+        + pages_wired
+        + pages_compressed;
     if total_pages == 0 {
         return MemoryPressure::Normal;
     }
@@ -247,6 +253,33 @@ fn get_memory_pressure() -> MemoryPressure {
         0..=69 => MemoryPressure::Normal, // < 70%
         70..=84 => MemoryPressure::High,  // 70-85%
         _ => MemoryPressure::Critical,    // >= 85%
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn get_memory_pressure_from_memory_pressure() -> Option<MemoryPressure> {
+    use std::process::Command;
+
+    let output = Command::new("memory_pressure").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let free_percent = stdout.lines().find_map(|line| {
+        let prefix = "System-wide memory free percentage:";
+        let value = line
+            .trim()
+            .strip_prefix(prefix)?
+            .trim()
+            .trim_end_matches('%');
+        value.parse::<u64>().ok()
+    })?;
+
+    match free_percent {
+        0..=14 => Some(MemoryPressure::Critical),
+        15..=29 => Some(MemoryPressure::High),
+        _ => Some(MemoryPressure::Normal),
     }
 }
 

@@ -11,6 +11,29 @@ use crate::storage::{
     StorageManager,
 };
 
+fn keyword_terms(query: &str) -> Vec<String> {
+    let mut terms = query
+        .split(|ch: char| ch.is_whitespace() || ch.is_ascii_punctuation())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if terms.len() == 1 && terms[0].chars().count() >= 5 {
+        let chars = terms[0].chars().collect::<Vec<_>>();
+        if chars.iter().any(|ch| !ch.is_ascii()) {
+            for window in chars.windows(2) {
+                let term = window.iter().collect::<String>();
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
+            }
+        }
+    }
+
+    terms
+}
+
 fn extract_document_identity(url: &str) -> String {
     let url = url.trim();
     if url.is_empty() {
@@ -388,12 +411,28 @@ impl StorageManager {
                  WHERE k.category = 'bake_article'",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
-            if let Some(q) = query {
-                sql.push_str(" AND (k.summary LIKE ? OR COALESCE(k.overview, '') LIKE ? OR COALESCE(k.details, '') LIKE ?)");
-                let pattern = format!("%{}%", q);
-                bind_values.push(Box::new(pattern.clone()));
-                bind_values.push(Box::new(pattern.clone()));
-                bind_values.push(Box::new(pattern));
+            let query_terms = query.map(keyword_terms).unwrap_or_default();
+            if !query_terms.is_empty() {
+                let query_clause = query_terms
+                    .iter()
+                    .map(|_| {
+                        "(k.summary LIKE ? OR COALESCE(k.overview, '') LIKE ? OR COALESCE(k.details, '') LIKE ? OR COALESCE(k.frag_win_title, '') LIKE ? OR EXISTS (
+                            SELECT 1 FROM captures c
+                            WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
+                              AND (COALESCE(c.win_title, '') LIKE ? OR COALESCE(c.webpage_title, '') LIKE ? OR COALESCE(c.url, '') LIKE ? OR COALESCE(c.ax_text, '') LIKE ? OR COALESCE(c.ocr_text, '') LIKE ? OR COALESCE(c.input_text, '') LIKE ? OR COALESCE(c.audio_text, '') LIKE ?)
+                        ))".to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                sql.push_str(" AND (");
+                sql.push_str(&query_clause);
+                sql.push(')');
+                for term in &query_terms {
+                    let pattern = format!("%{}%", term);
+                    for _ in 0..11 {
+                        bind_values.push(Box::new(pattern.clone()));
+                    }
+                }
             }
             if let Some(value) = from_ts {
                 sql.push_str(" AND k.created_at_ms >= ?");
@@ -429,12 +468,28 @@ impl StorageManager {
                  WHERE k.category = 'bake_article'",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
-            if let Some(q) = query {
-                sql.push_str(" AND (k.summary LIKE ? OR COALESCE(k.overview, '') LIKE ? OR COALESCE(k.details, '') LIKE ?)");
-                let pattern = format!("%{}%", q);
-                bind_values.push(Box::new(pattern.clone()));
-                bind_values.push(Box::new(pattern.clone()));
-                bind_values.push(Box::new(pattern));
+            let query_terms = query.map(keyword_terms).unwrap_or_default();
+            if !query_terms.is_empty() {
+                let query_clause = query_terms
+                    .iter()
+                    .map(|_| {
+                        "(k.summary LIKE ? OR COALESCE(k.overview, '') LIKE ? OR COALESCE(k.details, '') LIKE ? OR COALESCE(k.frag_win_title, '') LIKE ? OR EXISTS (
+                            SELECT 1 FROM captures c
+                            WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
+                              AND (COALESCE(c.win_title, '') LIKE ? OR COALESCE(c.webpage_title, '') LIKE ? OR COALESCE(c.url, '') LIKE ? OR COALESCE(c.ax_text, '') LIKE ? OR COALESCE(c.ocr_text, '') LIKE ? OR COALESCE(c.input_text, '') LIKE ? OR COALESCE(c.audio_text, '') LIKE ?)
+                        ))".to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                sql.push_str(" AND (");
+                sql.push_str(&query_clause);
+                sql.push(')');
+                for term in &query_terms {
+                    let pattern = format!("%{}%", term);
+                    for _ in 0..11 {
+                        bind_values.push(Box::new(pattern.clone()));
+                    }
+                }
             }
             if let Some(value) = from_ts {
                 sql.push_str(" AND k.created_at_ms >= ?");
@@ -751,7 +806,9 @@ impl StorageManager {
                         k.occurrence_count, k.observed_at, k.event_time_start, k.event_time_end,
                         k.history_view, k.content_origin, k.activity_type, k.is_self_generated,
                         k.evidence_strength, k.user_verified, k.user_edited, k.created_at, k.updated_at,
-                        k.created_at_ms, k.updated_at_ms, k.capture_ids, k.start_time, k.end_time,
+                        k.created_at_ms,
+                        MAX(k.updated_at_ms, COALESCE((SELECT MAX(c2.ts) FROM captures c2 WHERE c2.timeline_id = k.id), 0)),
+                        k.capture_ids, k.start_time, k.end_time,
                         k.duration_minutes, k.frag_app_name, k.frag_win_title, k.time_range_start,
                         k.time_range_end, k.key_timestamps,
                         c.ts, c.app_name, c.win_title, c.ax_text, c.ocr_text, c.input_text, c.audio_text,
@@ -760,9 +817,24 @@ impl StorageManager {
                  INNER JOIN captures c ON c.id = k.capture_id
                  LEFT JOIN bake_retry_state r ON r.timeline_id = k.id
                  WHERE k.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
-                   AND k.updated_at_ms > ?1
+                   AND (
+                     MAX(k.updated_at_ms, COALESCE((SELECT MAX(c2.ts) FROM captures c2 WHERE c2.timeline_id = k.id), 0)) > ?1
+                     OR EXISTS (
+                       SELECT 1
+                       FROM bake_documents d
+                       JOIN captures c3 ON c3.timeline_id = k.id
+                       WHERE d.deleted_at IS NULL
+                         AND (
+                           d.source_memory_ids = ('[\"' || k.id || '\"]')
+                           OR d.source_memory_ids LIKE ('[\"' || k.id || '\",%')
+                           OR d.source_memory_ids LIKE ('%,\"' || k.id || '\",%')
+                           OR d.source_memory_ids LIKE ('%,\"' || k.id || '\"]')
+                         )
+                         AND instr(d.source_capture_ids, '\"' || c3.id || '\"') = 0
+                     )
+                   )
                    AND COALESCE(r.failure_count, 0) < ?3
-                 ORDER BY k.updated_at_ms ASC, k.id ASC
+                 ORDER BY MAX(k.updated_at_ms, COALESCE((SELECT MAX(c2.ts) FROM captures c2 WHERE c2.timeline_id = k.id), 0)) ASC, k.id ASC
                  LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![since_ts_ms, limit as i64, max_failures], |row| {
@@ -787,6 +859,12 @@ impl StorageManager {
             let mut records: Vec<BakeMemorySourceRecord> =
                 rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)?;
             for record in records.iter_mut() {
+                let full_member_ids =
+                    list_timeline_capture_ids(conn, record.timeline.id, record.timeline.capture_id)?;
+                if !full_member_ids.is_empty() {
+                    record.timeline.capture_ids = Some(to_json_array_string(&full_member_ids));
+                }
+
                 // 优先聚合 timeline 全部成员 capture 的内容（含文档型成员的正文），
                 // 因为主 capture 常是 IM，代表不了 timeline 里浏览/编辑的文档。
                 let member_ids = parse_capture_ids(record.timeline.capture_ids.as_deref());
@@ -1195,6 +1273,30 @@ fn aggregate_member_capture_text(
     Ok(Some((buf, included)))
 }
 
+fn list_timeline_capture_ids(
+    conn: &Connection,
+    timeline_id: i64,
+    primary_capture_id: i64,
+) -> Result<Vec<i64>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM captures
+         WHERE timeline_id = ?1 OR id = ?2
+         ORDER BY ts ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![timeline_id, primary_capture_id], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let mut ids = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::Sqlite)?;
+    ids.dedup();
+    Ok(ids)
+}
+
+fn to_json_array_string(ids: &[i64]) -> String {
+    serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// 判断 URL 是否指向文档（用于成员聚合时优先文档型 capture）。
 fn is_document_url(url: &str) -> bool {
     let u = url.trim().to_lowercase();
@@ -1583,16 +1685,23 @@ impl StorageManager {
     /// 获取时间线关联的Capture IDs
     pub fn get_timeline_capture_ids(&self, timeline_id: i64) -> Result<Vec<i64>, StorageError> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT capture_ids FROM timelines WHERE id = ?1")?;
+            let mut stmt =
+                conn.prepare("SELECT capture_id, capture_ids FROM timelines WHERE id = ?1")?;
             match stmt.query_row(params![timeline_id], |row| {
-                let json_str: Option<String> = row.get(0)?;
-                Ok(json_str)
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
             }) {
-                Ok(Some(json)) => {
-                    let ids: Vec<i64> = serde_json::from_str(&json).unwrap_or_default();
+                Ok((primary_capture_id, Some(json))) => {
+                    let mut ids = list_timeline_capture_ids(conn, timeline_id, primary_capture_id)?;
+                    for id in serde_json::from_str::<Vec<i64>>(&json).unwrap_or_default() {
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
                     Ok(ids)
                 }
-                Ok(None) => Ok(vec![]),
+                Ok((primary_capture_id, None)) => {
+                    list_timeline_capture_ids(conn, timeline_id, primary_capture_id)
+                }
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(vec![]),
                 Err(e) => Err(StorageError::Sqlite(e)),
             }
@@ -1764,6 +1873,26 @@ impl StorageManager {
         })
     }
 
+    pub fn find_bake_knowledge_by_timeline_id(
+        &self,
+        timeline_id: i64,
+    ) -> Result<Option<BakeKnowledgeRecord>, StorageError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, timeline_id, title, summary, content, detailed_content, entities, importance,
+                        user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms, source_capture_ids
+                 FROM bake_knowledge WHERE timeline_id = ?1 ORDER BY updated_at_ms DESC, id DESC LIMIT 1"
+            )?;
+            match stmt.query_row(params![timeline_id], |row| {
+                row_to_bake_knowledge(row).map_err(|_| rusqlite::Error::InvalidQuery)
+            }) {
+                Ok(knowledge) => Ok(Some(knowledge)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(StorageError::Sqlite(e)),
+            }
+        })
+    }
+
     pub fn update_bake_knowledge(
         &self,
         id: i64,
@@ -1780,6 +1909,42 @@ impl StorageManager {
                      updated_at = datetime(?6 / 1000, 'unixepoch'), updated_at_ms = ?6
                  WHERE id = ?5",
                 params![title, summary, content, entities, id, now],
+            )?;
+            Ok(affected > 0)
+        })
+    }
+
+    pub fn update_bake_knowledge_system(
+        &self,
+        id: i64,
+        title: &str,
+        summary: &str,
+        content: Option<&str>,
+        detailed_content: Option<&str>,
+        entities: &str,
+        importance: i64,
+        source_capture_ids: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        self.with_conn(|conn| {
+            let now = current_ts_ms();
+            let affected = conn.execute(
+                "UPDATE bake_knowledge
+                 SET title = ?1, summary = ?2, content = ?3, detailed_content = ?4,
+                     entities = ?5, importance = ?6,
+                     source_capture_ids = COALESCE(?7, source_capture_ids, '[]'),
+                     updated_at = datetime(?9 / 1000, 'unixepoch'), updated_at_ms = ?9
+                 WHERE id = ?8",
+                params![
+                    title,
+                    summary,
+                    content,
+                    detailed_content,
+                    entities,
+                    importance,
+                    source_capture_ids,
+                    id,
+                    now,
+                ],
             )?;
             Ok(affected > 0)
         })

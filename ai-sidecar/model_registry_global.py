@@ -125,7 +125,9 @@ def get_active_ollama_model() -> str:
             if config_path.exists():
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                active_llm_id = config.get('active_llm', 'qwen3.5-4b')
+                active_llm_id = config.get('active_llm', 'mbem-v1-local')
+                if active_llm_id == 'qwen3.5-4b':
+                    active_llm_id = 'mbem-v1-local'
                 model_info = MANAGER_MODELS.get(active_llm_id)
                 if model_info and model_info.provider == 'ollama':
                     _active_ollama_model = model_info.model_id

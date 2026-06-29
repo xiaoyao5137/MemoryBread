@@ -280,27 +280,33 @@ impl CaptureEngine {
         );
 
         // 3. 应用黑名单检测（优先级最高，快速跳过）
-        if let Some(bundle_id) = &merged.app_bundle_id {
-            if self.blacklist.is_blacklisted(bundle_id) {
-                info!(
-                    app = ?merged.app_name,
-                    bundle_id = %bundle_id,
-                    "应用在黑名单中，跳过采集"
-                );
-                // 记录拦截统计
-                let storage = self.storage.clone();
-                let bundle_id = bundle_id.clone();
+        if self.blacklist.is_blacklisted_by_bundle_or_name(
+            merged.app_bundle_id.as_deref(),
+            merged.app_name.as_deref(),
+        ) {
+            info!(
+                app = ?merged.app_name,
+                bundle_id = ?merged.app_bundle_id,
+                "应用在黑名单中，跳过采集"
+            );
+            // 记录拦截统计。优先按 Bundle ID 归档，缺失时按应用名兜底。
+            let storage = self.storage.clone();
+            let stat_target = merged
+                .app_bundle_id
+                .clone()
+                .or_else(|| merged.app_name.clone());
+            if let Some(target_id) = stat_target {
                 tokio::spawn(async move {
                     let _ = storage.with_conn(|conn| {
                         crate::storage::repo::privacy::increment_block_stat(
                             conn,
                             "blacklist",
-                            &bundle_id,
+                            &target_id,
                         )
                     });
                 });
-                return Ok(None);
             }
+            return Ok(None);
         }
 
         // 4. 隐私过滤

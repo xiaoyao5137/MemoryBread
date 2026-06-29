@@ -5,7 +5,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from werkzeug.exceptions import BadGateway, ServiceUnavailable
-from model_manager import ModelManager, ModelType, AVAILABLE_MODELS as MANAGER_MODELS
+from model_manager import ModelManager, ModelType, AVAILABLE_MODELS as MANAGER_MODELS, MODEL_ID_ALIASES
 from model_registry import AVAILABLE_MODELS, get_recommendations, get_model, list_models as registry_list
 import psutil
 import logging
@@ -186,7 +186,6 @@ def get_bake_extractor():
 
 
 def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[dict], latency_ms: int) -> int | None:
-    retrieved_ids = [ctx.get('capture_id') for ctx in contexts if ctx.get('capture_id') is not None]
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -198,7 +197,7 @@ def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[
                 int(time.time() * 1000),
                 'monitor',
                 query,
-                json.dumps(retrieved_ids, ensure_ascii=False),
+                json.dumps(contexts, ensure_ascii=False),
                 prompt_used,
                 answer,
                 latency_ms,
@@ -211,6 +210,64 @@ def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[
     except Exception as exc:
         logger.warning("RAG 会话落库失败: %s", exc)
         return None
+
+
+@app.route('/api/rag/history', methods=['GET'])
+def rag_history():
+    """读取最近的咨询记录，供咨询页回看历史问答。"""
+    try:
+        try:
+            limit = int(request.args.get('limit', 20))
+        except (TypeError, ValueError):
+            limit = 20
+        limit = max(1, min(limit, 100))
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT id, ts, user_query, retrieved_ids, llm_response, latency_ms
+               FROM rag_sessions
+               ORDER BY ts DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        items = []
+        for row in rows:
+            raw_contexts = []
+            try:
+                raw_contexts = json.loads(row['retrieved_ids'] or '[]')
+            except Exception:
+                raw_contexts = []
+            contexts = []
+            for item in raw_contexts:
+                if isinstance(item, dict):
+                    contexts.append(item)
+                elif item is not None:
+                    contexts.append({
+                        'capture_id': item,
+                        'text': f'历史咨询关联的采集记录 #{item}',
+                        'score': 0,
+                        'source': 'capture',
+                        'source_type': 'capture',
+                    })
+            items.append({
+                'id': row['id'],
+                'ts': row['ts'],
+                'query': row['user_query'] or '',
+                'answer': row['llm_response'] or '',
+                'contexts': contexts,
+                'context_count': len(contexts),
+                'latency_ms': row['latency_ms'],
+            })
+
+        return jsonify({'items': items})
+    except Exception as e:
+        logger.error(f"读取 RAG 咨询记录失败: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 def get_rag_pipeline():
@@ -267,7 +324,7 @@ def get_rag_pipeline():
                         ),
                         fts5_retriever=Fts5Retriever(db_path=db_path),
                         knowledge_retriever=KnowledgeFts5Retriever(db_path=db_path),
-                        llm=OllamaBackend(model=ollama_model, timeout=180, num_predict=1536),
+                        llm=OllamaBackend(model=ollama_model, timeout=360, num_predict=1536),
                         top_k=5,
                         db_path=db_path,
                     )
@@ -289,6 +346,23 @@ def get_rag_pipeline():
                     _rag_pipeline = None
                     raise ServiceUnavailable(f"RAG pipeline 初始化失败: {exc}") from exc
     return _rag_pipeline
+
+
+def _build_rag_llm_override(data: dict):
+    """根据创作模型配置构造 RAG 本次查询使用的 LLM。"""
+    model = (data.get('creation_model') or '').strip()
+    api_key = (data.get('creation_api_key') or '').strip()
+    base_url = (data.get('creation_base_url') or '').strip()
+    if not model:
+        return None
+
+    # 有 API Key 的模型按创作页云端模型处理；没有 API Key 的 qwen3.5:4b 等本地模型走 Ollama。
+    if api_key:
+        from rag.llm.cloud import CloudChatBackend
+        return CloudChatBackend(model=model, api_key=api_key, base_url=base_url, timeout=360)
+
+    from rag.llm.ollama import OllamaBackend
+    return OllamaBackend(model=model, timeout=360, num_predict=1536)
 
 
 def _model_to_dict(meta, status_info: dict) -> dict:
@@ -346,8 +420,9 @@ def list_models():
 
         # 获取运行时状态
         runtime = model_manager.get_all_status()
-        if runtime.get('qwen2.5-3b', {}).get('status') in ('installed', 'active') and model_manager.config.get('active_llm') not in runtime:
-            model_manager.config['active_llm'] = 'qwen2.5-3b'
+        active_llm = MODEL_ID_ALIASES.get(model_manager.config.get('active_llm'), model_manager.config.get('active_llm'))
+        if active_llm != model_manager.config.get('active_llm'):
+            model_manager.config['active_llm'] = active_llm
             model_manager._save_config()
             runtime = model_manager.get_all_status()
         # 获取推荐列表
@@ -411,15 +486,10 @@ def get_hardware():
 def get_active_models():
     """返回当前激活的 LLM、Embedding 和 Image 模型"""
     try:
-        active_llm_id  = model_manager.config.get('active_llm')
+        active_llm_id  = MODEL_ID_ALIASES.get(model_manager.config.get('active_llm'), model_manager.config.get('active_llm'))
         active_emb_id  = model_manager.config.get('active_embedding')
         active_image_id = model_manager.config.get('active_image')
         runtime        = model_manager.get_all_status()
-        if runtime.get('qwen2.5-3b', {}).get('status') in ('installed', 'active') and not active_llm_id:
-            active_llm_id = 'qwen2.5-3b'
-            model_manager.config['active_llm'] = active_llm_id
-            model_manager._save_config()
-
         def _build(model_id):
             if not model_id:
                 return None
@@ -443,6 +513,7 @@ def get_active_models():
 def model_status(model_id: str):
     """查询单个模型的下载状态（用于前端轮询进度）"""
     try:
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         runtime = model_manager.get_all_status()
         info = runtime.get(model_id, {'status': 'not_installed', 'download_progress': 0})
         return jsonify({'status': 'ok', 'model_id': model_id, **info})
@@ -458,6 +529,7 @@ def configure_model(model_id: str):
     Body: { "fields": { "api_key": "sk-...", "base_url": "..." } }
     """
     try:
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         data   = request.json or {}
         fields = data.get('fields', {})
         meta   = get_model(model_id)
@@ -479,6 +551,7 @@ def configure_model(model_id: str):
 def validate_model(model_id: str):
     """验证 API Key 是否有效（发送测试请求）"""
     try:
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         ok, msg = model_manager.validate_api_key(model_id)
         return jsonify({'status': 'ok' if ok else 'error', 'valid': ok, 'message': msg})
     except Exception as e:
@@ -488,6 +561,7 @@ def validate_model(model_id: str):
 @app.route('/api/models/<model_id>/download', methods=['POST'])
 def download_model(model_id: str):
     try:
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         result = model_manager.download_model(model_id)
         status = result.get('status', 'error') if isinstance(result, dict) else ('ok' if result else 'error')
         if status in ('ok', 'downloading', 'pending'):
@@ -502,6 +576,7 @@ def download_model(model_id: str):
 def activate_model(model_id: str):
     global _rag_pipeline
     try:
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         success = model_manager.activate_model(model_id)
         if success:
             # 同步更新全局 Ollama 模型名，确保后续所有调用使用新模型
@@ -532,6 +607,7 @@ def activate_model(model_id: str):
 @app.route('/api/models/<model_id>/delete', methods=['DELETE'])
 def delete_model(model_id: str):
     try:
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         success = model_manager.delete_model(model_id)
         if success:
             return jsonify({'status': 'ok', 'message': f'模型 {model_id} 已删除'})
@@ -667,6 +743,7 @@ def model_chat(model_id: str):
     Body: { "messages": [{"role": "user", "content": "..."}] }
     """
     try:
+        model_id = MODEL_ID_ALIASES.get(model_id, model_id)
         data = request.get_json(silent=True) or {}
         messages = data.get('messages', [])
         if not messages:
@@ -910,12 +987,14 @@ def rag_query():
             }), 503
 
         pipeline = _rag_pipeline
+        llm_override = _build_rag_llm_override(data)
+
         # 通过 InferenceQueue 统一调度所有 LLM 推理，P0 = 在线 RAG 查询
         try:
             result = get_global_queue().submit_sync(
                 Priority.P0,
-                lambda: pipeline.query(query, top_k=top_k),
-                timeout=120.0,
+                lambda: pipeline.query(query, top_k=top_k, llm=llm_override),
+                timeout=420.0,
                 lane=LANE_P0_QUERY,
             )
         except QueueEvictedError as ee:
@@ -923,7 +1002,10 @@ def rag_query():
             return jsonify({'error': '系统繁忙，请稍候再试'}), 503
         except concurrent.futures.TimeoutError:
             logger.warning("RAG 查询执行超时")
-            return jsonify({'error': '查询超时'}), 504
+            return jsonify({
+                'error': '查询超时',
+                'message': '本次咨询生成时间过长，请稍后重试或缩小查询范围'
+            }), 504
 
         contexts = [
             {
@@ -934,9 +1016,30 @@ def rag_query():
                 'source': chunk.metadata.get('source_type') or chunk.source,
                 'source_type': chunk.metadata.get('source_type') or chunk.source,
                 'knowledge_id': chunk.metadata.get('knowledge_id'),
+                'artifact_id': chunk.metadata.get('artifact_id'),
+                'document_id': chunk.metadata.get('document_id'),
                 'app_name': chunk.metadata.get('app_name'),
                 'win_title': chunk.metadata.get('win_title'),
+                'url': chunk.metadata.get('url') or chunk.metadata.get('source_url'),
+                'source_url': chunk.metadata.get('source_url') or chunk.metadata.get('url'),
+                'title': chunk.metadata.get('title'),
+                'doc_type': chunk.metadata.get('doc_type'),
                 'time': chunk.metadata.get('time') or chunk.metadata.get('ts') or chunk.metadata.get('end_time') or chunk.metadata.get('start_time'),
+                'observed_at': chunk.metadata.get('observed_at'),
+                'event_time_start': chunk.metadata.get('event_time_start'),
+                'event_time_end': chunk.metadata.get('event_time_end'),
+                'start_time': chunk.metadata.get('start_time'),
+                'end_time': chunk.metadata.get('end_time'),
+                'summary': chunk.metadata.get('summary'),
+                'overview': chunk.metadata.get('overview'),
+                'category': chunk.metadata.get('category'),
+                'activity_type': chunk.metadata.get('activity_type'),
+                'content_origin': chunk.metadata.get('content_origin'),
+                'history_view': chunk.metadata.get('history_view'),
+                'evidence_strength': chunk.metadata.get('evidence_strength'),
+                'importance': chunk.metadata.get('importance'),
+                'source_timeline_ids': chunk.metadata.get('source_timeline_ids'),
+                'linked_knowledge_ids': chunk.metadata.get('linked_knowledge_ids'),
             }
             for chunk in result.contexts
         ]

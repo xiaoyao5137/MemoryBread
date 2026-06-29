@@ -69,31 +69,11 @@ pub async fn list_captures(
         }));
     }
 
-    if let Some(q) = params.q.filter(|s| !s.is_empty()) {
-        let total = tokio::task::spawn_blocking({
-            let storage = storage.clone();
-            let q = q.clone();
-            move || storage.count_search_captures(&q)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?? as usize;
-
-        let rows = tokio::task::spawn_blocking(move || {
-            storage.search_captures_paginated(&q, limit, offset)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))??;
-
-        return Ok(Json(CapturesResponse {
-            total,
-            captures: rows,
-        }));
-    }
-
     let mut filter = CaptureFilter::new();
     filter.app_name = params.app;
     filter.from_ts = params.from;
     filter.to_ts = params.to;
+    filter.query = params.q.filter(|s| !s.trim().is_empty());
     filter.limit = limit;
     filter.offset = offset;
 

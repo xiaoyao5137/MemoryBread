@@ -711,8 +711,25 @@ end tell"#,
             "开始 AX generic-first 文本提取"
         );
 
-        // 快速检测 AX 支持（带缓存，首次 50ms，后续 <1ms）
+        let fallback = fallback_extractor_for_context(bundle_id, app_name);
+
+        // 快速检测 AX 支持（带缓存，首次 50ms，后续 <1ms）。
+        // Chrome/Safari 的页面文本来自浏览器 AppleScript，不依赖 System Events 的 AX 树；
+        // 因此 AX 探测失败时仍应尝试浏览器 fallback。
         if !check_ax_support(app_name) {
+            if matches!(
+                fallback,
+                Some(TextExtractor::Chrome) | Some(TextExtractor::Safari)
+            ) {
+                debug!(
+                    app = ?app_name,
+                    bundle_id = ?bundle_id,
+                    fallback = fallback.map(|extractor| extractor.as_str()),
+                    "AX 快速检测失败，改走浏览器 fallback 文本提取"
+                );
+                return extract_fallback_text(fallback.unwrap(), app_name, bundle_id, win_title);
+            }
+
             debug!(
                 app = ?app_name,
                 "AX 快速检测失败，应用不支持或无响应，直接降级 OCR"
@@ -750,7 +767,7 @@ end tell"#,
         }
 
         // generic 失败，尝试专用提取器
-        let Some(fallback) = fallback_extractor_for_context(bundle_id, app_name) else {
+        let Some(fallback) = fallback else {
             debug!(
                 app = ?app_name,
                 bundle_id = ?bundle_id,
@@ -766,6 +783,15 @@ end tell"#,
             "generic 未命中质量门槛，尝试 fallback"
         );
 
+        extract_fallback_text(fallback, app_name, bundle_id, win_title)
+    }
+
+    fn extract_fallback_text(
+        fallback: TextExtractor,
+        app_name: Option<&str>,
+        bundle_id: Option<&str>,
+        win_title: Option<&str>,
+    ) -> Option<ExtractedText> {
         let fallback_text = match fallback {
             TextExtractor::Generic => None,
             TextExtractor::Chrome => extract_chrome_text(),

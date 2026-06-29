@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft } from 'lucide-react'
 import {
   useCreateBakeTemplate,
@@ -6,19 +6,22 @@ import {
   useDeleteBakeSop,
   useDeleteBakeTemplate,
   useFetchBakeKnowledge,
+  useFetchBakeMemories,
   useFetchBakeOverview,
   useFetchBakeSops,
+  useFetchBakeTemplate,
   useFetchBakeTemplates,
   useToggleBakeTemplateStatus,
   useUpdateBakeTemplate,
   useModelStatus,
 } from '../hooks/useApi'
-import { useAppStore } from '../store/useAppStore'
+import { useAppStore, type BakeNavigationTarget } from '../store/useAppStore'
 import type {
   ArticleTemplate,
   BakeKnowledgeItem,
   BakeOverview,
   SopCandidate,
+  TimelineItem,
 } from '../types'
 import BakeHeader from './bake/BakeHeader'
 import BakeOverviewTab from './bake/BakeOverviewTab'
@@ -26,6 +29,8 @@ import BakeTemplatesTab from './bake/BakeTemplatesTab'
 import BakeSopTab from './bake/BakeSopTab'
 import BakeKnowledgeTab from './bake/BakeKnowledgeTab'
 import BakeTabs from './bake/BakeTabs'
+import { BakeButton } from './bake/BakeShared'
+import { parseDateInputToMs } from './bake/BakeCaptureTab'
 import './bake/BakePanel.css'
 
 const PAGE_SIZE = 20
@@ -72,17 +77,25 @@ const BakePanel: React.FC = () => {
     selectedKnowledgeId,
     bakeKnowledgeOffset,
     bakeKnowledgeQuery,
+    bakeKnowledgeFrom,
+    bakeKnowledgeTo,
     bakeKnowledgeLimit,
     bakeTemplateOffset,
     bakeTemplateQuery,
+    bakeTemplateFrom,
+    bakeTemplateTo,
     bakeTemplateLimit,
     bakeSopOffset,
     bakeSopQuery,
+    bakeSopFrom,
+    bakeSopTo,
     bakeSopLimit,
     setBakeTab,
     setRepositoryTab,
     setWindowMode,
-    setCaptureBackTarget,
+    bakeNavigationStack,
+    pushBakeNavigationTarget,
+    popBakeNavigationTarget,
     setSelectedMemoryId,
     setSelectedTemplateId,
     setSelectedSopId,
@@ -92,10 +105,8 @@ const BakePanel: React.FC = () => {
     setBakeKnowledgeQuery,
     setBakeKnowledgeLimit,
     setBakeTemplateOffset,
-    setBakeTemplateQuery,
     setBakeTemplateLimit,
     setBakeSopOffset,
-    setBakeSopQuery,
     setBakeSopLimit,
     setRepositoryCaptureSourceCaptureId,
     creationBackTarget,
@@ -105,8 +116,10 @@ const BakePanel: React.FC = () => {
   const { status: modelStatus, ready: modelsReady, loading: modelStatusLoading } = useModelStatus()
   const fetchOverview = useFetchBakeOverview()
   const fetchKnowledge = useFetchBakeKnowledge()
+  const fetchMemories = useFetchBakeMemories()
   const deleteKnowledge = useDeleteBakeKnowledge()
   const fetchTemplates = useFetchBakeTemplates()
+  const fetchTemplate = useFetchBakeTemplate()
   const createTemplate = useCreateBakeTemplate()
   const updateTemplate = useUpdateBakeTemplate()
   const toggleTemplateStatus = useToggleBakeTemplateStatus()
@@ -117,12 +130,22 @@ const BakePanel: React.FC = () => {
   const [overview, setOverview] = useState<BakeOverview>(defaultOverview)
   const [knowledgeItems, setKnowledgeItems] = useState<BakeKnowledgeItem[]>([])
   const [knowledgeTotal, setKnowledgeTotal] = useState(0)
+  const [memoryItems, setMemoryItems] = useState<TimelineItem[]>([])
   const [templates, setTemplates] = useState<ArticleTemplate[]>([])
   const [templateTotal, setTemplateTotal] = useState(0)
   const [sopCandidates, setSopCandidates] = useState<SopCandidate[]>([])
   const [sopTotal, setSopTotal] = useState(0)
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
   const [draftKnowledgeQuery, setDraftKnowledgeQuery] = useState(bakeKnowledgeQuery)
+  const [draftKnowledgeFrom, setDraftKnowledgeFrom] = useState(bakeKnowledgeFrom)
+  const [draftKnowledgeTo, setDraftKnowledgeTo] = useState(bakeKnowledgeTo)
+  const [draftTemplateQuery, setDraftTemplateQuery] = useState(bakeTemplateQuery)
+  const [draftTemplateFrom, setDraftTemplateFrom] = useState(bakeTemplateFrom)
+  const [draftTemplateTo, setDraftTemplateTo] = useState(bakeTemplateTo)
+  const [draftSopQuery, setDraftSopQuery] = useState(bakeSopQuery)
+  const [draftSopFrom, setDraftSopFrom] = useState(bakeSopFrom)
+  const [draftSopTo, setDraftSopTo] = useState(bakeSopTo)
+  const knowledgeRequestSeqRef = useRef(0)
 
   useEffect(() => {
     void fetchOverview().then((data) => {
@@ -140,23 +163,40 @@ const BakePanel: React.FC = () => {
   }, [fetchOverview])
 
   useEffect(() => {
+    if (!['templates', 'knowledge', 'sop'].includes(bakeTab)) return
+    void fetchMemories({ limit: 1000, offset: 0 }).then((data) => {
+      setMemoryItems(data.items)
+    }).catch(() => {
+      setMemoryItems([])
+    })
+  }, [bakeTab, fetchMemories])
+
+  useEffect(() => {
     if (bakeTab !== 'knowledge') return
+    const requestSeq = knowledgeRequestSeqRef.current + 1
+    knowledgeRequestSeqRef.current = requestSeq
     void fetchKnowledge({
       q: bakeKnowledgeQuery.trim() || undefined,
+      from: parseDateInputToMs(bakeKnowledgeFrom),
+      to: parseDateInputToMs(bakeKnowledgeTo, true),
       limit: bakeKnowledgeLimit,
       offset: bakeKnowledgeOffset,
     }).then((data) => {
+      if (requestSeq !== knowledgeRequestSeqRef.current) return
       setKnowledgeItems(data.items)
       setKnowledgeTotal(data.total)
     }).catch((error) => {
+      if (requestSeq !== knowledgeRequestSeqRef.current) return
       setStatusMessage(error instanceof Error ? error.message : '知识加载失败')
     })
-  }, [bakeKnowledgeLimit, bakeKnowledgeOffset, bakeKnowledgeQuery, bakeTab, fetchKnowledge])
+  }, [bakeKnowledgeFrom, bakeKnowledgeLimit, bakeKnowledgeOffset, bakeKnowledgeQuery, bakeKnowledgeTo, bakeTab, fetchKnowledge])
 
   useEffect(() => {
     if (bakeTab !== 'templates') return
     void fetchTemplates({
       q: bakeTemplateQuery.trim() || undefined,
+      from: parseDateInputToMs(bakeTemplateFrom),
+      to: parseDateInputToMs(bakeTemplateTo, true),
       limit: bakeTemplateLimit,
       offset: bakeTemplateOffset,
     }).then((data) => {
@@ -165,12 +205,24 @@ const BakePanel: React.FC = () => {
     }).catch((error) => {
       setStatusMessage(error instanceof Error ? error.message : '模板加载失败')
     })
-  }, [bakeTab, bakeTemplateLimit, bakeTemplateOffset, bakeTemplateQuery, fetchTemplates])
+  }, [bakeTab, bakeTemplateFrom, bakeTemplateLimit, bakeTemplateOffset, bakeTemplateQuery, bakeTemplateTo, fetchTemplates])
+
+  useEffect(() => {
+    if (bakeTab !== 'templates' || !selectedTemplateId) return
+    if (templates.some(item => item.id === selectedTemplateId)) return
+    void fetchTemplate(selectedTemplateId).then((item) => {
+      setTemplates(prev => [item, ...prev.filter(existing => existing.id !== item.id)])
+    }).catch(() => {
+      setStatusMessage(`未找到文档 #${selectedTemplateId}`)
+    })
+  }, [bakeTab, fetchTemplate, selectedTemplateId, templates])
 
   useEffect(() => {
     if (bakeTab !== 'sop') return
     void fetchSops({
       q: bakeSopQuery.trim() || undefined,
+      from: parseDateInputToMs(bakeSopFrom),
+      to: parseDateInputToMs(bakeSopTo, true),
       limit: bakeSopLimit,
       offset: bakeSopOffset,
     }).then((data) => {
@@ -179,7 +231,7 @@ const BakePanel: React.FC = () => {
     }).catch((error) => {
       setStatusMessage(error instanceof Error ? error.message : '操作手册加载失败')
     })
-  }, [bakeSopLimit, bakeSopOffset, bakeSopQuery, bakeTab, fetchSops])
+  }, [bakeSopFrom, bakeSopLimit, bakeSopOffset, bakeSopQuery, bakeSopTo, bakeTab, fetchSops])
 
   useEffect(() => {
     if (!statusMessage) return
@@ -191,9 +243,44 @@ const BakePanel: React.FC = () => {
     setDraftKnowledgeQuery(bakeKnowledgeQuery)
   }, [bakeKnowledgeQuery])
 
+  useEffect(() => {
+    setDraftKnowledgeFrom(bakeKnowledgeFrom)
+  }, [bakeKnowledgeFrom])
+
+  useEffect(() => {
+    setDraftKnowledgeTo(bakeKnowledgeTo)
+  }, [bakeKnowledgeTo])
+
+  useEffect(() => {
+    setDraftTemplateQuery(bakeTemplateQuery)
+  }, [bakeTemplateQuery])
+
+  useEffect(() => {
+    setDraftTemplateFrom(bakeTemplateFrom)
+  }, [bakeTemplateFrom])
+
+  useEffect(() => {
+    setDraftTemplateTo(bakeTemplateTo)
+  }, [bakeTemplateTo])
+
+  useEffect(() => {
+    setDraftSopQuery(bakeSopQuery)
+  }, [bakeSopQuery])
+
+  useEffect(() => {
+    setDraftSopFrom(bakeSopFrom)
+  }, [bakeSopFrom])
+
+  useEffect(() => {
+    setDraftSopTo(bakeSopTo)
+  }, [bakeSopTo])
+
   const resolvedTemplateId = selectedTemplateId ?? templates[0]?.id ?? null
   const resolvedSopId = selectedSopId ?? sopCandidates[0]?.id ?? null
   const resolvedKnowledgeId = selectedKnowledgeId ?? knowledgeItems[0]?.id ?? null
+  const resolvedKnowledgeItem = knowledgeItems.find(item => item.id === resolvedKnowledgeId)
+  const resolvedSopItem = sopCandidates.find(item => item.id === resolvedSopId)
+  const memoryTitleById = useMemo(() => new Map(memoryItems.map(item => [item.id, item.title])), [memoryItems])
 
   const refreshOverview = async () => {
     const data = await fetchOverview()
@@ -210,6 +297,8 @@ const BakePanel: React.FC = () => {
   const refreshKnowledge = async (offset = bakeKnowledgeOffset) => {
     const data = await fetchKnowledge({
       q: bakeKnowledgeQuery.trim() || undefined,
+      from: parseDateInputToMs(bakeKnowledgeFrom),
+      to: parseDateInputToMs(bakeKnowledgeTo, true),
       limit: bakeKnowledgeLimit,
       offset,
     })
@@ -220,6 +309,8 @@ const BakePanel: React.FC = () => {
   const refreshTemplates = async (offset = bakeTemplateOffset) => {
     const data = await fetchTemplates({
       q: bakeTemplateQuery.trim() || undefined,
+      from: parseDateInputToMs(bakeTemplateFrom),
+      to: parseDateInputToMs(bakeTemplateTo, true),
       limit: bakeTemplateLimit,
       offset,
     })
@@ -230,6 +321,8 @@ const BakePanel: React.FC = () => {
   const refreshSops = async (offset = bakeSopOffset) => {
     const data = await fetchSops({
       q: bakeSopQuery.trim() || undefined,
+      from: parseDateInputToMs(bakeSopFrom),
+      to: parseDateInputToMs(bakeSopTo, true),
       limit: bakeSopLimit,
       offset,
     })
@@ -237,18 +330,102 @@ const BakePanel: React.FC = () => {
     setSopTotal(data.total)
   }
 
+  const currentNavigationTarget = () => ({
+    windowMode: 'bake' as const,
+    bakeTab,
+    selectedMemoryId,
+    selectedTemplateId: resolvedTemplateId,
+    selectedSopId: resolvedSopId,
+    selectedKnowledgeId: resolvedKnowledgeId,
+  })
+
+  const restoreNavigationTarget = (target: BakeNavigationTarget) => {
+    setWindowMode(target.windowMode)
+    if (target.bakeTab) setBakeTab(target.bakeTab)
+    if (target.repositoryTab) setRepositoryTab(target.repositoryTab)
+    if (target.selectedMemoryId !== undefined) setSelectedMemoryId(target.selectedMemoryId)
+    if (target.selectedTemplateId !== undefined) setSelectedTemplateId(target.selectedTemplateId)
+    if (target.selectedSopId !== undefined) setSelectedSopId(target.selectedSopId)
+    if (target.selectedKnowledgeId !== undefined) setSelectedKnowledgeId(target.selectedKnowledgeId)
+    if (target.selectedCaptureId !== undefined) setSelectedCaptureId(target.selectedCaptureId)
+    if (target.repositoryCaptureSourceCaptureId !== undefined) {
+      setRepositoryCaptureSourceCaptureId(target.repositoryCaptureSourceCaptureId)
+    }
+  }
+
+  const handleGoBack = () => {
+    const target = popBakeNavigationTarget()
+    if (!target) {
+      setStatusMessage('当前没有可返回的上一步页面')
+      return
+    }
+    restoreNavigationTarget(target)
+    setStatusMessage('已返回上一步页面')
+  }
+
   const handleSearchKnowledge = () => {
+    setSelectedKnowledgeId(null)
     useAppStore.setState({
       bakeKnowledgeQuery: draftKnowledgeQuery,
+      bakeKnowledgeFrom: draftKnowledgeFrom,
+      bakeKnowledgeTo: draftKnowledgeTo,
       bakeKnowledgeOffset: 0,
     })
   }
 
   const handleClearKnowledgeFilters = () => {
     setDraftKnowledgeQuery('')
+    setDraftKnowledgeFrom('')
+    setDraftKnowledgeTo('')
     useAppStore.setState({
       bakeKnowledgeQuery: '',
+      bakeKnowledgeFrom: '',
+      bakeKnowledgeTo: '',
       bakeKnowledgeOffset: 0,
+    })
+  }
+
+  const handleSearchTemplate = () => {
+    setSelectedTemplateId(null)
+    useAppStore.setState({
+      bakeTemplateQuery: draftTemplateQuery,
+      bakeTemplateFrom: draftTemplateFrom,
+      bakeTemplateTo: draftTemplateTo,
+      bakeTemplateOffset: 0,
+    })
+  }
+
+  const handleClearTemplateFilters = () => {
+    setDraftTemplateQuery('')
+    setDraftTemplateFrom('')
+    setDraftTemplateTo('')
+    useAppStore.setState({
+      bakeTemplateQuery: '',
+      bakeTemplateFrom: '',
+      bakeTemplateTo: '',
+      bakeTemplateOffset: 0,
+    })
+  }
+
+  const handleSearchSop = () => {
+    setSelectedSopId(null)
+    useAppStore.setState({
+      bakeSopQuery: draftSopQuery,
+      bakeSopFrom: draftSopFrom,
+      bakeSopTo: draftSopTo,
+      bakeSopOffset: 0,
+    })
+  }
+
+  const handleClearSopFilters = () => {
+    setDraftSopQuery('')
+    setDraftSopFrom('')
+    setDraftSopTo('')
+    useAppStore.setState({
+      bakeSopQuery: '',
+      bakeSopFrom: '',
+      bakeSopTo: '',
+      bakeSopOffset: 0,
     })
   }
 
@@ -266,25 +443,9 @@ const BakePanel: React.FC = () => {
     }
   }
 
-  const handleCopy = async (text: string, successMessage: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
-      setStatusMessage(successMessage)
-    } catch {
-      setStatusMessage('复制失败，请稍后重试')
-    }
-  }
-
   const handleOpenLink = (url?: string, sourceCaptureId?: string) => {
     if (sourceCaptureId) {
-      setCaptureBackTarget({
-        windowMode: 'bake',
-        bakeTab,
-        selectedMemoryId,
-        selectedTemplateId: resolvedTemplateId,
-        selectedSopId: resolvedSopId,
-        selectedKnowledgeId: resolvedKnowledgeId,
-      })
+      pushBakeNavigationTarget(currentNavigationTarget())
       setWindowMode('knowledge')
       setRepositoryTab('capture')
       setRepositoryCaptureSourceCaptureId(sourceCaptureId)
@@ -348,6 +509,7 @@ const BakePanel: React.FC = () => {
       setStatusMessage('当前模板还没有关联来源时间线')
       return
     }
+    pushBakeNavigationTarget(currentNavigationTarget())
     setWindowMode('knowledge')
     setRepositoryTab('memory')
     setSelectedMemoryId(memoryId)
@@ -360,6 +522,7 @@ const BakePanel: React.FC = () => {
       setStatusMessage('当前时间线还没有被提炼为文档')
       return
     }
+    pushBakeNavigationTarget(currentNavigationTarget())
     setBakeTab('templates')
     setBakeTemplateOffset(0)
     setSelectedTemplateId(relatedDoc.id)
@@ -367,9 +530,14 @@ const BakePanel: React.FC = () => {
   }
 
   const handleViewLinkedKnowledge = (knowledgeId: string) => {
+    pushBakeNavigationTarget(currentNavigationTarget())
     setBakeTab('knowledge')
-    setBakeKnowledgeQuery('')
-    setBakeKnowledgeOffset(0)
+    useAppStore.setState({
+      bakeKnowledgeQuery: '',
+      bakeKnowledgeFrom: '',
+      bakeKnowledgeTo: '',
+      bakeKnowledgeOffset: 0,
+    })
     setSelectedKnowledgeId(knowledgeId)
     setStatusMessage('已切换到关联知识')
   }
@@ -453,6 +621,15 @@ const BakePanel: React.FC = () => {
         </div>
       )}
       <BakeHeader />
+      {bakeNavigationStack.length > 0 && (
+        <div className="bake-backbar">
+          <span>可以返回上一步页面</span>
+          <BakeButton compact onClick={handleGoBack}>
+            <ArrowLeft size={14} />
+            返回上一步
+          </BakeButton>
+        </div>
+      )}
       {statusMessage && <div className="bake-inline-message">{statusMessage}</div>}
 
       {/* 模型未就绪提示 */}
@@ -486,6 +663,7 @@ const BakePanel: React.FC = () => {
             overview={overview}
             onOpenTab={setBakeTab}
             onOpenRepository={(tab) => {
+              pushBakeNavigationTarget(currentNavigationTarget())
               setWindowMode('knowledge')
               setRepositoryTab(tab)
             }}
@@ -499,15 +677,22 @@ const BakePanel: React.FC = () => {
             limit={bakeKnowledgeLimit}
             query={bakeKnowledgeQuery}
             draftQuery={draftKnowledgeQuery}
+            from={bakeKnowledgeFrom}
+            to={bakeKnowledgeTo}
+            draftFrom={draftKnowledgeFrom}
+            draftTo={draftKnowledgeTo}
             selectedKnowledgeId={resolvedKnowledgeId}
             onSelectKnowledge={setSelectedKnowledgeId}
             onPageChange={setBakeKnowledgeOffset}
             onLimitChange={setBakeKnowledgeLimit}
             onDraftQueryChange={setDraftKnowledgeQuery}
+            onDraftFromChange={setDraftKnowledgeFrom}
+            onDraftToChange={setDraftKnowledgeTo}
             onSearch={handleSearchKnowledge}
             onClearFilters={handleClearKnowledgeFilters}
             onDeleteKnowledge={handleDeleteKnowledge}
             onViewSourceTimeline={handleViewSourceMemory}
+            sourceTimelineTitle={resolvedKnowledgeItem?.sourceTimelineId ? memoryTitleById.get(resolvedKnowledgeItem.sourceTimelineId) : undefined}
             onCreateKnowledge={(knowledge) => {
               setStatusMessage('手工录入功能需要后端API支持，当前仅为UI演示')
             }}
@@ -516,14 +701,7 @@ const BakePanel: React.FC = () => {
                 setStatusMessage('当前内容暂无关联采集记录')
                 return
               }
-              setCaptureBackTarget({
-                windowMode: 'bake',
-                bakeTab,
-                selectedMemoryId,
-                selectedTemplateId: resolvedTemplateId,
-                selectedSopId: resolvedSopId,
-                selectedKnowledgeId: resolvedKnowledgeId,
-              })
+              pushBakeNavigationTarget(currentNavigationTarget())
               setWindowMode('knowledge')
               setRepositoryTab('capture')
               setRepositoryCaptureSourceCaptureId(captureId)
@@ -539,6 +717,11 @@ const BakePanel: React.FC = () => {
             offset={bakeTemplateOffset}
             limit={bakeTemplateLimit}
             query={bakeTemplateQuery}
+            from={bakeTemplateFrom}
+            to={bakeTemplateTo}
+            draftQuery={draftTemplateQuery}
+            draftFrom={draftTemplateFrom}
+            draftTo={draftTemplateTo}
             selectedTemplateId={resolvedTemplateId}
             onSelectTemplate={setSelectedTemplateId}
             onCreateTemplate={handleCreateTemplate}
@@ -546,9 +729,14 @@ const BakePanel: React.FC = () => {
             onToggleTemplateStatus={handleToggleTemplateStatus}
             onDeleteTemplate={handleDeleteTemplate}
             onViewSourceMemory={handleViewSourceMemory}
+            memoryTitleById={memoryTitleById}
             onPageChange={setBakeTemplateOffset}
             onLimitChange={setBakeTemplateLimit}
-            onQueryChange={setBakeTemplateQuery}
+            onDraftQueryChange={setDraftTemplateQuery}
+            onDraftFromChange={setDraftTemplateFrom}
+            onDraftToChange={setDraftTemplateTo}
+            onSearch={handleSearchTemplate}
+            onClearFilters={handleClearTemplateFilters}
           />
         )}
         {bakeTab === 'sop' && (
@@ -558,18 +746,26 @@ const BakePanel: React.FC = () => {
             offset={bakeSopOffset}
             limit={bakeSopLimit}
             query={bakeSopQuery}
+            from={bakeSopFrom}
+            to={bakeSopTo}
+            draftQuery={draftSopQuery}
+            draftFrom={draftSopFrom}
+            draftTo={draftSopTo}
             selectedSopId={resolvedSopId}
             onSelectSop={setSelectedSopId}
             onDeleteSop={handleDeleteSop}
-            onViewLinkedKnowledge={handleViewLinkedKnowledge}
             onViewSourceTimeline={handleViewSourceMemory}
-            onCopySteps={(candidate: SopCandidate) => handleCopy(candidate.steps.map((step, idx) => `${idx + 1}. ${step}`).join('\n'), '已复制流程步骤')}
+            sourceTimelineTitle={resolvedSopItem?.sourceTimelineId ? memoryTitleById.get(resolvedSopItem.sourceTimelineId) : undefined}
             onCreateSop={(sop) => {
               setStatusMessage('手工录入功能需要后端API支持，当前仅为UI演示')
             }}
             onPageChange={setBakeSopOffset}
             onLimitChange={setBakeSopLimit}
-            onQueryChange={setBakeSopQuery}
+            onDraftQueryChange={setDraftSopQuery}
+            onDraftFromChange={setDraftSopFrom}
+            onDraftToChange={setDraftSopTo}
+            onSearch={handleSearchSop}
+            onClearFilters={handleClearSopFilters}
           />
         )}
       </div>

@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::storage::repo::privacy;
 use crate::storage::StorageManager;
@@ -21,6 +21,7 @@ pub struct BlacklistChecker {
 
 struct BlacklistCache {
     bundle_ids: HashSet<String>,
+    app_names: HashSet<String>,
     last_refresh: Instant,
 }
 
@@ -31,6 +32,7 @@ impl BlacklistChecker {
             storage,
             cache: Arc::new(RwLock::new(BlacklistCache {
                 bundle_ids: HashSet::new(),
+                app_names: HashSet::new(),
                 last_refresh: Instant::now() - CACHE_REFRESH_INTERVAL, // 强制首次加载
             })),
         };
@@ -45,6 +47,15 @@ impl BlacklistChecker {
 
     /// 检查指定 Bundle ID 是否在黑名单中
     pub fn is_blacklisted(&self, bundle_id: &str) -> bool {
+        self.is_blacklisted_by_bundle_or_name(Some(bundle_id), None)
+    }
+
+    /// 检查指定 Bundle ID 或应用名是否在黑名单中
+    pub fn is_blacklisted_by_bundle_or_name(
+        &self,
+        bundle_id: Option<&str>,
+        app_name: Option<&str>,
+    ) -> bool {
         // 检查是否需要刷新缓存
         {
             let cache = self.cache.read().unwrap();
@@ -58,17 +69,26 @@ impl BlacklistChecker {
 
         // 查询缓存
         let cache = self.cache.read().unwrap();
-        cache.bundle_ids.contains(bundle_id)
+        bundle_id
+            .filter(|id| cache.bundle_ids.contains(*id))
+            .is_some()
+            || app_name
+                .filter(|name| cache.app_names.contains(*name))
+                .is_some()
     }
 
     /// 从数据库刷新缓存
     fn refresh_cache(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let bundle_ids = self
+        let entries = self
             .storage
-            .with_conn(|conn| privacy::get_enabled_blacklist_bundle_ids(conn))?;
+            .with_conn(|conn| privacy::get_enabled_blacklist_entries(conn))?;
 
         let mut cache = self.cache.write().unwrap();
-        cache.bundle_ids = bundle_ids;
+        cache.bundle_ids = entries
+            .iter()
+            .map(|(bundle_id, _)| bundle_id.clone())
+            .collect();
+        cache.app_names = entries.into_iter().map(|(_, app_name)| app_name).collect();
         cache.last_refresh = Instant::now();
 
         debug!("黑名单缓存已刷新，共 {} 个应用", cache.bundle_ids.len());

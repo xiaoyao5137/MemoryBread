@@ -3,10 +3,21 @@ import {
   useFetchBakeMemories,
   useFetchBakeCaptureDetail,
   useFetchBakeCaptures,
+  useFetchBakeKnowledge,
+  useFetchBakeSops,
+  useFetchBakeTemplates,
   useFetchCaptures,
 } from '../hooks/useApi'
-import { useAppStore } from '../store/useAppStore'
-import type { BakeCaptureItem, TimelineItem, RepositoryTab, CaptureRecord } from '../types'
+import { useAppStore, type BakeNavigationTarget } from '../store/useAppStore'
+import type {
+  ArticleTemplate,
+  BakeCaptureItem,
+  BakeKnowledgeItem,
+  CaptureRecord,
+  RepositoryTab,
+  SopCandidate,
+  TimelineItem,
+} from '../types'
 import BakeCaptureTab, { parseDateInputToMs } from './bake/BakeCaptureTab'
 import BakeHeader from './bake/BakeHeader'
 import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './bake/BakeShared'
@@ -43,6 +54,9 @@ const RepositoryPanel: React.FC = () => {
     repositoryCaptureTo,
     repositoryCaptureLimit,
     repositoryCaptureSourceCaptureId,
+    selectedTemplateId,
+    selectedSopId,
+    selectedKnowledgeId,
     setWindowMode,
     setBakeTab,
     setRepositoryTab,
@@ -57,14 +71,18 @@ const RepositoryPanel: React.FC = () => {
     setRepositoryCaptureLimit,
     setRepositoryCaptureSourceCaptureId,
     captureBackTarget,
-    setCaptureBackTarget,
-    clearCaptureBackTarget,
+    bakeNavigationStack,
+    pushBakeNavigationTarget,
+    popBakeNavigationTarget,
   } = useAppStore()
 
   const fetchMemories = useFetchBakeMemories()
   const fetchCaptures = useFetchBakeCaptures()
   const fetchCaptureDetail = useFetchBakeCaptureDetail()
   const fetchCapturesRaw = useFetchCaptures()
+  const fetchTemplates = useFetchBakeTemplates()
+  const fetchKnowledge = useFetchBakeKnowledge()
+  const fetchSops = useFetchBakeSops()
 
   const [memories, setMemories] = useState<TimelineItem[]>([])
   const [memoryTotal, setMemoryTotal] = useState(0)
@@ -72,6 +90,12 @@ const RepositoryPanel: React.FC = () => {
   const [captureTotal, setCaptureTotal] = useState(0)
   const [captureDetail, setCaptureDetail] = useState<BakeCaptureItem | null>(null)
   const [memoryCaptures, setMemoryCaptures] = useState<CaptureRecord[]>([])
+  const [selectedMemoryRelations, setSelectedMemoryRelations] = useState<{
+    document: ArticleTemplate | null
+    knowledge: BakeKnowledgeItem | null
+    sop: SopCandidate | null
+    loading: boolean
+  }>({ document: null, knowledge: null, sop: null, loading: false })
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
   const [memoryPageInput, setMemoryPageInput] = useState('')
   const [draftMemoryQuery, setDraftMemoryQuery] = useState(repositoryMemoryQuery)
@@ -80,9 +104,13 @@ const RepositoryPanel: React.FC = () => {
   const [draftCaptureQuery, setDraftCaptureQuery] = useState(repositoryCaptureQuery)
   const [draftCaptureFrom, setDraftCaptureFrom] = useState(repositoryCaptureFrom)
   const [draftCaptureTo, setDraftCaptureTo] = useState(repositoryCaptureTo)
+  const memoryRequestSeqRef = useRef(0)
+  const captureRequestSeqRef = useRef(0)
 
   useEffect(() => {
     if (repositoryTab !== 'memory') return
+    const requestSeq = memoryRequestSeqRef.current + 1
+    memoryRequestSeqRef.current = requestSeq
     void fetchMemories({
       q: repositoryMemoryQuery.trim() || undefined,
       from: parseDateInputToMs(repositoryMemoryFrom),
@@ -90,9 +118,11 @@ const RepositoryPanel: React.FC = () => {
       limit: repositoryMemoryLimit,
       offset: bakeMemoryOffset,
     }).then((data) => {
+      if (requestSeq !== memoryRequestSeqRef.current) return
       setMemories(data.items)
       setMemoryTotal(data.total)
     }).catch((error) => {
+      if (requestSeq !== memoryRequestSeqRef.current) return
       setStatusMessage(error instanceof Error ? error.message : '时间线加载失败')
     })
   }, [
@@ -107,6 +137,8 @@ const RepositoryPanel: React.FC = () => {
 
   useEffect(() => {
     if (repositoryTab !== 'capture') return
+    const requestSeq = captureRequestSeqRef.current + 1
+    captureRequestSeqRef.current = requestSeq
     void fetchCaptures({
       q: repositoryCaptureQuery.trim() || undefined,
       from: parseDateInputToMs(repositoryCaptureFrom),
@@ -115,9 +147,11 @@ const RepositoryPanel: React.FC = () => {
       limit: repositoryCaptureLimit,
       offset: bakeCaptureOffset,
     }).then((data) => {
+      if (requestSeq !== captureRequestSeqRef.current) return
       setCaptureItems(data.items)
       setCaptureTotal(data.total)
     }).catch((error) => {
+      if (requestSeq !== captureRequestSeqRef.current) return
       setStatusMessage(error instanceof Error ? error.message : '采集记录加载失败')
     })
   }, [
@@ -159,6 +193,10 @@ const RepositoryPanel: React.FC = () => {
     setDraftCaptureTo(repositoryCaptureTo)
   }, [repositoryCaptureFrom, repositoryCaptureQuery, repositoryCaptureTo])
 
+  const resolvedMemoryId = selectedMemoryId ?? memories[0]?.id ?? null
+  const resolvedCaptureId = selectedCaptureId ?? captureItems[0]?.id ?? null
+  const selectedMemory = memories.find(item => item.id === resolvedMemoryId) ?? (selectedMemoryId ? null : memories[0] ?? null)
+
   useEffect(() => {
     if (repositoryTab !== 'memory') return
     if (memories.length === 0) return
@@ -167,14 +205,54 @@ const RepositoryPanel: React.FC = () => {
     }
   }, [memories, repositoryTab, selectedMemoryId, setSelectedMemoryId])
 
+  useEffect(() => {
+    if (repositoryTab !== 'memory' || !resolvedMemoryId) {
+      setSelectedMemoryRelations({ document: null, knowledge: null, sop: null, loading: false })
+      return
+    }
+
+    let cancelled = false
+    setSelectedMemoryRelations(prev => ({ ...prev, loading: true }))
+    void Promise.all([
+      fetchTemplates({ limit: 1000 }),
+      fetchKnowledge({ limit: 1000 }),
+      fetchSops({ limit: 1000 }),
+    ]).then(([templateData, knowledgeData, sopData]) => {
+      if (cancelled) return
+      setSelectedMemoryRelations({
+        document: templateData.items.find(template => template.sourceMemoryIds.includes(resolvedMemoryId)) ?? null,
+        knowledge: knowledgeData.items.find(item => item.sourceTimelineId === resolvedMemoryId) ?? null,
+        sop: sopData.items.find(item => item.sourceTimelineId === resolvedMemoryId) ?? null,
+        loading: false,
+      })
+    }).catch(() => {
+      if (!cancelled) {
+        setSelectedMemoryRelations({ document: null, knowledge: null, sop: null, loading: false })
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [fetchKnowledge, fetchSops, fetchTemplates, repositoryTab, resolvedMemoryId])
+
   const fetchedForIdRef = useRef<string | null>(null)
   useEffect(() => {
     if (!selectedMemoryId || repositoryTab !== 'memory') return
+    if (repositoryMemoryQuery.trim() || repositoryMemoryFrom || repositoryMemoryTo) return
     if (memories.some(m => m.id === selectedMemoryId)) return
     if (fetchedForIdRef.current === selectedMemoryId) return
     fetchedForIdRef.current = selectedMemoryId
     void fetchMemories({ limit: 500, offset: 0 }).then(data => setMemories(data.items))
-  }, [selectedMemoryId, repositoryTab, memories, fetchMemories])
+  }, [
+    selectedMemoryId,
+    repositoryTab,
+    repositoryMemoryQuery,
+    repositoryMemoryFrom,
+    repositoryMemoryTo,
+    memories,
+    fetchMemories,
+  ])
 
   useEffect(() => {
     if (repositoryTab !== 'capture') return
@@ -199,20 +277,17 @@ const RepositoryPanel: React.FC = () => {
     }).catch(() => setMemoryCaptures([]))
   }, [selectedMemoryId, memories, fetchCapturesRaw])
 
-  const resolvedMemoryId = selectedMemoryId ?? memories[0]?.id ?? null
-  const resolvedCaptureId = selectedCaptureId ?? captureItems[0]?.id ?? null
-  const selectedMemory = memories.find(item => item.id === resolvedMemoryId) ?? (selectedMemoryId ? null : memories[0] ?? null)
   const memoryPage = Math.floor(bakeMemoryOffset / repositoryMemoryLimit) + 1
   const memoryTotalPages = Math.max(1, Math.ceil(memoryTotal / repositoryMemoryLimit))
   const memoryFilterPills = useMemo(() => {
     const pills: string[] = []
-    if (repositoryMemoryQuery.trim()) pills.push(`关键词：${repositoryMemoryQuery.trim()}`)
     if (repositoryMemoryFrom) pills.push(`开始：${repositoryMemoryFrom}`)
     if (repositoryMemoryTo) pills.push(`结束：${repositoryMemoryTo}`)
     return pills
-  }, [repositoryMemoryFrom, repositoryMemoryQuery, repositoryMemoryTo])
+  }, [repositoryMemoryFrom, repositoryMemoryTo])
 
   const handleSearchMemories = () => {
+    setSelectedMemoryId(null)
     useAppStore.setState({
       repositoryMemoryQuery: draftMemoryQuery,
       repositoryMemoryFrom: draftMemoryFrom,
@@ -234,6 +309,8 @@ const RepositoryPanel: React.FC = () => {
   }
 
   const handleSearchCaptures = () => {
+    setSelectedCaptureId(null)
+    setCaptureDetail(null)
     useAppStore.setState({
       repositoryCaptureQuery: draftCaptureQuery,
       repositoryCaptureFrom: draftCaptureFrom,
@@ -255,28 +332,94 @@ const RepositoryPanel: React.FC = () => {
     })
   }
 
+  const currentNavigationTarget = () => ({
+    windowMode: 'knowledge' as const,
+    repositoryTab,
+    selectedMemoryId: resolvedMemoryId,
+    selectedCaptureId: resolvedCaptureId,
+    selectedTemplateId,
+    selectedSopId,
+    selectedKnowledgeId,
+    repositoryCaptureSourceCaptureId,
+  })
+
+  const restoreNavigationTarget = (target: BakeNavigationTarget) => {
+    setWindowMode(target.windowMode)
+    if (target.bakeTab) setBakeTab(target.bakeTab)
+    if (target.repositoryTab) setRepositoryTab(target.repositoryTab)
+    if (target.selectedMemoryId !== undefined) setSelectedMemoryId(target.selectedMemoryId)
+    if (target.selectedTemplateId !== undefined) setSelectedTemplateId(target.selectedTemplateId)
+    if (target.selectedSopId !== undefined) setSelectedSopId(target.selectedSopId)
+    if (target.selectedKnowledgeId !== undefined) setSelectedKnowledgeId(target.selectedKnowledgeId)
+    if (target.selectedCaptureId !== undefined) setSelectedCaptureId(target.selectedCaptureId)
+    if (target.repositoryCaptureSourceCaptureId !== undefined) {
+      setRepositoryCaptureSourceCaptureId(target.repositoryCaptureSourceCaptureId)
+    }
+  }
+
   const handleViewLinkedKnowledge = (knowledgeId?: string | null) => {
     if (!knowledgeId) {
       setStatusMessage('当前时间线尚未提炼出 bake 知识')
       return
     }
+    pushBakeNavigationTarget(currentNavigationTarget())
     setWindowMode('bake')
     setBakeTab('knowledge')
-    setSelectedKnowledgeId(null)
-    setStatusMessage('已切换到已提炼知识页；来源 knowledge 不在这里展示')
+    setSelectedKnowledgeId(knowledgeId)
+    setStatusMessage('已切换到关联知识')
   }
 
   const handleViewRelatedDocument = async (timelineId: string) => {
     try {
-      const { items: templates } = await fetchMemories({ limit: 1000 })
-      // Note: This requires API support for fetching templates with sourceMemoryIds
-      // For now, we'll navigate to templates tab and let user search
+      const { items: templates } = await fetchTemplates({ limit: 1000 })
+      const relatedDoc = templates.find(template => template.sourceMemoryIds.includes(timelineId))
+      if (!relatedDoc) {
+        setStatusMessage('当前时间线还没有关联文档')
+        return
+      }
+      pushBakeNavigationTarget(currentNavigationTarget())
       setWindowMode('bake')
       setBakeTab('templates')
-      setSelectedTemplateId(null)
-      setStatusMessage('已切换到文档页，请在该页面中查找关联文档')
+      setSelectedTemplateId(relatedDoc.id)
+      setStatusMessage(`已切换到关联文档「${relatedDoc.title}」`)
     } catch (error) {
       setStatusMessage('查询关联文档失败')
+    }
+  }
+
+  const handleViewRelatedKnowledge = async (timelineId: string) => {
+    try {
+      const { items: knowledgeItems } = await fetchKnowledge({ limit: 1000 })
+      const relatedKnowledge = knowledgeItems.find(item => item.sourceTimelineId === timelineId)
+      if (!relatedKnowledge) {
+        setStatusMessage('当前时间线还没有关联知识')
+        return
+      }
+      pushBakeNavigationTarget(currentNavigationTarget())
+      setWindowMode('bake')
+      setBakeTab('knowledge')
+      setSelectedKnowledgeId(relatedKnowledge.id)
+      setStatusMessage(`已切换到关联知识「${relatedKnowledge.summary}」`)
+    } catch {
+      setStatusMessage('查询关联知识失败')
+    }
+  }
+
+  const handleViewRelatedSop = async (timelineId: string) => {
+    try {
+      const { items: sops } = await fetchSops({ limit: 1000 })
+      const relatedSop = sops.find(item => item.sourceTimelineId === timelineId)
+      if (!relatedSop) {
+        setStatusMessage('当前时间线还没有关联操作')
+        return
+      }
+      pushBakeNavigationTarget(currentNavigationTarget())
+      setWindowMode('bake')
+      setBakeTab('sop')
+      setSelectedSopId(relatedSop.id)
+      setStatusMessage(`已切换到关联操作「${relatedSop.extractedProblem || relatedSop.sourceTitle || relatedSop.id}」`)
+    } catch {
+      setStatusMessage('查询关联操作失败')
     }
   }
 
@@ -285,6 +428,7 @@ const RepositoryPanel: React.FC = () => {
       setStatusMessage('该采集尚未归入任何时间线')
       return
     }
+    pushBakeNavigationTarget(currentNavigationTarget())
     setWindowMode('knowledge')
     setRepositoryTab('memory')
     setSelectedMemoryId(timelineId)
@@ -297,25 +441,9 @@ const RepositoryPanel: React.FC = () => {
       return
     }
 
-    const target = captureBackTarget
-    clearCaptureBackTarget()
-
-    if (target.windowMode === 'bake') {
-      setWindowMode('bake')
-      if (target.bakeTab) setBakeTab(target.bakeTab)
-      if (target.selectedMemoryId !== undefined) setSelectedMemoryId(target.selectedMemoryId)
-      if (target.selectedTemplateId !== undefined) setSelectedTemplateId(target.selectedTemplateId)
-      if (target.selectedSopId !== undefined) setSelectedSopId(target.selectedSopId)
-      if (target.selectedKnowledgeId !== undefined) setSelectedKnowledgeId(target.selectedKnowledgeId)
-      setStatusMessage('已返回上一步页面')
-      return
-    }
-
-    setWindowMode('knowledge')
-    if (target.repositoryTab) setRepositoryTab(target.repositoryTab)
-    if (target.selectedMemoryId !== undefined) setSelectedMemoryId(target.selectedMemoryId)
-    if (target.selectedCaptureId !== undefined) setSelectedCaptureId(target.selectedCaptureId)
-    setRepositoryCaptureSourceCaptureId(target.repositoryCaptureSourceCaptureId ?? null)
+    const target = popBakeNavigationTarget()
+    if (!target) return
+    restoreNavigationTarget(target)
     setStatusMessage('已返回上一步页面')
   }
 
@@ -326,7 +454,13 @@ const RepositoryPanel: React.FC = () => {
 
   return (
     <div className="bake-panel">
-      <BakeHeader title="采集" subtitle="集中浏览时间线与采集记录，只做回溯原始上下文" />
+      <BakeHeader title="采集" subtitle="" />
+      {bakeNavigationStack.length > 0 && (
+        <div className="bake-backbar">
+          <span>可以返回上一步页面</span>
+          <BakeButton compact onClick={handleCaptureGoBack}>返回上一步</BakeButton>
+        </div>
+      )}
       {statusMessage && <div className="bake-inline-message">{statusMessage}</div>}
       <section className="bake-tabs bake-tabs--scroll">
         {tabs.map(tab => (
@@ -402,7 +536,6 @@ const RepositoryPanel: React.FC = () => {
             <BakeCard className="bake-memory-list-card bake-memory-list-card--fixed">
               <BakeSectionHeader
                 title="时间线"
-                subtitle="只做浏览与回溯，不在这里执行提炼动作"
               />
 
               {memories.length === 0 ? (
@@ -492,7 +625,6 @@ const RepositoryPanel: React.FC = () => {
                         <div className="bake-title" style={{ fontSize: 20, lineHeight: 1.4 }}>{selectedMemory.title}</div>
                         <div className="bake-muted bake-line-clamp-1" style={{ marginTop: 6 }}>{selectedMemory.url || `时间线 #${selectedMemory.id || '—'}`}</div>
                       </div>
-                      <BakePill text="时间线浏览" />
                     </div>
                     <div className="bake-memory-detail__stats">
                       <span className="bake-stat-chip">创建于 {formatMemoryTime(selectedMemory)}</span>
@@ -571,7 +703,7 @@ const RepositoryPanel: React.FC = () => {
                                         href="#"
                                         onClick={(e) => {
                                           e.preventDefault()
-                                          setCaptureBackTarget({
+                                          pushBakeNavigationTarget({
                                             windowMode: 'knowledge',
                                             repositoryTab: 'memory',
                                             selectedMemoryId: selectedMemory.id,
@@ -600,7 +732,6 @@ const RepositoryPanel: React.FC = () => {
                   <div className="bake-memory-action-card bake-memory-action-card--secondary">
                     <div>
                       <div className="bake-kv__title">回溯</div>
-                      <div className="bake-muted" style={{ marginTop: 4, lineHeight: 1.7 }}>从采集中的时间线跳到来源采集记录，或回到收藏查看已提炼出的知识、模板与 SOP。</div>
                     </div>
                     <div className="bake-actions bake-actions--secondary bake-memory-detail__action-copy">
                       <BakeButton compact onClick={() => {
@@ -608,7 +739,7 @@ const RepositoryPanel: React.FC = () => {
                           setStatusMessage('当前时间线暂无来源采集记录')
                           return
                         }
-                        setCaptureBackTarget({
+                        pushBakeNavigationTarget({
                           windowMode: 'knowledge',
                           repositoryTab: 'memory',
                           selectedMemoryId: selectedMemory.id,
@@ -618,8 +749,35 @@ const RepositoryPanel: React.FC = () => {
                         setSelectedCaptureId(selectedMemory.sourceCaptureId)
                         setStatusMessage('已切换到来源采集记录')
                       }}>来源采集记录</BakeButton>
-                      <BakeButton compact onClick={() => handleViewLinkedKnowledge(selectedMemory.sourceTimelineId)}>关联时间线</BakeButton>
                       <BakeButton compact onClick={() => handleViewRelatedDocument(selectedMemory.id)}>关联文档</BakeButton>
+                      <BakeButton compact onClick={() => handleViewRelatedKnowledge(selectedMemory.id)}>关联知识</BakeButton>
+                      <BakeButton compact onClick={() => handleViewRelatedSop(selectedMemory.id)}>关联操作</BakeButton>
+                    </div>
+                    <div className="bake-related-summary">
+                      <div className="bake-related-row">
+                        <span className="bake-related-row__label">来源采集记录</span>
+                        <span className="bake-related-row__value">{selectedMemory.sourceCaptureId ? `采集记录 #${selectedMemory.sourceCaptureId}` : '暂无'}</span>
+                      </div>
+                      <div className="bake-related-row">
+                        <span className="bake-related-row__label">关联文档</span>
+                        <span className="bake-related-row__value">
+                          {selectedMemoryRelations.loading ? '查询中...' : selectedMemoryRelations.document?.title ?? '暂无'}
+                        </span>
+                      </div>
+                      <div className="bake-related-row">
+                        <span className="bake-related-row__label">关联知识</span>
+                        <span className="bake-related-row__value">
+                          {selectedMemoryRelations.loading ? '查询中...' : selectedMemoryRelations.knowledge?.summary ?? '暂无'}
+                        </span>
+                      </div>
+                      <div className="bake-related-row">
+                        <span className="bake-related-row__label">关联操作</span>
+                        <span className="bake-related-row__value">
+                          {selectedMemoryRelations.loading
+                            ? '查询中...'
+                            : selectedMemoryRelations.sop?.extractedProblem || selectedMemoryRelations.sop?.sourceTitle || '暂无'}
+                        </span>
+                      </div>
                     </div>
                   </div>
                 </div>

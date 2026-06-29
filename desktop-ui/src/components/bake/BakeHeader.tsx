@@ -13,7 +13,7 @@ const BakeHeader: React.FC<{
       <div className="bake-header">
         <div>
           <h1 className="bake-title">{title}</h1>
-          <p className="bake-subtitle">{subtitle}</p>
+          {subtitle && <p className="bake-subtitle">{subtitle}</p>}
         </div>
       </div>
     </BakeCard>

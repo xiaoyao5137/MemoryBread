@@ -11,6 +11,15 @@ use crate::storage::{
     StorageManager,
 };
 
+fn keyword_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| ch.is_whitespace() || ch.is_ascii_punctuation())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 写操作
 // ─────────────────────────────────────────────────────────────────────────────
@@ -200,12 +209,17 @@ impl StorageManager {
                         c.is_sensitive, c.pii_scrubbed, c.screenshot_source, c.url, c.webpage_title
                  FROM captures c",
             );
-            let query_pattern = filter.query.as_ref().map(|value| format!("%{}%", value));
+            let query_terms = filter.query.as_ref().map(|value| keyword_terms(value)).unwrap_or_default();
             sql.push_str(" WHERE ");
 
             let mut wheres: Vec<String> = Vec::new();
-            if filter.query.is_some() {
-                wheres.push("(COALESCE(c.win_title, '') LIKE ? OR c.id IN (SELECT rowid FROM captures_fts WHERE captures_fts MATCH ?))".into());
+            if !query_terms.is_empty() {
+                let query_clause = query_terms
+                    .iter()
+                    .map(|_| "(COALESCE(c.win_title, '') LIKE ? OR COALESCE(c.webpage_title, '') LIKE ? OR COALESCE(c.url, '') LIKE ? OR COALESCE(c.ax_text, '') LIKE ? OR COALESCE(c.ocr_text, '') LIKE ? OR COALESCE(c.input_text, '') LIKE ? OR COALESCE(c.audio_text, '') LIKE ?)".to_string())
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                wheres.push(format!("({})", query_clause));
             }
             if filter.from_ts.is_some() { wheres.push("c.ts >= ?".into()); }
             if filter.to_ts.is_some() { wheres.push("c.ts <= ?".into()); }
@@ -219,11 +233,11 @@ impl StorageManager {
 
             let mut stmt = conn.prepare(&sql)?;
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-            if let Some(ref pattern) = query_pattern {
-                bind_values.push(Box::new(pattern.clone()));
-            }
-            if let Some(ref query) = filter.query {
-                bind_values.push(Box::new(query.clone()));
+            for term in &query_terms {
+                let pattern = format!("%{}%", term);
+                for _ in 0..7 {
+                    bind_values.push(Box::new(pattern.clone()));
+                }
             }
             if let Some(v) = filter.from_ts { bind_values.push(Box::new(v)); }
             if let Some(v) = filter.to_ts { bind_values.push(Box::new(v)); }
@@ -244,12 +258,17 @@ impl StorageManager {
     pub fn count_captures(&self, filter: &CaptureFilter) -> Result<i64, StorageError> {
         self.with_conn(|conn| {
             let mut sql = String::from("SELECT COUNT(*) FROM captures c");
-            let query_pattern = filter.query.as_ref().map(|value| format!("%{}%", value));
+            let query_terms = filter.query.as_ref().map(|value| keyword_terms(value)).unwrap_or_default();
             sql.push_str(" WHERE ");
 
             let mut wheres: Vec<String> = Vec::new();
-            if filter.query.is_some() {
-                wheres.push("(COALESCE(c.win_title, '') LIKE ? OR c.id IN (SELECT rowid FROM captures_fts WHERE captures_fts MATCH ?))".into());
+            if !query_terms.is_empty() {
+                let query_clause = query_terms
+                    .iter()
+                    .map(|_| "(COALESCE(c.win_title, '') LIKE ? OR COALESCE(c.webpage_title, '') LIKE ? OR COALESCE(c.url, '') LIKE ? OR COALESCE(c.ax_text, '') LIKE ? OR COALESCE(c.ocr_text, '') LIKE ? OR COALESCE(c.input_text, '') LIKE ? OR COALESCE(c.audio_text, '') LIKE ?)".to_string())
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                wheres.push(format!("({})", query_clause));
             }
             if filter.from_ts.is_some() { wheres.push("c.ts >= ?".into()); }
             if filter.to_ts.is_some() { wheres.push("c.ts <= ?".into()); }
@@ -262,11 +281,11 @@ impl StorageManager {
 
             let mut stmt = conn.prepare(&sql)?;
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-            if let Some(ref pattern) = query_pattern {
-                bind_values.push(Box::new(pattern.clone()));
-            }
-            if let Some(ref query) = filter.query {
-                bind_values.push(Box::new(query.clone()));
+            for term in &query_terms {
+                let pattern = format!("%{}%", term);
+                for _ in 0..7 {
+                    bind_values.push(Box::new(pattern.clone()));
+                }
             }
             if let Some(v) = filter.from_ts { bind_values.push(Box::new(v)); }
             if let Some(v) = filter.to_ts { bind_values.push(Box::new(v)); }
@@ -284,40 +303,17 @@ impl StorageManager {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<CaptureRecord>, StorageError> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT c.id, c.ts, c.app_name, c.app_bundle_id, c.win_title, c.event_type,
-                        c.ax_text, c.ax_focused_role, c.ax_focused_id,
-                        c.ocr_text, c.screenshot_path, c.input_text, c.audio_text,
-                        c.is_sensitive, c.pii_scrubbed, c.screenshot_source, c.url, c.webpage_title
-                 FROM captures c
-                 JOIN captures_fts f ON f.rowid = c.id
-                 WHERE captures_fts MATCH ?1
-                   AND c.is_sensitive = 0
-                 ORDER BY rank
-                 LIMIT ?2 OFFSET ?3",
-            )?;
-            let rows = stmt.query_map(params![query, limit as i64, offset as i64], |row| {
-                Ok(row_to_capture(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(StorageError::Sqlite)
-        })
+        let mut filter = CaptureFilter::new();
+        filter.query = Some(query.to_string());
+        filter.limit = limit;
+        filter.offset = offset;
+        self.list_captures(&filter)
     }
 
     pub fn count_search_captures(&self, query: &str) -> Result<i64, StorageError> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*)
-                 FROM captures c
-                 JOIN captures_fts f ON f.rowid = c.id
-                 WHERE captures_fts MATCH ?1
-                   AND c.is_sensitive = 0",
-                params![query],
-                |row| row.get(0),
-            )
-            .map_err(StorageError::Sqlite)
-        })
+        let mut filter = CaptureFilter::new();
+        filter.query = Some(query.to_string());
+        self.count_captures(&filter)
     }
 
     /// 查询一批 capture 各自所属时间线的 (timeline_id, summary)。

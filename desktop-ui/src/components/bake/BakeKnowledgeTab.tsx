@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useState } from 'react'
 import type { BakeKnowledgeItem } from '../../types'
 import { BakeButton, BakeCard, BakeMarkdown, BakePill, BakeSectionHeader } from './BakeShared'
 
@@ -22,16 +22,23 @@ const BakeKnowledgeTab: React.FC<{
   offset: number
   query: string
   draftQuery: string
+  from: string
+  to: string
+  draftFrom: string
+  draftTo: string
   selectedKnowledgeId: string | null
   onSelectKnowledge: (id: string | null) => void
   onPageChange: (offset: number) => void
   onLimitChange: (limit: number) => void
   onDraftQueryChange: (query: string) => void
+  onDraftFromChange: (value: string) => void
+  onDraftToChange: (value: string) => void
   onSearch: () => void
   onClearFilters: () => void
   onDeleteKnowledge: (id: string) => void
   onOpenCapture: (captureId?: string) => void
   onViewSourceTimeline: (timelineId?: string) => void
+  sourceTimelineTitle?: string
   onCreateKnowledge?: (knowledge: Partial<BakeKnowledgeItem>) => void
 }> = ({
   items,
@@ -40,21 +47,34 @@ const BakeKnowledgeTab: React.FC<{
   offset,
   query,
   draftQuery,
+  from,
+  to,
+  draftFrom,
+  draftTo,
   selectedKnowledgeId,
   onSelectKnowledge,
   onPageChange,
   onLimitChange,
   onDraftQueryChange,
+  onDraftFromChange,
+  onDraftToChange,
   onSearch,
   onClearFilters,
   onDeleteKnowledge,
   onOpenCapture,
   onViewSourceTimeline,
+  sourceTimelineTitle,
   onCreateKnowledge,
 }) => {
   const selected = items.find(item => item.id === selectedKnowledgeId) ?? items[0]
+  const selectedSourceCaptureIds = selected?.sourceCaptureIds.length
+    ? selected.sourceCaptureIds
+    : selected?.captureId
+      ? [selected.captureId]
+      : []
   const page = Math.floor(offset / limit) + 1
   const totalPages = Math.max(1, Math.ceil(total / limit))
+  const hasActiveFilters = Boolean(query.trim() || from || to)
   const [pageInput, setPageInput] = useState('')
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [newKnowledge, setNewKnowledge] = useState({
@@ -64,18 +84,13 @@ const BakeKnowledgeTab: React.FC<{
     category: '',
     importance: 5,
   })
-  const filterPills = useMemo(() => {
-    const pills: string[] = []
-    if (query.trim()) pills.push(`关键词：${query.trim()}`)
-    return pills
-  }, [query])
-
   const handleCreate = () => {
     if (!newKnowledge.summary.trim()) return
     onCreateKnowledge?.({
       ...newKnowledge,
       id: `knowledge-manual-${Date.now()}`,
       captureId: '',
+      sourceCaptureIds: [],
       entities: [],
       occurrenceCount: 1,
       status: 'confirmed',
@@ -103,35 +118,61 @@ const BakeKnowledgeTab: React.FC<{
           subtitle="浏览已提炼的知识条目，并追溯其来源采集记录"
           right={onCreateKnowledge && <BakeButton primary onClick={() => setShowCreateDialog(true)}>新建知识</BakeButton>}
         />
-        <div className="bake-list-toolbar">
-          <div className="bake-list-toolbar__filters">
-            <label className="bake-form-field bake-filter-field bake-filter-field--search">
-              <span className="bake-filter-label">关键词</span>
-              <input
-                className="bake-input"
-                value={draftQuery}
-                onChange={(event) => onDraftQueryChange(event.target.value)}
-                onKeyDown={(event) => event.key === 'Enter' && onSearch()}
-                placeholder="搜索知识摘要、概述、详情或分类"
-              />
-            </label>
+        <form
+          className="bake-list-toolbar bake-list-toolbar--repository"
+          onSubmit={(event) => {
+            event.preventDefault()
+            onSearch()
+          }}
+        >
+          <div className="bake-list-toolbar__repository">
+            <div className="bake-list-toolbar__repository-row bake-list-toolbar__repository-row--search">
+              <label className="bake-form-field bake-filter-field bake-filter-field--search">
+                <span className="bake-filter-label">关键词</span>
+                <input
+                  className="bake-input"
+                  value={draftQuery}
+                  onChange={(event) => onDraftQueryChange(event.target.value)}
+                  placeholder="搜索知识摘要、概述、详情或分类"
+                />
+              </label>
+              <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--search">
+                <BakeButton compact primary type="submit">搜索</BakeButton>
+              </div>
+            </div>
+            <div className="bake-list-toolbar__repository-row bake-list-toolbar__repository-row--dates">
+              <label className="bake-form-field bake-filter-field">
+                <span className="bake-filter-label">开始日期</span>
+                <input
+                  className="bake-input"
+                  type="date"
+                  value={draftFrom}
+                  onChange={(event) => onDraftFromChange(event.target.value)}
+                />
+              </label>
+              <label className="bake-form-field bake-filter-field">
+                <span className="bake-filter-label">结束日期</span>
+                <input
+                  className="bake-input"
+                  type="date"
+                  value={draftTo}
+                  onChange={(event) => onDraftToChange(event.target.value)}
+                />
+              </label>
+              {(draftQuery || query || draftFrom || from || draftTo || to) && (
+                <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--secondary">
+                  <BakeButton compact type="button" onClick={onClearFilters}>清除筛选</BakeButton>
+                </div>
+              )}
+            </div>
           </div>
-          <div className="bake-list-toolbar__actions">
-            <BakeButton compact primary onClick={onSearch}>搜索</BakeButton>
-            {(draftQuery || query) && <BakeButton compact onClick={onClearFilters}>清除筛选</BakeButton>}
-          </div>
-        </div>
-        {filterPills.length > 0 && (
-          <div className="bake-filter-summary">
-            {filterPills.map(item => <BakePill key={item} text={item} />)}
-          </div>
-        )}
+        </form>
       </BakeCard>
       <div className="bake-split-list-detail bake-split-list-detail--knowledge">
         <BakeCard className="bake-knowledge-list-card">
         <div className="bake-list bake-knowledge-list">
           {items.length === 0 ? (
-            <div className="bake-muted">{query.trim() ? '当前筛选条件下没有可展示的知识条目。' : '当前还没有知识条目。'}</div>
+            <div className="bake-muted">{hasActiveFilters ? '当前筛选条件下没有可展示的知识条目。' : '当前还没有知识条目。'}</div>
           ) : items.map(item => {
             return (
               <button
@@ -251,10 +292,40 @@ const BakeKnowledgeTab: React.FC<{
                 )) : <span className="bake-muted">暂无实体</span>}
               </div>
             </div>
+            <div className="bake-knowledge-detail__section">
+              <div className="bake-kv__title">来源采集记录</div>
+              <div className="bake-memory-detail__stats">
+                {selectedSourceCaptureIds.length > 0 ? selectedSourceCaptureIds.map((captureId) => (
+                  <button
+                    key={captureId}
+                    type="button"
+                    className="bake-stat-chip bake-stat-chip--button"
+                    onClick={() => onOpenCapture(captureId)}
+                  >
+                    采集记录 #{captureId}
+                  </button>
+                )) : <span className="bake-muted">暂无关联采集记录</span>}
+              </div>
+            </div>
             <div className="bake-actions--primary">
               <BakeButton onClick={() => onViewSourceTimeline(selected.sourceTimelineId || selected.id)}>关联时间线</BakeButton>
-              <BakeButton onClick={() => onOpenCapture(selected.captureId)}>来源采集记录</BakeButton>
               <BakeButton onClick={() => onDeleteKnowledge(selected.id)}>删除知识</BakeButton>
+            </div>
+            <div className="bake-related-summary">
+              <div className="bake-related-row">
+                <span className="bake-related-row__label">关联时间线</span>
+                <span className="bake-related-row__value">
+                  {sourceTimelineTitle || (selected.sourceTimelineId ? `时间线 #${selected.sourceTimelineId}` : '暂无')}
+                </span>
+              </div>
+              <div className="bake-related-row">
+                <span className="bake-related-row__label">来源采集标题</span>
+                <span className="bake-related-row__value">
+                  {selectedSourceCaptureIds.length > 0
+                    ? selectedSourceCaptureIds.map(captureId => `采集记录 #${captureId}`).join('、')
+                    : '暂无'}
+                </span>
+              </div>
             </div>
           </div>
         ) : (

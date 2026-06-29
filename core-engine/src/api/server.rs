@@ -14,12 +14,12 @@ use super::{
         action::execute_action,
         bake::{
             create_bake_document, delete_bake_document, delete_bake_knowledge, delete_bake_sop,
-            get_bake_capture, get_bake_capture_screenshot, get_bake_memory_preview,
-            get_bake_overview, get_bake_style_config, ignore_bake_memory, initialize_bake_memories,
-            list_bake_captures, list_bake_documents, list_bake_knowledge, list_bake_memories,
-            list_bake_sops, promote_bake_memory_to_document, promote_bake_memory_to_sop,
-            run_bake_pipeline, toggle_bake_document_status, update_bake_document,
-            update_bake_style_config,
+            get_bake_capture, get_bake_capture_screenshot, get_bake_document,
+            get_bake_memory_preview, get_bake_overview, get_bake_style_config, ignore_bake_memory,
+            initialize_bake_memories, list_bake_captures, list_bake_documents, list_bake_knowledge,
+            list_bake_memories, list_bake_sops, promote_bake_memory_to_document,
+            promote_bake_memory_to_sop, run_bake_pipeline, toggle_bake_document_status,
+            update_bake_document, update_bake_style_config,
         },
         captures::list_captures,
         config_checks::{
@@ -41,7 +41,7 @@ use super::{
             update_blacklist_enabled, update_filter_config, update_filter_enabled,
         },
         profile::{get_latest_profile, get_profile, list_profiles, update_profile},
-        query::rag_query,
+        query::{create_rag_job, get_rag_job, rag_history, rag_query},
         tasks::{
             create_task, delete_task, get_task, list_executions, list_tasks, trigger_task,
             update_task,
@@ -64,6 +64,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/captures", get(list_captures))
         .route("/captures", get(list_captures))
         .route("/query", post(rag_query))
+        .route("/api/rag/jobs", post(create_rag_job))
+        .route("/api/rag/jobs/:job_id", get(get_rag_job))
+        .route("/api/rag/history", get(rag_history))
         .route("/action/execute", post(execute_action))
         .route("/preferences", get(list_preferences))
         .route(
@@ -149,7 +152,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/bake/documents/:id",
-            put(update_bake_document).delete(delete_bake_document),
+            get(get_bake_document)
+                .put(update_bake_document)
+                .delete(delete_bake_document),
         )
         .route(
             "/api/bake/documents/:id/toggle-status",

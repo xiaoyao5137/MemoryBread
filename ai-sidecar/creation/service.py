@@ -128,22 +128,44 @@ class CreationService:
             web_results=web_results,
         )
 
-        logger.info("使用模型: %s", creation_model or self.model)
+        local_model = creation_model or self.model
+        logger.info("使用模型: %s", local_model)
         logger.info("创作类型: %s, 参考资料: %s", parsed.get("doc_type") or "未指定", len(references))
 
         if creation_model and creation_api_key:
-            async for chunk in self._generate_cloud(system_prompt, user_message, creation_model, creation_api_key, creation_base_url or ""):
-                yield chunk
+            output_parts: list[str] = []
+            started_ms = int(time.time() * 1000)
+            try:
+                async for chunk in self._generate_cloud(system_prompt, user_message, creation_model, creation_api_key, creation_base_url or ""):
+                    output_parts.append(chunk)
+                    yield chunk
+                self._log_creation_usage(
+                    model_name=creation_model,
+                    prompt_text=system_prompt + "\n\n" + user_message,
+                    response_text="".join(output_parts),
+                    latency_ms=int(time.time() * 1000) - started_ms,
+                    status="success",
+                )
+            except Exception as exc:
+                self._log_creation_usage(
+                    model_name=creation_model,
+                    prompt_text=system_prompt + "\n\n" + user_message,
+                    response_text="".join(output_parts),
+                    latency_ms=int(time.time() * 1000) - started_ms,
+                    status="failed",
+                    error_msg=str(exc),
+                )
+                raise
             return
 
         # Qwen3.5 在 Ollama chat 模式下有 thinking 解析 bug，导致长时间不输出内容。
         # 改用 /api/generate raw 模式，绕过有问题的 chat 解析器。
-        is_qwen35 = "qwen3.5" in self.model.lower()
+        is_qwen35 = "qwen3.5" in local_model.lower()
 
         if is_qwen35:
             prompt = self._build_qwen35_prompt(system_prompt, user_message)
             payload = {
-                "model": self.model,
+                "model": local_model,
                 "prompt": prompt,
                 "raw": True,
                 "stream": True,
@@ -156,7 +178,7 @@ class CreationService:
             endpoint = "/api/generate"
         else:
             payload = {
-                "model": self.model,
+                "model": local_model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
@@ -171,35 +193,85 @@ class CreationService:
             endpoint = "/api/chat"
 
         chunk_count = 0
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            async with client.stream(
-                "POST", f"{self.ollama_base_url}{endpoint}", json=payload
-            ) as response:
-                response.raise_for_status()
-                if is_qwen35:
-                    async for chunk in self._stream_qwen35_raw(response):
-                        if chunk:
-                            chunk_count += 1
-                            if chunk_count % 100 == 0:
-                                logger.info("已生成 %s 个块", chunk_count)
-                            yield chunk
-                else:
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        msg = data.get("message", {})
-                        content = msg.get("content", "")
-                        if content:
-                            chunk_count += 1
-                            if chunk_count % 100 == 0:
-                                logger.info("已生成 %s 个块", chunk_count)
-                            yield content
+        output_parts: list[str] = []
+        started_ms = int(time.time() * 1000)
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream(
+                    "POST", f"{self.ollama_base_url}{endpoint}", json=payload
+                ) as response:
+                    response.raise_for_status()
+                    if is_qwen35:
+                        async for chunk in self._stream_qwen35_raw(response):
+                            if chunk:
+                                output_parts.append(chunk)
+                                chunk_count += 1
+                                if chunk_count % 100 == 0:
+                                    logger.info("已生成 %s 个块", chunk_count)
+                                yield chunk
+                    else:
+                        async for line in response.aiter_lines():
+                            if not line:
+                                continue
+                            try:
+                                data = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            msg = data.get("message", {})
+                            content = msg.get("content", "")
+                            if content:
+                                output_parts.append(content)
+                                chunk_count += 1
+                                if chunk_count % 100 == 0:
+                                    logger.info("已生成 %s 个块", chunk_count)
+                                yield content
 
-        logger.info("生成完成，总共 %s 个块", chunk_count)
+            logger.info("生成完成，总共 %s 个块", chunk_count)
+            self._log_creation_usage(
+                model_name=local_model,
+                prompt_text=system_prompt + "\n\n" + user_message,
+                response_text="".join(output_parts),
+                latency_ms=int(time.time() * 1000) - started_ms,
+                status="success",
+            )
+        except Exception as exc:
+            self._log_creation_usage(
+                model_name=local_model,
+                prompt_text=system_prompt + "\n\n" + user_message,
+                response_text="".join(output_parts),
+                latency_ms=int(time.time() * 1000) - started_ms,
+                status="failed",
+                error_msg=str(exc),
+            )
+            raise
+
+    def _log_creation_usage(
+        self,
+        model_name: str,
+        prompt_text: str,
+        response_text: str,
+        latency_ms: int,
+        status: str,
+        error_msg: str | None = None,
+    ) -> None:
+        """记录创作模型 token 用量，失败不影响主生成链路。"""
+        try:
+            from monitor.llm_tracker import estimate_tokens, log_llm_usage
+
+            log_llm_usage(
+                caller="creation",
+                model_name=model_name,
+                prompt_tokens=estimate_tokens(prompt_text),
+                completion_tokens=estimate_tokens(response_text),
+                latency_ms=latency_ms,
+                status=status,
+                error_msg=error_msg,
+                raw_preview=prompt_text,
+                response_preview=response_text,
+                db_path=self.db_path,
+            )
+        except Exception as exc:
+            logger.warning("创作 token 用量埋点失败: %s", exc)
 
     async def _generate_cloud(
         self,
@@ -466,6 +538,7 @@ class CreationService:
                     usage_count=int(row.get("usage_count") or 0),
                     review_status=row.get("review_status") or "",
                     updated_at=int(row.get("updated_at") or 0),
+                    source_url=row.get("source_url"),
                     relevance_score=relevance,
                     quality_score=quality,
                     completeness_score=completeness,

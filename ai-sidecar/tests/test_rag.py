@@ -19,7 +19,7 @@ from embedding.base  import EmbeddingBackend, EmbeddingVector
 from embedding.model import EmbeddingModel
 from rag.llm.base    import LlmBackend, LlmResponse
 from rag.llm.ollama  import OllamaBackend
-from rag.pipeline    import RagPipeline, RagResult
+from rag.pipeline    import RagPipeline, RagResult, _normalize_evidence_references, _normalize_weekly_report
 from rag.retriever   import Fts5Retriever, KnowledgeFts5Retriever, RetrievedChunk, VectorRetriever, VectorSearchFilter
 from rag.reranker    import reciprocal_rank_fusion
 
@@ -606,7 +606,8 @@ class TestRagPipeline:
         pipeline.query("帮我生成项目周报，包含OKR/KPI/专项进展")
         assert "## 本周量化进展（OKR/KPI/专项）" in llm.last_prompt
         assert "【量化证据】（仅可引用以下证据中的数字结论）" in llm.last_prompt
-        assert "证据：K#12/C#34" in llm.last_prompt
+        assert "引用：R#1" in llm.last_prompt
+        assert "K#12/C#34" not in llm.last_prompt
 
     def test_quant_evidence_extractor_filters_noise_numbers(self):
         candidate = (
@@ -695,8 +696,36 @@ class TestRagPipeline:
 
         block = pipeline._build_quant_evidence_block([chunk_high, chunk_low], kpi_mode=True, top_n=3)
         assert "【量化证据】" in block
-        assert "K#21/C#101" in block
+        assert "R#1" in block
+        assert "K#21/C#101" not in block
         assert "K#22/C#102" not in block
+
+    def test_weekly_report_normalizes_internal_evidence_refs(self):
+        chunk = RetrievedChunk(
+            capture_id=101,
+            text="完成 4 项需求",
+            score=0.9,
+            source="knowledge",
+            doc_key="knowledge:21",
+            metadata={
+                "source_type": "knowledge",
+                "doc_key": "knowledge:21",
+                "knowledge_id": 21,
+                "capture_id": 101,
+            },
+        )
+
+        answer = "## 本周核心产出\n- **修复问题**：完成 4 项需求（证据：K#21/C#101）。"
+        normalized = _normalize_evidence_references(answer, [chunk])
+        assert "证据：R#1" in normalized
+        assert "K#21/C#101" not in normalized
+
+    def test_weekly_report_drops_leaked_evidence_appendix(self):
+        answer = "## 本周核心产出\n- **修复问题**：完成 4 项需求。\n\n依据证据\n- [1] 完成 4 项需求"
+        normalized = _normalize_weekly_report(answer)
+        assert "修复问题" in normalized
+        assert "依据证据" not in normalized
+        assert "[1] 完成 4 项需求" not in normalized
 
     def test_weekly_report_system_prompt_used(self):
         """周报任务应使用专属 system prompt，而非默认 prompt"""

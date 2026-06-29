@@ -1,6 +1,6 @@
 //! 监控 API 处理器
 //!
-//! GET /api/monitor/overview?range=7d
+//! GET /api/monitor/overview?range_ms=21600000
 //! 聚合返回：token 用量、采集流水、问答记录、定时任务执行
 
 use std::collections::HashSet;
@@ -42,22 +42,77 @@ fn build_not_like_clause(column: &str, keywords: &[&str]) -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct MonitorQuery {
-    /// 时间范围：1d | 7d | 30d，默认 7d
+    /// 兼容旧参数：1h | 6h | 24h | 1d | 7d | 30d
     #[serde(default = "default_range")]
     pub range: String,
+    /// 动态时间宽幅（毫秒），优先于 range。默认最近 6 小时。
+    pub range_ms: Option<i64>,
 }
 
 fn default_range() -> String {
-    "7d".to_string()
+    "6h".to_string()
 }
 
 fn range_to_ms(range: &str) -> i64 {
-    let days: i64 = match range {
-        "1d" => 1,
-        "30d" => 30,
-        _ => 7,
-    };
-    days * 24 * 3600 * 1000
+    match range {
+        "1h" => 3600 * 1000,
+        "6h" => 6 * 3600 * 1000,
+        "24h" | "1d" => 24 * 3600 * 1000,
+        "30d" => 30 * 24 * 3600 * 1000,
+        _ => 7 * 24 * 3600 * 1000,
+    }
+}
+
+fn query_range_ms(params: &MonitorQuery) -> i64 {
+    const MIN_RANGE_MS: i64 = 60 * 1000;
+    const MAX_RANGE_MS: i64 = 90 * 24 * 3600 * 1000;
+    params
+        .range_ms
+        .unwrap_or_else(|| range_to_ms(&params.range))
+        .clamp(MIN_RANGE_MS, MAX_RANGE_MS)
+}
+
+fn nice_bucket_ms(range_ms: i64) -> i64 {
+    const TARGET_POINTS: i64 = 80;
+    const BUCKETS: [i64; 8] = [
+        60 * 1000,
+        5 * 60 * 1000,
+        15 * 60 * 1000,
+        60 * 60 * 1000,
+        3 * 60 * 60 * 1000,
+        6 * 60 * 60 * 1000,
+        12 * 60 * 60 * 1000,
+        24 * 60 * 60 * 1000,
+    ];
+    let wanted = (range_ms / TARGET_POINTS).max(BUCKETS[0]);
+    BUCKETS
+        .iter()
+        .copied()
+        .find(|bucket| *bucket >= wanted)
+        .unwrap_or(*BUCKETS.last().unwrap())
+}
+
+fn is_sub_day_range(range_ms: i64) -> bool {
+    range_ms <= 24 * 3600 * 1000
+}
+
+fn trend_bucket_ms(range_ms: i64) -> i64 {
+    nice_bucket_ms(range_ms)
+}
+
+fn knowledge_bucket_ms(range_ms: i64) -> i64 {
+    nice_bucket_ms(range_ms)
+}
+
+fn bucket_label(range_ms: i64, bucket_start_ms: i64) -> String {
+    let local_dt = chrono::DateTime::<Utc>::from_timestamp_millis(bucket_start_ms)
+        .map(|dt| dt.with_timezone(&Local))
+        .unwrap_or_else(Local::now);
+    if is_sub_day_range(range_ms) {
+        local_dt.format("%H:%M").to_string()
+    } else {
+        local_dt.format("%m-%d").to_string()
+    }
 }
 
 fn local_day_start_ms(now_ms: i64) -> i64 {
@@ -74,22 +129,6 @@ fn local_day_start_ms(now_ms: i64) -> i64 {
         .timestamp_millis()
 }
 
-fn trend_bucket_ms(range: &str) -> i64 {
-    match range {
-        "1d" => 60 * 1000,
-        "30d" => 24 * 60 * 60 * 1000,
-        _ => 6 * 60 * 60 * 1000,
-    }
-}
-
-fn knowledge_bucket_ms(range: &str) -> i64 {
-    match range {
-        "1d" => 60 * 1000,
-        "30d" => 24 * 60 * 60 * 1000,
-        _ => 60 * 60 * 1000,
-    }
-}
-
 fn system_bucket_ms(range: &str) -> i64 {
     match range {
         "1h" => 60 * 1000,
@@ -97,16 +136,6 @@ fn system_bucket_ms(range: &str) -> i64 {
         "24h" => 60 * 1000,
         "1d" => 60 * 1000,
         _ => 60 * 1000,
-    }
-}
-
-fn bucket_label(range: &str, bucket_start_ms: i64) -> String {
-    let local_dt = chrono::DateTime::<Utc>::from_timestamp_millis(bucket_start_ms)
-        .map(|dt| dt.with_timezone(&Local))
-        .unwrap_or_else(Local::now);
-    match range {
-        "1d" => local_dt.format("%H:%M").to_string(),
-        _ => local_dt.format("%m-%d").to_string(),
     }
 }
 
@@ -158,12 +187,15 @@ pub struct TokenUsage {
     pub by_model: Vec<ModelUsage>,
     pub by_caller: Vec<CallerUsage>,
     pub trend: Vec<DayTrend>,
+    pub trend_by_model: Vec<ModelTrend>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ModelUsage {
     pub model: String,
     pub total: i64,
+    pub prompt: i64,
+    pub completion: i64,
     pub calls: i64,
 }
 
@@ -180,6 +212,14 @@ pub struct DayTrend {
     pub date: String,
     pub tokens: i64,
     pub calls: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelTrend {
+    pub model: String,
+    pub total: i64,
+    pub calls: i64,
+    pub trend: Vec<DayTrend>,
 }
 
 #[derive(Debug, Serialize)]
@@ -303,11 +343,11 @@ pub async fn monitor_overview(
     Query(params): Query<MonitorQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
-    let range_ms = range_to_ms(&params.range);
+    let range_ms = query_range_ms(&params);
     let from_ms = now_ms - range_ms;
     let today_start = local_day_start_ms(now_ms);
-    let token_bucket_ms = trend_bucket_ms(&params.range);
-    let knowledge_bucket_ms = knowledge_bucket_ms(&params.range);
+    let token_bucket_ms = trend_bucket_ms(range_ms);
+    let knowledge_bucket_ms = knowledge_bucket_ms(range_ms);
     let fallback_noise_pattern = format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX);
 
     let mut overview = state.storage.with_conn_async(move |conn| {
@@ -332,16 +372,22 @@ pub async fn monitor_overview(
         ).unwrap_or(0);
 
         let mut by_model_stmt = conn.prepare(
-            "SELECT model_name, COALESCE(SUM(total_tokens),0), COUNT(*)
+            "SELECT model_name,
+                    COALESCE(SUM(total_tokens),0),
+                    COALESCE(SUM(prompt_tokens),0),
+                    COALESCE(SUM(completion_tokens),0),
+                    COUNT(*)
              FROM llm_usage_logs WHERE ts >= ?1
              GROUP BY model_name ORDER BY COALESCE(SUM(total_tokens),0) DESC LIMIT 8"
         )?;
-        let by_model = by_model_stmt
+        let by_model: Vec<ModelUsage> = by_model_stmt
             .query_map(rusqlite::params![from_ms], |r| {
                 Ok(ModelUsage {
                     model: r.get::<_, String>(0)?,
                     total: r.get::<_, i64>(1)?,
-                    calls: r.get::<_, i64>(2)?,
+                    prompt: r.get::<_, i64>(2)?,
+                    completion: r.get::<_, i64>(3)?,
+                    calls: r.get::<_, i64>(4)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -373,13 +419,40 @@ pub async fn monitor_overview(
                 let bucket_start: i64 = r.get(0)?;
                 Ok(DayTrend {
                     ts: bucket_start + token_bucket_ms / 2,
-                    date: bucket_label(&params.range, bucket_start),
+                    date: bucket_label(range_ms, bucket_start),
                     tokens: r.get::<_, i64>(1)?,
                     calls: r.get::<_, i64>(2)?,
                 })
             })?
             .filter_map(|r| r.ok())
             .collect();
+
+        let mut trend_by_model: Vec<ModelTrend> = Vec::new();
+        for item in by_model.iter() {
+            let mut model_trend_stmt = conn.prepare(
+                "SELECT (ts / ?1) * ?1 as bucket, COALESCE(SUM(total_tokens),0), COUNT(*)
+                 FROM llm_usage_logs WHERE ts >= ?2 AND model_name = ?3
+                 GROUP BY bucket ORDER BY bucket"
+            )?;
+            let model_trend = model_trend_stmt
+                .query_map(rusqlite::params![token_bucket_ms, from_ms, &item.model], |r| {
+                    let bucket_start: i64 = r.get(0)?;
+                    Ok(DayTrend {
+                        ts: bucket_start + token_bucket_ms / 2,
+                        date: bucket_label(range_ms, bucket_start),
+                        tokens: r.get::<_, i64>(1)?,
+                        calls: r.get::<_, i64>(2)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            trend_by_model.push(ModelTrend {
+                model: item.model.clone(),
+                total: item.total,
+                calls: item.calls,
+                trend: model_trend,
+            });
+        }
 
         let today_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM captures WHERE ts >= ?1",
@@ -474,12 +547,13 @@ pub async fn monitor_overview(
                 OR (c.ax_text IS NOT NULL AND c.ax_text != ''))
                AND c.timeline_id IS NULL
                AND c.is_sensitive = 0
+               AND c.ts >= ?1
                AND ({app_not_like})
                AND ({win_not_like})"
         );
         let pending_extraction_count: i64 = conn.query_row(
             &pending_extraction_count_sql,
-            [],
+            rusqlite::params![from_ms],
             |r| r.get(0),
         ).unwrap_or(0);
 
@@ -605,6 +679,7 @@ pub async fn monitor_overview(
                 by_model,
                 by_caller,
                 trend,
+                trend_by_model,
             },
             capture_flow: CaptureFlow {
                 today_count,
@@ -904,9 +979,10 @@ pub struct ExtractionLiveResponse {
 
 pub async fn monitor_extraction_live(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<MonitorQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
-    let from_ms = now_ms - 24 * 3600 * 1000;
+    let from_ms = now_ms - query_range_ms(&params);
     let fallback_noise_pattern = format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX);
     let app_not_like = build_not_like_clause("app_name", &SELF_GENERATED_APP_KEYWORDS);
     let win_not_like = build_not_like_clause("win_title", &SELF_GENERATED_WINDOW_KEYWORDS);

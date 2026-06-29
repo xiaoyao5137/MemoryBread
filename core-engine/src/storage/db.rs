@@ -270,6 +270,17 @@ impl StorageManager {
                 continue;
             }
 
+            if *version == "033_drop_bake_episodic_memory_id"
+                && self.bake_legacy_memory_columns_already_dropped(&conn)?
+            {
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    rusqlite::params![version, current_ts_ms()],
+                )?;
+                info!("迁移 {} 已由现有 schema 满足，登记后跳过", version);
+                continue;
+            }
+
             if *version == "031_ensure_full_schema" {
                 self.run_ensure_full_schema(&conn)?;
                 let count: i64 = conn.query_row(
@@ -420,6 +431,16 @@ impl StorageManager {
         let has_timeline_id = columns.iter().any(|name| name == "timeline_id");
         let has_knowledge_id = columns.iter().any(|name| name == "knowledge_id");
         Ok(has_timeline_id && !has_knowledge_id)
+    }
+
+    fn bake_legacy_memory_columns_already_dropped(
+        &self,
+        conn: &Connection,
+    ) -> Result<bool, StorageError> {
+        Ok(Self::has_column(conn, "bake_knowledge", "timeline_id")?
+            && !Self::has_column(conn, "bake_knowledge", "episodic_memory_id")?
+            && Self::has_column(conn, "bake_sops", "timeline_id")?
+            && !Self::has_column(conn, "bake_sops", "episodic_memory_id")?)
     }
 
     // ── 工具方法 ─────────────────────────────────────────────────────────────

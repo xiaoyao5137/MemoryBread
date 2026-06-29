@@ -112,6 +112,8 @@ pub async fn list_bake_sops(
     let filter = BakeListFilter {
         q: params.q.filter(|value| !value.trim().is_empty()),
         bucket,
+        from_ts: params.from,
+        to_ts: params.to,
         limit,
         offset,
     };
@@ -149,6 +151,8 @@ pub async fn list_bake_documents(
     let filter = BakeListFilter {
         q: params.q.filter(|value| !value.trim().is_empty()),
         bucket,
+        from_ts: params.from,
+        to_ts: params.to,
         limit,
         offset,
     };
@@ -170,6 +174,17 @@ pub async fn create_bake_document(
 ) -> Result<Json<BakeDocumentPayload>, ApiError> {
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
     let document = tokio::task::spawn_blocking(move || service.create_document(body))
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    Ok(Json(document))
+}
+
+pub async fn get_bake_document(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<BakeDocumentPayload>, ApiError> {
+    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
+    let document = tokio::task::spawn_blocking(move || service.get_document(id))
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
     Ok(Json(document))
@@ -247,6 +262,8 @@ pub async fn list_bake_knowledge(
     let filter = BakeListFilter {
         q: params.q.filter(|value| !value.trim().is_empty()),
         bucket,
+        from_ts: params.from,
+        to_ts: params.to,
         limit,
         offset,
     };

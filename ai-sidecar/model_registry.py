@@ -32,40 +32,29 @@ class ModelMeta:
     min_memory_gb:    float = 0.0  # 运行所需最低内存
 
 
+# 前端只暴露 MemoryBread 品牌模型 ID；真实模型名集中在后端映射，便于后续替换底层模型。
+MODEL_ID_ALIASES: Dict[str, str] = {
+    "qwen3.5-4b": "mbem-v1-local",
+    "qwen2.5-3b": "mbem-v1-local",
+    "qwen2.5-7b": "mbem-v1-local",
+    "deepseek-r1-7b": "mbem-v1-local",
+    "gemma4-e4b": "mbem-v1-local",
+    "bge-m3": "bge-small-zh",
+    "nomic-embed-text": "bge-small-zh",
+    "text-embedding-3-small": "bge-small-zh",
+}
+
+
 # ── 模型目录 ──────────────────────────────────────────────────────────────────
 
 AVAILABLE_MODELS: List[ModelMeta] = [
 
-    # ── 本地 LLM（Ollama）────────────────────────────────────────────────────
+    # ── 采集分析模型（本地 Ollama）───────────────────────────────────────────
     ModelMeta(
-        id="qwen3.5-4b", name="Qwen3.5 4B", category="llm", provider="ollama",
+        id="mbem-v1-local", name="MBEM v1.0", category="llm", provider="ollama",
         size_gb=3.4, min_memory_gb=6.0, is_default=True,
-        description="阿里通义千问 3.5，4B 参数，原生多模态，推理更强，适合 8GB+ 内存",
-        tags=["推荐", "中文优化", "多模态"],
-    ),
-    ModelMeta(
-        id="gemma4-e4b", name="Gemma 4 E4B", category="llm", provider="ollama",
-        size_gb=9.6, min_memory_gb=16.0,
-        description="Google Gemma 4，4B 有效参数，原生多模态，Apache 2.0 开源",
-        tags=["多模态", "Google"],
-    ),
-    ModelMeta(
-        id="qwen2.5-3b", name="Qwen2.5 3B", category="llm", provider="ollama",
-        size_gb=2.0, min_memory_gb=4.0, is_default=False,
-        description="阿里通义千问 2.5，3B 参数，适合 8GB 以下内存机器",
-        tags=["轻量", "中文优化"],
-    ),
-    ModelMeta(
-        id="qwen2.5-7b", name="Qwen2.5 7B", category="llm", provider="ollama",
-        size_gb=4.1, min_memory_gb=8.0,
-        description="阿里通义千问 2.5，7B 参数，效果更好，需要 8GB+ 内存",
-        tags=["中文优化", "均衡"],
-    ),
-    ModelMeta(
-        id="deepseek-r1-7b", name="DeepSeek-R1 7B", category="llm", provider="ollama",
-        size_gb=4.7, min_memory_gb=8.0,
-        description="DeepSeek R1 推理模型，7B 参数，推理能力强",
-        tags=["推理", "均衡"],
+        description="MemoryBread Extract Model Local 1.0，本地提炼模型 v1，用于采集内容理解、知识提炼和本地咨询分析",
+        tags=["推荐", "本地", "采集分析"],
     ),
 
     # ── 本地 Embedding（Ollama）──────────────────────────────────────────────
@@ -75,148 +64,8 @@ AVAILABLE_MODELS: List[ModelMeta] = [
         description="BAAI BGE-Small 中文版，512 维，量化版本，内存占用低",
         tags=["推荐", "超轻量", "中文"],
     ),
-    ModelMeta(
-        id="bge-m3", name="BGE-M3", category="embedding", provider="ollama",
-        size_gb=0.6, min_memory_gb=2.0, is_default=False,
-        description="BAAI BGE-M3，多语言向量模型，中英文效果优秀",
-        tags=["多语言"],
-    ),
-    ModelMeta(
-        id="nomic-embed-text", name="Nomic Embed Text", category="embedding", provider="ollama",
-        size_gb=0.3, min_memory_gb=1.0,
-        description="Nomic 文本向量模型，英文效果好",
-        tags=["英文"],
-    ),
-
-    # ── 商业 LLM：OpenAI ─────────────────────────────────────────────────────
-    ModelMeta(
-        id="gpt-5.5", name="GPT-5.5", category="llm", provider="openai",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="OpenAI GPT-5.5，最新旗舰模型，推理和创作能力大幅提升",
-        tags=["最新", "高质量", "多模态"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-            ApiKeyField("base_url", "Base URL（可选）", "https://api.openai.com/v1", required=False, secret=False),
-        ],
-    ),
-    ModelMeta(
-        id="gpt-4o", name="GPT-4o", category="llm", provider="openai",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="OpenAI GPT-4o，强大多模态模型，按 token 计费",
-        tags=["高质量", "多模态"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-            ApiKeyField("base_url", "Base URL（可选）", "https://api.openai.com/v1", required=False, secret=False),
-        ],
-    ),
-    ModelMeta(
-        id="gpt-4o-mini", name="GPT-4o Mini", category="llm", provider="openai",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="OpenAI GPT-4o Mini，性价比高，速度快",
-        tags=["快速", "低成本"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-            ApiKeyField("base_url", "Base URL（可选）", "https://api.openai.com/v1", required=False, secret=False),
-        ],
-    ),
-
-    # ── 商业 LLM：Anthropic ──────────────────────────────────────────────────
-    ModelMeta(
-        id="claude-4.7-opus", name="Claude 4.7 Opus", category="llm", provider="anthropic",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="Anthropic Claude 4.7 Opus，最强推理与创作能力，旗舰模型",
-        tags=["最新", "高质量", "代码", "推理"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-ant-...", required=True, secret=True),
-        ],
-    ),
-
-    # ── 商业 LLM：通义千问 ───────────────────────────────────────────────────
-    ModelMeta(
-        id="qwen-plus", name="通义千问 Plus", category="llm", provider="tongyi",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="阿里云通义千问 Plus，中文能力强，国内访问稳定",
-        tags=["中文优化", "国内"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-        ],
-    ),
-    ModelMeta(
-        id="qwen-max", name="通义千问 Max", category="llm", provider="tongyi",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="阿里云通义千问 Max，最强版本",
-        tags=["高质量", "中文优化", "国内"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-        ],
-    ),
-
-    # ── 商业 LLM：豆包 ───────────────────────────────────────────────────────
-    ModelMeta(
-        id="doubao-pro-32k", name="豆包 Pro 32K", category="llm", provider="doubao",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="字节跳动豆包 Pro，32K 上下文，国内访问稳定",
-        tags=["长上下文", "国内"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "...", required=True, secret=True),
-            ApiKeyField("endpoint_id", "Endpoint ID", "ep-...", required=True, secret=False),
-        ],
-    ),
-
-    # ── 商业 LLM：DeepSeek ───────────────────────────────────────────────────
-    ModelMeta(
-        id="deepseek-chat", name="DeepSeek Chat", category="llm", provider="deepseek",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="DeepSeek Chat，性价比极高，推理能力强",
-        tags=["高性价比", "推理", "国内"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-        ],
-    ),
-    ModelMeta(
-        id="deepseek-reasoner", name="DeepSeek Reasoner", category="llm", provider="deepseek",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="DeepSeek R1 推理模型，复杂推理任务首选",
-        tags=["推理", "国内"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-        ],
-    ),
-
-    # ── 商业 LLM：Kimi ───────────────────────────────────────────────────────
-    ModelMeta(
-        id="kimi-2.5", name="Kimi 2.5", category="llm", provider="kimi",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="月之暗面 Kimi 2.5，最新版本，长文本理解能力更强，国内访问稳定",
-        tags=["最新", "长上下文", "国内"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-        ],
-    ),
-
-    # ── 商业 Embedding：OpenAI ───────────────────────────────────────────────
-    ModelMeta(
-        id="text-embedding-3-small", name="text-embedding-3-small", category="embedding",
-        provider="openai", size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="OpenAI 文本向量模型，效果好，按 token 计费",
-        tags=["高质量"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-            ApiKeyField("base_url", "Base URL（可选）", "https://api.openai.com/v1", required=False, secret=False),
-        ],
-    ),
 
     # ── 生图模型 ─────────────────────────────────────────────────────────────
-    ModelMeta(
-        id="dall-e-3", name="DALL·E 3", category="image", provider="openai",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="OpenAI DALL·E 3，高质量文生图模型，支持详细提示词",
-        tags=["文生图", "高质量"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-            ApiKeyField("base_url", "Base URL（可选）", "https://api.openai.com/v1", required=False, secret=False),
-        ],
-    ),
     ModelMeta(
         id="gpt-image-2", name="GPT Image 2", category="image", provider="openai",
         size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
@@ -236,24 +85,6 @@ AVAILABLE_MODELS: List[ModelMeta] = [
             ApiKeyField("api_key", "API Key", "...", required=True, secret=True),
         ],
     ),
-    ModelMeta(
-        id="qwen-image-edit", name="Qwen Image Edit", category="image", provider="tongyi",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="阿里通义千问图像编辑模型，支持图像编辑和修复",
-        tags=["图像编辑", "中文优化", "国内"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "sk-...", required=True, secret=True),
-        ],
-    ),
-    ModelMeta(
-        id="kling-v1", name="可灵 v1", category="image", provider="kling",
-        size_gb=0.0, min_memory_gb=0.0, requires_api_key=True,
-        description="快手可灵 AI，文生图/视频模型，中文理解能力强，国内访问稳定",
-        tags=["文生图", "视频生成", "中文优化", "国内"],
-        api_key_fields=[
-            ApiKeyField("api_key", "API Key", "...", required=True, secret=True),
-        ],
-    ),
 ]
 
 # 快速查找
@@ -261,6 +92,7 @@ _MODEL_MAP: Dict[str, ModelMeta] = {m.id: m for m in AVAILABLE_MODELS}
 
 
 def get_model(model_id: str) -> Optional[ModelMeta]:
+    model_id = MODEL_ID_ALIASES.get(model_id, model_id)
     return _MODEL_MAP.get(model_id)
 
 
@@ -303,14 +135,12 @@ def get_recommendations(
             if m.category == "llm" and m.provider == "ollama" and m.min_memory_gb <= memory_gb:
                 recommended_ids.append(m.id)
         # 商业 API 也推荐
-        recommended_ids += ["deepseek-chat", "qwen-plus", "gpt-4o-mini"]
     elif memory_gb < 16:
         tier = "mid"
         reason = f"内存 {memory_gb:.0f}GB，可运行 3B-7B 本地模型"
         for m in AVAILABLE_MODELS:
             if m.category == "llm" and m.provider == "ollama" and m.min_memory_gb <= memory_gb:
                 recommended_ids.append(m.id)
-        recommended_ids += ["deepseek-chat", "qwen-plus"]
     else:
         tier = "high"
         reason = f"内存 {memory_gb:.0f}GB，可运行大型本地模型"
@@ -325,13 +155,10 @@ def get_recommendations(
         recommended_ids = [i for i in recommended_ids
                            if not _MODEL_MAP.get(i) or _MODEL_MAP[i].size_gb < disk_free_gb]
         if not any(i for i in recommended_ids if _MODEL_MAP.get(i) and _MODEL_MAP[i].provider == "ollama"):
-            recommended_ids = ["deepseek-chat", "qwen-plus", "gpt-4o-mini"]
+            recommended_ids = []
 
     # Embedding 推荐
-    if memory_gb >= 2:
-        recommended_ids.append("bge-m3")
-    else:
-        recommended_ids.append("bge-small-zh")
+    recommended_ids.append("bge-small-zh")
 
     return {
         "recommended_ids": list(dict.fromkeys(recommended_ids)),  # 去重保序

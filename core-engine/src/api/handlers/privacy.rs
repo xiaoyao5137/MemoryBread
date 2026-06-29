@@ -104,7 +104,8 @@ pub async fn list_blacklist(
             let with_stats: Vec<BlacklistWithStats> = records
                 .into_iter()
                 .map(|r| BlacklistWithStats {
-                    week_blocked: *stats_map.get(&r.bundle_id).unwrap_or(&0),
+                    week_blocked: *stats_map.get(&r.bundle_id).unwrap_or(&0)
+                        + *stats_map.get(&r.app_name).unwrap_or(&0),
                     record: r,
                 })
                 .collect();

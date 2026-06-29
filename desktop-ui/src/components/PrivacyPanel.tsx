@@ -151,9 +151,7 @@ const PrivacyPanel: React.FC = () => {
                   <div className="filter-name">{filter.filter_name}</div>
                   <div className="filter-desc">
                     {FILTER_DESCRIPTIONS[filter.filter_type] || '使用配置规则检测并过滤敏感内容'}
-                    {filter.week_blocked !== undefined && filter.week_blocked > 0 && (
-                      <span className="stat-badge"> · 本周已拦截 {filter.week_blocked} 条</span>
-                    )}
+                    <span className="stat-badge"> · 本周已拦截 {filter.week_blocked ?? 0} 条</span>
                   </div>
                 </div>
                 <label className="switch">
@@ -184,9 +182,7 @@ const PrivacyPanel: React.FC = () => {
                     <div className="app-name">{item.app_name}</div>
                     <div className="bundle-id">
                       {item.bundle_id}
-                      {item.week_blocked !== undefined && item.week_blocked > 0 && (
-                        <span className="stat-badge"> · 本周已拦截 {item.week_blocked} 次</span>
-                      )}
+                      <span className="stat-badge"> · 本周已拦截 {item.week_blocked ?? 0} 次</span>
                     </div>
                     {item.reason && <div className="reason">{item.reason}</div>}
                   </div>

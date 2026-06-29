@@ -23,10 +23,31 @@ import OnboardingWizard       from './components/OnboardingWizard'
 const hasConfiguredCreationModel = (configs: Array<{ enabled?: boolean; apiKey?: string }>) =>
   configs.some(config => Boolean(config.enabled || config.apiKey))
 
+const parseReferenceId = (docKey?: string | null) => {
+  if (!docKey) return null
+  const match = String(docKey).match(/:(\d+)$/)
+  return match ? match[1] : null
+}
+
 const App: React.FC = () => {
   const {
     windowMode,
     setWindowMode,
+    setBakeTab,
+    setRepositoryTab,
+    setSelectedMemoryId,
+    setSelectedCaptureId,
+    setSelectedTemplateId,
+    setSelectedKnowledgeId,
+    setSelectedSopId,
+    setBakeTemplateOffset,
+    setBakeTemplateLimit,
+    setBakeKnowledgeOffset,
+    setBakeKnowledgeLimit,
+    setBakeSopOffset,
+    setBakeSopLimit,
+    setRepositoryCaptureSourceCaptureId,
+    pushBakeNavigationTarget,
     hasCompletedSetup,
     setupSkipped,
     apiBaseUrl,
@@ -90,6 +111,73 @@ const App: React.FC = () => {
       window.removeEventListener('view-capture', handleViewCapture as EventListener)
     }
   }, [setWindowMode])
+
+  useEffect(() => {
+    const handleViewReference = (event: CustomEvent) => {
+      const { type, captureId, knowledgeId, artifactId, documentId, docKey } = event.detail || {}
+      const parsedTargetId = parseReferenceId(docKey)
+      const targetId = String(documentId ?? artifactId ?? parsedTargetId ?? '')
+      pushBakeNavigationTarget({ windowMode: 'rag' })
+
+      if (type === 'document') {
+        setBakeTab('templates')
+        setBakeTemplateOffset(0)
+        setBakeTemplateLimit(100)
+        setSelectedTemplateId(targetId || null)
+        setWindowMode('bake')
+        return
+      }
+      if (type === 'bake_knowledge') {
+        setBakeTab('knowledge')
+        setBakeKnowledgeOffset(0)
+        setBakeKnowledgeLimit(1000)
+        setSelectedKnowledgeId(targetId || null)
+        setWindowMode('bake')
+        return
+      }
+      if (type === 'operation' || type === 'action') {
+        setBakeTab('sop')
+        setBakeSopOffset(0)
+        setBakeSopLimit(1000)
+        setSelectedSopId(targetId || null)
+        setWindowMode('bake')
+        return
+      }
+      setWindowMode('knowledge')
+      if (type === 'knowledge' && knowledgeId) {
+        setRepositoryTab('memory')
+        setSelectedMemoryId(String(knowledgeId))
+        return
+      }
+      if (captureId) {
+        setRepositoryTab('capture')
+        setRepositoryCaptureSourceCaptureId(String(captureId))
+        setSelectedCaptureId(String(captureId))
+      }
+    }
+
+    window.addEventListener('view-rag-reference', handleViewReference as EventListener)
+    return () => {
+      window.removeEventListener('view-rag-reference', handleViewReference as EventListener)
+    }
+  }, [
+    pushBakeNavigationTarget,
+    setBakeKnowledgeLimit,
+    setBakeKnowledgeOffset,
+    setBakeSopLimit,
+    setBakeSopOffset,
+    setBakeTab,
+    setBakeTemplateLimit,
+    setBakeTemplateOffset,
+    setRepositoryCaptureSourceCaptureId,
+    setRepositoryTab,
+    setSelectedCaptureId,
+    setSelectedKnowledgeId,
+    setSelectedMemoryId,
+    setSelectedSopId,
+    setSelectedTemplateId,
+    setWindowMode,
+  ])
 
   if (showOnboarding) {
     return (

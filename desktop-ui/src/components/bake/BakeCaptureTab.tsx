@@ -78,11 +78,10 @@ const BakeCaptureTab: React.FC<{
   const screenshotUrl = selected?.screenshotPath ? `${apiBaseUrl}/api/bake/captures/${encodeURIComponent(selected.id)}/screenshot` : null
   const activeFilters = useMemo(() => {
     const items: string[] = []
-    if (query.trim()) items.push(`关键词：${query.trim()}`)
     if (from) items.push(`开始：${from}`)
     if (to) items.push(`结束：${to}`)
     return items
-  }, [from, query, to])
+  }, [from, to])
 
   useEffect(() => {
     if (!screenshotUrl && isScreenshotOpen) {
@@ -108,7 +107,7 @@ const BakeCaptureTab: React.FC<{
       <BakeCard className="bake-capture-list-card">
         <BakeSectionHeader
           title="采集记录"
-          subtitle="浏览原始采集片段与关联知识"
+          subtitle="浏览原始采集记录与关联知识"
           right={canGoBack ? <BakeButton compact onClick={onGoBack}>返回上一步</BakeButton> : undefined}
         />
 
@@ -164,9 +163,9 @@ const BakeCaptureTab: React.FC<{
 
         {(sourceCaptureId || activeFilters.length > 0) && (
           <div className="bake-filter-summary">
-            {sourceCaptureId && <BakePill text={`仅看来源片段 #${sourceCaptureId}`} />}
+            {sourceCaptureId && <BakePill text={`仅看来源 ID #${sourceCaptureId}`} />}
             {activeFilters.map(item => <BakePill key={item} text={item} />)}
-            {sourceCaptureId && <BakeButton compact onClick={onClearScope}>查看全部片段</BakeButton>}
+            {sourceCaptureId && <BakeButton compact onClick={onClearScope}>查看全部</BakeButton>}
           </div>
         )}
 
@@ -180,7 +179,7 @@ const BakeCaptureTab: React.FC<{
               onClick={() => onSelectCapture(item.id)}
               className={`bake-list-item bake-capture-list-item ${item.id === selected?.id ? 'bake-list-item--active' : ''}`.trim()}
             >
-              <div className="bake-list-item__title bake-line-clamp-1">{item.summary || item.winTitle || `片段 #${item.id}`}</div>
+              <div className="bake-list-item__title bake-line-clamp-1">{item.summary || item.winTitle || `ID #${item.id}`}</div>
               <div className="bake-muted bake-line-clamp-2">{item.bestText || item.axText || item.ocrText || '暂无正文'}</div>
               <div className="bake-memory-list-item__meta">
                 <span>{item.appName || '未知应用'}</span>
@@ -246,10 +245,10 @@ const BakeCaptureTab: React.FC<{
           <div className="bake-kv bake-capture-detail">
             <div className="bake-inline-meta">
               <div>
-                <div className="bake-title" style={{ fontSize: 18 }}>{selected.summary || selected.winTitle || `片段 #${selected.id}`}</div>
+                <div className="bake-title" style={{ fontSize: 18 }}>{selected.summary || selected.winTitle || `ID #${selected.id}`}</div>
                 <div className="bake-muted" style={{ marginTop: 4 }}>{selected.appName || '未知应用'} · {formatCaptureTime(selected.ts)}</div>
               </div>
-              <BakePill text={`片段 #${selected.id}`} />
+              <BakePill text={`ID #${selected.id}`} />
             </div>
 
             <div className="bake-grid-2 bake-capture-detail__meta-grid">
@@ -258,7 +257,6 @@ const BakeCaptureTab: React.FC<{
                 <div className="bake-muted" style={{ lineHeight: 1.7 }}>{selected.winTitle || '—'}</div>
               </div>
               <div className="bake-capture-detail__meta-card">
-                <div className="bake-kv__title">记忆类型</div>
                 <div className="bake-capture-detail__type-stack">
                   <div className="bake-capture-detail__type-primary">{selected.semanticTypeLabel || '未识别类型'}</div>
                   <div className="bake-muted">原始模态：{selected.rawTypeLabel || selected.eventType || '—'}</div>
@@ -278,12 +276,11 @@ const BakeCaptureTab: React.FC<{
                     <img
                       className="bake-capture-detail__screenshot-image"
                       src={screenshotUrl}
-                      alt={selected.summary || selected.winTitle || `片段 #${selected.id}`}
+                      alt={selected.summary || selected.winTitle || `ID #${selected.id}`}
                       loading="lazy"
                     />
                     <span className="bake-capture-detail__screenshot-hint">点击查看大图</span>
                   </button>
-                  <div className="bake-capture-detail__screenshot-path">{selected.screenshotPath}</div>
                 </div>
               ) : (
                 <div className="bake-muted">当前没有截图文件。</div>
@@ -327,11 +324,13 @@ const BakeCaptureTab: React.FC<{
             )}
 
             <div className="bake-actions">
-              <BakeButton onClick={() => onViewLinkedTimeline(selected.linkedTimelineId)}>
-                {selected.linkedTimelineId
-                  ? `查看所属时间线${selected.linkedTimelineSummary ? ` · ${selected.linkedTimelineSummary.slice(0, 24)}` : ''}`
-                  : '尚未归入时间线'}
-              </BakeButton>
+              {selected.linkedTimelineId ? (
+                <BakeButton onClick={() => onViewLinkedTimeline(selected.linkedTimelineId)}>
+                  查看所属时间线{selected.linkedTimelineSummary ? ` · ${selected.linkedTimelineSummary.slice(0, 24)}` : ''}
+                </BakeButton>
+              ) : (
+                <BakePill text="尚未归入时间线" />
+              )}
             </div>
           </div>
         ) : (
@@ -354,7 +353,7 @@ const BakeCaptureTab: React.FC<{
             <div className="bake-capture-lightbox__header">
               <div>
                 <div className="bake-kv__title">截图大图</div>
-                <div className="bake-muted">{selected.summary || selected.winTitle || `片段 #${selected.id}`}</div>
+                <div className="bake-muted">{selected.summary || selected.winTitle || `ID #${selected.id}`}</div>
               </div>
               <BakeButton compact onClick={() => setIsScreenshotOpen(false)}>关闭</BakeButton>
             </div>
@@ -362,10 +361,9 @@ const BakeCaptureTab: React.FC<{
               <img
                 className="bake-capture-lightbox__image"
                 src={screenshotUrl}
-                alt={selected.summary || selected.winTitle || `片段 #${selected.id}`}
+                alt={selected.summary || selected.winTitle || `ID #${selected.id}`}
               />
             </div>
-            <div className="bake-capture-lightbox__footer bake-muted">{selected.screenshotPath}</div>
           </div>
         </div>
       )}

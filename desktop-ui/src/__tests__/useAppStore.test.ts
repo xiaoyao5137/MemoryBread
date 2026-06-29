@@ -125,7 +125,7 @@ describe('Action Confirm 状态', () => {
 
 describe('配置状态', () => {
   it('默认 apiBaseUrl', () => {
-    expect(useAppStore.getState().apiBaseUrl).toBe('http://localhost:7070')
+    expect(useAppStore.getState().apiBaseUrl).toBe('http://127.0.0.1:7070')
   })
 
   it('setApiBaseUrl 更新地址', () => {

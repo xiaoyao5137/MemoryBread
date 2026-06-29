@@ -28,7 +28,7 @@ type LlmConcurrencyConfig = {
 }
 
 const PROVIDER_LABEL: Record<string, string> = {
-  ollama: '本地模型', huggingface: 'HuggingFace',
+  ollama: '分析模型', huggingface: 'HuggingFace',
   openai: 'OpenAI', anthropic: 'Anthropic',
   tongyi: '通义千问', doubao: '豆包', deepseek: 'DeepSeek', kimi: 'Kimi',
   google: 'Google', kling: '可灵',
@@ -40,7 +40,8 @@ const PROVIDER_COLOR: Record<string, string> = {
   google: '#4285F4', kling: '#FF2D55',
 }
 const CATEGORY_LABEL: Record<string, string> = {
-  llm: 'LLM', embedding: '向量模型', image: '生图模型', ocr: 'OCR', asr: '语音识别', vlm: '视觉模型',
+  llm: '分析模型', embedding: '向量模型', image: '生图模型', ocr: 'OCR', asr: '语音识别', vlm: '视觉模型',
+  inference_engine: '运行环境',
 }
 const STATUS_COLOR: Record<string, string> = {
   not_installed: '#AEAEB2', downloading: '#FF9500', loading: '#FF9500',
@@ -49,6 +50,66 @@ const STATUS_COLOR: Record<string, string> = {
 const STATUS_LABEL: Record<string, string> = {
   not_installed: '未安装', downloading: '下载中', loading: '加载中',
   installed: '已安装', active: '使用中', error: '错误',
+}
+
+const ANALYSIS_MODEL_ALIASES = new Set([
+  'mbem-v1-local',
+  'qwen3.5-4b',
+])
+
+const VECTOR_MODEL_ALIASES = new Set([
+  'bge-small-zh',
+])
+
+const IMAGE_MODEL_ALLOWLIST = new Set([
+  'gpt-image-2',
+  'gemini-nano-banana',
+])
+
+function normalizeVisibleModels(items: ModelEntry[]): ModelEntry[] {
+  const normalized: ModelEntry[] = []
+  let hasAnalysisModel = false
+  let hasVectorModel = false
+
+  for (const model of items) {
+    if (model.category === 'llm') {
+      if (!ANALYSIS_MODEL_ALIASES.has(model.id)) continue
+      if (hasAnalysisModel) continue
+      normalized.push({
+        ...model,
+        name: 'MBEM v1.0',
+        description: 'MemoryBread Extract Model Local 1.0，本地提炼模型 v1，用于采集内容理解、知识提炼和本地咨询分析',
+        size_gb: model.size_gb || 3.4,
+        tags: ['推荐', '本地', '采集分析'],
+      })
+      hasAnalysisModel = true
+      continue
+    }
+
+    if (model.category === 'embedding') {
+      if (!VECTOR_MODEL_ALIASES.has(model.id)) continue
+      if (hasVectorModel) continue
+      normalized.push({
+        ...model,
+        id: 'bge-small-zh',
+        name: 'BGE-Small-ZH-Q4',
+      })
+      hasVectorModel = true
+      continue
+    }
+
+    if (model.category === 'image') {
+      if (!IMAGE_MODEL_ALLOWLIST.has(model.id)) continue
+      normalized.push(model)
+      continue
+    }
+
+    if (model.category === 'inference_engine') {
+      normalized.push(model)
+    }
+  }
+
+  return normalized
 }
 
 // ── API Key 配置弹窗 ──────────────────────────────────────────────────────────
@@ -452,7 +513,7 @@ const ModelCard: React.FC<{
 }
 
 // ── 主组件 ────────────────────────────────────────────────────────────────────
-type TabType = 'llm' | 'embedding' | 'image' | 'creation'
+type TabType = 'llm' | 'creation'
 
 const ModelManager: React.FC = () => {
   const [tab, setTab] = useState<TabType>('llm')
@@ -497,7 +558,7 @@ const ModelManager: React.FC = () => {
     try {
       const r = await fetch(`${SIDECAR}/api/models`)
       const d = await r.json()
-      if (d.status === 'ok') setModels(d.models)
+      if (d.status === 'ok') setModels(normalizeVisibleModels(d.models || []))
     } catch { } finally { setLoading(false) }
   }
 
@@ -533,10 +594,10 @@ const ModelManager: React.FC = () => {
           stats: d.stats,
         })
       } else {
-        setLlmConcurrencyError(d.message || '无法获取 LLM 并发配置')
+        setLlmConcurrencyError(d.message || '无法获取采集分析并发配置')
       }
     } catch {
-      setLlmConcurrencyError('无法获取 LLM 并发配置')
+      setLlmConcurrencyError('无法获取采集分析并发配置')
     }
   }
 
@@ -550,7 +611,7 @@ const ModelManager: React.FC = () => {
         body: JSON.stringify({ max_concurrency: value }),
       })
       if (r.status === 404) {
-        setLlmConcurrencyError('AI Sidecar 需要重启后才能配置 LLM 并发')
+        setLlmConcurrencyError('AI Sidecar 需要重启后才能配置采集分析并发')
         return
       }
       const d = await r.json()
@@ -633,7 +694,7 @@ const ModelManager: React.FC = () => {
 
   const handleDownload = async (model: ModelEntry) => {
     if (model.provider === 'ollama' && !ollamaSetup?.ollama_running) {
-      setOllamaError('请先安装并启动 Ollama，再下载本地模型')
+      setOllamaError('请先安装并启动 Ollama，再下载分析模型')
       return
     }
 
@@ -715,22 +776,16 @@ const ModelManager: React.FC = () => {
 
   // 按 tab 过滤
   const filtered = models.filter(m => {
-    if (m.category === 'inference_engine') return tab === 'llm'
-    return m.category === tab
+    if (tab === 'llm') return ['llm', 'embedding', 'inference_engine'].includes(m.category)
+    if (tab === 'creation') return m.category === 'image'
+    return false
   })
 
-  // 按 category 分组
-  const grouped = filtered.reduce<Record<string, ModelEntry[]>>((acc, m) => {
+  // 按产品分类分组，避免暴露底层模型供应商作为主导航。
+  const displayGroups = filtered.reduce<Record<string, ModelEntry[]>>((acc, m) => {
     const key = m.category
     if (!acc[key]) acc[key] = []
     acc[key].push(m)
-    return acc
-  }, {})
-
-  // 商业 API 按 provider 分组
-  const byProvider = filtered.reduce<Record<string, ModelEntry[]>>((acc, m) => {
-    if (!acc[m.provider]) acc[m.provider] = []
-    acc[m.provider].push(m)
     return acc
   }, {})
 
@@ -744,8 +799,8 @@ const ModelManager: React.FC = () => {
       {/* 顶部激活状态 */}
       <div style={{ padding: '10px 14px 0', display: 'flex', gap: 8 }}>
         {[
-          { label: 'LLM', model: activeLlm },
-          { label: 'Embedding', model: activeEmb },
+          { label: '采集分析模型', model: activeLlm },
+          { label: '向量模型', model: activeEmb },
         ].map(({ label, model }) => (
           <div key={label} style={{
             flex: 1, background: 'white', borderRadius: 10, padding: '8px 12px',
@@ -764,9 +819,7 @@ const ModelManager: React.FC = () => {
       {/* Tab 切换 */}
       <div style={{ display: 'flex', gap: 4, padding: '10px 14px 0' }}>
         {([
-          { key: 'llm', label: '对话模型' },
-          { key: 'embedding', label: '向量模型' },
-          { key: 'image', label: '生图模型' },
+          { key: 'llm', label: '采集分析模型' },
           { key: 'creation', label: '创作模型' },
         ] as { key: TabType; label: string }[]).map(t => (
           <button key={t.key} onClick={() => setTab(t.key)} style={{
@@ -795,7 +848,7 @@ const ModelManager: React.FC = () => {
             gap: 12,
           }}>
             <div style={{ minWidth: 0 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: '#1D1D1F' }}>LLM 并发</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#1D1D1F' }}>采集分析并发</div>
               <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 2 }}>
                 运行中 {llmConcurrency?.stats?.running_total ?? 0} · P0 快速通道保留
               </div>
@@ -835,32 +888,45 @@ const ModelManager: React.FC = () => {
       {/* 内容区 */}
       <div style={{ flex: 1, overflow: 'auto', padding: '10px 14px 14px' }}>
         {tab === 'creation' ? (
-          <CreationModelPanel
-            configs={creationModelConfigs}
-            openId={configuringCreationId}
-            onToggleOpen={setConfiguringCreationId}
-            onChange={handleCreationModelChange}
-          />
+          <>
+            <CreationModelPanel
+              configs={creationModelConfigs}
+              openId={configuringCreationId}
+              onToggleOpen={setConfiguringCreationId}
+              onChange={handleCreationModelChange}
+            />
+            {Object.entries(displayGroups).map(([category, items]) => (
+              <ModelSection
+                key={category}
+                title={CATEGORY_LABEL[category] || category}
+                models={items}
+                downloadingIds={downloadingIds}
+                activatingIds={activatingIds}
+                onDownload={handleDownload}
+                onActivate={handleActivate}
+                onDelete={handleDelete}
+                onConfigure={setConfiguringModel}
+                onChat={setChattingModel}
+              />
+            ))}
+          </>
         ) : (
           <>
         {loading && models.length === 0 && (
           <div style={{ textAlign: 'center', color: '#AEAEB2', fontSize: 13, padding: 40 }}>加载中...</div>
         )}
 
-        {Object.entries(byProvider).map(([provider, items]) => (
-          <div key={provider} style={{ marginBottom: 16 }}>
+        {Object.entries(displayGroups).map(([category, items]) => (
+          <div key={category} style={{ marginBottom: 16 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-              <span style={{
-                width: 8, height: 8, borderRadius: '50%',
-                background: PROVIDER_COLOR[provider] || '#AEAEB2',
-              }} />
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#007AFF' }} />
               <span style={{ fontSize: 12, fontWeight: 600, color: '#333' }}>
-                {PROVIDER_LABEL[provider] || provider}
+                {CATEGORY_LABEL[category] || category}
               </span>
             </div>
 
             {/* Ollama 运行环境信息 */}
-            {provider === 'ollama' && tab === 'llm' && (
+            {category === 'inference_engine' && tab === 'llm' && (
               <div style={{ background: 'white', borderRadius: 10, padding: 12, border: '1px solid rgba(0,0,0,0.07)', marginBottom: 8 }}>
                 {ollamaChecking ? (
                   <div style={{ fontSize: 12, color: '#AEAEB2' }}>检测中...</div>
@@ -945,26 +1011,64 @@ const ModelManager: React.FC = () => {
   )
 }
 
+const ModelSection: React.FC<{
+  title: string
+  models: ModelEntry[]
+  downloadingIds: Set<string>
+  activatingIds: Set<string>
+  onDownload: (model: ModelEntry) => void
+  onActivate: (model: ModelEntry) => void
+  onDelete: (model: ModelEntry) => void
+  onConfigure: (model: ModelEntry) => void
+  onChat: (model: ModelEntry) => void
+}> = ({ title, models, downloadingIds, activatingIds, onDownload, onActivate, onDelete, onConfigure, onChat }) => (
+  <div style={{ marginTop: 14, marginBottom: 16 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+      <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#007AFF' }} />
+      <span style={{ fontSize: 12, fontWeight: 600, color: '#333' }}>{title}</span>
+    </div>
+    {models.map(m => (
+      <ModelCard
+        key={m.id}
+        model={m}
+        downloading={downloadingIds.has(m.id)}
+        activating={activatingIds.has(m.id)}
+        onDownload={() => onDownload(m)}
+        onActivate={() => onActivate(m)}
+        onDelete={() => onDelete(m)}
+        onConfigure={() => onConfigure(m)}
+        onChat={m.category === 'llm' && (m.status === 'active' || (m.requires_api_key && (m.status as string === 'installed' || m.status as string === 'active'))) ? () => onChat(m) : undefined}
+      />
+    ))}
+  </div>
+)
+
 const CREATION_MODEL_DEFS = [
-  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8',    provider: 'anthropic', hasBaseUrl: true },
-  { id: 'gpt-5-5',         name: 'GPT 5.5',            provider: 'openai',    hasBaseUrl: false },
-  { id: 'qwen-3-7',        name: 'Qwen 3.7B',          provider: 'tongyi',    hasBaseUrl: false },
-  { id: 'qwen-3-5-4b',     name: 'Qwen 3.5 4B (本地)', provider: 'ollama',    hasBaseUrl: true },
-  { id: 'glm-latest',      name: 'GLM 最新版',          provider: 'doubao',    hasBaseUrl: false },
-  { id: 'kimi-latest',     name: 'Kimi 最新版',         provider: 'kimi',      hasBaseUrl: false },
+  {
+    id: 'mbcd-plus-v1',
+    name: 'MBCD Plus v1.0',
+    description: 'MemoryBread Create Document Plus 1.0，文本创作模型 Plus v1',
+    provider: 'anthropic',
+    hasBaseUrl: true,
+  },
+  {
+    id: 'mbcd-std-v1',
+    name: 'MBCD Std v1.0',
+    description: 'MemoryBread Create Document Standard 1.0，文本创作模型 v1',
+    provider: 'ollama',
+    hasBaseUrl: true,
+  },
 ] as const
 
 const CREATION_MODEL_ID_TO_NAME: Record<string, string> = {
+  'mbcd-plus-v1': 'claude-opus-4-8',
+  'mbcd-std-v1':  'qwen3.5:4b',
   'claude-opus-4-8': 'claude-opus-4-8',
-  'gpt-5-5':         'gpt-5.5-turbo',
-  'qwen-3-7':        'qwen3-7b-instruct',
-  'qwen-3-5-4b':     'qwen3.5:4b',
-  'glm-latest':      'glm-4-plus',
-  'kimi-latest':     'moonshot-v1-128k',
+  'qwen-3-5-4b': 'qwen3.5:4b',
 }
 
 const CREATION_SVC = 'http://127.0.0.1:8001'
-const LOCAL_CREATION_MODEL_ID = 'qwen-3-5-4b'
+const LOCAL_CREATION_MODEL_ID = 'mbcd-std-v1'
 
 type CreationChatEntry = { def: typeof CREATION_MODEL_DEFS[number]; cfg: { id: string; apiKey: string; baseUrl?: string } }
 
@@ -1071,6 +1175,9 @@ const CreationModelPanel: React.FC<{
 }> = ({ configs, openId, onToggleOpen, onChange }) => {
   const [testState, setTestState] = React.useState<Record<string, { loading: boolean; result?: string; error?: string }>>({})
   const [chattingModel, setChattingModel] = React.useState<CreationChatEntry | null>(null)
+  const activeConfig = configs.find(config => config.enabled)
+  const activeDef = CREATION_MODEL_DEFS.find(def => def.id === activeConfig?.id)
+  const activeModelName = activeDef?.name || 'MBCD Std v1.0'
 
   const handleTest = async (def: typeof CREATION_MODEL_DEFS[number], cfg: { id: string; enabled: boolean; apiKey: string; baseUrl?: string }) => {
     if (!cfg.apiKey) return
@@ -1095,8 +1202,15 @@ const CreationModelPanel: React.FC<{
 
   return (
     <div>
-      <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 10 }}>
-        启用后，创作页面将调用该模型代替本地模型生成文档。
+      <div style={{ fontSize: 12, color: '#1D1D1F', marginBottom: 8, fontWeight: 650 }}>
+        当前创作模型：{activeModelName}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+        <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#AF52DE' }} />
+        <span style={{ fontSize: 12, fontWeight: 600, color: '#333' }}>咨询生成模型</span>
+      </div>
+      <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 10, lineHeight: 1.5 }}>
+        只能启用一个咨询生成模型。未配置云端 API Key 时，默认使用本地 MBCD Std v1.0。
       </div>
       {CREATION_MODEL_DEFS.map(def => {
         const cfg = configs.find(c => c.id === def.id) || { id: def.id, enabled: false, apiKey: '' }
@@ -1107,7 +1221,10 @@ const CreationModelPanel: React.FC<{
           <div key={def.id} style={{ background: 'white', borderRadius: 10, padding: '10px 12px', border: '1px solid rgba(0,0,0,0.07)', marginBottom: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ width: 8, height: 8, borderRadius: '50%', background: PROVIDER_COLOR[def.provider] || '#AEAEB2', flexShrink: 0 }} />
-              <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: '#1D1D1F' }}>{def.name}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#1D1D1F' }}>{def.name}</div>
+                <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 2 }}>{def.description}</div>
+              </div>
               {!isLocalModel && cfg.apiKey && (
                 <button onClick={() => handleTest(def, cfg)} disabled={ts?.loading} style={btn(ts?.result ? '#34C759' : ts?.error ? '#FF3B30' : '#F2F2F7', ts?.result || ts?.error ? 'white' : '#333', 11)}>
                   {ts?.loading ? '验证中…' : ts?.result ? '已通' : ts?.error ? '失败' : '验证'}

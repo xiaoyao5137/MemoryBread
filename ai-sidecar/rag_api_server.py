@@ -87,9 +87,20 @@ def rag_query():
                 'source': chunk.source,
                 'source_type': chunk.metadata.get('source_type') or chunk.source,
                 'knowledge_id': chunk.metadata.get('knowledge_id'),
+                'artifact_id': chunk.metadata.get('artifact_id'),
+                'document_id': chunk.metadata.get('document_id'),
                 'app_name': chunk.metadata.get('app_name'),
                 'win_title': chunk.metadata.get('win_title'),
+                'url': chunk.metadata.get('url') or chunk.metadata.get('source_url'),
+                'source_url': chunk.metadata.get('source_url') or chunk.metadata.get('url'),
+                'title': chunk.metadata.get('title'),
+                'doc_type': chunk.metadata.get('doc_type'),
                 'time': chunk.metadata.get('time') or chunk.metadata.get('ts') or chunk.metadata.get('end_time') or chunk.metadata.get('start_time'),
+                'summary': chunk.metadata.get('summary'),
+                'overview': chunk.metadata.get('overview'),
+                'category': chunk.metadata.get('category'),
+                'source_timeline_ids': chunk.metadata.get('source_timeline_ids'),
+                'linked_knowledge_ids': chunk.metadata.get('linked_knowledge_ids'),
             }
             for chunk in result.contexts
         ]

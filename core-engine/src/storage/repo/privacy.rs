@@ -37,6 +37,20 @@ pub fn get_enabled_blacklist_bundle_ids(conn: &Connection) -> Result<HashSet<Str
     Ok(bundle_ids)
 }
 
+/// 获取所有启用的黑名单 Bundle ID 与应用名（用于内存缓存）
+pub fn get_enabled_blacklist_entries(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT bundle_id, app_name FROM app_blacklist WHERE enabled = 1")?;
+
+    let entries = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(entries)
+}
+
 /// 检查指定 Bundle ID 是否在黑名单中
 pub fn is_app_blacklisted(conn: &Connection, bundle_id: &str) -> Result<bool> {
     let count: i64 = conn.query_row(

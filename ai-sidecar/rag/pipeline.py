@@ -62,7 +62,7 @@ _PROJECT_WEEKLY_REPORT_SYSTEM_PROMPT = (
     "- 禁止输出'请提供'、'请告诉我'等请求性语句\n"
     "- 只写可验证结论，不写活动流水\n"
     "【结构规范】固定输出：本周核心产出、项目进展、本周量化进展（OKR/KPI/专项，如有）、下周计划、风险/阻塞\n"
-    "【证据规范】数字化结论必须可追溯到证据编号（如 K#12/C#34）；无证据不得输出数字。\n"
+    "【证据规范】数字化结论必须可追溯到参考资料编号（如 R#1）；无证据不得输出数字。\n"
     "【输出规范】禁止输出表格、元数据标记、时间戳、应用名、窗口名、来源字段。"
 )
 
@@ -210,7 +210,7 @@ class RagPipeline:
             "- 无法判断时，按正常流程处理"
         )
 
-    def query(self, user_query: str, top_k: int | None = None) -> RagResult:
+    def query(self, user_query: str, top_k: int | None = None, llm=None) -> RagResult:
         """执行完整 RAG 查询，返回 LLM 答案及引用的上下文片段。"""
         effective_top_k = top_k or self._top_k
         intent = self._parse_query_intent(user_query)
@@ -367,7 +367,7 @@ class RagPipeline:
         if intent.task_type == "weekly_report":
             kpi_section_rule = (
                 "11. 若涉及 OKR/KPI/专项进展，必须新增“## 本周量化进展（OKR/KPI/专项）”章节；"
-                "每条使用「- 指标结论（证据：K#xx/C#yy）」格式。\n"
+                "每条使用「- 指标结论（证据：R#序号）」格式。\n"
                 "12. 量化结论必须来自“量化证据”区块；无证据不得输出任何数字。\n"
                 if intent.kpi_mode else
                 "11. 若上下文提供“量化证据”区块，优先引用其数字；无证据不得编造数字。\n"
@@ -394,10 +394,10 @@ class RagPipeline:
             )
         elif intent.task_type == "project_weekly_report":
             kpi_section_rule = (
-                "6. 必须输出“## 本周量化进展（OKR/KPI/专项）”章节；每条量化结论都必须带证据编号（证据：K#xx/C#yy）。\n"
+                "6. 必须输出“## 本周量化进展（OKR/KPI/专项）”章节；每条量化结论都必须带参考资料编号（证据：R#序号）。\n"
                 "7. 未在证据区块出现的数字禁止输出，无法验证时改为定性描述。\n"
                 if intent.kpi_mode else
-                "6. 若上下文提供量化证据，优先输出可验证数字并附证据编号（证据：K#xx/C#yy）；无证据不要编造数字。\n"
+                "6. 若上下文提供量化证据，优先输出可验证数字并附参考资料编号（证据：R#序号）；无证据不要编造数字。\n"
             )
             prompt = (
                 "【输出规则】\n"
@@ -441,7 +441,11 @@ class RagPipeline:
                 "## 下一步计划\n- 至少3条\n"
             )
         else:
-            prompt = f"工作记录上下文：\n{context_text}\n\n用户问题：{user_query}"
+            link_rule = (
+                "用户正在询问地址/链接/网址。若上下文中包含 URL，请在回答中直接给出完整 URL，并用 Markdown 链接格式展示。\n"
+                if _is_link_query(user_query) else ""
+            )
+            prompt = f"{link_rule}工作记录上下文：\n{context_text}\n\n用户问题：{user_query}"
 
         # 根据意图动态选择 system prompt，并注入用户身份
         # user_identity 已在前面读取（用于主语去除），复用，避免重复查询 DB
@@ -468,39 +472,23 @@ class RagPipeline:
             else:
                 llm_kwargs["num_predict"] = 896
 
-        primary_llm = self._llm
+        primary_llm = llm or self._llm
         # 报告模式不再切换为硬编码的 qwen2.5:3b，避免 Ollama 频繁 swap 模型
         # 任何查询都使用当前激活的 LLM 模型
 
         try:
             llm_resp = primary_llm.complete(prompt, system=system, **llm_kwargs)
             answer = llm_resp.text
-        except Exception as e:
-            err_str = str(e).lower()
-            if "timed out" in err_str or "timeout" in err_str or "urlopen error" in err_str:
-                # Ollama 忙（后台时间线提炼等任务占用），返回提示让用户稍后重试
-                fallback_context = self._build_context(
-                    selected_contexts,
-                    strip_user_subject=is_report,
-                    user_names=user_names if is_report else None,
-                )
-                fallback_tips = (
-                    "⏳ AI 正在处理后台任务，Ollama 暂时繁忙。请稍候 1-2 分钟再试。\n\n"
-                    "以下是检索到的相关内容供参考：\n\n"
-                )
-                return RagResult(
-                    answer=fallback_tips + fallback_context,
-                    contexts=selected_contexts,
-                    model="unavailable",
-                    tokens=0,
-                )
-            else:
-                raise
+        except Exception:
+            raise
 
         # 报告模式：后处理兜底去除主语（应对 LLM 未遵从指令的情况）
         if is_report:
             answer = _postprocess_strip_subjects(answer, user_names)
-        if intent.task_type == "weekly_report":
+        if _is_link_query(user_query):
+            answer = _ensure_link_answer(answer, selected_contexts)
+        if intent.task_type in ("weekly_report", "project_weekly_report"):
+            answer = _normalize_evidence_references(answer, selected_contexts)
             answer = _normalize_weekly_report(answer)
 
         return RagResult(
@@ -557,7 +545,7 @@ class RagPipeline:
         details_map = self._load_knowledge_details(chunks)
         candidates: list[tuple[str, str, float]] = []
 
-        for chunk in chunks:
+        for context_index, chunk in enumerate(chunks, 1):
             metadata = chunk.metadata or {}
             knowledge_id = metadata.get("knowledge_id")
             text_parts = [(chunk.text or "").strip()]
@@ -574,7 +562,7 @@ class RagPipeline:
             if not fact_lines:
                 continue
 
-            evidence_ref = self._format_evidence_ref(metadata, chunk.capture_id)
+            evidence_ref = f"R#{context_index}"
             evidence_score = self._score_evidence(metadata)
             for fact in fact_lines:
                 candidates.append((fact, evidence_ref, evidence_score))
@@ -804,6 +792,7 @@ class RagPipeline:
             key=lambda chunk: (
                 # 报告模式：importance 低的排后面（importance 为 None 按 3 处理）
                 -(chunk.metadata.get("importance") or 3) if is_report_mode else 0,
+                _source_priority(chunk.metadata.get("source_type") or chunk.source) if not is_report_mode else 0,
                 0 if is_report_mode and chunk.metadata.get("activity_type") not in {"other", None} else 1,
                 0 if is_report_mode and chunk.metadata.get("evidence_strength") in {"high", "medium"} else 1,
                 -float(chunk.score),
@@ -814,7 +803,7 @@ class RagPipeline:
             if len(selected) >= top_k:
                 break
             source_type = chunk.metadata.get("source_type") or chunk.source
-            if source_type != "knowledge":
+            if source_type not in {"knowledge", "document", "bake_knowledge", "operation"}:
                 logger.info(f"  跳过: source_type={source_type}")
                 continue
             if _is_noise_chunk(chunk):
@@ -867,9 +856,17 @@ class RagPipeline:
             if not doc_key or doc_key in selected_keys:
                 logger.info(f"  跳过: doc_key重复或为空")
                 continue
+            if source_type == "knowledge" and any(
+                str(chunk.metadata.get("knowledge_id")) in _source_ids_of(selected_chunk)
+                for selected_chunk in selected
+            ):
+                logger.info("  跳过: 时间线已有对应产物入选")
+                continue
             logger.info(f"  ✓ 选中: importance={chunk.metadata.get('importance')}, activity={chunk.metadata.get('activity_type')}")
             selected.append(chunk)
             selected_keys.add(doc_key)
+            for linked_id in _source_ids_of(chunk):
+                selected_keys.add(f"knowledge:{linked_id}")
 
         logger.info(f"_select_contexts: 最终选中 {len(selected)} 条")
         return selected
@@ -1125,6 +1122,61 @@ def _is_noise_chunk(chunk: RetrievedChunk) -> bool:
     return _looks_like_noise_chunk(chunk)
 
 
+def _source_ids_of(chunk: RetrievedChunk) -> set[str]:
+    metadata = chunk.metadata or {}
+    ids: set[str] = set()
+    for key in ("source_timeline_ids", "linked_knowledge_ids"):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            ids.update(str(item) for item in value if item is not None)
+        elif isinstance(value, str) and value.strip():
+            ids.update(re.findall(r"\d+", value))
+    return ids
+
+
+def _source_priority(source_type: str | None) -> int:
+    return {
+        "document": 0,
+        "bake_knowledge": 1,
+        "operation": 2,
+        "knowledge": 3,
+    }.get(str(source_type or ""), 9)
+
+
+def _is_link_query(query: str) -> bool:
+    lowered = query.lower()
+    return any(term in lowered for term in ("url", "链接", "地址", "网址", "文档地址", "页面"))
+
+
+def _ensure_link_answer(answer: str, contexts: list[RetrievedChunk]) -> str:
+    link_items: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for chunk in contexts:
+        metadata = chunk.metadata or {}
+        url = str(metadata.get("source_url") or metadata.get("url") or "").strip()
+        if not url:
+            match = re.search(r"https?://[^\s)）】]+", chunk.text or "")
+            url = match.group(0) if match else ""
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        title = str(metadata.get("title") or metadata.get("overview") or metadata.get("summary") or "相关文档").strip()
+        link_items.append((title, url))
+        if len(link_items) >= 3:
+            break
+
+    if not link_items:
+        return answer
+
+    if any(url in answer for _, url in link_items):
+        return answer
+
+    lines = ["找到的文档地址："]
+    for title, url in link_items:
+        lines.append(f"- [{title}]({url})")
+    return "\n".join(lines)
+
+
 
 def _postprocess_strip_subjects(text: str, user_names: list[str]) -> str:
     """对 LLM 最终输出做后处理，去掉人名和第三人称代词作主语。"""
@@ -1160,6 +1212,38 @@ def _postprocess_strip_subjects(text: str, user_names: list[str]) -> str:
     return "\n".join(result)
 
 
+def _normalize_evidence_references(text: str, contexts: list[RetrievedChunk]) -> str:
+    """把内部证据号归一为前端参考资料序号，避免 answer 引用到不可对应的 K#/C#。"""
+    if not text or not contexts:
+        return text
+
+    replacements: dict[str, str] = {}
+    for index, chunk in enumerate(contexts, 1):
+        metadata = chunk.metadata or {}
+        display_ref = f"R#{index}"
+        internal_ref = RagPipeline._format_evidence_ref(metadata, chunk.capture_id)
+        if internal_ref and internal_ref != "未知证据":
+            replacements[internal_ref] = display_ref
+
+        knowledge_id = metadata.get("knowledge_id")
+        capture_id = metadata.get("capture_id") or chunk.capture_id
+        try:
+            if knowledge_id is not None:
+                replacements[f"K#{int(knowledge_id)}"] = display_ref
+        except Exception:
+            pass
+        try:
+            if capture_id is not None:
+                replacements[f"C#{int(capture_id)}"] = display_ref
+        except Exception:
+            pass
+
+    normalized = text
+    for old_ref in sorted(replacements, key=len, reverse=True):
+        normalized = normalized.replace(old_ref, replacements[old_ref])
+    return normalized
+
+
 def _normalize_weekly_report(text: str) -> str:
     """对周报结果做轻量格式修正，提升小模型输出稳定性。"""
     import re
@@ -1170,8 +1254,18 @@ def _normalize_weekly_report(text: str) -> str:
     text = text.replace("### ", "## ")
     lines = [line.rstrip() for line in text.split("\n")]
 
-    # 丢弃模型回显的原始工作记录
-    cut_markers = ("工作记录：", "以下是本周真实工作记录", "原始工作记录：")
+    # 丢弃模型回显的原始工作记录或内部证据清单。
+    cut_markers = (
+        "工作记录：",
+        "以下是本周真实工作记录",
+        "原始工作记录：",
+        "依据证据",
+        "证据依据",
+        "引用依据",
+        "参考依据",
+        "【量化证据】",
+        "量化证据：",
+    )
     trimmed = []
     for line in lines:
         if any(marker in line for marker in cut_markers):

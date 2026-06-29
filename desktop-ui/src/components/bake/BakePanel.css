@@ -164,6 +164,20 @@
   font-weight: 600;
 }
 
+.bake-backbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(0, 122, 255, 0.16);
+  border-radius: 10px;
+  background: rgba(0, 122, 255, 0.08);
+  color: #1D4F8F;
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .bake-form-field {
   display: grid;
   gap: 6px;
@@ -215,6 +229,10 @@
 
 .bake-list-toolbar__repository-row--dates {
   grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+}
+
+.bake-list-toolbar__repository-row--compact {
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .bake-list-toolbar__repository-actions {
@@ -769,6 +787,34 @@ button.bake-list-item.bake-list-item--active {
 
 .bake-stat-chip--button:hover {
   background: rgba(0, 122, 255, 0.16);
+}
+
+.bake-related-summary {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
+  background: #FAFAFA;
+}
+
+.bake-related-row {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bake-related-row__label {
+  color: #6B7280;
+  font-weight: 600;
+}
+
+.bake-related-row__value {
+  color: #111827;
+  overflow-wrap: anywhere;
 }
 
 .bake-aside-stack {

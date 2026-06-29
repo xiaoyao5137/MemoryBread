@@ -99,9 +99,10 @@ struct ReferencePayload {
 
 pub async fn generate_document(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<GenerateRequest>,
+    Json(mut req): Json<GenerateRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     info!("创作请求: prompt={}", req.user_prompt);
+    enrich_creation_model_from_preferences(&state, &mut req);
 
     // 1. 查询文档模板
     let templates = state.storage.get_document_templates(Some(5)).map_err(
@@ -164,7 +165,7 @@ pub async fn generate_document(
 
     let client = reqwest::Client::new();
     let response = client
-        .post("http://localhost:8001/creation/generate")
+        .post("http://127.0.0.1:8001/creation/generate")
         .json(&payload)
         .send()
         .await
@@ -184,12 +185,16 @@ pub async fn generate_document(
     let stream = async_stream::stream! {
         let mut bytes_stream = response.bytes_stream();
         use futures::StreamExt;
+        let mut buffer = String::new();
 
         while let Some(chunk) = bytes_stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                        for line in text.lines() {
+                        buffer.push_str(&text);
+                        while let Some(newline_index) = buffer.find('\n') {
+                            let line = buffer[..newline_index].trim_end_matches('\r').to_string();
+                            buffer.drain(..=newline_index);
                             if line.starts_with("data: ") {
                                 let content = &line[6..];
                                 yield Ok(Event::default().data(content));
@@ -199,9 +204,16 @@ pub async fn generate_document(
                 }
                 Err(e) => {
                     error!("流式读取错误: {}", e);
+                    let payload = serde_json::json!({ "error": format!("AI 流式响应中断: {}", e) }).to_string();
+                    yield Ok(Event::default().data(payload));
                     break;
                 }
             }
+        }
+        let line = buffer.trim();
+        if line.starts_with("data: ") {
+            let content = &line[6..];
+            yield Ok(Event::default().data(content));
         }
     };
 
@@ -232,7 +244,7 @@ pub async fn preview_references(
 
     let client = reqwest::Client::new();
     let response = client
-        .post("http://localhost:8001/creation/references")
+        .post("http://127.0.0.1:8001/creation/references")
         .json(&payload)
         .send()
         .await
@@ -293,6 +305,59 @@ fn default_freshness_weight() -> f64 {
 
 fn default_max_references() -> i64 {
     6
+}
+
+fn creation_model_name(id: &str) -> &str {
+    match id {
+        "mbcd-plus-v1" => "claude-opus-4-8",
+        "mbcd-std-v1" => "qwen3.5:4b",
+        "claude-opus-4-8" => "claude-opus-4-8",
+        "qwen-3-5-4b" => "qwen3.5:4b",
+        _ => id,
+    }
+}
+
+fn enrich_creation_model_from_preferences(state: &Arc<AppState>, req: &mut GenerateRequest) {
+    if req.creation_model.is_some() {
+        return;
+    }
+
+    let Some(raw) = state
+        .storage
+        .get_preference_value("creation.models")
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Ok(models) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(items) = models.as_array() else {
+        return;
+    };
+    let Some(selected) = items.iter().find(|item| {
+        item.get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    }) else {
+        return;
+    };
+    let Some(id) = selected.get("id").and_then(|value| value.as_str()) else {
+        return;
+    };
+
+    req.creation_model = Some(creation_model_name(id).to_string());
+    req.creation_api_key = selected
+        .get("apiKey")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_string());
+    req.creation_base_url = selected
+        .get("baseUrl")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_string());
 }
 
 #[derive(Debug, Deserialize)]
