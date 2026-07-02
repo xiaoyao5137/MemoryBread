@@ -35,13 +35,17 @@ use super::{
             monitor_extraction_live, monitor_overview, monitor_pipeline_dag, monitor_system,
         },
         pii::pii_scrub,
-        preferences::{list_preferences, run_screenshot_cleanup_now, update_preference},
+        preferences::{
+            list_preferences, run_capture_cleanup_now, run_screenshot_cleanup_now,
+            update_preference,
+        },
         privacy::{
             add_blacklist, delete_blacklist, list_blacklist, list_filters,
             update_blacklist_enabled, update_filter_config, update_filter_enabled,
         },
         profile::{get_latest_profile, get_profile, list_profiles, update_profile},
         query::{create_rag_job, get_rag_job, rag_history, rag_query},
+        runtime::{get_runtime_status, update_runtime_status},
         tasks::{
             create_task, delete_task, get_task, list_executions, list_tasks, trigger_task,
             update_task,
@@ -61,6 +65,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/health", get(health_handler))
+        .route(
+            "/api/runtime/status",
+            get(get_runtime_status).put(update_runtime_status),
+        )
         .route("/api/captures", get(list_captures))
         .route("/captures", get(list_captures))
         .route("/query", post(rag_query))
@@ -72,6 +80,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/preferences/screenshot-cleanup/run",
             post(run_screenshot_cleanup_now),
+        )
+        .route(
+            "/preferences/capture-cleanup/run",
+            post(run_capture_cleanup_now),
         )
         .route("/preferences/:key", put(update_preference))
         .route("/api/config-checks", get(list_config_checks))

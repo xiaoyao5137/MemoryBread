@@ -185,8 +185,102 @@ def get_bake_extractor():
     return _bake_extractor
 
 
-def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[dict], latency_ms: int) -> int | None:
+def _with_floating_assist_context(contexts: list[dict], metadata: dict | None = None) -> list[dict]:
+    saved_contexts = list(contexts or [])
+    metadata = metadata or {}
+    has_floating_context = any(
+        (item.get('source_type') or item.get('source')) == 'floating_assist'
+        for item in saved_contexts
+        if isinstance(item, dict)
+    )
+    if not has_floating_context and metadata.get('source') == 'floating_assist' and metadata.get('screenshot_path'):
+        ocr_text = (metadata.get('ocr_text') or '').strip()
+        saved_contexts.insert(0, {
+            'capture_id': 0,
+            'doc_key': f"floating-assist:{int(time.time() * 1000)}",
+            'text': ocr_text[:1200] if ocr_text else '悬浮球截屏识别',
+            'score': 1.0,
+            'source': 'floating_assist',
+            'source_type': 'floating_assist',
+            'title': '悬浮球截屏',
+            'screenshot_path': metadata.get('screenshot_path'),
+            'screenshot_width': metadata.get('screenshot_width'),
+            'screenshot_height': metadata.get('screenshot_height'),
+        })
+    return saved_contexts
+
+
+def _extract_floating_assist_question(ocr_text: str) -> str:
+    text = (ocr_text or '').strip()
+    if not text:
+        return ''
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    question_markers = ('?', '？', '是什么', '怎么样', '多少', '如何', '怎么', '哪些', '为什么', '有没有', '能否')
+    noise_tokens = (
+        '显示器 ', 'http://', 'https://', '发送/', '换行', '发送', '搜索', '登录', '注册账号',
+        '安全与隐私', '用户控制台', '菜单', '窗口', '帮助', 'File', 'Edit', 'View', 'Window'
+    )
+
+    candidates: list[str] = []
+    for line in lines:
+        if any(token in line for token in noise_tokens):
+            continue
+        if any(marker in line for marker in question_markers):
+            candidates.append(line)
+
+    if candidates:
+        candidates.sort(key=lambda item: (('？' in item or '?' in item), len(item)), reverse=True)
+        return candidates[0][:240]
+
+    return ''
+
+
+def _extract_floating_assist_ocr_from_query(raw_query: str) -> str:
+    text = raw_query or ''
+    marker = '当前屏幕 OCR：'
+    if marker not in text:
+        marker = '当前屏幕 OCR:'
+    if marker not in text:
+        return ''
+    return text.split(marker, 1)[1].strip()
+
+
+def _floating_assist_metadata(raw_query: str, metadata: dict | None = None) -> dict:
+    data = dict(metadata or {})
+    if data.get('source') != 'floating_assist' and '工作场景助手' in (raw_query or '') and '当前屏幕 OCR' in (raw_query or ''):
+        data['source'] = 'floating_assist'
+    if data.get('source') == 'floating_assist' and not (data.get('ocr_text') or '').strip():
+        ocr_text = _extract_floating_assist_ocr_from_query(raw_query)
+        if ocr_text:
+            data['ocr_text'] = ocr_text
+    return data
+
+
+def _build_floating_assist_rag_query(raw_query: str, metadata: dict | None = None) -> str:
+    metadata = _floating_assist_metadata(raw_query, metadata)
+    if metadata.get('source') != 'floating_assist':
+        return raw_query
+
+    focused_question = _extract_floating_assist_question(metadata.get('ocr_text') or '')
+    if not focused_question:
+        return raw_query
+
+    return (
+        f'核心问题：{focused_question}\n'
+        '输出格式：\n'
+        '## 用户问题理解\n'
+        '用一句话说明用户当前真正想问什么。\n'
+        '## 回答\n'
+        '直接回答核心问题，给结论、关键依据和可复制文本；不可反问，'
+        '不可输出让用户去询问、同步、确认的提问话术，不可只列资料名。'
+    )
+
+
+def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[dict], latency_ms: int, metadata: dict | None = None) -> int | None:
     try:
+        metadata = metadata or {}
+        saved_contexts = _with_floating_assist_context(contexts, metadata)
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
@@ -195,9 +289,9 @@ def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(time.time() * 1000),
-                'monitor',
+                'floating_assist' if metadata.get('source') == 'floating_assist' else 'monitor',
                 query,
-                json.dumps(contexts, ensure_ascii=False),
+                json.dumps(saved_contexts, ensure_ascii=False),
                 prompt_used,
                 answer,
                 latency_ms,
@@ -968,6 +1062,8 @@ def rag_query():
         query = data['query']
         top_k = data.get('top_k', 5)
         logger.info(f"收到 RAG 查询: {query}")
+        data = _floating_assist_metadata(query, data)
+        rag_query_text = _build_floating_assist_rag_query(query, data)
 
         # 内存压力检查
         from model_registry_global import check_memory_pressure
@@ -993,7 +1089,7 @@ def rag_query():
         try:
             result = get_global_queue().submit_sync(
                 Priority.P0,
-                lambda: pipeline.query(query, top_k=top_k, llm=llm_override),
+                lambda: pipeline.query(rag_query_text, top_k=top_k, llm=llm_override),
                 timeout=420.0,
                 lane=LANE_P0_QUERY,
             )
@@ -1044,12 +1140,14 @@ def rag_query():
             for chunk in result.contexts
         ]
 
+        response_contexts = contexts
+        saved_contexts = _with_floating_assist_context(contexts, data)
         prompt_used = pipeline._build_context(result.contexts)
         latency_ms = int(time.time() * 1000) - start_ms
-        session_id = _save_rag_session(query, prompt_used, result.answer, contexts, latency_ms)
+        session_id = _save_rag_session(rag_query_text, prompt_used, result.answer, saved_contexts, latency_ms, data)
 
         completion_tokens = result.tokens or estimate_tokens(result.answer)
-        prompt_tokens = estimate_tokens(f"工作记录上下文：\n{prompt_used}\n\n用户问题：{query}")
+        prompt_tokens = estimate_tokens(f"工作记录上下文：\n{prompt_used}\n\n用户问题：{rag_query_text}")
         log_llm_usage(
             caller='rag',
             model_name=result.model or 'unknown',
@@ -1061,7 +1159,7 @@ def rag_query():
 
         return jsonify({
             'answer': result.answer,
-            'contexts': contexts,
+            'contexts': response_contexts,
             'model': result.model,
         })
     except Exception as e:
@@ -1081,7 +1179,12 @@ def rag_query():
         logger.error(f"RAG 查询失败: {e}", exc_info=True)
 
         lowered = error_text.lower()
-        if 'ollama' in lowered or 'bad gateway' in lowered:
+        if (
+            'ollama' in lowered
+            or 'bad gateway' in lowered
+            or '云端模型服务不可达' in error_text
+            or '云端模型请求失败' in error_text
+        ):
             return jsonify({'error': error_text}), 502
         if 'service unavailable' in lowered or '初始化失败' in error_text or 'busy' in lowered:
             return jsonify({'error': error_text}), 503

@@ -98,6 +98,9 @@ export interface RagContext {
   importance?: number | null
   source_timeline_ids?: string[] | null
   linked_knowledge_ids?: string[] | null
+  screenshot_path?: string | null
+  screenshot_width?: number | null
+  screenshot_height?: number | null
 }
 
 export interface RagHistoryItem {
@@ -147,7 +150,63 @@ export interface ActionResult {
   action_id:   string
 }
 
-export type WindowMode = 'buddy' | 'rag' | 'creation' | 'knowledge' | 'models' | 'privacy' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake' | 'profile'
+export type WindowMode = 'buddy' | 'rag' | 'creation' | 'knowledge' | 'models' | 'privacy' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake' | 'profile' | 'account'
+
+export type ServiceEnvironment = 'production' | 'staging'
+
+export type AccountType = 'user' | 'platform_admin'
+
+export interface CloudUser {
+  id: string
+  email?: string | null
+  phone?: string | null
+  status: string
+  roles: string[]
+  locale: string
+  timezone: string
+  created_at: string
+}
+
+export interface AuthSession {
+  access_token: string
+  expires_at: string
+  user: CloudUser
+}
+
+export interface CloudDevice {
+  id: string
+  name: string
+  platform: string
+  client_version: string
+  last_seen_at: string
+  revoked_at?: string | null
+}
+
+export interface UpsertCloudDeviceRequest {
+  device_id?: string
+  name: string
+  platform: string
+  client_version: string
+  public_key_base64: string
+}
+
+export interface CloudSnapshot {
+  id: string
+  device_id: string
+  encrypted_size: number
+  status: string
+  committed_at?: string | null
+}
+
+export interface CompleteCloudSnapshotRequest {
+  device_id: string
+  encrypted_size: number
+  oss_object_key: string
+  checksum_sha256?: string | null
+  format_version: number
+  schema_version: number
+  encryption_version: number
+}
 
 export type BakeTab = 'overview' | 'templates' | 'knowledge' | 'sop'
 

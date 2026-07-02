@@ -33,6 +33,16 @@ _DEFAULT_SYSTEM_PROMPT = (
     "如果上下文中没有相关信息，请直接说明。"
 )
 
+
+def _extract_core_retrieval_query(user_query: str) -> str:
+    """For structured assistant prompts, keep retrieval focused on the actual user question."""
+    text = (user_query or "").strip()
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("核心问题：") or line.startswith("核心问题:"):
+            return line.split(":", 1)[1].strip() if ":" in line else line.split("：", 1)[1].strip()
+    return text
+
 _WEEKLY_REPORT_SYSTEM_PROMPT = (
     "你是记忆面包，一个本地运行的 AI 工作助手。"
     "你的任务是：直接根据下方【工作记录上下文】生成一份工作周报，立即输出，不得提问、不得要求用户补充任何信息。\n"
@@ -112,6 +122,11 @@ _PROJECT_SUMMARY_SYSTEM_PROMPT = (
 )
 
 _MAX_CHUNK_LEN = 800   # 单个上下文片段最大字符数
+_KEYWORD_RRF_WEIGHT = 0.45
+_VECTOR_RRF_WEIGHT = 1.0
+_LOOKUP_MIN_RRF_SCORE_WITH_VECTOR = 0.01
+_VECTOR_LOOKUP_SCORE_THRESHOLD = 0.45
+_VECTOR_SUMMARY_SCORE_THRESHOLD = 0.35
 
 
 @dataclass
@@ -214,6 +229,7 @@ class RagPipeline:
         """执行完整 RAG 查询，返回 LLM 答案及引用的上下文片段。"""
         effective_top_k = top_k or self._top_k
         intent = self._parse_query_intent(user_query)
+        retrieval_query = _extract_core_retrieval_query(user_query)
 
         # 报告类任务优先保证稳定返回，限制上下文规模，避免 prompt 过大导致本地模型超时
         if intent.task_type == "weekly_report":
@@ -230,19 +246,20 @@ class RagPipeline:
 
         query_vector: list[float] = []
         try:
-            embed_results = self._embed.encode([user_query])
+            embed_results = self._embed.encode([retrieval_query])
             if embed_results:
                 query_vector = embed_results[0].vector
         except Exception as exc:
-            logger.warning("Query embedding 失败，跳过语义检索: %s", exc)
+            logger.warning("Query embedding 失败: %s", exc)
+            raise RuntimeError(f"Query embedding 失败，无法执行向量检索: {exc}") from exc
 
         # 任务型意图：不按关键词过滤，纯按时间段和活动类型宽松召回
-        knowledge_entity_terms = None if intent.task_type else (intent.entity_terms or None)
+        knowledge_entity_terms = None if (intent.task_type or retrieval_query != user_query) else (intent.entity_terms or None)
 
         _is_report_task = intent.task_type in ("weekly_report", "daily_report", "project_weekly_report")
         logger.info(f"任务类型: {intent.task_type}, 是否报告任务: {_is_report_task}, start_ts: {intent.start_ts}, end_ts: {intent.end_ts}")
         knowledge_results = self._knowledge.search(
-            user_query if not intent.task_type else "",
+            retrieval_query if not intent.task_type else "",
             top_k=effective_top_k * 2,
             # 周报/日报：start_ts/end_ts 过滤 k.start_time/k.end_time（事件时间），与 created_at 时间段无关，置 None
             start_ts=None if _is_report_task else intent.start_ts,
@@ -298,6 +315,11 @@ class RagPipeline:
             self._vector.search(
                 query_vector,
                 top_k=effective_top_k * 3,
+                score_threshold=(
+                    _VECTOR_SUMMARY_SCORE_THRESHOLD
+                    if intent.query_mode == "summary" or intent.task_type
+                    else _VECTOR_LOOKUP_SCORE_THRESHOLD
+                ),
                 filters=VectorSearchFilter(
                     start_ts=intent.start_ts,
                     end_ts=intent.end_ts,
@@ -305,8 +327,8 @@ class RagPipeline:
                     observed_end_ts=intent.observed_end_ts,
                     event_start_ts=intent.event_start_ts,
                     event_end_ts=intent.event_end_ts,
-                    source_types=["knowledge"],
-                    app_names=None if (intent.query_mode == "summary" or intent.task_type) else (intent.app_names or intent.entity_terms or None),
+                    source_types=["knowledge", "document"],
+                    app_names=None if (retrieval_query != user_query or intent.query_mode == "summary" or intent.task_type) else (intent.app_names or intent.entity_terms or None),
                     category=intent.category,
                     activity_types=intent.activity_types or None,
                     content_origins=intent.content_origins or None,
@@ -318,9 +340,16 @@ class RagPipeline:
             if query_vector else []
         )
 
+        keyword_weight = _KEYWORD_RRF_WEIGHT if vector_results else 1.0
+        min_rrf_score = (
+            _LOOKUP_MIN_RRF_SCORE_WITH_VECTOR
+            if vector_results and intent.query_mode == "lookup" and not intent.task_type
+            else 0.0
+        )
         merged = reciprocal_rank_fusion(
-            [knowledge_results, vector_results],
+            [(knowledge_results, keyword_weight), (vector_results, _VECTOR_RRF_WEIGHT)],
             top_k=max(effective_top_k * 2, 6),
+            min_score=min_rrf_score,
         )
         selected_contexts = self._select_contexts(merged, effective_top_k, query_mode=intent.query_mode)
 
@@ -445,7 +474,16 @@ class RagPipeline:
                 "用户正在询问地址/链接/网址。若上下文中包含 URL，请在回答中直接给出完整 URL，并用 Markdown 链接格式展示。\n"
                 if _is_link_query(user_query) else ""
             )
-            prompt = f"{link_rule}工作记录上下文：\n{context_text}\n\n用户问题：{user_query}"
+            floating_format_rule = ""
+            if "## 用户问题理解" in user_query and "## 回答" in user_query:
+                floating_format_rule = (
+                    "必须严格按以下 Markdown 结构输出，不能省略任何章节：\n"
+                    "## 用户问题理解\n"
+                    "用一句话说明你判断出的用户真实问题。\n"
+                    "## 回答\n"
+                    "直接给出结论和依据，不要反问，不要只给追问话术。\n\n"
+                )
+            prompt = f"{link_rule}{floating_format_rule}工作记录上下文：\n{context_text}\n\n用户问题：{user_query}"
 
         # 根据意图动态选择 system prompt，并注入用户身份
         # user_identity 已在前面读取（用于主语去除），复用，避免重复查询 DB

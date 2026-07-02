@@ -40,6 +40,8 @@ INSERT OR IGNORE INTO user_preferences (key, value, source, confidence, updated_
     ('privacy.audio_capture',   'false',            'manual', 1.0, CAST(strftime('%s','now')*1000 AS INTEGER), 0),
     ('privacy.screenshot_keep_days', '90',          'manual', 1.0, CAST(strftime('%s','now')*1000 AS INTEGER), 0),
                                                     -- 截图文件保留天数，超出自动删除
+    ('privacy.capture_retention_days', '14',        'manual', 1.0, CAST(strftime('%s','now')*1000 AS INTEGER), 0),
+                                                    -- 原始采集记录保留天数，超出自动清空；时间线/知识/操作记录等提炼物不清空
 
     -- ——— 大模型配置 ———
     ('llm.provider',            '"ollama"',         'manual', 1.0, CAST(strftime('%s','now')*1000 AS INTEGER), 0),

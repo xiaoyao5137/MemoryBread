@@ -94,6 +94,10 @@ pub async fn extract_knowledge(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ExtractKnowledgeRequest>,
 ) -> Result<Json<ExtractKnowledgeResponse>, ApiError> {
+    if !state.is_capture_enabled() {
+        return Err(ApiError::BadRequest("采集与提炼当前已暂停".to_string()));
+    }
+
     let client = reqwest::Client::new();
     let upstream_url = format!("{}/knowledge/extract", state.sidecar_url);
 

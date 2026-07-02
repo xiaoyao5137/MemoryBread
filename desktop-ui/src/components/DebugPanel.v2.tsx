@@ -124,7 +124,7 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
   const handleClose = () => setWindowMode('buddy')
 
   const handleClearExtractionQueue = async () => {
-    if (!window.confirm('确认清空所有待提炼 captures？此操作将跳过所有历史积压，无法恢复。')) return
+    if (!window.confirm('确认清空所有待提炼内容？此操作将跳过所有历史积压，无法恢复。')) return
     setClearingQueue(true)
     setClearQueueResult(null)
     try {
@@ -347,7 +347,7 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
             <span className="text-sm text-gray-600">{clearQueueResult}</span>
           )}
         </div>
-        <p className="text-xs text-gray-400 mt-2">将所有待提炼 captures 标记为跳过，释放积压队列。</p>
+        <p className="text-xs text-gray-400 mt-2">跳过当前积压的待提炼内容，让新的记录优先处理。</p>
       </section>
 
       {/* 实时采集记录 */}

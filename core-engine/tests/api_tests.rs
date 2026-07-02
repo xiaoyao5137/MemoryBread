@@ -45,11 +45,7 @@ async fn make_test_router() -> (axum::Router, tempfile::TempDir) {
 }
 
 fn make_test_state(sm: StorageManager, debug_log_specs: Vec<DebugLogSpec>) -> Arc<AppState> {
-    Arc::new(AppState {
-        storage: sm,
-        sidecar_url: "http://127.0.0.1:7071".to_string(),
-        debug_log_specs,
-    })
+    AppState::with_config(sm, "http://127.0.0.1:7071".to_string(), debug_log_specs)
 }
 
 async fn spawn_bake_sidecar(responses: Vec<String>) -> String {
@@ -123,11 +119,7 @@ fn make_bake_error_response(status_line: &str, body: &str) -> String {
 }
 
 fn make_bake_state(sm: StorageManager, sidecar_url: String) -> Arc<AppState> {
-    Arc::new(AppState {
-        storage: sm,
-        sidecar_url,
-        debug_log_specs: vec![],
-    })
+    AppState::with_config(sm, sidecar_url, vec![])
 }
 
 async fn spawn_failing_sidecar() -> String {
@@ -1959,11 +1951,7 @@ async fn test_query_sidecar_unavailable_returns_502() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("test.db");
     let sm = StorageManager::open(&db).unwrap();
-    let state = Arc::new(AppState {
-        storage: sm,
-        sidecar_url: "http://127.0.0.1:9".to_string(),
-        debug_log_specs: vec![],
-    });
+    let state = AppState::with_config(sm, "http://127.0.0.1:9".to_string(), vec![]);
     let router = memory_bread_core::api::create_router(state);
 
     let req = Request::builder()
@@ -1982,11 +1970,7 @@ async fn test_query_sidecar_error_response_returns_502() {
     let db = tmp.path().join("test.db");
     let sm = StorageManager::open(&db).unwrap();
     let sidecar_url = spawn_failing_sidecar().await;
-    let state = Arc::new(AppState {
-        storage: sm,
-        sidecar_url,
-        debug_log_specs: vec![],
-    });
+    let state = AppState::with_config(sm, sidecar_url, vec![]);
     let router = memory_bread_core::api::create_router(state);
 
     let req = Request::builder()

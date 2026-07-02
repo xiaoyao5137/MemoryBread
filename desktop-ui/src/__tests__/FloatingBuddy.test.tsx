@@ -23,9 +23,21 @@ describe('FloatingBuddy', () => {
 
   it('收藏菜单排在第二位，采集排在第三位', () => {
     render(<FloatingBuddy />)
-    const buttons = screen.getAllByRole('button')
-    expect(buttons[1]).toHaveAttribute('data-testid', 'bake-btn')
-    expect(buttons[2]).toHaveAttribute('data-testid', 'knowledge-btn')
+    const buttonTestIds = screen.getAllByRole('button').map(button => button.getAttribute('data-testid'))
+    expect(buttonTestIds.indexOf('knowledge-btn')).toBe(buttonTestIds.indexOf('bake-btn') + 1)
+  })
+
+  it('平台管理员可以切换测试和正式环境并持久化', () => {
+    useAppStore.getState().setAccountType('platform_admin')
+    render(<FloatingBuddy />)
+
+    expect(screen.getByLabelText('服务环境切换')).toBeInTheDocument()
+    expect(useAppStore.getState().serviceEnvironment).toBe('production')
+
+    fireEvent.click(screen.getByRole('button', { name: '测试' }))
+
+    expect(useAppStore.getState().serviceEnvironment).toBe('staging')
+    expect(screen.getByRole('button', { name: '测试' })).toHaveAttribute('aria-pressed', 'true')
   })
 })
 

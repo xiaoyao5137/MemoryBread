@@ -545,14 +545,14 @@ const ExtractionQueueCard: React.FC<{
   } else if (status === 'waiting') {
     sub = '等待片段积累足够（≥3 条且静默 ≥10 分钟）后批量提炼'
   } else if (status === 'stalled') {
-    sub = '后台提炼器未启动，请检查 sidecar 服务'
+    sub = '后台提炼未启动，请检查本机服务'
   } else {
     sub = pending > 0 ? `${pending} 条待评估` : '当前无待提炼内容'
   }
 
   return (
     <div
-      title="数字代表已采集但尚未被合并到任何 knowledge 的 captures。系统按片段（≥3 条 + 静默 10 分钟）批量提炼，因此该数字会持续累计、阶段性下降，并不代表卡死。"
+      title="数字代表已采集但尚未整理成知识的内容。系统会分批提炼，因此该数字会持续累计、阶段性下降，并不代表卡住。"
       style={{
         background: `${baseColor}10`, borderRadius: 10, padding: '10px 12px',
         border: `1px solid ${baseColor}20`, flex: 1, minWidth: 0,
@@ -735,7 +735,7 @@ const OverviewContent: React.FC<{
               }}
             />
             {tokenTrendSeries.filter((item) => item.data.length > 0).every((item) => item.data.length === 1) && (
-              <div style={{ color: '#AEAEB2', fontSize: 11, marginTop: 6 }}>当前时间范围内仅 1 个统计点，已按真实数据展示。</div>
+              <div style={{ color: '#AEAEB2', fontSize: 11, marginTop: 6 }}>当前时间范围内仅 1 个统计点。</div>
             )}
           </>
         ) : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无趋势数据</div>}
@@ -770,7 +770,7 @@ const OverviewContent: React.FC<{
               detailFormatter={(point) => `${fmtTs(point.ts)} · ${point.value} 条知识`}
             />
             {knowledge_flow.by_time.length === 1 && (
-              <div style={{ color: '#AEAEB2', fontSize: 11, marginTop: 6 }}>当前时间范围内仅 1 个统计点，已按真实数据展示。</div>
+              <div style={{ color: '#AEAEB2', fontSize: 11, marginTop: 6 }}>当前时间范围内仅 1 个统计点。</div>
             )}
           </>
         ) : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无知识趋势数据</div>}
@@ -1746,8 +1746,8 @@ const MonitorPanel: React.FC = () => {
         </div>
       </div>
 
-      {tab === 'overview' && overviewError && <ErrorNotice message={`${overviewError}，请检查 API 地址或确认 Core Engine 已启动`} />}
-      {tab === 'system' && systemError && <ErrorNotice message={`${systemError}，请检查 API 地址或确认 Core Engine 已启动`} />}
+      {tab === 'overview' && overviewError && <ErrorNotice message={`${overviewError}，请检查本机服务连接地址或确认应用服务已启动`} />}
+      {tab === 'system' && systemError && <ErrorNotice message={`${systemError}，请检查本机服务连接地址或确认应用服务已启动`} />}
 
       {tab === 'overview' && data && (
         <OverviewContent data={data} range={range} liveData={liveData} nowMs={nowMs} />

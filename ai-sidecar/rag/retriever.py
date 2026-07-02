@@ -165,11 +165,23 @@ def _merge_chunks(chunks: list["RetrievedChunk"], limit: int, prefer_url: bool =
 def _rank_keyword_chunks(chunks: list["RetrievedChunk"], terms: list[str], prefer_url: bool) -> list["RetrievedChunk"]:
     lowered_terms = [term.lower() for term in terms if term]
 
-    def _score(chunk: RetrievedChunk) -> tuple[int, float, int]:
+    def _score(chunk: RetrievedChunk) -> tuple[float, float, int]:
         text = chunk.text.lower()
         metadata = chunk.metadata or {}
+        title = str(metadata.get("title") or "").lower()
+        summary = str(metadata.get("summary") or metadata.get("overview") or "").lower()
         url = str(metadata.get("url") or "")
-        score = sum(1 for term in lowered_terms if term in text)
+        text_hits = sum(1 for term in lowered_terms if term in text)
+        title_hits = sum(1 for term in lowered_terms if term in title)
+        summary_hits = sum(1 for term in lowered_terms if term in summary)
+        score = float(text_hits) + title_hits * 4.0 + summary_hits * 1.5
+
+        meaningful_terms = [term for term in lowered_terms if len(term) >= 2]
+        title_coverage = title_hits / max(1, min(len(meaningful_terms), 12))
+        long_title_hits = sum(1 for term in meaningful_terms if len(term) >= 3 and term in title)
+        if title_hits:
+            score += 12.0 + title_coverage * 32.0 + long_title_hits * 3.0
+
         if prefer_url and url:
             score += 5
         if prefer_url and metadata.get("source_type") == "document":
@@ -178,6 +190,7 @@ def _rank_keyword_chunks(chunks: list["RetrievedChunk"], terms: list[str], prefe
             score += 2
         if "docs.corp.kuaishou.com" in url:
             score += 3
+        score += min(float(chunk.score or 0) / 6.0, 30.0)
         time_value = int(metadata.get("time") or metadata.get("ts") or 0)
         return score, chunk.score, time_value
 
@@ -223,7 +236,38 @@ class VectorRetriever:
         self._client = None
         self._use_internal_http: Optional[bool] = None  # None=未探测
 
-    def _try_internal_http(self, query_vector: list[float], top_k: int, score_threshold: float) -> Optional[list]:
+    @staticmethod
+    def _filters_to_payload(filters: VectorSearchFilter | None) -> dict[str, Any] | None:
+        if filters is None:
+            return None
+        return {
+            key: value
+            for key, value in {
+                "start_ts": filters.start_ts,
+                "end_ts": filters.end_ts,
+                "observed_start_ts": filters.observed_start_ts,
+                "observed_end_ts": filters.observed_end_ts,
+                "event_start_ts": filters.event_start_ts,
+                "event_end_ts": filters.event_end_ts,
+                "source_types": filters.source_types,
+                "app_names": filters.app_names,
+                "category": filters.category,
+                "activity_types": filters.activity_types,
+                "content_origins": filters.content_origins,
+                "history_view": filters.history_view,
+                "is_self_generated": filters.is_self_generated,
+                "evidence_strengths": filters.evidence_strengths,
+            }.items()
+            if value is not None
+        }
+
+    def _try_internal_http(
+        self,
+        query_vector: list[float],
+        top_k: int,
+        score_threshold: float,
+        filters: VectorSearchFilter | None,
+    ) -> Optional[list]:
         """尝试通过 sidecar 内部 HTTP 服务做向量搜索，避免 Qdrant 文件锁冲突。"""
         try:
             import urllib.request, json as _json
@@ -231,6 +275,7 @@ class VectorRetriever:
                 'query_vector': query_vector,
                 'top_k': top_k,
                 'score_threshold': score_threshold,
+                'filters': self._filters_to_payload(filters),
             }).encode()
             req = urllib.request.Request(
                 self._INTERNAL_SEARCH_URL,
@@ -280,9 +325,10 @@ class VectorRetriever:
         if not query_vector:
             return []
 
-        # 本地模式：优先走 sidecar 内部 HTTP（避免 Qdrant 文件锁冲突）
-        if self.qdrant_path and filters is None:
-            raw = self._try_internal_http(query_vector, top_k, score_threshold)
+        # 本地模式：始终优先走 sidecar 内部 HTTP（避免 Qdrant 文件锁冲突）。
+        # 注意：即使带 metadata filters 也不能直连本地 Qdrant 文件，否则会与 sidecar 写入进程抢锁。
+        if self.qdrant_path:
+            raw = self._try_internal_http(query_vector, top_k, score_threshold, filters)
             if raw is not None:
                 chunks = []
                 for item in raw:
@@ -298,12 +344,11 @@ class VectorRetriever:
                     ))
                 logger.debug(f"内部向量检索返回 {len(chunks)} 条结果")
                 return chunks
-            logger.debug("内部向量搜索服务不可用，降级为直连 Qdrant")
+            raise RuntimeError("内部向量搜索服务不可用，已阻止降级到关键词兜底")
 
         client = self._get_client()
         if not client:
-            logger.warning("Qdrant 不可用，跳过向量检索")
-            return []
+            raise RuntimeError("Qdrant 不可用，向量检索无法执行")
 
         try:
             query_kwargs: dict[str, Any] = {
@@ -349,7 +394,7 @@ class VectorRetriever:
             return chunks
         except Exception as e:
             logger.error(f"向量检索失败: {e}")
-            return []
+            raise RuntimeError(f"向量检索失败: {e}") from e
 
     @staticmethod
     def _build_qdrant_filter(filters: VectorSearchFilter | None):
@@ -1063,10 +1108,10 @@ class KnowledgeFts5Retriever:
             ORDER BY updated_at DESC
             LIMIT ?
         """
-        cursor.execute(sql, [*params, max(top_k * 10, 50)])
+        cursor.execute(sql, [*params, max(top_k * 40, 300)])
         rows = cursor.fetchall()
         chunks = [self._document_row_to_chunk(row, terms) for row in rows]
-        return chunks[:top_k]
+        return chunks
 
     def _search_knowledge_artifacts(
         self,
@@ -1094,9 +1139,9 @@ class KnowledgeFts5Retriever:
             ORDER BY COALESCE(updated_at_ms, 0) DESC
             LIMIT ?
         """
-        cursor.execute(sql, [*params, max(top_k * 10, 50)])
+        cursor.execute(sql, [*params, max(top_k * 40, 300)])
         rows = cursor.fetchall()
-        return [self._knowledge_artifact_row_to_chunk(row, terms) for row in rows[:top_k]]
+        return [self._knowledge_artifact_row_to_chunk(row, terms) for row in rows]
 
     def _search_operation_artifacts(
         self,
@@ -1124,9 +1169,9 @@ class KnowledgeFts5Retriever:
             ORDER BY COALESCE(updated_at_ms, 0) DESC
             LIMIT ?
         """
-        cursor.execute(sql, [*params, max(top_k * 10, 50)])
+        cursor.execute(sql, [*params, max(top_k * 40, 300)])
         rows = cursor.fetchall()
-        return [self._operation_artifact_row_to_chunk(row, terms) for row in rows[:top_k]]
+        return [self._operation_artifact_row_to_chunk(row, terms) for row in rows]
 
     @staticmethod
     def _json_ids(value: str | None) -> list[str]:
@@ -1146,6 +1191,27 @@ class KnowledgeFts5Retriever:
         lowered = text.lower()
         return float(sum(1 for term in terms if term.lower() in lowered))
 
+    @staticmethod
+    def _document_artifact_score(row: sqlite3.Row, terms: list[str], text: str) -> float:
+        base = KnowledgeFts5Retriever._keyword_score(text, terms) + 50.0
+        title = str(row["title"] or "").lower()
+        summary = str(row["summary"] or "").lower()
+        full = f"{title} {summary}"
+
+        title_hits = sum(1 for term in terms if term.lower() in title)
+        summary_hits = sum(1 for term in terms if term.lower() in summary)
+        score = base + title_hits * 8.0 + summary_hits * 2.0
+
+        meaningful_terms = [term.lower() for term in terms if len(term) >= 2]
+        title_coverage = title_hits / max(1, min(len(meaningful_terms), 12))
+        long_title_hits = sum(1 for term in meaningful_terms if len(term) >= 3 and term in title)
+        full_coverage = sum(1 for term in meaningful_terms if term in full) / max(1, min(len(meaningful_terms), 12))
+        if title_hits:
+            score += 12.0 + title_coverage * 32.0 + long_title_hits * 3.0
+        if full_coverage:
+            score += full_coverage * 10.0
+        return score
+
     def _document_row_to_chunk(self, row: sqlite3.Row, terms: list[str]) -> RetrievedChunk:
         artifact_id = int(row["id"])
         doc_key = _artifact_doc_key("document", artifact_id)
@@ -1155,7 +1221,7 @@ class KnowledgeFts5Retriever:
         return RetrievedChunk(
             capture_id=0,
             text=text,
-            score=self._keyword_score(text, terms) + 50.0,
+            score=self._document_artifact_score(row, terms, text),
             source="document",
             doc_key=doc_key,
             metadata={

@@ -133,8 +133,8 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
               </svg>
             </div>
             <div>
-              <h2 className="settings-v2__card-title">API 服务</h2>
-              <p className="settings-v2__card-desc">配置 Core Engine 连接地址</p>
+              <h2 className="settings-v2__card-title">本机服务</h2>
+              <p className="settings-v2__card-desc">配置记忆面包本机服务连接地址</p>
             </div>
           </div>
 

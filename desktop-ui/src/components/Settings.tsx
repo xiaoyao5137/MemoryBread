@@ -13,6 +13,7 @@ import { useAppStore } from '../store/useAppStore'
 import {
   useFetchConfigChecks,
   useFetchPreferences,
+  useRunCaptureCleanup,
   useRunConfigCheckAction,
   useRunScreenshotCleanup,
   useUpdatePreference,
@@ -27,13 +28,16 @@ interface SettingsProps {
 const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const CAPTURE_INTERVAL_KEY = 'privacy.capture_interval_sec'
   const SCREENSHOT_KEEP_DAYS_KEY = 'privacy.screenshot_keep_days'
+  const CAPTURE_RETENTION_DAYS_KEY = 'privacy.capture_retention_days'
   const USER_IDENTITY_KEY = 'user.identity_keywords'
   const DEFAULT_API_BASE = 'http://localhost:7070'
 
   const {
     apiBaseUrl,
     sidecarVersion,
+    debugModeEnabled,
     setApiBaseUrl,
+    setDebugModeEnabled,
     setWindowMode,
   } = useAppStore()
 
@@ -45,6 +49,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const [identityInput, setIdentityInput] = useState('')
   const [identitySaved, setIdentitySaved] = useState(false)
   const [cleanupRunning, setCleanupRunning] = useState(false)
+  const [captureCleanupRunning, setCaptureCleanupRunning] = useState(false)
   const [configChecks, setConfigChecks] = useState<ConfigCheckItem[]>([])
   const [configChecksLoading, setConfigChecksLoading] = useState(false)
   const [configActionRunning, setConfigActionRunning] = useState<string | null>(null)
@@ -54,6 +59,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const runConfigCheckAction = useRunConfigCheckAction()
   const updatePref = useUpdatePreference()
   const runScreenshotCleanup = useRunScreenshotCleanup()
+  const runCaptureCleanup = useRunCaptureCleanup()
 
   const sortedPreferences = useMemo(() => {
     return [...preferences].sort((a, b) => {
@@ -61,9 +67,11 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
       if (b.key === CAPTURE_INTERVAL_KEY) return 1
       if (a.key === SCREENSHOT_KEEP_DAYS_KEY) return -1
       if (b.key === SCREENSHOT_KEEP_DAYS_KEY) return 1
+      if (a.key === CAPTURE_RETENTION_DAYS_KEY) return -1
+      if (b.key === CAPTURE_RETENTION_DAYS_KEY) return 1
       return a.key.localeCompare(b.key)
     })
-  }, [preferences, CAPTURE_INTERVAL_KEY, SCREENSHOT_KEEP_DAYS_KEY])
+  }, [preferences, CAPTURE_INTERVAL_KEY, SCREENSHOT_KEEP_DAYS_KEY, CAPTURE_RETENTION_DAYS_KEY])
 
   useEffect(() => {
     setLoading(true)
@@ -129,17 +137,20 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
           prev.map((p) => (p.key === key ? { ...p, value: updated.value } : p))
         )
         if (key === CAPTURE_INTERVAL_KEY) {
-          setSaveMsg('OCR / 截图频率已保存，需重启 Core Engine 后生效')
+          setSaveMsg('OCR / 截图频率已保存，需重启应用后生效')
           setTimeout(() => setSaveMsg(null), 3000)
         } else if (key === SCREENSHOT_KEEP_DAYS_KEY) {
           setSaveMsg('图片过期时间已保存，将在下一次后台清理时生效')
+          setTimeout(() => setSaveMsg(null), 3000)
+        } else if (key === CAPTURE_RETENTION_DAYS_KEY) {
+          setSaveMsg('采集记录过期时间已保存，将在下一次后台清理时生效')
           setTimeout(() => setSaveMsg(null), 3000)
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
       }
     },
-    [CAPTURE_INTERVAL_KEY, updatePref]
+    [CAPTURE_INTERVAL_KEY, SCREENSHOT_KEEP_DAYS_KEY, CAPTURE_RETENTION_DAYS_KEY, updatePref]
   )
 
   const handleRunScreenshotCleanup = useCallback(async () => {
@@ -158,6 +169,23 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
       setCleanupRunning(false)
     }
   }, [fetchPrefs, runScreenshotCleanup])
+
+  const handleRunCaptureCleanup = useCallback(async () => {
+    setCaptureCleanupRunning(true)
+    setError(null)
+    try {
+      const result = await runCaptureCleanup()
+      const freedMb = Math.round(result.freed_bytes / 1024 / 1024)
+      setSaveMsg(`采集记录清理完成：删除 ${result.deleted_count} 条记录、${result.deleted_screenshot_count} 个截图，释放约 ${freedMb} MB（保留 ${result.retention_days} 天）`)
+      setTimeout(() => setSaveMsg(null), 5000)
+      const prefs = await fetchPrefs()
+      setPreferences(prefs)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setCaptureCleanupRunning(false)
+    }
+  }, [fetchPrefs, runCaptureCleanup])
 
   const handleConfigCheckAction = useCallback(async (
     id: string,
@@ -418,8 +446,8 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
               </svg>
             </div>
             <div>
-              <h2 className="settings-v2__card-title">API 服务</h2>
-              <p className="settings-v2__card-desc">配置 Core Engine 连接地址</p>
+              <h2 className="settings-v2__card-title">本机服务</h2>
+              <p className="settings-v2__card-desc">配置记忆面包本机服务连接地址</p>
             </div>
           </div>
 
@@ -501,6 +529,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
             {sortedPreferences.map((pref) => {
               const isCaptureInterval = pref.key === CAPTURE_INTERVAL_KEY
               const isScreenshotKeepDays = pref.key === SCREENSHOT_KEEP_DAYS_KEY
+              const isCaptureRetentionDays = pref.key === CAPTURE_RETENTION_DAYS_KEY
               return (
                 <div
                   key={pref.key}
@@ -512,16 +541,23 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
                       ? 'OCR / 截图频率（秒）'
                       : isScreenshotKeepDays
                         ? '图片过期时间（天）'
-                        : pref.key}
+                        : isCaptureRetentionDays
+                          ? '采集记录过期时间（天）'
+                          : pref.key}
                   </label>
                   {isCaptureInterval && (
                     <p className="settings-v2__pref-help">
-                      控制后台 OCR / 截图采集频率，不是调试面板的页面刷新频率。默认值保持当前配置，修改后需重启 Core Engine 生效。
+                      控制文字识别和截图采集频率。默认值会保持当前配置，修改后需重启应用生效。
                     </p>
                   )}
                   {isScreenshotKeepDays && (
                     <p className="settings-v2__pref-help">
                       控制图片缓存的过期时间。超过该天数的本地截图文件会自动删除，并清空对应 capture 记录中的截图路径。
+                    </p>
+                  )}
+                  {isCaptureRetentionDays && (
+                    <p className="settings-v2__pref-help">
+                      控制原始采集记录的过期时间。超过该天数的采集记录会自动清空，时间线、知识、操作记录等提炼物会继续保留。
                     </p>
                   )}
                   {isScreenshotKeepDays && (
@@ -536,7 +572,19 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
                       </button>
                     </div>
                   )}
-                  {!isCaptureInterval && !isScreenshotKeepDays && (
+                  {isCaptureRetentionDays && (
+                    <div className="settings-v2__input-group" style={{ marginBottom: 8 }}>
+                      <button
+                        type="button"
+                        className="settings-v2__btn settings-v2__btn--secondary"
+                        onClick={handleRunCaptureCleanup}
+                        disabled={captureCleanupRunning}
+                      >
+                        {captureCleanupRunning ? '清理中...' : '立即清理采集记录'}
+                      </button>
+                    </div>
+                  )}
+                  {!isCaptureInterval && !isScreenshotKeepDays && !isCaptureRetentionDays && (
                     <div className="settings-v2__pref-key">{pref.key}</div>
                   )}
                   <input
@@ -577,7 +625,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
             <div>
               <h2 className="settings-v2__card-title">开发者工具</h2>
               <p className="settings-v2__card-desc">
-                查看实时采集记录、向量化状态和系统性能指标
+                查看实时采集记录、处理状态和系统性能指标
               </p>
             </div>
           </div>
@@ -602,6 +650,19 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
             </svg>
             打开调试面板
           </button>
+
+          <label className="settings-v2__toggle-row" htmlFor="debug-mode-toggle">
+            <span>
+              <strong>调试模式</strong>
+              <small>开启后显示更多连接与诊断选项。</small>
+            </span>
+            <input
+              id="debug-mode-toggle"
+              type="checkbox"
+              checked={debugModeEnabled}
+              onChange={(event) => setDebugModeEnabled(event.target.checked)}
+            />
+          </label>
         </section>
 
         {/* 版本信息 */}

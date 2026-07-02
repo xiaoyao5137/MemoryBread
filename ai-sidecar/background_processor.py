@@ -196,6 +196,22 @@ class BackgroundProcessor:
         # 初始化时立即写一次，保证 core-engine 拿得到 running=true 信号
         self._write_status_file()
 
+    def _capture_and_extraction_enabled(self) -> bool:
+        """读取与 Core Engine 共用的持久化运行开关；缺失或读取失败时保持默认开启。"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM user_preferences WHERE key = ? LIMIT 1",
+                    ("runtime.capture_enabled",),
+                ).fetchone()
+                return row is None or str(row[0]).lower() != "false"
+            finally:
+                conn.close()
+        except Exception as error:
+            logger.warning("读取采集与提炼运行开关失败，保持默认开启: %s", error)
+            return True
+
     def _build_status_snapshot(self) -> dict:
         """构造写入文件 / HTTP 响应共用的状态快照。调用前需持有 _extracting_lock。"""
         extracting_captures: list[dict] = []
@@ -1403,6 +1419,11 @@ class BackgroundProcessor:
 
         while self.running:
             try:
+                if not self._capture_and_extraction_enabled():
+                    logger.debug("采集与自动提炼已暂停，跳过本轮后台处理")
+                    await asyncio.sleep(self.interval)
+                    continue
+
                 processed = await self._process_batch()
 
                 if processed > 0:

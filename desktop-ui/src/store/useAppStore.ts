@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ActionCommand, BakeTab, RagContext, RepositoryTab, WindowMode } from '../types'
+import type { AccountType, ActionCommand, AuthSession, BakeTab, CloudUser, RagContext, RepositoryTab, ServiceEnvironment, WindowMode } from '../types'
 
 export interface BakeNavigationTarget {
   windowMode: WindowMode
@@ -128,7 +128,14 @@ export interface AppState {
 
   // ── 全局配置 ─────────────────────────────────────────────────────────────────
   apiBaseUrl:     string
+  adminApiBaseUrl: string
   sidecarVersion: string
+  accountType: AccountType
+  serviceEnvironment: ServiceEnvironment
+  debugModeEnabled: boolean
+  authToken: string | null
+  authExpiresAt: string | null
+  currentUser: CloudUser | null
 
   // ── 首次引导 ─────────────────────────────────────────────────────────────────
   hasCompletedSetup: boolean
@@ -187,7 +194,13 @@ export interface AppState {
   confirmAction:         () => void
   cancelAction:          () => void
   setApiBaseUrl:         (url: string) => void
+  setAdminApiBaseUrl:    (url: string) => void
   setSidecarVersion:     (v: string) => void
+  setAccountType:        (type: AccountType) => void
+  setAuthSession:        (session: AuthSession) => void
+  clearAuthSession:      () => void
+  setServiceEnvironment: (environment: ServiceEnvironment) => void
+  setDebugModeEnabled: (enabled: boolean) => void
   setHasCompletedSetup:  (v: boolean) => void
   setSetupSkipped:       (v: boolean) => void
   setCreationModelConfigs: (configs: CreationModelConfig[]) => void
@@ -197,6 +210,11 @@ export interface AppState {
 
 const SETUP_KEY = 'memory-bread_setup_done'
 const SKIP_KEY  = 'memory-bread_setup_skipped'
+export const AUTH_SESSION_KEY = 'memory-bread_auth_session'
+export const ACCOUNT_TYPE_KEY = 'memory-bread_account_type'
+export const ADMIN_API_BASE_URL_KEY = 'memory-bread_admin_api_base_url'
+export const SERVICE_ENVIRONMENT_KEY = 'memory-bread_service_env'
+export const DEBUG_MODE_KEY = 'memory-bread_debug_mode_enabled'
 export const CREATION_MODEL_KEY = 'memory-bread_creation_models'
 export const CREATION_MODEL_PREFERENCE_KEY = 'creation.models'
 
@@ -208,6 +226,44 @@ const DEFAULT_CREATION_MODELS: CreationModelConfig[] = [
   { id: 'mbcd-plus-v1', enabled: false, apiKey: '', baseUrl: 'https://api.anthropic.com' },
   { id: 'mbcd-std-v1',  enabled: true,  apiKey: '' },
 ]
+
+const normalizeServiceEnvironment = (value?: string | null): ServiceEnvironment =>
+  value === 'staging' ? 'staging' : 'production'
+
+const normalizeAccountType = (value?: string | null): AccountType =>
+  value === 'platform_admin' || value === 'admin' ? 'platform_admin' : 'user'
+
+const getBuildAccountType = (): string | null => {
+  try {
+    return (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_MEMORYBREAD_ACCOUNT_TYPE ?? null
+  } catch {
+    return null
+  }
+}
+
+const getBuildAdminApiBaseUrl = (): string | null => {
+  try {
+    return (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_MEMORYBREAD_ADMIN_API_BASE_URL ?? null
+  } catch {
+    return null
+  }
+}
+
+const loadAuthSession = (): AuthSession | null => {
+  try {
+    const raw = safeLocalStorage?.getItem(AUTH_SESSION_KEY)
+    if (!raw) return null
+    const session = JSON.parse(raw) as AuthSession
+    if (!session.access_token || !session.user || Date.parse(session.expires_at) <= Date.now()) {
+      safeLocalStorage?.removeItem(AUTH_SESSION_KEY)
+      return null
+    }
+    return session
+  } catch {
+    safeLocalStorage?.removeItem(AUTH_SESSION_KEY)
+    return null
+  }
+}
 
 export function normalizeCreationModels(models: CreationModelConfig[]): CreationModelConfig[] {
   const aliases: Record<string, string> = {
@@ -260,6 +316,8 @@ const initialCreationDraft: CreationDraft = {
   referencePreview: null,
 }
 
+const initialSession = loadAuthSession()
+
 const initialState = {
   windowMode:          'rag' as WindowMode,
   bakeTab:             'overview' as BakeTab,
@@ -307,7 +365,14 @@ const initialState = {
   pendingAction:       null,
   actionConfirmed:     false,
   apiBaseUrl:          'http://127.0.0.1:7070',
+  adminApiBaseUrl:     safeLocalStorage?.getItem(ADMIN_API_BASE_URL_KEY) || getBuildAdminApiBaseUrl() || 'http://127.0.0.1:8080',
   sidecarVersion:      '0.1.0',
+  accountType:         normalizeAccountType(initialSession?.user.roles.includes('platform_admin') ? 'platform_admin' : safeLocalStorage?.getItem(ACCOUNT_TYPE_KEY) || getBuildAccountType()),
+  serviceEnvironment:  normalizeServiceEnvironment(safeLocalStorage?.getItem(SERVICE_ENVIRONMENT_KEY)),
+  debugModeEnabled:    safeLocalStorage?.getItem(DEBUG_MODE_KEY) === 'true',
+  authToken:           initialSession?.access_token ?? null,
+  authExpiresAt:       initialSession?.expires_at ?? null,
+  currentUser:         initialSession?.user ?? null,
   hasCompletedSetup:   safeLocalStorage?.getItem(SETUP_KEY) === 'true',
   setupSkipped:        safeLocalStorage?.getItem(SKIP_KEY)  === 'true',
   creationModelConfigs: loadCreationModels(),
@@ -448,7 +513,50 @@ export const useAppStore = create<AppState>((set) => ({
 
   setApiBaseUrl:     (url) => set({ apiBaseUrl: url }),
 
+  setAdminApiBaseUrl: (url) => {
+    safeLocalStorage?.setItem(ADMIN_API_BASE_URL_KEY, url)
+    set({ adminApiBaseUrl: url })
+  },
+
   setSidecarVersion: (v) => set({ sidecarVersion: v }),
+
+  setAccountType: (type) => {
+    safeLocalStorage?.setItem(ACCOUNT_TYPE_KEY, type)
+    set({ accountType: type })
+  },
+
+  setAuthSession: (session) => {
+    const accountType = normalizeAccountType(session.user.roles.includes('platform_admin') ? 'platform_admin' : 'user')
+    safeLocalStorage?.setItem(AUTH_SESSION_KEY, JSON.stringify(session))
+    safeLocalStorage?.setItem(ACCOUNT_TYPE_KEY, accountType)
+    set({
+      authToken: session.access_token,
+      authExpiresAt: session.expires_at,
+      currentUser: session.user,
+      accountType,
+    })
+  },
+
+  clearAuthSession: () => {
+    safeLocalStorage?.removeItem(AUTH_SESSION_KEY)
+    safeLocalStorage?.setItem(ACCOUNT_TYPE_KEY, 'user')
+    set({
+      authToken: null,
+      authExpiresAt: null,
+      currentUser: null,
+      accountType: 'user',
+    })
+  },
+
+  setServiceEnvironment: (environment) => {
+    safeLocalStorage?.setItem(SERVICE_ENVIRONMENT_KEY, environment)
+    set({ serviceEnvironment: environment })
+  },
+
+  setDebugModeEnabled: (enabled) => {
+    safeLocalStorage?.setItem(DEBUG_MODE_KEY, String(enabled))
+    set({ debugModeEnabled: enabled })
+  },
 
   setHasCompletedSetup: (v) => {
     safeLocalStorage?.setItem(SETUP_KEY, String(v))

@@ -230,6 +230,41 @@
   gap: 8px;
 }
 
+.settings-v2__toggle-row {
+  margin-top: 12px;
+  padding: 12px 0 0;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-v2__toggle-row span {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.settings-v2__toggle-row strong {
+  color: #000000;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settings-v2__toggle-row small {
+  color: #6E6E73;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.settings-v2__toggle-row input {
+  width: 44px;
+  height: 26px;
+  flex: 0 0 auto;
+  accent-color: #007AFF;
+}
+
 /* 成功消息 */
 .settings-v2__success-msg {
   margin-top: 8px;

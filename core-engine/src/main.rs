@@ -32,6 +32,16 @@ fn parse_screenshot_keep_days(storage: &StorageManager) -> i64 {
         .unwrap_or(90)
 }
 
+fn parse_capture_retention_days(storage: &StorageManager) -> i64 {
+    storage
+        .get_preference("privacy.capture_retention_days")
+        .ok()
+        .flatten()
+        .and_then(|p| p.value.parse::<i64>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(14)
+}
+
 fn screenshot_captures_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".memory-bread").join("captures")
@@ -53,6 +63,35 @@ async fn run_screenshot_cleanup_loop(storage: StorageManager) {
             }
             Err(error) => {
                 tracing::warn!(keep_days, %error, "截图自动清理失败");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+    }
+}
+
+async fn run_capture_cleanup_loop(storage: StorageManager) {
+    let captures_dir = screenshot_captures_dir();
+    tracing::info!(path = %captures_dir.display(), "启动采集记录自动清理后台任务");
+
+    tokio::time::sleep(Duration::from_secs(90)).await;
+
+    loop {
+        let retention_days = parse_capture_retention_days(&storage);
+        let cutoff = current_ts_ms() - retention_days * 24 * 60 * 60 * 1000;
+
+        match storage.run_old_captures_cleanup(cutoff, &captures_dir) {
+            Ok((deleted, deleted_screenshots, freed_bytes)) => {
+                tracing::info!(
+                    retention_days,
+                    deleted,
+                    deleted_screenshots,
+                    freed_bytes,
+                    "采集记录自动清理完成"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(retention_days, %error, "采集记录自动清理失败");
             }
         }
 
@@ -101,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
     let interval_secs = parse_capture_interval_secs(&storage);
     let mut listener_config = ListenerConfig::default();
     listener_config.interval_secs = interval_secs;
+    listener_config.enabled = state.capture_enabled.clone();
     let enabled = listener_config.enabled.clone();
 
     tokio::spawn(async move {
@@ -125,6 +165,13 @@ async fn main() -> anyhow::Result<()> {
     let cleanup_storage = storage.clone();
     tokio::spawn(async move {
         run_screenshot_cleanup_loop(cleanup_storage).await;
+    });
+
+    // 启动采集记录自动清理任务
+    tracing::info!("启动采集记录自动清理任务...");
+    let capture_cleanup_storage = storage.clone();
+    tokio::spawn(async move {
+        run_capture_cleanup_loop(capture_cleanup_storage).await;
     });
 
     // 启动 API 服务器

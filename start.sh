@@ -430,6 +430,24 @@ stop_all() {
     log_success "所有服务已停止"
 }
 
+# 由菜单栏 App 的“退出”触发：先等待当前窗口进程退出，再清理整套服务。
+stop_after_app() {
+    local app_pid=$1
+    if ! [[ "$app_pid" =~ ^[0-9]+$ ]]; then
+        log_error "无效的 Desktop UI PID: $app_pid"
+        exit 1
+    fi
+
+    for _ in {1..50}; do
+        if ! ps -p "$app_pid" > /dev/null 2>&1; then
+            break
+        fi
+        sleep 0.2
+    done
+
+    stop_all
+}
+
 # 检查依赖
 check_dependencies() {
     log_info "检查依赖..."
@@ -453,6 +471,42 @@ check_dependencies() {
     fi
 
     log_success "依赖检查通过"
+}
+
+clean_stale_tauri_cache() {
+    local tauri_root="$PROJECT_ROOT/desktop-ui/src-tauri"
+    local tauri_target="$tauri_root/target"
+    local stale_marker=""
+    local old_paths=(
+        "/Users/xianjiaqi/Documents/mygit/MemoryBread/desktop-ui/src-tauri"
+        "/Users/xianjiaqi/Documents/mygit/cy/gzdz/desktop-ui/src-tauri"
+    )
+
+    if [ ! -d "$tauri_target" ]; then
+        return 0
+    fi
+
+    for old_path in "${old_paths[@]}"; do
+        if [ "$old_path" = "$tauri_root" ]; then
+            continue
+        fi
+
+        if grep -R -m 1 -F "$old_path" "$tauri_target" > /dev/null 2>&1; then
+            stale_marker="$old_path"
+            break
+        fi
+    done
+
+    if [ -z "$stale_marker" ] && [ -f "$UI_LOG" ]; then
+        if grep -Fq "failed to read plugin permissions" "$UI_LOG"; then
+            stale_marker="failed to read plugin permissions"
+        fi
+    fi
+
+    if [ -n "$stale_marker" ]; then
+        log_warn "检测到 Tauri 构建缓存包含旧路径或权限生成残留，正在清理: $stale_marker"
+        (cd "$tauri_root" && cargo clean)
+    fi
 }
 
 # 启动 AI Sidecar
@@ -619,20 +673,26 @@ start_ui() {
 
     cleanup_port "$UI_PORT" "Desktop UI / Vite"
     cleanup_desktop_app
+    clean_stale_tauri_cache
 
     # 启动 Tauri 开发服务器（后台运行）
     log_info "启动 Tauri 开发服务器..."
     nohup npm run tauri:dev > "$UI_LOG" 2>&1 &
     echo $! > "$UI_PID_FILE"
+    disown "$(cat "$UI_PID_FILE")" 2>/dev/null || true
 
     log_success "Desktop UI 已启动 (启动器 PID: $(cat "$UI_PID_FILE"))"
     log_info "日志文件: $UI_LOG"
-    log_info "等待 Desktop UI 初始化..."
-    sleep 5
+    log_info "等待 Desktop UI 初始化（首次清理缓存后可能需要较长时间编译）..."
 
-    if record_desktop_app_pid 20 1; then
+    if record_desktop_app_pid 180 1; then
         log_success "Desktop UI 窗口进程已记录 (PID: $(cat "$UI_APP_PID_FILE"))"
     else
+        if ! is_running "$UI_PID_FILE"; then
+            log_error "Desktop UI 启动器已退出，请查看日志: $UI_LOG"
+            rm -f "$UI_PID_FILE"
+            exit 1
+        fi
         log_warn "未能记录 Desktop UI 窗口进程 PID，后续将依赖残留扫描兜底"
     fi
 
@@ -663,8 +723,19 @@ main() {
             start_ui
             show_status
             ;;
+        start-backends)
+            check_path_leaks
+            check_dependencies
+            ensure_ollama_running
+            start_sidecar
+            start_creation_service
+            start_core
+            ;;
         stop)
             stop_all
+            ;;
+        stop-after-app)
+            stop_after_app "${2:-}"
             ;;
         restart)
             log_info "执行全组件 restart（AI Sidecar → Core Engine → Desktop UI）..."

@@ -152,6 +152,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "035_seed_privacy_defaults",
         include_str!("migrations/035_seed_privacy_defaults.sql"),
     ),
+    (
+        "036_seed_capture_retention_days",
+        include_str!("migrations/036_seed_capture_retention_days.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

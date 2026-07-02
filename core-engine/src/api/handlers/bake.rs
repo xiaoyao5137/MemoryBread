@@ -411,6 +411,14 @@ pub async fn run_bake_pipeline(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RunBakeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.is_capture_enabled() {
+        return Ok(Json(serde_json::json!({
+            "id": null,
+            "status": "skipped",
+            "reason": "capture and extraction are paused",
+        })));
+    }
+
     let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
     let trigger_reason = body
         .trigger_reason

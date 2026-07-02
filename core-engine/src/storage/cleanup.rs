@@ -5,7 +5,7 @@
 //! # 设计策略
 //!
 //! - 截图文件（screenshot_purge）：按用户配置删除过期且未关联时间线的 JPEG 文件，并更新 captures 中的路径为 NULL
-//! - 旧采集记录（old_captures）：删除 180 天前的全部采集行（FTS5 触发器自动同步）
+//! - 旧采集记录（old_captures）：按用户配置删除过期采集行及其截图文件；时间线、知识和操作记录不参与删除
 //! - VACUUM：整理 SQLite 碎片空间，建议每周运行一次
 
 use std::path::Path;
@@ -107,33 +107,118 @@ impl StorageManager {
         Ok((deleted_count, freed_bytes))
     }
 
-    /// 清理过期采集记录（默认保留 180 天）。
+    /// 清理过期采集记录。
     ///
-    /// FTS5 触发器会自动同步 captures_fts，无需手动操作。
+    /// 只删除原始 captures、其向量索引元数据和对应截图文件；时间线、知识、
+    /// 操作记录等提炼物不会被删除。历史 schema 中 timelines.capture_id 是外键，
+    /// 因此这里临时关闭外键检查以允许“原始证据过期，提炼物保留”的产品语义。
     ///
-    /// 返回删除的行数。
-    pub fn run_old_captures_cleanup(&self, older_than_ms: i64) -> Result<usize, StorageError> {
+    /// 返回 `(deleted_capture_count, deleted_screenshot_count, freed_bytes)`。
+    pub fn run_old_captures_cleanup(
+        &self,
+        older_than_ms: i64,
+        captures_dir: &Path,
+    ) -> Result<(usize, usize, u64), StorageError> {
+        let rows = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, screenshot_path FROM captures
+                 WHERE ts < ?1",
+            )?;
+            let result = stmt
+                .query_map(params![older_than_ms], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(result)
+        })?;
+
+        if rows.is_empty() {
+            self.write_cleanup_log(
+                "old_captures",
+                0,
+                0,
+                format!("older_than_ms={older_than_ms}"),
+            )?;
+            return Ok((0, 0, 0));
+        }
+
+        let mut deleted_screenshot_count = 0usize;
+        let mut freed_bytes = 0u64;
+
+        for (_, rel_path) in &rows {
+            let Some(rel_path) = rel_path else {
+                continue;
+            };
+            let full_path = captures_dir.join(rel_path);
+            match std::fs::metadata(&full_path) {
+                Ok(meta) => {
+                    freed_bytes += meta.len();
+                    if let Err(e) = std::fs::remove_file(&full_path) {
+                        warn!("删除过期采集截图文件失败 {:?}: {}", full_path, e);
+                        continue;
+                    }
+                    deleted_screenshot_count += 1;
+                }
+                Err(_) => {
+                    deleted_screenshot_count += 1;
+                }
+            }
+        }
+
         let affected = self.with_conn(|conn| {
-            let n = conn.execute("DELETE FROM captures WHERE ts < ?1", params![older_than_ms])?;
-            Ok(n)
+            conn.execute("DELETE FROM vector_index WHERE capture_id IN (SELECT id FROM captures WHERE ts < ?1)", params![older_than_ms])?;
+
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+            let delete_result = conn.execute("DELETE FROM captures WHERE ts < ?1", params![older_than_ms]);
+            let restore_result = conn.execute_batch("PRAGMA foreign_keys = ON;");
+
+            match (delete_result, restore_result) {
+                (Ok(n), Ok(())) => Ok(n),
+                (Err(err), _) => Err(StorageError::Sqlite(err)),
+                (Ok(_), Err(err)) => Err(StorageError::Sqlite(err)),
+            }
         })?;
 
         let now = current_ts_ms();
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO data_cleanup_log (ts, cleanup_type, affected_count, freed_bytes, detail)
-                 VALUES (?1, 'old_captures', ?2, 0, ?3)",
+                 VALUES (?1, 'old_captures', ?2, ?3, ?4)",
                 params![
                     now,
                     affected as i64,
-                    format!("older_than_ms={older_than_ms}"),
+                    freed_bytes as i64,
+                    format!(
+                        "older_than_ms={older_than_ms}; deleted_screenshots={deleted_screenshot_count}; freed_bytes={freed_bytes}"
+                    ),
                 ],
             )?;
             Ok(())
         })?;
 
-        info!("old_captures 清理完成: 删除 {} 行", affected);
-        Ok(affected)
+        info!(
+            "old_captures 清理完成: 删除 {} 行，清理 {} 个截图文件，释放 {} bytes",
+            affected, deleted_screenshot_count, freed_bytes
+        );
+        Ok((affected, deleted_screenshot_count, freed_bytes))
+    }
+
+    fn write_cleanup_log(
+        &self,
+        cleanup_type: &str,
+        affected_count: i64,
+        freed_bytes: i64,
+        detail: String,
+    ) -> Result<(), StorageError> {
+        let now = current_ts_ms();
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO data_cleanup_log (ts, cleanup_type, affected_count, freed_bytes, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![now, cleanup_type, affected_count, freed_bytes, detail],
+            )?;
+            Ok(())
+        })
     }
 
     /// 执行 VACUUM，释放碎片空间。
@@ -215,6 +300,7 @@ mod tests {
     #[test]
     fn test_old_captures_cleanup() {
         let mgr = make_mgr();
+        let dir = tempdir().unwrap();
 
         // 插入一条 "180天前" 的记录
         let old_ts = current_ts_ms() - 180 * 24 * 3600 * 1000 - 1;
@@ -238,8 +324,11 @@ mod tests {
         .unwrap();
 
         let cutoff = current_ts_ms() - 180 * 24 * 3600 * 1000;
-        let deleted = mgr.run_old_captures_cleanup(cutoff).unwrap();
+        let (deleted, deleted_screenshots, freed) =
+            mgr.run_old_captures_cleanup(cutoff, dir.path()).unwrap();
         assert_eq!(deleted, 1);
+        assert_eq!(deleted_screenshots, 0);
+        assert_eq!(freed, 0);
 
         // 验证清理日志
         let logs = mgr.list_cleanup_logs(10).unwrap();
@@ -294,6 +383,7 @@ mod tests {
     #[test]
     fn test_insert_and_cleanup_uses_capture_helper() {
         let mgr = make_mgr();
+        let dir = tempdir().unwrap();
         let cap = NewCapture {
             ts: 1_700_000_000_000,
             app_name: Some("TestApp".into()),
@@ -315,7 +405,47 @@ mod tests {
         mgr.insert_capture(&cap).unwrap();
 
         // 清理比该记录更新的时间（不应删除任何东西）
-        let deleted = mgr.run_old_captures_cleanup(1_000_000_000_000).unwrap();
+        let (deleted, _, _) = mgr
+            .run_old_captures_cleanup(1_000_000_000_000, dir.path())
+            .unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_old_captures_cleanup_keeps_timeline_extracts() {
+        let mgr = make_mgr();
+        let dir = tempdir().unwrap();
+        let old_ts = current_ts_ms() - 15 * 24 * 3600 * 1000;
+        let capture_id = mgr
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO captures (ts, event_type, ax_text) VALUES (?1, 'auto', 'raw')",
+                    params![old_ts],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .unwrap();
+
+        mgr.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO timelines (capture_id, summary, category)
+                 VALUES (?1, 'timeline extract', 'meeting')",
+                params![capture_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cutoff = current_ts_ms() - 14 * 24 * 3600 * 1000;
+        let (deleted, _, _) = mgr.run_old_captures_cleanup(cutoff, dir.path()).unwrap();
+        assert_eq!(deleted, 1);
+
+        let timeline_count: i64 = mgr
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM timelines", [], |row| row.get(0))
+                    .map_err(StorageError::Sqlite)
+            })
+            .unwrap();
+        assert_eq!(timeline_count, 1);
     }
 }

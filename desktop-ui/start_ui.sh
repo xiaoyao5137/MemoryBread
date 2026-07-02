@@ -1,4 +1,4 @@
 #!/bin/bash
-cd /Users/xianjiaqi/Documents/mygit/cy/gzdz/desktop-ui
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 npm run tauri dev

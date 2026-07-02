@@ -369,6 +369,25 @@ class TestRrf:
         # k=10 时分母更小，分数更高
         assert merged10[0].score > merged60[0].score
 
+    def test_weighted_lists_prioritize_vector_source(self):
+        keyword_only = _chunk(1, source="document", doc_key="document:1", metadata={"source_type": "document", "doc_key": "document:1"})
+        vector_only = _chunk(2, source="vector", doc_key="document:2", metadata={"source_type": "document", "doc_key": "document:2"})
+        merged = reciprocal_rank_fusion(
+            [([keyword_only], 0.45), ([vector_only], 1.0)],
+            top_k=2,
+        )
+        assert [chunk.doc_key for chunk in merged] == ["document:2", "document:1"]
+
+    def test_min_score_filters_weak_keyword_only_matches(self):
+        keyword_only = _chunk(1, source="document", doc_key="document:1", metadata={"source_type": "document", "doc_key": "document:1"})
+        vector_only = _chunk(2, source="vector", doc_key="document:2", metadata={"source_type": "document", "doc_key": "document:2"})
+        merged = reciprocal_rank_fusion(
+            [([keyword_only], 0.45), ([vector_only], 1.0)],
+            top_k=2,
+            min_score=0.01,
+        )
+        assert [chunk.doc_key for chunk in merged] == ["document:2"]
+
 
 # ── RagPipeline ───────────────────────────────────────────────────────────────
 
@@ -442,7 +461,7 @@ class TestRagPipeline:
         filters = vector_r.last_kwargs["filters"]
         assert filters is not None
         assert filters.start_ts is not None
-        assert filters.source_types == ["knowledge"]
+        assert filters.source_types == ["knowledge", "document"]
         assert "gemini" in (filters.app_names or [])
 
     def test_chinese_question_extracts_meaningful_terms(self):
@@ -947,7 +966,50 @@ class TestRagPipeline:
         )
         pipeline.query("问题")
         assert vector_r.call_count == 1
-        assert vector_r.last_kwargs["filters"].source_types == ["knowledge"]
+        assert vector_r.last_kwargs["filters"].source_types == ["knowledge", "document"]
+        assert vector_r.last_kwargs["score_threshold"] == pytest.approx(0.45)
+
+    def test_lookup_prefers_vector_and_drops_weak_keyword_only_documents(self):
+        relevant = _chunk(
+            65,
+            source="vector",
+            doc_key="document:65",
+            metadata={"source_type": "document", "doc_key": "document:65", "title": "万擎内部开源模型性能压测表"},
+        )
+        weak_keyword = _chunk(
+            55,
+            source="document",
+            doc_key="document:55",
+            metadata={"source_type": "document", "doc_key": "document:55", "title": "万擎 - 私有大模型 - 模型部署接口设计"},
+        )
+        pipeline = RagPipeline(
+            embedding_model=EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever=MockVectorRetriever(chunks=[relevant]),  # type: ignore[arg-type]
+            fts5_retriever=MockFts5Retriever(),      # type: ignore[arg-type]
+            knowledge_retriever=MockFts5Retriever(chunks=[weak_keyword]),  # type: ignore[arg-type]
+            llm=MockLlmBackend(),
+            top_k=3,
+        )
+        result = pipeline.query("万擎的模型压测结果是什么样的？")
+        assert [chunk.doc_key for chunk in result.contexts] == ["document:65"]
+
+    def test_keyword_results_remain_fallback_when_vector_has_no_hits(self):
+        keyword_only = _chunk(
+            65,
+            source="document",
+            doc_key="document:65",
+            metadata={"source_type": "document", "doc_key": "document:65", "title": "万擎内部开源模型性能压测表"},
+        )
+        pipeline = RagPipeline(
+            embedding_model=EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever=MockVectorRetriever(chunks=[]),  # type: ignore[arg-type]
+            fts5_retriever=MockFts5Retriever(),      # type: ignore[arg-type]
+            knowledge_retriever=MockFts5Retriever(chunks=[keyword_only]),  # type: ignore[arg-type]
+            llm=MockLlmBackend(),
+            top_k=3,
+        )
+        result = pipeline.query("万擎的模型压测结果是什么样的？")
+        assert [chunk.doc_key for chunk in result.contexts] == ["document:65"]
 
     def test_vector_retriever_skipped_when_embedding_fails(self):
         """embedding 失败时，向量检索应跳过"""

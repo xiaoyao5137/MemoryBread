@@ -132,9 +132,46 @@ def _start_vector_search_server() -> None:
     """在 daemon 线程中启动内部向量搜索 HTTP 服务（端口 7072）。"""
     try:
         from flask import Flask, jsonify, request as flask_request
+        from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue, Range
 
         _vs_app = Flask("vector_search_internal")
         logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+        def build_qdrant_filter(raw_filters: dict | None):
+            if not raw_filters:
+                return None
+            conditions = []
+
+            def add_range(key: str, gte_key: str, lte_key: str) -> None:
+                gte = raw_filters.get(gte_key)
+                lte = raw_filters.get(lte_key)
+                if gte is not None or lte is not None:
+                    conditions.append(FieldCondition(key=key, range=Range(gte=gte, lte=lte)))
+
+            def add_match(key: str, value) -> None:
+                if value is None:
+                    return
+                if isinstance(value, list):
+                    normalized = [item for item in dict.fromkeys(value) if item is not None and item != ""]
+                    if len(normalized) == 1:
+                        conditions.append(FieldCondition(key=key, match=MatchValue(value=normalized[0])))
+                    elif len(normalized) > 1:
+                        conditions.append(FieldCondition(key=key, match=MatchAny(any=normalized)))
+                else:
+                    conditions.append(FieldCondition(key=key, match=MatchValue(value=value)))
+
+            add_range("time", "start_ts", "end_ts")
+            add_range("observed_at", "observed_start_ts", "observed_end_ts")
+            add_range("event_time_start", "event_start_ts", "event_end_ts")
+            add_match("source_type", raw_filters.get("source_types"))
+            add_match("app_name", raw_filters.get("app_names"))
+            add_match("category", raw_filters.get("category"))
+            add_match("activity_type", raw_filters.get("activity_types"))
+            add_match("content_origin", raw_filters.get("content_origins"))
+            add_match("history_view", raw_filters.get("history_view"))
+            add_match("is_self_generated", raw_filters.get("is_self_generated"))
+            add_match("evidence_strength", raw_filters.get("evidence_strengths"))
+            return Filter(must=conditions) if conditions else None
 
         @_vs_app.route('/vector_search', methods=['POST'])
         def vector_search():
@@ -144,6 +181,7 @@ def _start_vector_search_server() -> None:
             query_vector = data['query_vector']
             top_k = int(data.get('top_k', 10))
             score_threshold = float(data.get('score_threshold', 0.3))
+            qdrant_filter = build_qdrant_filter(data.get('filters'))
             try:
                 from embedding.vector_storage import get_vector_storage
                 vs = get_vector_storage()
@@ -155,6 +193,7 @@ def _start_vector_search_server() -> None:
                     query=query_vector,
                     limit=top_k,
                     score_threshold=score_threshold,
+                    query_filter=qdrant_filter,
                 ).points
                 hits = []
                 for hit in results:

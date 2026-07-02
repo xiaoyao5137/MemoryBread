@@ -78,10 +78,10 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
         </button>
       </div>
 
-      {/* API 地址配置 */}
+      {/* 本机服务地址配置 */}
       <section className="settings__section" data-testid="settings-api-section">
-        <h2 className="settings__section-title">API 服务</h2>
-        <label htmlFor="api-url-input">Core Engine 地址</label>
+        <h2 className="settings__section-title">本机服务</h2>
+        <label htmlFor="api-url-input">服务地址</label>
         <div className="settings__row">
           <input
             id="api-url-input"

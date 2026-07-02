@@ -3,7 +3,10 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crate::storage::StorageManager;
@@ -91,18 +94,39 @@ pub struct AppState {
     pub debug_log_specs: Vec<DebugLogSpec>,
     pub rag_jobs: Arc<Mutex<HashMap<String, RagJobRecord>>>,
     pub rag_job_seq: Arc<AtomicU64>,
+    pub capture_enabled: Arc<AtomicBool>,
 }
 
 impl AppState {
     pub fn new(storage: StorageManager) -> Arc<Self> {
         let sidecar_url =
             std::env::var("SIDECAR_URL").unwrap_or_else(|_| "http://127.0.0.1:7071".to_string());
+        Self::with_config(storage, sidecar_url, default_debug_log_specs())
+    }
+
+    pub fn with_config(
+        storage: StorageManager,
+        sidecar_url: String,
+        debug_log_specs: Vec<DebugLogSpec>,
+    ) -> Arc<Self> {
+        let capture_enabled = storage
+            .get_preference("runtime.capture_enabled")
+            .ok()
+            .flatten()
+            .map(|preference| preference.value != "false")
+            .unwrap_or(true);
+
         Arc::new(Self {
             storage,
             sidecar_url,
-            debug_log_specs: default_debug_log_specs(),
+            debug_log_specs,
             rag_jobs: Arc::new(Mutex::new(HashMap::new())),
             rag_job_seq: Arc::new(AtomicU64::new(1)),
+            capture_enabled: Arc::new(AtomicBool::new(capture_enabled)),
         })
+    }
+
+    pub fn is_capture_enabled(&self) -> bool {
+        self.capture_enabled.load(Ordering::Relaxed)
     }
 }

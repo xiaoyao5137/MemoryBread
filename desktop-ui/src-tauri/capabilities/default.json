@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Default capabilities for the main window",
-  "windows": ["main"],
+  "windows": ["main", "floating-assist"],
   "permissions": [
     "core:default",
     "shell:allow-open"

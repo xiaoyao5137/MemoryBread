@@ -24,7 +24,7 @@ import type {
 const LOCAL_CORE_API = 'http://127.0.0.1:7070'
 const LOCAL_MODEL_API = 'http://127.0.0.1:7071'
 
-const normalizeLocalApiBaseUrl = (baseUrl: string) =>
+export const normalizeLocalApiBaseUrl = (baseUrl: string) =>
   baseUrl.replace(/^http:\/\/localhost(?::7070)?$/i, LOCAL_CORE_API)
 
 const isNetworkLoadFailure = (error: unknown) => {
@@ -32,7 +32,7 @@ const isNetworkLoadFailure = (error: unknown) => {
   return message === 'Load failed' || message.includes('Failed to fetch') || message.includes('NetworkError')
 }
 
-const fetchWithLocalhostFallback = async (input: string, init?: RequestInit) => {
+export const fetchWithLocalhostFallback = async (input: string, init?: RequestInit) => {
   try {
     return await fetch(input, init)
   } catch (error) {
@@ -45,7 +45,7 @@ const fetchWithLocalhostFallback = async (input: string, init?: RequestInit) => 
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
-const parseApiErrorMessage = async (resp: Response, fallback: string) => {
+export const parseApiErrorMessage = async (resp: Response, fallback: string) => {
   let errMsg = fallback
   try {
     const errJson = await resp.json()
@@ -86,7 +86,7 @@ const CREATION_MODEL_NAMES: Record<string, string> = {
   'qwen-3-5-4b': 'qwen3.5:4b',
 }
 
-const getActiveCreationModelPayload = (configs: CreationModelConfig[]) => {
+export const getActiveCreationModelPayload = (configs: CreationModelConfig[]) => {
   const active = configs.find(config =>
     config.enabled && (config.id === LOCAL_CREATION_MODEL_ID || config.apiKey)
   )
@@ -101,6 +101,56 @@ const getActiveCreationModelPayload = (configs: CreationModelConfig[]) => {
     payload.creation_base_url = active.baseUrl
   }
   return payload
+}
+
+export async function runRagQueryJob(
+  apiBaseUrl: string,
+  creationModelConfigs: CreationModelConfig[],
+  query: string,
+  topK = 5,
+  extraPayload: Record<string, unknown> = {},
+): Promise<RagQueryResponse> {
+  const normalizedApiBaseUrl = normalizeLocalApiBaseUrl(apiBaseUrl)
+  const createResp = await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/jobs`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({
+      query,
+      top_k: topK,
+      ...getActiveCreationModelPayload(creationModelConfigs),
+      ...extraPayload,
+    }),
+  })
+  if (!createResp.ok) {
+    throw new Error(await parseApiErrorMessage(createResp, `query job create failed: ${createResp.status}`))
+  }
+
+  const created: RagJobCreateResponse = await createResp.json()
+  const deadline = Date.now() + 10 * 60 * 1000
+  let data: RagQueryResponse | null = null
+
+  while (Date.now() < deadline) {
+    await sleep(2000)
+    const statusResp = await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/jobs/${encodeURIComponent(created.job_id)}`)
+    if (!statusResp.ok) {
+      throw new Error(await parseApiErrorMessage(statusResp, `query job status failed: ${statusResp.status}`))
+    }
+
+    const job: RagJobStatusResponse = await statusResp.json()
+    if (job.status === 'succeeded') {
+      data = job.result ?? null
+      break
+    }
+    if (job.status === 'failed') {
+      throw new Error(job.error || '咨询生成失败，请稍后重试')
+    }
+  }
+
+  if (!data) {
+    throw new Error('咨询生成等待超时，请稍后在「咨询记录」中查看是否已完成')
+  }
+
+  return data
 }
 
 export interface ModelStatus {
@@ -193,50 +243,13 @@ export function useRagQuery() {
   return useCallback(async (query: string, topK = 5): Promise<RagQueryResponse> => {
     setLoading(true)
     try {
-      const createResp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/rag/jobs`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-          query,
-          top_k: topK,
-          ...getActiveCreationModelPayload(creationModelConfigs),
-        }),
-      })
-      if (!createResp.ok) {
-        throw new Error(await parseApiErrorMessage(createResp, `query job create failed: ${createResp.status}`))
-      }
-
-      const created: RagJobCreateResponse = await createResp.json()
-      const deadline = Date.now() + 10 * 60 * 1000
-      let data: RagQueryResponse | null = null
-
-      while (Date.now() < deadline) {
-        await sleep(2000)
-        const statusResp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/rag/jobs/${encodeURIComponent(created.job_id)}`)
-        if (!statusResp.ok) {
-          throw new Error(await parseApiErrorMessage(statusResp, `query job status failed: ${statusResp.status}`))
-        }
-
-        const job: RagJobStatusResponse = await statusResp.json()
-        if (job.status === 'succeeded') {
-          data = job.result ?? null
-          break
-        }
-        if (job.status === 'failed') {
-          throw new Error(job.error || '咨询生成失败，请稍后重试')
-        }
-      }
-
-      if (!data) {
-        throw new Error('咨询生成等待超时，请稍后在「咨询记录」中查看是否已完成')
-      }
-
+      const data = await runRagQueryJob(apiBaseUrl, creationModelConfigs, query, topK)
       setResult(data.answer, data.contexts ?? [])
       return data
     } catch (err) {
       const rawMsg = err instanceof Error ? err.message : String(err)
       const msg = rawMsg === 'Load failed'
-        ? '咨询请求连接失败，请确认 MemoryBread 后端已启动，并稍后重试'
+        ? '咨询请求连接失败，请确认本机服务已启动，并稍后重试'
         : rawMsg
       setError(msg)
       throw err
@@ -308,6 +321,13 @@ export interface ScreenshotCleanupResult {
   freed_bytes: number
 }
 
+export interface CaptureCleanupResult {
+  retention_days: number
+  deleted_count: number
+  deleted_screenshot_count: number
+  freed_bytes: number
+}
+
 export function useRunScreenshotCleanup() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
@@ -316,6 +336,18 @@ export function useRunScreenshotCleanup() {
       method: 'POST',
     })
     if (!resp.ok) throw new Error(`run screenshot cleanup failed: ${resp.status}`)
+    return resp.json()
+  }, [apiBaseUrl])
+}
+
+export function useRunCaptureCleanup() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (): Promise<CaptureCleanupResult> => {
+    const resp = await fetch(`${apiBaseUrl}/preferences/capture-cleanup/run`, {
+      method: 'POST',
+    })
+    if (!resp.ok) throw new Error(`run capture cleanup failed: ${resp.status}`)
     return resp.json()
   }, [apiBaseUrl])
 }

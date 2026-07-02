@@ -1,4 +1,6 @@
 import React, { useEffect } from 'react'
+import { listen } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import {
   CREATION_MODEL_PREFERENCE_KEY,
   loadCreationModels,
@@ -19,6 +21,11 @@ import MonitorPanel           from './components/MonitorPanel'
 import BakePanel              from './components/BakePanel'
 import ProfilePanel           from './components/ProfilePanel'
 import OnboardingWizard       from './components/OnboardingWizard'
+import AuthPanel              from './components/AuthPanel'
+import SystemFloatingAssist   from './components/SystemFloatingAssist'
+import { fetchCurrentUser } from './utils/authApi'
+
+const FLOATING_ASSIST_ENABLED_KEY = 'memoryBread.floatingAssist.enabled'
 
 const hasConfiguredCreationModel = (configs: Array<{ enabled?: boolean; apiKey?: string }>) =>
   configs.some(config => Boolean(config.enabled || config.apiKey))
@@ -30,6 +37,12 @@ const parseReferenceId = (docKey?: string | null) => {
 }
 
 const App: React.FC = () => {
+  const searchParams = new URLSearchParams(window.location.search)
+  const isFloatingAssistWindow = searchParams.get('view') === 'floating-assist'
+  if (isFloatingAssistWindow) {
+    return <SystemFloatingAssist />
+  }
+
   const {
     windowMode,
     setWindowMode,
@@ -51,9 +64,79 @@ const App: React.FC = () => {
     hasCompletedSetup,
     setupSkipped,
     apiBaseUrl,
+    adminApiBaseUrl,
+    authToken,
     setCreationModelConfigs,
+    setAuthSession,
+    clearAuthSession,
   } = useAppStore()
+
   const showOnboarding = !hasCompletedSetup && !setupSkipped
+
+  useEffect(() => {
+    let cancelled = false
+    const cleanups: Array<() => void> = []
+
+    const syncCaptureMenuState = async (): Promise<boolean> => {
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/runtime/status`)
+        if (!response.ok) return false
+        const status = await response.json() as { capture_enabled: boolean }
+        if (!cancelled) {
+          await invoke('set_capture_menu_state', { enabled: status.capture_enabled })
+        }
+        return true
+      } catch {
+        // 浏览器预览或 Core Engine 尚未启动时保持菜单默认开启。
+        return false
+      }
+    }
+
+    const syncCaptureMenuUntilReady = async () => {
+      for (let attempt = 0; attempt < 12 && !cancelled; attempt += 1) {
+        if (await syncCaptureMenuState()) return
+        await new Promise(resolve => window.setTimeout(resolve, 5000))
+      }
+    }
+
+    const registerTrayEvents = async () => {
+      try {
+        const floatingAssistEnabled = localStorage.getItem(FLOATING_ASSIST_ENABLED_KEY) === 'true'
+        await invoke('set_floating_assist_menu_state', { enabled: floatingAssistEnabled })
+        if (floatingAssistEnabled) {
+          await invoke('set_floating_assist_visible', { enabled: true })
+        }
+        cleanups.push(await listen('tray-navigate-settings', () => {
+          setWindowMode('settings')
+        }))
+        cleanups.push(await listen<boolean>('tray-floating-assist-changed', event => {
+          localStorage.setItem(FLOATING_ASSIST_ENABLED_KEY, String(event.payload))
+        }))
+        cleanups.push(await listen<boolean>('tray-capture-changed', async event => {
+          const requested = event.payload
+          try {
+            const response = await fetch(`${apiBaseUrl}/api/runtime/status`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ capture_enabled: requested }),
+            })
+            if (!response.ok) throw new Error(`runtime status update failed: ${response.status}`)
+          } catch {
+            await syncCaptureMenuState()
+          }
+        }))
+        void syncCaptureMenuUntilReady()
+      } catch {
+        // 普通浏览器环境没有 Tauri event runtime。
+      }
+    }
+
+    void registerTrayEvents()
+    return () => {
+      cancelled = true
+      cleanups.forEach(cleanup => cleanup())
+    }
+  }, [apiBaseUrl, setWindowMode])
 
   useEffect(() => {
     let cancelled = false
@@ -94,6 +177,27 @@ const App: React.FC = () => {
     return () => { cancelled = true }
   }, [apiBaseUrl, setCreationModelConfigs])
 
+  useEffect(() => {
+    if (!authToken) return
+    let cancelled = false
+    const validateSession = async () => {
+      try {
+        const user = await fetchCurrentUser(adminApiBaseUrl, authToken)
+        if (!cancelled) {
+          setAuthSession({
+            access_token: authToken,
+            expires_at: useAppStore.getState().authExpiresAt || new Date(Date.now() + 30 * 86400_000).toISOString(),
+            user,
+          })
+        }
+      } catch {
+        if (!cancelled) clearAuthSession()
+      }
+    }
+    void validateSession()
+    return () => { cancelled = true }
+  }, [adminApiBaseUrl, authToken, clearAuthSession, setAuthSession])
+
   // 监听查看采集记录事件
   useEffect(() => {
     const handleViewCapture = (event: CustomEvent) => {
@@ -113,8 +217,8 @@ const App: React.FC = () => {
   }, [setWindowMode])
 
   useEffect(() => {
-    const handleViewReference = (event: CustomEvent) => {
-      const { type, captureId, knowledgeId, artifactId, documentId, docKey } = event.detail || {}
+    const openReferenceDetail = (detail: any) => {
+      const { type, captureId, knowledgeId, artifactId, documentId, docKey } = detail || {}
       const parsedTargetId = parseReferenceId(docKey)
       const targetId = String(documentId ?? artifactId ?? parsedTargetId ?? '')
       pushBakeNavigationTarget({ windowMode: 'rag' })
@@ -156,9 +260,21 @@ const App: React.FC = () => {
       }
     }
 
+    const handleViewReference = (event: CustomEvent) => {
+      openReferenceDetail(event.detail)
+    }
+
+    let tauriCleanup: (() => void) | null = null
+    void listen<any>('floating-assist-open-reference', event => {
+      openReferenceDetail(event.payload)
+    }).then(cleanup => {
+      tauriCleanup = cleanup
+    }).catch(() => {})
+
     window.addEventListener('view-rag-reference', handleViewReference as EventListener)
     return () => {
       window.removeEventListener('view-rag-reference', handleViewReference as EventListener)
+      tauriCleanup?.()
     }
   }, [
     pushBakeNavigationTarget,
@@ -204,6 +320,7 @@ const App: React.FC = () => {
         {windowMode === 'monitor'   && <MonitorPanel />}
         {windowMode === 'bake'      && <BakePanel />}
         {windowMode === 'profile'   && <ProfilePanel />}
+        {windowMode === 'account'   && <AuthPanel />}
       </main>
 
       <ActionConfirm />

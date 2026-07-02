@@ -28,6 +28,16 @@ pub struct RagQueryRequest {
     pub creation_api_key: Option<String>,
     #[serde(default)]
     pub creation_base_url: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub screenshot_path: Option<String>,
+    #[serde(default)]
+    pub screenshot_width: Option<u32>,
+    #[serde(default)]
+    pub screenshot_height: Option<u32>,
+    #[serde(default)]
+    pub ocr_text: Option<String>,
 }
 
 fn default_top_k() -> usize {
@@ -94,6 +104,12 @@ pub struct RagContext {
     pub source_timeline_ids: Option<Vec<String>>,
     #[serde(default)]
     pub linked_knowledge_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub screenshot_path: Option<String>,
+    #[serde(default)]
+    pub screenshot_width: Option<u32>,
+    #[serde(default)]
+    pub screenshot_height: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -338,6 +354,9 @@ fn legacy_capture_context(capture_id: i64) -> RagContext {
         importance: None,
         source_timeline_ids: None,
         linked_knowledge_ids: None,
+        screenshot_path: None,
+        screenshot_width: None,
+        screenshot_height: None,
     }
 }
 
@@ -433,6 +452,11 @@ async fn call_rag_service(
         "creation_model": body.creation_model,
         "creation_api_key": body.creation_api_key,
         "creation_base_url": body.creation_base_url,
+        "source": body.source,
+        "screenshot_path": body.screenshot_path,
+        "screenshot_width": body.screenshot_width,
+        "screenshot_height": body.screenshot_height,
+        "ocr_text": body.ocr_text,
     });
 
     let response = client

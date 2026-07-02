@@ -12,6 +12,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
+import { convertFileSrc } from '@tauri-apps/api/core'
 import { BookOpen, ChevronDown, Copy, ExternalLink, History, Loader2, MessageSquare, Send } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { useFetchRagHistory, useModelStatus, useRagQuery } from '../hooks/useApi'
@@ -162,6 +163,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   const [ragHistory, setRagHistory] = useState<RagHistoryItem[]>([])
   const [copySuccess, setCopySuccess] = useState(false)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
+  const [screenshotPreview, setScreenshotPreview] = useState<string | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const answerRef = useRef<HTMLDivElement>(null)
   const doQuery = useRagQuery()
@@ -170,8 +172,11 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
 
   // 内容变化时自动调整高度
   const adjustHeight = useCallback((el: HTMLTextAreaElement) => {
+    const maxHeight = 220
     el.style.height = 'auto'
-    el.style.height = `${el.scrollHeight}px`
+    const nextHeight = Math.min(el.scrollHeight, maxHeight)
+    el.style.height = `${nextHeight}px`
+    el.style.overflowY = el.scrollHeight > maxHeight ? 'auto' : 'hidden'
   }, [])
 
   // inputValue 变化时（含模板填入、外部更新）同步高度
@@ -276,6 +281,9 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
     setTimeout(() => answerRef.current?.scrollTo({ top: 0, behavior: 'smooth' }), 100)
   }
 
+  const historyScreenshot = (item: RagHistoryItem) =>
+    (item.contexts ?? []).find(ctx => ctx.source_type === 'floating_assist' && ctx.screenshot_path)
+
   const toggleBottomTab = (tab: 'references' | 'history' | 'templates') =>
     setActiveBottomTab(prev => prev === tab ? null : tab)
   const thinkingProgress = ragLoading
@@ -348,7 +356,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           value={inputValue}
           onChange={handleInputChange}
           rows={3}
-          style={{ resize: 'none', overflow: 'hidden' }}
+          style={{ resize: 'none' }}
           disabled={ragLoading || !modelsReady}
         />
         <button
@@ -495,12 +503,41 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           {activeBottomTab === 'history' && (
             ragHistory.length ? (
               <div className="rag-panel__history-list">
-                {ragHistory.map((item) => (
-                  <button key={item.id} className="rag-panel__history-item" onClick={() => handleRestoreHistory(item)}>
-                    <span className="rag-panel__history-query">{item.query}</span>
-                    <span className="rag-panel__history-meta">{formatTs(item.ts)} · {item.context_count} 条参考</span>
-                  </button>
-                ))}
+                {ragHistory.map((item) => {
+                  const shot = historyScreenshot(item)
+                  const shotSrc = shot?.screenshot_path ? convertFileSrc(shot.screenshot_path) : ''
+                  return (
+                    <button key={item.id} className="rag-panel__history-item" onClick={() => handleRestoreHistory(item)}>
+                      {shotSrc && (
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          className="rag-panel__history-shot"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            setScreenshotPreview(shotSrc)
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault()
+                              event.stopPropagation()
+                              setScreenshotPreview(shotSrc)
+                            }
+                          }}
+                          aria-label="查看悬浮球截屏"
+                        >
+                          <img src={shotSrc} alt="悬浮球截屏缩略图" />
+                        </span>
+                      )}
+                      <span className="rag-panel__history-main">
+                        <span className="rag-panel__history-query">{item.query}</span>
+                        <span className="rag-panel__history-meta">
+                          {formatTs(item.ts)} · {shotSrc ? '悬浮截屏 · ' : ''}{item.context_count} 条参考
+                        </span>
+                      </span>
+                    </button>
+                  )
+                })}
               </div>
             ) : (
               <div className="rag-panel__bottom-empty">暂无咨询记录。</div>
@@ -534,6 +571,12 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {screenshotPreview && (
+        <div className="rag-panel__screenshot-preview" onClick={() => setScreenshotPreview(null)}>
+          <img src={screenshotPreview} alt="悬浮球截屏预览" />
         </div>
       )}
     </div>
@@ -586,6 +629,7 @@ const MarkdownContent = ({ content, components }: { content: string; components:
 
 const sourceLabel = (item: RagContext) => {
   const source = item.source_type || item.source
+  if (source === 'floating_assist') return '悬浮截屏'
   if (item.knowledge_id || source === 'knowledge') return '时间线'
   if (source === 'capture') return '采集记录'
   if (source === 'document') return '文档'

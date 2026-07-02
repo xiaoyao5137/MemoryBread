@@ -1,6 +1,7 @@
 //! GET /preferences — 获取所有用户偏好
 //! PUT /preferences/:key — 更新单条偏好
 //! POST /preferences/screenshot-cleanup/run — 立即执行一次截图清理
+//! POST /preferences/capture-cleanup/run — 立即执行一次采集记录清理
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,6 +53,14 @@ pub struct RunScreenshotCleanupResponse {
     pub freed_bytes: u64,
 }
 
+#[derive(Serialize)]
+pub struct RunCaptureCleanupResponse {
+    pub retention_days: i64,
+    pub deleted_count: usize,
+    pub deleted_screenshot_count: usize,
+    pub freed_bytes: u64,
+}
+
 fn parse_screenshot_keep_days(storage: &crate::storage::StorageManager) -> i64 {
     storage
         .get_preference("privacy.screenshot_keep_days")
@@ -60,6 +69,16 @@ fn parse_screenshot_keep_days(storage: &crate::storage::StorageManager) -> i64 {
         .and_then(|p| p.value.parse::<i64>().ok())
         .map(|value| value.max(1))
         .unwrap_or(90)
+}
+
+fn parse_capture_retention_days(storage: &crate::storage::StorageManager) -> i64 {
+    storage
+        .get_preference("privacy.capture_retention_days")
+        .ok()
+        .flatten()
+        .and_then(|p| p.value.parse::<i64>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(14)
 }
 
 fn screenshot_captures_dir() -> PathBuf {
@@ -86,6 +105,35 @@ pub async fn run_screenshot_cleanup_now(
         keep_days: result.0,
         deleted_count: result.1,
         freed_bytes: result.2,
+    }))
+}
+
+pub async fn run_capture_cleanup_now(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<RunCaptureCleanupResponse>, ApiError> {
+    let storage = state.storage.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let retention_days = parse_capture_retention_days(&storage);
+        let cutoff = current_ts_ms() - retention_days * 24 * 60 * 60 * 1000;
+        let captures_dir = screenshot_captures_dir();
+        let (deleted_count, deleted_screenshot_count, freed_bytes) =
+            storage.run_old_captures_cleanup(cutoff, &captures_dir)?;
+        Ok::<_, crate::storage::StorageError>((
+            retention_days,
+            deleted_count,
+            deleted_screenshot_count,
+            freed_bytes,
+        ))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))??;
+
+    Ok(Json(RunCaptureCleanupResponse {
+        retention_days: result.0,
+        deleted_count: result.1,
+        deleted_screenshot_count: result.2,
+        freed_bytes: result.3,
     }))
 }
 

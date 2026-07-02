@@ -129,7 +129,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
       return
     }
 
-    setError('当前版本暂不支持服务端搜索，请先使用分类筛选或直接刷新列表')
+    setError('当前版本暂不支持搜索，请先使用分类筛选或直接刷新列表')
   }
 
   const handleExtract = async () => {

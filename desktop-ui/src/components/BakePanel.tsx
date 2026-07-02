@@ -693,9 +693,6 @@ const BakePanel: React.FC = () => {
             onDeleteKnowledge={handleDeleteKnowledge}
             onViewSourceTimeline={handleViewSourceMemory}
             sourceTimelineTitle={resolvedKnowledgeItem?.sourceTimelineId ? memoryTitleById.get(resolvedKnowledgeItem.sourceTimelineId) : undefined}
-            onCreateKnowledge={(knowledge) => {
-              setStatusMessage('手工录入功能需要后端API支持，当前仅为UI演示')
-            }}
             onOpenCapture={(captureId?: string) => {
               if (!captureId) {
                 setStatusMessage('当前内容暂无关联采集记录')
@@ -756,9 +753,6 @@ const BakePanel: React.FC = () => {
             onDeleteSop={handleDeleteSop}
             onViewSourceTimeline={handleViewSourceMemory}
             sourceTimelineTitle={resolvedSopItem?.sourceTimelineId ? memoryTitleById.get(resolvedSopItem.sourceTimelineId) : undefined}
-            onCreateSop={(sop) => {
-              setStatusMessage('手工录入功能需要后端API支持，当前仅为UI演示')
-            }}
             onPageChange={setBakeSopOffset}
             onLimitChange={setBakeSopLimit}
             onDraftQueryChange={setDraftSopQuery}
