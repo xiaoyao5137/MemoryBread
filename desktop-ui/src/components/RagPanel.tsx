@@ -7,9 +7,10 @@
  * 3. 优化布局和样式
  */
 
-import React, { useCallback, useState } from 'react'
+import React, { useCallback, useRef, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { useRagQuery } from '../hooks/useApi'
+import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false)
@@ -73,7 +74,21 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   } = useAppStore()
 
   const [inputValue, setInputValue] = useState(ragQuery)
+  const [attachments, setAttachments] = useState<UserAttachment[]>([])
+  const [attachmentError, setAttachmentError] = useState<string | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const doQuery = useRagQuery()
+
+  const addFiles = useCallback(async (files: Iterable<File>) => {
+    setAttachmentError(null)
+    try {
+      const next = await filesToAttachments(files, attachments.length)
+      setAttachments(prev => [...prev, ...next])
+    } catch (err) {
+      setAttachmentError(err instanceof Error ? err.message : '附件读取失败')
+    }
+  }, [attachments.length])
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -81,14 +96,26 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
       const q = inputValue.trim()
       if (!q) return
       setRagQuery(q)
+      const controller = new AbortController()
+      abortRef.current = controller
+      const attachmentPrompt = buildAttachmentPrompt(attachments)
+      const queryWithAttachments = attachmentPrompt ? `${q}\n\n${attachmentPrompt}` : q
       try {
-        await doQuery(q)
-      } catch {
+        await doQuery(queryWithAttachments, 5, attachments.length ? { attachments: buildAttachmentMetadata(attachments) } : {}, controller.signal)
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return
         // error is set in store by useRagQuery
+      } finally {
+        if (abortRef.current === controller) abortRef.current = null
       }
     },
-    [inputValue, setRagQuery, doQuery]
+    [attachments, inputValue, setRagQuery, doQuery]
   )
+
+  const handleStop = useCallback(() => {
+    abortRef.current?.abort()
+    useAppStore.getState().setRagLoading(false)
+  }, [])
 
   return (
     <div
@@ -131,14 +158,42 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           placeholder="问我任何工作相关的问题..."
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
+          onPaste={(event) => {
+            const files = Array.from(event.clipboardData.files || [])
+            if (files.length) void addFiles(files)
+          }}
           rows={3}
           disabled={ragLoading}
         />
+        {attachments.length > 0 && (
+          <div className="rag-panel__attachments">
+            {attachments.map(item => (
+              <span className="rag-panel__attachment" key={item.id}>
+                <span>{item.name}</span>
+                <small>{formatAttachmentSize(item.size)}</small>
+                <button type="button" onClick={() => setAttachments(prev => prev.filter(existing => existing.id !== item.id))} aria-label={`移除 ${item.name}`}>×</button>
+              </span>
+            ))}
+          </div>
+        )}
+        {attachmentError && <div className="rag-panel__attachment-error">{attachmentError}</div>}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept="image/*,.pdf,.txt,.md,.doc,.docx"
+          style={{ display: 'none' }}
+          onChange={(event) => {
+            if (event.target.files) void addFiles(event.target.files)
+            event.currentTarget.value = ''
+          }}
+        />
         <button
-          type="submit"
+          type={ragLoading ? 'button' : 'submit'}
           className="rag-panel__submit"
           data-testid="rag-panel-submit"
-          disabled={ragLoading || !inputValue.trim()}
+          disabled={!ragLoading && !inputValue.trim()}
+          onClick={ragLoading ? handleStop : undefined}
         >
           {ragLoading ? (
             <>
@@ -156,7 +211,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
               >
                 <path d="M21 12a9 9 0 1 1-6.219-8.56" />
               </svg>
-              思考中...
+              中止
             </>
           ) : (
             <>
@@ -177,6 +232,14 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
               提问
             </>
           )}
+        </button>
+        <button
+          type="button"
+          className="rag-panel__attach-btn"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={ragLoading}
+        >
+          附件
         </button>
       </form>
 

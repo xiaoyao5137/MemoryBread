@@ -3,13 +3,13 @@
    ======================================== */
 
 .floating-buddy-v2 {
-  width: clamp(220px, 22vw, 256px);
-  min-width: 220px;
+  width: clamp(184px, 18vw, 212px);
+  min-width: 184px;
   height: 100%;
-  padding: 24px 16px;
+  padding: 22px 12px;
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: 20px;
   background: rgba(255, 255, 255, 0.95);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
@@ -20,14 +20,14 @@
 .buddy-sidebar-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 8px;
+  gap: 10px;
+  padding: 6px;
 }
 
 .buddy-sidebar-logo {
-  width: 60px;
-  height: 60px;
-  border-radius: 16px;
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -224,20 +224,20 @@
   color: #9CA3AF;
   letter-spacing: 0.6px;
   text-transform: none;
-  padding: 6px 12px 4px;
+  padding: 6px 10px 4px;
   user-select: none;
 }
 
 .buddy-action-btn {
   width: 100%;
   min-height: 44px;
-  padding: 10px 12px;
-  border-radius: 14px;
+  padding: 10px;
+  border-radius: 12px;
   background: transparent;
   border: none;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   color: #4B5563;
   cursor: pointer;
   text-align: left;

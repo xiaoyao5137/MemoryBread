@@ -272,6 +272,7 @@ pub struct RagSessionRecord {
     pub llm_response: Option<String>,
     pub user_feedback: Option<String>,
     pub latency_ms: Option<i64>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +284,7 @@ pub struct NewRagSession {
     pub prompt_used: Option<String>,
     pub llm_response: Option<String>,
     pub latency_ms: Option<i64>,
+    pub model: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -12,6 +12,7 @@ import React from 'react'
 import { ChevronRight, CircleUserRound, LogIn } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { type WindowMode } from '../types'
+import { getMembershipPlanLabel, getUserDisplayName } from '../utils/accountDisplay'
 import EnvironmentSwitch from './admin/EnvironmentSwitch'
 import './FloatingBuddy.v2.css'
 
@@ -167,8 +168,9 @@ const MENU_GROUPS: MenuGroup[] = [
 ]
 
 const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
-  const { windowMode, setWindowMode, currentUser } = useAppStore()
-  const accountLabel = currentUser?.email || currentUser?.phone || '登录账户'
+  const { windowMode, setWindowMode, currentUser, cloudSubscription } = useAppStore()
+  const accountLabel = getUserDisplayName(currentUser)
+  const planLabel = getMembershipPlanLabel(currentUser, cloudSubscription)
 
   return (
     <aside
@@ -215,14 +217,14 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
       <button
         className={`buddy-account-pill ${windowMode === 'account' ? 'buddy-account-pill--active' : ''}`}
         type="button"
-        aria-label={currentUser ? '打开用户账户' : '打开登录账户'}
+        aria-label={currentUser ? '打开用户账户' : '未登录，打开登录'}
         onClick={() => setWindowMode('account')}
       >
         <span className="buddy-account-pill__icon" aria-hidden="true">
           {currentUser ? <CircleUserRound size={17} /> : <LogIn size={17} />}
         </span>
         <span className="buddy-account-pill__text">
-          <span>{currentUser ? '云账户已连接' : '本地模式'}</span>
+          <span>{planLabel}</span>
           <strong>{accountLabel}</strong>
         </span>
         <ChevronRight className="buddy-account-pill__chevron" size={15} aria-hidden="true" />

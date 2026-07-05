@@ -733,6 +733,17 @@ impl BakeService {
         })
     }
 
+    pub fn get_sop(&self, id: i64) -> Result<BakeSopPayload, ApiError> {
+        let record = self
+            .storage
+            .get_timeline_entry(id)?
+            .ok_or_else(|| ApiError::NotFound(format!("sop {id} not found")))?;
+        if record.category != CATEGORY_BAKE_SOP {
+            return Err(ApiError::NotFound(format!("sop {id} not found")));
+        }
+        Ok(map_sop_record_with_linked_summaries(&self.storage, record))
+    }
+
     pub fn adopt_sop(&self, id: i64) -> Result<BakeSopPayload, ApiError> {
         let entry = self
             .storage
@@ -843,6 +854,17 @@ impl BakeService {
             limit: filter.limit,
             offset: filter.offset,
         })
+    }
+
+    pub fn get_knowledge(&self, id: i64) -> Result<BakeKnowledgePayload, ApiError> {
+        let record = self
+            .storage
+            .get_timeline_entry(id)?
+            .ok_or_else(|| ApiError::NotFound(format!("knowledge {id} not found")))?;
+        if record.category != CATEGORY_BAKE_KNOWLEDGE {
+            return Err(ApiError::NotFound(format!("knowledge {id} not found")));
+        }
+        Ok(map_bake_knowledge_record(record))
     }
 
     pub fn adopt_knowledge(&self, id: i64) -> Result<BakeKnowledgePayload, ApiError> {

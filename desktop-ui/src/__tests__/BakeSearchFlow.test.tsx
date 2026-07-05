@@ -131,6 +131,78 @@ describe('显式搜索交互', () => {
     expect(screen.getByText('当前还没有知识条目。')).toBeInTheDocument()
   })
 
+  it('BakePanel 关联知识跳转只展示目标知识，清除后恢复列表', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/models')) return jsonResponse({ ollama: true, llm: true, embedding: true })
+      if (url.includes('/api/bake/overview')) return jsonResponse(overviewResponse)
+      if (url === 'http://localhost:7070/api/bake/knowledge/9') {
+        return jsonResponse({
+          id: 9,
+          capture_id: 12,
+          summary: '目标知识',
+          overview: '目标详情',
+          details: '',
+          category: '文档',
+          importance: 4,
+          occurrence_count: 1,
+          status: 'confirmed',
+          review_status: 'confirmed',
+          entities: [],
+          updated_at: '2026-04-11 10:00:00',
+          updated_at_ms: 1,
+        })
+      }
+      if (url === 'http://localhost:7070/api/bake/knowledge?limit=20&offset=0') {
+        return jsonResponse({
+          items: [{
+            id: 8,
+            capture_id: 11,
+            summary: '普通知识',
+            overview: '普通详情',
+            details: '',
+            category: '文档',
+            importance: 3,
+            occurrence_count: 1,
+            status: 'confirmed',
+            review_status: 'confirmed',
+            entities: [],
+            updated_at: '2026-04-11 09:00:00',
+            updated_at_ms: 1,
+          }],
+          total: 1,
+          limit: 20,
+          offset: 0,
+        })
+      }
+      if (url.includes('/api/knowledge')) return jsonResponse({ entries: [], total: 0, limit: 1000, offset: 0 })
+      throw new Error(`unexpected url: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    useAppStore.setState({
+      bakeTab: 'knowledge',
+      bakeKnowledgeFocusId: '9',
+      selectedKnowledgeId: '9',
+    })
+
+    render(<BakePanel />)
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/knowledge/9')
+    })
+    expect(screen.getAllByText('目标知识').length).toBeGreaterThan(0)
+    expect(screen.getByText('仅看知识 #9')).toBeInTheDocument()
+    expect(screen.queryByText('普通知识')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '查看全部' }))
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/knowledge?limit=20&offset=0')
+    })
+    expect(useAppStore.getState().bakeKnowledgeFocusId).toBeNull()
+  })
+
   it('RepositoryPanel 展示采集标题以及情节记忆创建时间', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
@@ -235,6 +307,70 @@ describe('显式搜索交互', () => {
     })
     expect(screen.queryByText('旧时间线摘要')).not.toBeInTheDocument()
     expect(screen.queryByText('关键词：不存在')).not.toBeInTheDocument()
+  })
+
+  it('RepositoryPanel 时间线跳转只展示目标时间线，清除后恢复列表', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'http://localhost:7070/api/knowledge/7') {
+        return jsonResponse({
+          id: 7,
+          summary: '目标时间线',
+          overview: '目标时间线摘要',
+          capture_id: 71,
+          importance: 5,
+          occurrence_count: 1,
+          created_at: '2026-04-11 10:00',
+          created_at_ms: 1,
+          capture_ids: [],
+        })
+      }
+      if (url === 'http://localhost:7070/api/knowledge?limit=20&offset=0') {
+        return jsonResponse({
+          entries: [{
+            id: 6,
+            summary: '普通时间线',
+            overview: '普通时间线摘要',
+            capture_id: 61,
+            importance: 3,
+            occurrence_count: 1,
+            created_at: '2026-04-11 09:00',
+            created_at_ms: 1,
+            capture_ids: [],
+          }],
+          total: 1,
+          limit: 20,
+          offset: 0,
+        })
+      }
+      if (url.includes('/api/bake/documents') || url.includes('/api/bake/knowledge') || url.includes('/api/bake/sops')) {
+        return jsonResponse({ items: [], total: 0, limit: 1000, offset: 0 })
+      }
+      throw new Error(`unexpected url: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    useAppStore.setState({
+      repositoryTab: 'memory',
+      repositoryMemoryFocusId: '7',
+      selectedMemoryId: '7',
+    })
+
+    render(<RepositoryPanel />)
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/knowledge/7')
+    })
+    expect(screen.getAllByText('目标时间线').length).toBeGreaterThan(0)
+    expect(screen.getByText('仅看时间线 #7')).toBeInTheDocument()
+    expect(screen.queryByText('普通时间线')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '查看全部' }))
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/knowledge?limit=20&offset=0')
+    })
+    expect(useAppStore.getState().repositoryMemoryFocusId).toBeNull()
   })
 
   it('RepositoryPanel 记忆片段清除筛选会恢复默认请求并清掉来源范围', async () => {

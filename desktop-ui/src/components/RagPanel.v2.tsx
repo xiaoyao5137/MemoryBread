@@ -16,7 +16,10 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 import { BookOpen, ChevronDown, Copy, ExternalLink, History, Loader2, MessageSquare, Send } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { useFetchRagHistory, useModelStatus, useRagQuery } from '../hooks/useApi'
+import { fetchBillingBalance } from '../utils/authApi'
+import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
 import { BUILTIN_TEMPLATES, CATEGORY_COLORS, groupTemplatesByCategory } from '../data/taskTemplates'
+import ModelSelect from './ModelSelect'
 import type { RagContext, RagHistoryItem } from '../types'
 
 
@@ -156,6 +159,13 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
     ragLoading,
     ragError,
     setRagQuery,
+    adminApiBaseUrl,
+    authToken,
+    currentUser,
+    cloudBalance,
+    setCloudBalance,
+    creationModelConfigs,
+    setCreationModelConfig,
   } = useAppStore()
 
   const [inputValue, setInputValue] = useState(ragQuery)
@@ -169,6 +179,36 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   const doQuery = useRagQuery()
   const fetchRagHistory = useFetchRagHistory()
   const { status: modelStatus, ready: modelsReady, loading: modelStatusLoading } = useModelStatus()
+  const remoteModelAllowed = canUseRemoteCreationModel(currentUser, cloudBalance)
+  const activeModelId = getEffectiveCreationModelId(creationModelConfigs, remoteModelAllowed)
+
+  const handleSelectModel = useCallback((modelId: string) => {
+    if (modelId === REMOTE_CREATION_MODEL_ID && !remoteModelAllowed) return
+    setCreationModelConfig(modelId, { enabled: true })
+  }, [remoteModelAllowed, setCreationModelConfig])
+
+  useEffect(() => {
+    if (!authToken || !currentUser) {
+      setCloudBalance(null)
+      return
+    }
+    let cancelled = false
+    fetchBillingBalance(adminApiBaseUrl, authToken)
+      .then(balance => {
+        if (!cancelled) setCloudBalance(balance)
+      })
+      .catch(() => {
+        if (!cancelled) setCloudBalance(null)
+      })
+    return () => { cancelled = true }
+  }, [adminApiBaseUrl, authToken, currentUser, setCloudBalance])
+
+  useEffect(() => {
+    const active = creationModelConfigs.find(config => config.enabled)?.id
+    if (active === REMOTE_CREATION_MODEL_ID && !remoteModelAllowed) {
+      setCreationModelConfig(LOCAL_CREATION_MODEL_ID, { enabled: true })
+    }
+  }, [creationModelConfigs, remoteModelAllowed, setCreationModelConfig])
 
   // 内容变化时自动调整高度
   const adjustHeight = useCallback((el: HTMLTextAreaElement) => {
@@ -188,6 +228,22 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
     setInputValue(e.target.value)
     adjustHeight(e.target)
   }, [adjustHeight])
+
+  const handleInputWheel = useCallback((event: React.WheelEvent<HTMLTextAreaElement>) => {
+    const el = event.currentTarget
+    if (el.scrollHeight <= el.clientHeight) return
+
+    const scrollingUp = event.deltaY < 0
+    const scrollingDown = event.deltaY > 0
+    const canScrollUp = el.scrollTop > 0
+    const canScrollDown = el.scrollTop + el.clientHeight < el.scrollHeight
+
+    if ((scrollingUp && canScrollUp) || (scrollingDown && canScrollDown)) {
+      event.preventDefault()
+      event.stopPropagation()
+      el.scrollTop += event.deltaY
+    }
+  }, [])
 
   const refreshHistory = useCallback(async () => {
     try {
@@ -247,6 +303,11 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
 
   const handleOpenReference = (item: RagContext) => {
     const sourceType = item.source_type || item.source
+    const referenceType = ['document', 'bake_knowledge', 'operation', 'action'].includes(sourceType || '')
+      ? sourceType
+      : item.knowledge_id
+        ? 'knowledge'
+        : sourceType || 'capture'
     const hasInternalTarget = Boolean(
       item.knowledge_id ||
       item.capture_id ||
@@ -263,7 +324,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
     }
     window.dispatchEvent(new CustomEvent('view-rag-reference', {
       detail: {
-        type: item.knowledge_id ? 'knowledge' : sourceType || 'capture',
+        type: referenceType,
         captureId: item.capture_id,
         knowledgeId: item.knowledge_id,
         artifactId: item.artifact_id,
@@ -355,54 +416,71 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           placeholder={modelStatusLoading || modelsReady ? "问我任何工作相关的问题..." : "模型未就绪，请先配置模型"}
           value={inputValue}
           onChange={handleInputChange}
+          onWheel={handleInputWheel}
           rows={3}
           style={{ resize: 'none' }}
           disabled={ragLoading || !modelsReady}
         />
-        <button
-          type="submit"
-          className="rag-panel__submit"
-          data-testid="rag-panel-submit"
-          disabled={ragLoading || !inputValue.trim() || !modelsReady}
-        >
-          {ragLoading ? (
-            <>
-              {/* 加载图标 */}
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className="rag-panel__loading-icon"
-              >
-                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-              </svg>
-              思考中...
-            </>
-          ) : (
-            <>
-              {/* 发送图标 */}
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="m22 2-7 20-4-9-9-4Z" />
-                <path d="M22 2 11 13" />
-              </svg>
-              提问
-            </>
+        <div className="rag-panel__input-toolbar">
+          <ModelSelect
+            label="模型"
+            value={activeModelId}
+            options={CREATION_MODEL_DEFS}
+            disabled={ragLoading}
+            remoteAllowed={remoteModelAllowed}
+            onChange={handleSelectModel}
+            title="选择咨询生成模型"
+          />
+          {cloudBalance && (
+            <span className="rag-panel__credit-balance">
+              Credit {cloudBalance.available}
+            </span>
           )}
-        </button>
+          <button
+            type="submit"
+            className="rag-panel__submit"
+            data-testid="rag-panel-submit"
+            disabled={ragLoading || !inputValue.trim() || !modelsReady}
+          >
+            {ragLoading ? (
+              <>
+                {/* 加载图标 */}
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="rag-panel__loading-icon"
+                >
+                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                </svg>
+                思考中...
+              </>
+            ) : (
+              <>
+                {/* 发送图标 */}
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="m22 2-7 20-4-9-9-4Z" />
+                  <path d="M22 2 11 13" />
+                </svg>
+                提问
+              </>
+            )}
+          </button>
+        </div>
       </form>
 
       {ragLoading && (
@@ -532,7 +610,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
                       <span className="rag-panel__history-main">
                         <span className="rag-panel__history-query">{item.query}</span>
                         <span className="rag-panel__history-meta">
-                          {formatTs(item.ts)} · {shotSrc ? '悬浮截屏 · ' : ''}{item.context_count} 条参考
+                          {formatTs(item.ts)} · {getModelDisplayName(item.model)} · {shotSrc ? '悬浮截屏 · ' : ''}{item.context_count} 条参考
                         </span>
                       </span>
                     </button>

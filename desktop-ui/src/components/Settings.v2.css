@@ -265,6 +265,32 @@
   accent-color: #007AFF;
 }
 
+.settings-v2__debug-routes {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(255, 149, 0, 0.22);
+  border-radius: 8px;
+  background: rgba(255, 149, 0, 0.08);
+  display: grid;
+  gap: 6px;
+  color: #6E6E73;
+  font-size: 12px;
+}
+
+.settings-v2__debug-routes span {
+  min-width: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-v2__debug-routes strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #1D1D1F;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 /* 成功消息 */
 .settings-v2__success-msg {
   margin-top: 8px;

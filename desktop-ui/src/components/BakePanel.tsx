@@ -6,8 +6,10 @@ import {
   useDeleteBakeSop,
   useDeleteBakeTemplate,
   useFetchBakeKnowledge,
+  useFetchBakeKnowledgeDetail,
   useFetchBakeMemories,
   useFetchBakeOverview,
+  useFetchBakeSop,
   useFetchBakeSops,
   useFetchBakeTemplate,
   useFetchBakeTemplates,
@@ -75,6 +77,9 @@ const BakePanel: React.FC = () => {
     selectedTemplateId,
     selectedSopId,
     selectedKnowledgeId,
+    bakeTemplateFocusId,
+    bakeKnowledgeFocusId,
+    bakeSopFocusId,
     bakeKnowledgeOffset,
     bakeKnowledgeQuery,
     bakeKnowledgeFrom,
@@ -101,6 +106,10 @@ const BakePanel: React.FC = () => {
     setSelectedSopId,
     setSelectedKnowledgeId,
     setSelectedCaptureId,
+    setRepositoryMemoryFocusId,
+    setBakeTemplateFocusId,
+    setBakeKnowledgeFocusId,
+    setBakeSopFocusId,
     setBakeKnowledgeOffset,
     setBakeKnowledgeQuery,
     setBakeKnowledgeLimit,
@@ -116,6 +125,7 @@ const BakePanel: React.FC = () => {
   const { status: modelStatus, ready: modelsReady, loading: modelStatusLoading } = useModelStatus()
   const fetchOverview = useFetchBakeOverview()
   const fetchKnowledge = useFetchBakeKnowledge()
+  const fetchKnowledgeDetail = useFetchBakeKnowledgeDetail()
   const fetchMemories = useFetchBakeMemories()
   const deleteKnowledge = useDeleteBakeKnowledge()
   const fetchTemplates = useFetchBakeTemplates()
@@ -125,6 +135,7 @@ const BakePanel: React.FC = () => {
   const toggleTemplateStatus = useToggleBakeTemplateStatus()
   const deleteTemplate = useDeleteBakeTemplate()
   const fetchSops = useFetchBakeSops()
+  const fetchSop = useFetchBakeSop()
   const deleteSop = useDeleteBakeSop()
 
   const [overview, setOverview] = useState<BakeOverview>(defaultOverview)
@@ -173,6 +184,22 @@ const BakePanel: React.FC = () => {
 
   useEffect(() => {
     if (bakeTab !== 'knowledge') return
+    if (bakeKnowledgeFocusId) {
+      const requestSeq = knowledgeRequestSeqRef.current + 1
+      knowledgeRequestSeqRef.current = requestSeq
+      void fetchKnowledgeDetail(bakeKnowledgeFocusId).then((item) => {
+        if (requestSeq !== knowledgeRequestSeqRef.current) return
+        setKnowledgeItems([item])
+        setKnowledgeTotal(1)
+        setSelectedKnowledgeId(item.id)
+      }).catch((error) => {
+        if (requestSeq !== knowledgeRequestSeqRef.current) return
+        setKnowledgeItems([])
+        setKnowledgeTotal(0)
+        setStatusMessage(error instanceof Error ? error.message : `未找到知识 #${bakeKnowledgeFocusId}`)
+      })
+      return
+    }
     const requestSeq = knowledgeRequestSeqRef.current + 1
     knowledgeRequestSeqRef.current = requestSeq
     void fetchKnowledge({
@@ -189,10 +216,22 @@ const BakePanel: React.FC = () => {
       if (requestSeq !== knowledgeRequestSeqRef.current) return
       setStatusMessage(error instanceof Error ? error.message : '知识加载失败')
     })
-  }, [bakeKnowledgeFrom, bakeKnowledgeLimit, bakeKnowledgeOffset, bakeKnowledgeQuery, bakeKnowledgeTo, bakeTab, fetchKnowledge])
+  }, [bakeKnowledgeFocusId, bakeKnowledgeFrom, bakeKnowledgeLimit, bakeKnowledgeOffset, bakeKnowledgeQuery, bakeKnowledgeTo, bakeTab, fetchKnowledge, fetchKnowledgeDetail, setSelectedKnowledgeId])
 
   useEffect(() => {
     if (bakeTab !== 'templates') return
+    if (bakeTemplateFocusId) {
+      void fetchTemplate(bakeTemplateFocusId).then((item) => {
+        setTemplates([item])
+        setTemplateTotal(1)
+        setSelectedTemplateId(item.id)
+      }).catch((error) => {
+        setTemplates([])
+        setTemplateTotal(0)
+        setStatusMessage(error instanceof Error ? error.message : `未找到文档 #${bakeTemplateFocusId}`)
+      })
+      return
+    }
     void fetchTemplates({
       q: bakeTemplateQuery.trim() || undefined,
       from: parseDateInputToMs(bakeTemplateFrom),
@@ -205,7 +244,7 @@ const BakePanel: React.FC = () => {
     }).catch((error) => {
       setStatusMessage(error instanceof Error ? error.message : '模板加载失败')
     })
-  }, [bakeTab, bakeTemplateFrom, bakeTemplateLimit, bakeTemplateOffset, bakeTemplateQuery, bakeTemplateTo, fetchTemplates])
+  }, [bakeTab, bakeTemplateFocusId, bakeTemplateFrom, bakeTemplateLimit, bakeTemplateOffset, bakeTemplateQuery, bakeTemplateTo, fetchTemplate, fetchTemplates, setSelectedTemplateId])
 
   useEffect(() => {
     if (bakeTab !== 'templates' || !selectedTemplateId) return
@@ -219,6 +258,18 @@ const BakePanel: React.FC = () => {
 
   useEffect(() => {
     if (bakeTab !== 'sop') return
+    if (bakeSopFocusId) {
+      void fetchSop(bakeSopFocusId).then((item) => {
+        setSopCandidates([item])
+        setSopTotal(1)
+        setSelectedSopId(item.id)
+      }).catch((error) => {
+        setSopCandidates([])
+        setSopTotal(0)
+        setStatusMessage(error instanceof Error ? error.message : `未找到操作 #${bakeSopFocusId}`)
+      })
+      return
+    }
     void fetchSops({
       q: bakeSopQuery.trim() || undefined,
       from: parseDateInputToMs(bakeSopFrom),
@@ -231,7 +282,7 @@ const BakePanel: React.FC = () => {
     }).catch((error) => {
       setStatusMessage(error instanceof Error ? error.message : '操作手册加载失败')
     })
-  }, [bakeSopFrom, bakeSopLimit, bakeSopOffset, bakeSopQuery, bakeSopTo, bakeTab, fetchSops])
+  }, [bakeSopFocusId, bakeSopFrom, bakeSopLimit, bakeSopOffset, bakeSopQuery, bakeSopTo, bakeTab, fetchSop, fetchSops, setSelectedSopId])
 
   useEffect(() => {
     if (!statusMessage) return
@@ -337,6 +388,9 @@ const BakePanel: React.FC = () => {
     selectedTemplateId: resolvedTemplateId,
     selectedSopId: resolvedSopId,
     selectedKnowledgeId: resolvedKnowledgeId,
+    bakeTemplateFocusId,
+    bakeKnowledgeFocusId,
+    bakeSopFocusId,
   })
 
   const restoreNavigationTarget = (target: BakeNavigationTarget) => {
@@ -348,6 +402,10 @@ const BakePanel: React.FC = () => {
     if (target.selectedSopId !== undefined) setSelectedSopId(target.selectedSopId)
     if (target.selectedKnowledgeId !== undefined) setSelectedKnowledgeId(target.selectedKnowledgeId)
     if (target.selectedCaptureId !== undefined) setSelectedCaptureId(target.selectedCaptureId)
+    if (target.repositoryMemoryFocusId !== undefined) setRepositoryMemoryFocusId(target.repositoryMemoryFocusId)
+    if (target.bakeTemplateFocusId !== undefined) setBakeTemplateFocusId(target.bakeTemplateFocusId)
+    if (target.bakeKnowledgeFocusId !== undefined) setBakeKnowledgeFocusId(target.bakeKnowledgeFocusId)
+    if (target.bakeSopFocusId !== undefined) setBakeSopFocusId(target.bakeSopFocusId)
     if (target.repositoryCaptureSourceCaptureId !== undefined) {
       setRepositoryCaptureSourceCaptureId(target.repositoryCaptureSourceCaptureId)
     }
@@ -365,6 +423,7 @@ const BakePanel: React.FC = () => {
 
   const handleSearchKnowledge = () => {
     setSelectedKnowledgeId(null)
+    setBakeKnowledgeFocusId(null)
     useAppStore.setState({
       bakeKnowledgeQuery: draftKnowledgeQuery,
       bakeKnowledgeFrom: draftKnowledgeFrom,
@@ -377,7 +436,9 @@ const BakePanel: React.FC = () => {
     setDraftKnowledgeQuery('')
     setDraftKnowledgeFrom('')
     setDraftKnowledgeTo('')
+    setSelectedKnowledgeId(null)
     useAppStore.setState({
+      bakeKnowledgeFocusId: null,
       bakeKnowledgeQuery: '',
       bakeKnowledgeFrom: '',
       bakeKnowledgeTo: '',
@@ -387,6 +448,7 @@ const BakePanel: React.FC = () => {
 
   const handleSearchTemplate = () => {
     setSelectedTemplateId(null)
+    setBakeTemplateFocusId(null)
     useAppStore.setState({
       bakeTemplateQuery: draftTemplateQuery,
       bakeTemplateFrom: draftTemplateFrom,
@@ -399,7 +461,9 @@ const BakePanel: React.FC = () => {
     setDraftTemplateQuery('')
     setDraftTemplateFrom('')
     setDraftTemplateTo('')
+    setSelectedTemplateId(null)
     useAppStore.setState({
+      bakeTemplateFocusId: null,
       bakeTemplateQuery: '',
       bakeTemplateFrom: '',
       bakeTemplateTo: '',
@@ -409,6 +473,7 @@ const BakePanel: React.FC = () => {
 
   const handleSearchSop = () => {
     setSelectedSopId(null)
+    setBakeSopFocusId(null)
     useAppStore.setState({
       bakeSopQuery: draftSopQuery,
       bakeSopFrom: draftSopFrom,
@@ -421,7 +486,9 @@ const BakePanel: React.FC = () => {
     setDraftSopQuery('')
     setDraftSopFrom('')
     setDraftSopTo('')
+    setSelectedSopId(null)
     useAppStore.setState({
+      bakeSopFocusId: null,
       bakeSopQuery: '',
       bakeSopFrom: '',
       bakeSopTo: '',
@@ -512,6 +579,7 @@ const BakePanel: React.FC = () => {
     pushBakeNavigationTarget(currentNavigationTarget())
     setWindowMode('knowledge')
     setRepositoryTab('memory')
+    setRepositoryMemoryFocusId(memoryId)
     setSelectedMemoryId(memoryId)
     setStatusMessage('已切换到来源时间线')
   }
@@ -525,6 +593,7 @@ const BakePanel: React.FC = () => {
     pushBakeNavigationTarget(currentNavigationTarget())
     setBakeTab('templates')
     setBakeTemplateOffset(0)
+    setBakeTemplateFocusId(relatedDoc.id)
     setSelectedTemplateId(relatedDoc.id)
     setStatusMessage(`已切换到关联文档「${relatedDoc.title}」`)
   }
@@ -532,7 +601,9 @@ const BakePanel: React.FC = () => {
   const handleViewLinkedKnowledge = (knowledgeId: string) => {
     pushBakeNavigationTarget(currentNavigationTarget())
     setBakeTab('knowledge')
+    setBakeKnowledgeFocusId(knowledgeId)
     useAppStore.setState({
+      bakeKnowledgeFocusId: knowledgeId,
       bakeKnowledgeQuery: '',
       bakeKnowledgeFrom: '',
       bakeKnowledgeTo: '',
@@ -690,6 +761,7 @@ const BakePanel: React.FC = () => {
             onDraftToChange={setDraftKnowledgeTo}
             onSearch={handleSearchKnowledge}
             onClearFilters={handleClearKnowledgeFilters}
+            focusId={bakeKnowledgeFocusId}
             onDeleteKnowledge={handleDeleteKnowledge}
             onViewSourceTimeline={handleViewSourceMemory}
             sourceTimelineTitle={resolvedKnowledgeItem?.sourceTimelineId ? memoryTitleById.get(resolvedKnowledgeItem.sourceTimelineId) : undefined}
@@ -734,6 +806,7 @@ const BakePanel: React.FC = () => {
             onDraftToChange={setDraftTemplateTo}
             onSearch={handleSearchTemplate}
             onClearFilters={handleClearTemplateFilters}
+            focusId={bakeTemplateFocusId}
           />
         )}
         {bakeTab === 'sop' && (
@@ -760,6 +833,7 @@ const BakePanel: React.FC = () => {
             onDraftToChange={setDraftSopTo}
             onSearch={handleSearchSop}
             onClearFilters={handleClearSopFilters}
+            focusId={bakeSopFocusId}
           />
         )}
       </div>

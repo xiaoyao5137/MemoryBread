@@ -34,10 +34,14 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
 
   const {
     apiBaseUrl,
+    adminApiBaseUrl,
+    gatewayApiBaseUrl,
     sidecarVersion,
     debugModeEnabled,
+    localDebugModeEnabled,
     setApiBaseUrl,
     setDebugModeEnabled,
+    setLocalDebugModeEnabled,
     setWindowMode,
   } = useAppStore()
 
@@ -663,6 +667,26 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
               onChange={(event) => setDebugModeEnabled(event.target.checked)}
             />
           </label>
+
+          <label className="settings-v2__toggle-row" htmlFor="local-debug-mode-toggle">
+            <span>
+              <strong>本地调试模式</strong>
+              <small>开启后使用本机开发服务验证账户登录和云端创作流程。</small>
+            </span>
+            <input
+              id="local-debug-mode-toggle"
+              type="checkbox"
+              checked={localDebugModeEnabled}
+              onChange={(event) => setLocalDebugModeEnabled(event.target.checked)}
+            />
+          </label>
+          {localDebugModeEnabled && (
+            <div className="settings-v2__debug-routes" aria-label="本地调试服务地址">
+              <span>Core <strong>{apiBaseUrl}</strong></span>
+              <span>Account <strong>{adminApiBaseUrl}</strong></span>
+              <span>Cloud Creation <strong>{gatewayApiBaseUrl}</strong></span>
+            </div>
+          )}
         </section>
 
         {/* 版本信息 */}

@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AccountType, ActionCommand, AuthSession, BakeTab, CloudUser, RagContext, RepositoryTab, ServiceEnvironment, WindowMode } from '../types'
+import type { AccountType, ActionCommand, AuthSession, BakeTab, CloudBalance, CloudSubscription, CloudUser, RagContext, RepositoryTab, ServiceEnvironment, WindowMode } from '../types'
 
 export interface BakeNavigationTarget {
   windowMode: WindowMode
@@ -10,6 +10,10 @@ export interface BakeNavigationTarget {
   selectedSopId?: string | null
   selectedKnowledgeId?: string | null
   selectedCaptureId?: string | null
+  repositoryMemoryFocusId?: string | null
+  bakeTemplateFocusId?: string | null
+  bakeKnowledgeFocusId?: string | null
+  bakeSopFocusId?: string | null
   repositoryCaptureSourceCaptureId?: string | null
 }
 
@@ -84,6 +88,10 @@ export interface AppState {
   selectedSopId: string | null
   selectedKnowledgeId: string | null
   selectedCaptureId: string | null
+  repositoryMemoryFocusId: string | null
+  bakeTemplateFocusId: string | null
+  bakeKnowledgeFocusId: string | null
+  bakeSopFocusId: string | null
   bakeMemoryOffset: number
   bakeKnowledgeOffset: number
   bakeKnowledgeQuery: string
@@ -129,13 +137,17 @@ export interface AppState {
   // ── 全局配置 ─────────────────────────────────────────────────────────────────
   apiBaseUrl:     string
   adminApiBaseUrl: string
+  gatewayApiBaseUrl: string
   sidecarVersion: string
   accountType: AccountType
   serviceEnvironment: ServiceEnvironment
   debugModeEnabled: boolean
+  localDebugModeEnabled: boolean
   authToken: string | null
   authExpiresAt: string | null
   currentUser: CloudUser | null
+  cloudBalance: CloudBalance | null
+  cloudSubscription: CloudSubscription | null
 
   // ── 首次引导 ─────────────────────────────────────────────────────────────────
   hasCompletedSetup: boolean
@@ -151,6 +163,10 @@ export interface AppState {
   setSelectedSopId:      (id: string | null) => void
   setSelectedKnowledgeId:(id: string | null) => void
   setSelectedCaptureId:  (id: string | null) => void
+  setRepositoryMemoryFocusId: (id: string | null) => void
+  setBakeTemplateFocusId: (id: string | null) => void
+  setBakeKnowledgeFocusId: (id: string | null) => void
+  setBakeSopFocusId: (id: string | null) => void
   setBakeMemoryOffset:  (offset: number) => void
   setBakeKnowledgeOffset:(offset: number) => void
   setBakeKnowledgeQuery: (query: string) => void
@@ -195,12 +211,16 @@ export interface AppState {
   cancelAction:          () => void
   setApiBaseUrl:         (url: string) => void
   setAdminApiBaseUrl:    (url: string) => void
+  setGatewayApiBaseUrl:  (url: string) => void
   setSidecarVersion:     (v: string) => void
   setAccountType:        (type: AccountType) => void
   setAuthSession:        (session: AuthSession) => void
   clearAuthSession:      () => void
+  setCloudBalance:       (balance: CloudBalance | null) => void
+  setCloudSubscription:  (subscription: CloudSubscription | null) => void
   setServiceEnvironment: (environment: ServiceEnvironment) => void
   setDebugModeEnabled: (enabled: boolean) => void
+  setLocalDebugModeEnabled: (enabled: boolean) => void
   setHasCompletedSetup:  (v: boolean) => void
   setSetupSkipped:       (v: boolean) => void
   setCreationModelConfigs: (configs: CreationModelConfig[]) => void
@@ -213,8 +233,10 @@ const SKIP_KEY  = 'memory-bread_setup_skipped'
 export const AUTH_SESSION_KEY = 'memory-bread_auth_session'
 export const ACCOUNT_TYPE_KEY = 'memory-bread_account_type'
 export const ADMIN_API_BASE_URL_KEY = 'memory-bread_admin_api_base_url'
+export const GATEWAY_API_BASE_URL_KEY = 'memory-bread_gateway_api_base_url'
 export const SERVICE_ENVIRONMENT_KEY = 'memory-bread_service_env'
 export const DEBUG_MODE_KEY = 'memory-bread_debug_mode_enabled'
+export const LOCAL_DEBUG_MODE_KEY = 'memory-bread_local_debug_mode_enabled'
 export const CREATION_MODEL_KEY = 'memory-bread_creation_models'
 export const CREATION_MODEL_PREFERENCE_KEY = 'creation.models'
 
@@ -223,9 +245,11 @@ const safeLocalStorage = typeof window !== 'undefined' && typeof window.localSto
   : null
 
 const DEFAULT_CREATION_MODELS: CreationModelConfig[] = [
-  { id: 'mbcd-plus-v1', enabled: false, apiKey: '', baseUrl: 'https://api.anthropic.com' },
+  { id: 'mbcd-plus-v1', enabled: false, apiKey: '' },
   { id: 'mbcd-std-v1',  enabled: true,  apiKey: '' },
 ]
+const LOCAL_ADMIN_API_BASE_URL = 'http://127.0.0.1:8080'
+const LOCAL_GATEWAY_API_BASE_URL = 'http://127.0.0.1:8090'
 
 const normalizeServiceEnvironment = (value?: string | null): ServiceEnvironment =>
   value === 'staging' ? 'staging' : 'production'
@@ -327,6 +351,10 @@ const initialState = {
   selectedSopId:       null,
   selectedKnowledgeId: null,
   selectedCaptureId:   null,
+  repositoryMemoryFocusId: null,
+  bakeTemplateFocusId: null,
+  bakeKnowledgeFocusId: null,
+  bakeSopFocusId: null,
   bakeMemoryOffset:   0,
   bakeKnowledgeOffset: 0,
   bakeKnowledgeQuery:  '',
@@ -365,14 +393,22 @@ const initialState = {
   pendingAction:       null,
   actionConfirmed:     false,
   apiBaseUrl:          'http://127.0.0.1:7070',
-  adminApiBaseUrl:     safeLocalStorage?.getItem(ADMIN_API_BASE_URL_KEY) || getBuildAdminApiBaseUrl() || 'http://127.0.0.1:8080',
+  adminApiBaseUrl:     safeLocalStorage?.getItem(LOCAL_DEBUG_MODE_KEY) === 'true'
+    ? LOCAL_ADMIN_API_BASE_URL
+    : safeLocalStorage?.getItem(ADMIN_API_BASE_URL_KEY) || getBuildAdminApiBaseUrl() || LOCAL_ADMIN_API_BASE_URL,
+  gatewayApiBaseUrl:   safeLocalStorage?.getItem(LOCAL_DEBUG_MODE_KEY) === 'true'
+    ? LOCAL_GATEWAY_API_BASE_URL
+    : safeLocalStorage?.getItem(GATEWAY_API_BASE_URL_KEY) || LOCAL_GATEWAY_API_BASE_URL,
   sidecarVersion:      '0.1.0',
   accountType:         normalizeAccountType(initialSession?.user.roles.includes('platform_admin') ? 'platform_admin' : safeLocalStorage?.getItem(ACCOUNT_TYPE_KEY) || getBuildAccountType()),
   serviceEnvironment:  normalizeServiceEnvironment(safeLocalStorage?.getItem(SERVICE_ENVIRONMENT_KEY)),
   debugModeEnabled:    safeLocalStorage?.getItem(DEBUG_MODE_KEY) === 'true',
+  localDebugModeEnabled: safeLocalStorage?.getItem(LOCAL_DEBUG_MODE_KEY) === 'true',
   authToken:           initialSession?.access_token ?? null,
   authExpiresAt:       initialSession?.expires_at ?? null,
   currentUser:         initialSession?.user ?? null,
+  cloudBalance:        null,
+  cloudSubscription:   null,
   hasCompletedSetup:   safeLocalStorage?.getItem(SETUP_KEY) === 'true',
   setupSkipped:        safeLocalStorage?.getItem(SKIP_KEY)  === 'true',
   creationModelConfigs: loadCreationModels(),
@@ -396,6 +432,14 @@ export const useAppStore = create<AppState>((set) => ({
   setSelectedKnowledgeId: (id) => set({ selectedKnowledgeId: id }),
 
   setSelectedCaptureId: (id) => set({ selectedCaptureId: id }),
+
+  setRepositoryMemoryFocusId: (id) => set({ repositoryMemoryFocusId: id, bakeMemoryOffset: 0 }),
+
+  setBakeTemplateFocusId: (id) => set({ bakeTemplateFocusId: id, bakeTemplateOffset: 0 }),
+
+  setBakeKnowledgeFocusId: (id) => set({ bakeKnowledgeFocusId: id, bakeKnowledgeOffset: 0 }),
+
+  setBakeSopFocusId: (id) => set({ bakeSopFocusId: id, bakeSopOffset: 0 }),
 
   setBakeMemoryOffset: (offset) => set({ bakeMemoryOffset: offset }),
 
@@ -518,6 +562,11 @@ export const useAppStore = create<AppState>((set) => ({
     set({ adminApiBaseUrl: url })
   },
 
+  setGatewayApiBaseUrl: (url) => {
+    safeLocalStorage?.setItem(GATEWAY_API_BASE_URL_KEY, url)
+    set({ gatewayApiBaseUrl: url })
+  },
+
   setSidecarVersion: (v) => set({ sidecarVersion: v }),
 
   setAccountType: (type) => {
@@ -544,9 +593,15 @@ export const useAppStore = create<AppState>((set) => ({
       authToken: null,
       authExpiresAt: null,
       currentUser: null,
+      cloudBalance: null,
+      cloudSubscription: null,
       accountType: 'user',
     })
   },
+
+  setCloudBalance: (balance) => set({ cloudBalance: balance }),
+
+  setCloudSubscription: (subscription) => set({ cloudSubscription: subscription }),
 
   setServiceEnvironment: (environment) => {
     safeLocalStorage?.setItem(SERVICE_ENVIRONMENT_KEY, environment)
@@ -556,6 +611,24 @@ export const useAppStore = create<AppState>((set) => ({
   setDebugModeEnabled: (enabled) => {
     safeLocalStorage?.setItem(DEBUG_MODE_KEY, String(enabled))
     set({ debugModeEnabled: enabled })
+  },
+
+  setLocalDebugModeEnabled: (enabled) => {
+    safeLocalStorage?.setItem(LOCAL_DEBUG_MODE_KEY, String(enabled))
+    if (enabled) {
+      set({
+        localDebugModeEnabled: enabled,
+        apiBaseUrl: 'http://127.0.0.1:7070',
+        adminApiBaseUrl: LOCAL_ADMIN_API_BASE_URL,
+        gatewayApiBaseUrl: LOCAL_GATEWAY_API_BASE_URL,
+      })
+      return
+    }
+    set({
+      localDebugModeEnabled: enabled,
+      adminApiBaseUrl: safeLocalStorage?.getItem(ADMIN_API_BASE_URL_KEY) || getBuildAdminApiBaseUrl() || LOCAL_ADMIN_API_BASE_URL,
+      gatewayApiBaseUrl: safeLocalStorage?.getItem(GATEWAY_API_BASE_URL_KEY) || LOCAL_GATEWAY_API_BASE_URL,
+    })
   },
 
   setHasCompletedSetup: (v) => {

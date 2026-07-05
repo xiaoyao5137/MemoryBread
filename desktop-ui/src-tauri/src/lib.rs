@@ -13,13 +13,16 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, WebviewUrl,
+    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, WebviewUrl,
     WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
 const FLOATING_ASSIST_LABEL: &str = "floating-assist";
+const FLOATING_ASSIST_DEFAULT_MARGIN: i32 = 24;
+const FLOATING_ASSIST_DEFAULT_TOP: i32 = 140;
+const FLOATING_ASSIST_DEFAULT_SIZE: i32 = 42;
 
 struct TrayMenuState {
     capture: CheckMenuItem<tauri::Wry>,
@@ -116,11 +119,142 @@ fn ensure_floating_assist_window(app: &AppHandle) -> Result<tauri::WebviewWindow
     .map_err(|error| error.to_string())
 }
 
+fn default_floating_assist_position(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+) -> PhysicalPosition<i32> {
+    let window_size = window.outer_size().ok();
+    let window_width = window_size
+        .map(|size| size.width as i32)
+        .unwrap_or(FLOATING_ASSIST_DEFAULT_SIZE);
+    let window_height = window_size
+        .map(|size| size.height as i32)
+        .unwrap_or(FLOATING_ASSIST_DEFAULT_SIZE);
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| app.primary_monitor().ok().flatten());
+
+    if let Some(monitor) = monitor {
+        let monitor_position = monitor.position();
+        let monitor_size = monitor.size();
+        let min_x = monitor_position.x;
+        let min_y = monitor_position.y;
+        let max_x = min_x + monitor_size.width as i32 - window_width;
+        let max_y = min_y + monitor_size.height as i32 - window_height;
+        let x = max_x
+            .saturating_sub(FLOATING_ASSIST_DEFAULT_MARGIN)
+            .max(min_x);
+        let y = (min_y + FLOATING_ASSIST_DEFAULT_TOP).clamp(min_y, max_y.max(min_y));
+        return PhysicalPosition::new(x, y);
+    }
+
+    PhysicalPosition::new(960, FLOATING_ASSIST_DEFAULT_TOP)
+}
+
+fn monitor_contains_point(monitor: &Monitor, x: i32, y: i32) -> bool {
+    let position = monitor.position();
+    let size = monitor.size();
+    x >= position.x
+        && x < position.x + size.width as i32
+        && y >= position.y
+        && y < position.y + size.height as i32
+}
+
+fn monitor_for_position(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    position: PhysicalPosition<i32>,
+) -> Option<Monitor> {
+    app.available_monitors()
+        .ok()
+        .and_then(|monitors| {
+            monitors
+                .into_iter()
+                .find(|monitor| monitor_contains_point(monitor, position.x, position.y))
+        })
+        .or_else(|| window.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten())
+}
+
+fn clamp_position_to_monitor_work_area(
+    monitor: &Monitor,
+    position: PhysicalPosition<i32>,
+    window_width: i32,
+    window_height: i32,
+) -> PhysicalPosition<i32> {
+    let work_area = monitor.work_area();
+    let min_x = work_area.position.x;
+    let min_y = work_area.position.y;
+    let max_x = min_x + work_area.size.width as i32 - window_width.max(1);
+    let max_y = min_y + work_area.size.height as i32 - window_height.max(1);
+
+    PhysicalPosition::new(
+        position.x.clamp(min_x, max_x.max(min_x)),
+        position.y.clamp(min_y, max_y.max(min_y)),
+    )
+}
+
+fn floating_assist_outer_size(
+    window: &tauri::WebviewWindow,
+    fallback_logical_size: Option<(f64, f64)>,
+) -> (i32, i32) {
+    let fallback_size = fallback_logical_size.map(|(width, height)| {
+        let scale_factor = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .map(|monitor| monitor.scale_factor())
+            .unwrap_or(1.0);
+        (
+            (width * scale_factor).round() as i32,
+            (height * scale_factor).round() as i32,
+        )
+    });
+
+    if let Ok(size) = window.outer_size() {
+        let outer_size = (size.width as i32, size.height as i32);
+        if let Some(fallback_size) = fallback_size {
+            return (
+                outer_size.0.max(fallback_size.0),
+                outer_size.1.max(fallback_size.1),
+            );
+        }
+        return outer_size;
+    }
+
+    fallback_size.unwrap_or((FLOATING_ASSIST_DEFAULT_SIZE, FLOATING_ASSIST_DEFAULT_SIZE))
+}
+
+fn set_floating_assist_position_clamped(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    position: PhysicalPosition<i32>,
+    fallback_logical_size: Option<(f64, f64)>,
+) -> Result<(), String> {
+    let (window_width, window_height) = floating_assist_outer_size(window, fallback_logical_size);
+    let clamped_position = monitor_for_position(app, window, position)
+        .map(|monitor| {
+            clamp_position_to_monitor_work_area(&monitor, position, window_width, window_height)
+        })
+        .unwrap_or(position);
+
+    window
+        .set_position(clamped_position)
+        .map_err(|error| error.to_string())
+}
+
 fn set_floating_assist_visible_inner(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let window = ensure_floating_assist_window(app)?;
     if enabled {
         let _ = window.set_size(LogicalSize::new(42.0, 42.0));
-        let _ = window.set_position(LogicalPosition::new(80.0, 140.0));
+        let _ = set_floating_assist_position_clamped(
+            app,
+            &window,
+            default_floating_assist_position(app, &window),
+            Some((42.0, 42.0)),
+        );
         window.show().map_err(|error| error.to_string())?;
         let _ = window.set_always_on_top(true);
         let _ = app.emit("floating-assist-reset", ());
@@ -414,11 +548,20 @@ fn set_floating_assist_visible(app: AppHandle, enabled: bool) -> Result<(), Stri
 }
 
 #[tauri::command]
+fn show_main_panel_from_floating_assist(app: AppHandle) -> Result<(), String> {
+    show_main_window(&app);
+    Ok(())
+}
+
+#[tauri::command]
 fn set_floating_assist_position(app: AppHandle, x: f64, y: f64) -> Result<(), String> {
     let window = ensure_floating_assist_window(&app)?;
-    window
-        .set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32))
-        .map_err(|error| error.to_string())
+    set_floating_assist_position_clamped(
+        &app,
+        &window,
+        PhysicalPosition::new(x.round() as i32, y.round() as i32),
+        None,
+    )
 }
 
 #[tauri::command]
@@ -436,12 +579,15 @@ fn begin_floating_assist_drag(app: AppHandle) -> Result<FloatingAssistDragOrigin
 fn update_floating_assist_drag(app: AppHandle, offset_x: f64, offset_y: f64) -> Result<(), String> {
     let window = ensure_floating_assist_window(&app)?;
     let cursor_position = app.cursor_position().map_err(|error| error.to_string())?;
-    window
-        .set_position(PhysicalPosition::new(
+    set_floating_assist_position_clamped(
+        &app,
+        &window,
+        PhysicalPosition::new(
             (cursor_position.x - offset_x).round() as i32,
             (cursor_position.y - offset_y).round() as i32,
-        ))
-        .map_err(|error| error.to_string())
+        ),
+        None,
+    )
 }
 
 #[tauri::command]
@@ -449,7 +595,13 @@ fn set_floating_assist_size(app: AppHandle, width: f64, height: f64) -> Result<(
     let window = ensure_floating_assist_window(&app)?;
     window
         .set_size(LogicalSize::new(width, height))
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    if let Ok(position) = window.outer_position() {
+        set_floating_assist_position_clamped(&app, &window, position, Some((width, height)))?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -526,6 +678,7 @@ pub fn run() {
             set_capture_menu_state,
             set_floating_assist_menu_state,
             set_floating_assist_visible,
+            show_main_panel_from_floating_assist,
             set_floating_assist_position,
             begin_floating_assist_drag,
             update_floating_assist_drag,

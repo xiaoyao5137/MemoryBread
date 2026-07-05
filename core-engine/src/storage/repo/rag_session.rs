@@ -49,8 +49,8 @@ impl StorageManager {
 fn insert_rag_session_inner(conn: &Connection, s: &NewRagSession) -> Result<i64, StorageError> {
     conn.execute(
         "INSERT INTO rag_sessions
-            (ts, scene_type, user_query, retrieved_ids, prompt_used, llm_response, latency_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (ts, scene_type, user_query, retrieved_ids, prompt_used, llm_response, latency_ms, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             s.ts,
             s.scene_type,
@@ -59,6 +59,7 @@ fn insert_rag_session_inner(conn: &Connection, s: &NewRagSession) -> Result<i64,
             s.prompt_used,
             s.llm_response,
             s.latency_ms,
+            s.model,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -74,7 +75,7 @@ impl StorageManager {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, ts, scene_type, user_query, retrieved_ids,
-                        prompt_used, llm_response, user_feedback, latency_ms
+                        prompt_used, llm_response, user_feedback, latency_ms, model
                  FROM rag_sessions WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
@@ -95,7 +96,7 @@ impl StorageManager {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, ts, scene_type, user_query, retrieved_ids,
-                        prompt_used, llm_response, user_feedback, latency_ms
+                        prompt_used, llm_response, user_feedback, latency_ms, model
                  FROM rag_sessions ORDER BY ts DESC LIMIT ?1 OFFSET ?2",
             )?;
             let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
@@ -115,7 +116,7 @@ impl StorageManager {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, ts, scene_type, user_query, retrieved_ids,
-                        prompt_used, llm_response, user_feedback, latency_ms
+                        prompt_used, llm_response, user_feedback, latency_ms, model
                  FROM rag_sessions WHERE scene_type = ?1 ORDER BY ts DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![scene_type, limit as i64], |row| {
@@ -134,7 +135,7 @@ impl StorageManager {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, ts, scene_type, user_query, retrieved_ids,
-                        prompt_used, llm_response, user_feedback, latency_ms
+                        prompt_used, llm_response, user_feedback, latency_ms, model
                  FROM rag_sessions WHERE user_feedback IS NOT NULL ORDER BY ts DESC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit as i64], |row| {
@@ -161,6 +162,7 @@ fn row_to_rag_session(row: &rusqlite::Row<'_>) -> Result<RagSessionRecord, Stora
         llm_response: row.get(6)?,
         user_feedback: row.get(7)?,
         latency_ms: row.get(8)?,
+        model: row.get(9)?,
     })
 }
 
@@ -185,6 +187,7 @@ mod tests {
             prompt_used: Some("你是一名助手...".into()),
             llm_response: None,
             latency_ms: None,
+            model: Some("mbcd-std-v1".into()),
         }
     }
 

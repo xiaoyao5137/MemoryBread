@@ -73,6 +73,12 @@ const PipelineDagPanel: React.FC<Props> = ({ base, isVisible }) => {
   const setSelectedSopId = useAppStore((s) => s.setSelectedSopId)
   const setSelectedTemplateId = useAppStore((s) => s.setSelectedTemplateId)
   const setSelectedMemoryId = useAppStore((s) => s.setSelectedMemoryId)
+  const setRepositoryMemoryFocusId = useAppStore((s) => s.setRepositoryMemoryFocusId)
+  const setBakeTemplateFocusId = useAppStore((s) => s.setBakeTemplateFocusId)
+  const setBakeKnowledgeFocusId = useAppStore((s) => s.setBakeKnowledgeFocusId)
+  const setBakeSopFocusId = useAppStore((s) => s.setBakeSopFocusId)
+  const setRepositoryCaptureSourceCaptureId = useAppStore((s) => s.setRepositoryCaptureSourceCaptureId)
+  const setRepositoryTab = useAppStore((s) => s.setRepositoryTab)
 
   const [data, setData] = useState<PipelineDagResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -123,25 +129,31 @@ const PipelineDagPanel: React.FC<Props> = ({ base, isVisible }) => {
     switch (item.kind) {
       case 'capture':
         setSelectedCaptureId(String(item.id))
+        setRepositoryTab('capture')
+        setRepositoryCaptureSourceCaptureId(String(item.id))
         setWindowMode('knowledge')
         break
       case 'timeline':
         setSelectedMemoryId(String(item.id))
-        setWindowMode('bake')
-        setBakeTab('overview')
+        setRepositoryMemoryFocusId(String(item.id))
+        setRepositoryTab('memory')
+        setWindowMode('knowledge')
         break
       case 'bake_knowledge':
         setSelectedKnowledgeId(String(item.id))
+        setBakeKnowledgeFocusId(String(item.id))
         setWindowMode('bake')
         setBakeTab('knowledge')
         break
       case 'bake_sop':
         setSelectedSopId(String(item.id))
+        setBakeSopFocusId(String(item.id))
         setWindowMode('bake')
         setBakeTab('sop')
         break
       case 'document':
         setSelectedTemplateId(String(item.id))
+        setBakeTemplateFocusId(String(item.id))
         setWindowMode('bake')
         setBakeTab('templates')
         break

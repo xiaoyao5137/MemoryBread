@@ -1,7 +1,9 @@
 import type {
   AuthSession,
+  CloudBalance,
   CloudDevice,
   CloudSnapshot,
+  CloudSubscription,
   CloudUser,
   CompleteCloudSnapshotRequest,
   UpsertCloudDeviceRequest,
@@ -93,6 +95,43 @@ export async function fetchCurrentUser(adminApiBaseUrl: string, token: string): 
     throw new Error(authErrorMessage(payload, `auth session invalid: ${response.status}`))
   }
   return payload.data as CloudUser
+}
+
+export async function fetchBillingBalance(
+  adminApiBaseUrl: string,
+  token: string,
+): Promise<CloudBalance> {
+  const response = await fetch(`${adminApiBaseUrl}/v1/billing/balance`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }).catch((error) => {
+    throw normalizeAuthFetchError(error, adminApiBaseUrl)
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(authErrorMessage(payload, `balance fetch failed: ${response.status}`))
+  }
+  return payload.data as CloudBalance
+}
+
+export interface CloudConsoleSummary {
+  balance?: CloudBalance
+  current_subscription?: CloudSubscription | null
+}
+
+export async function fetchConsoleSummary(
+  adminApiBaseUrl: string,
+  token: string,
+): Promise<CloudConsoleSummary> {
+  const response = await fetch(`${adminApiBaseUrl}/v1/console/summary`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }).catch((error) => {
+    throw normalizeAuthFetchError(error, adminApiBaseUrl)
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(authErrorMessage(payload, `console summary fetch failed: ${response.status}`))
+  }
+  return payload.data as CloudConsoleSummary
 }
 
 export async function logoutSession(adminApiBaseUrl: string, token: string): Promise<void> {

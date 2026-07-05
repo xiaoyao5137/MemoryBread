@@ -87,4 +87,50 @@ describe('AuthPanel', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('账户服务暂时未就绪')
     expect(screen.getByRole('alert')).not.toHaveTextContent('mb-admin/.env')
   })
+
+  it('用户详情显示套餐并可打开控制台充值', async () => {
+    useAppStore.getState().setAuthSession({
+      access_token: 'mbs_test_token',
+      expires_at: new Date(Date.now() + 86400_000).toISOString(),
+      user: {
+        id: '018f0000-0000-7000-8000-000000000003',
+        display_name: '土豆',
+        email: 'tudou@memorybread.local',
+        status: 'active',
+        roles: ['user'],
+        locale: 'zh-CN',
+        timezone: 'Asia/Shanghai',
+        created_at: new Date().toISOString(),
+      },
+    })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          balance: {
+            available: '120.0000',
+            reserved: '0.0000',
+            currency: 'CREDIT',
+            as_of: new Date().toISOString(),
+          },
+          current_subscription: {
+            id: 'sub_001',
+            status: 'active',
+            plan_key: 'gold',
+            name: '黄金',
+          },
+        },
+      }),
+    }))
+    const openMock = vi.spyOn(window, 'open').mockImplementation(() => null)
+
+    render(<AuthPanel />)
+
+    expect(screen.getByText('土豆')).toBeInTheDocument()
+    expect(await screen.findByText('黄金')).toBeInTheDocument()
+    expect(await screen.findByText('120.0000')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '充值' }))
+    expect(openMock).toHaveBeenCalledWith('http://127.0.0.1:3000/console', '_blank', 'noopener,noreferrer')
+  })
 })

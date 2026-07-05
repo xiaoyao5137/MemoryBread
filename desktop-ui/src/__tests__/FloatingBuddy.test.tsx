@@ -39,6 +39,35 @@ describe('FloatingBuddy', () => {
     expect(useAppStore.getState().serviceEnvironment).toBe('staging')
     expect(screen.getByRole('button', { name: '测试' })).toHaveAttribute('aria-pressed', 'true')
   })
+
+  it('账号入口显示用户名和会员套餐', () => {
+    useAppStore.getState().setAuthSession({
+      access_token: 'mbs_test_token',
+      expires_at: new Date(Date.now() + 86400_000).toISOString(),
+      user: {
+        id: '018f0000-0000-7000-8000-000000000002',
+        display_name: '土豆',
+        email: 'tudou@memorybread.local',
+        status: 'active',
+        roles: ['user'],
+        locale: 'zh-CN',
+        timezone: 'Asia/Shanghai',
+        created_at: new Date().toISOString(),
+      },
+    })
+    useAppStore.getState().setCloudSubscription({
+      id: 'sub_001',
+      status: 'active',
+      plan_key: 'gold',
+      name: '黄金',
+    })
+
+    render(<FloatingBuddy />)
+
+    expect(screen.getByText('土豆')).toBeInTheDocument()
+    expect(screen.getByText('黄金')).toBeInTheDocument()
+    expect(screen.queryByText('云账户已连接')).not.toBeInTheDocument()
+  })
 })
 
 describe('BakeTabs', () => {

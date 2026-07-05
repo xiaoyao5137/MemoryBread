@@ -2,6 +2,8 @@ import React, { useEffect, useRef, useState } from 'react'
 import type { ModelEntry } from '../types'
 import { CREATION_MODEL_PREFERENCE_KEY, useAppStore } from '../store/useAppStore'
 import type { CreationModelConfig } from '../store/useAppStore'
+import { fetchBillingBalance } from '../utils/authApi'
+import { REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel } from '../utils/modelSelection'
 
 const SIDECAR = 'http://localhost:7071'
 
@@ -30,12 +32,14 @@ type LlmConcurrencyConfig = {
 const PROVIDER_LABEL: Record<string, string> = {
   ollama: '分析模型', huggingface: 'HuggingFace',
   openai: 'OpenAI', anthropic: 'Anthropic',
+  gateway: '云端创作',
   tongyi: '通义千问', doubao: '豆包', deepseek: 'DeepSeek', kimi: 'Kimi',
   google: 'Google', kling: '可灵',
 }
 const PROVIDER_COLOR: Record<string, string> = {
   ollama: '#007AFF', huggingface: '#FF9500',
   openai: '#34C759', anthropic: '#AF52DE',
+  gateway: '#AF52DE',
   tongyi: '#FF6B35', doubao: '#1677FF', deepseek: '#06B6D4', kimi: '#8B5CF6',
   google: '#4285F4', kling: '#FF2D55',
 }
@@ -533,11 +537,17 @@ const ModelManager: React.FC = () => {
   const [llmConcurrencyError, setLlmConcurrencyError] = useState('')
   const [configuringCreationId, setConfiguringCreationId] = useState<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const { apiBaseUrl, creationModelConfigs, setCreationModelConfig } = useAppStore(s => ({
+  const { apiBaseUrl, adminApiBaseUrl, authToken, currentUser, cloudBalance, setCloudBalance, creationModelConfigs, setCreationModelConfig } = useAppStore(s => ({
     apiBaseUrl: s.apiBaseUrl,
+    adminApiBaseUrl: s.adminApiBaseUrl,
+    authToken: s.authToken,
+    currentUser: s.currentUser,
+    cloudBalance: s.cloudBalance,
+    setCloudBalance: s.setCloudBalance,
     creationModelConfigs: s.creationModelConfigs,
     setCreationModelConfig: s.setCreationModelConfig,
   }))
+  const remoteModelAllowed = canUseRemoteCreationModel(currentUser, cloudBalance)
 
   const persistCreationModelConfigs = async () => {
     const configs = useAppStore.getState().creationModelConfigs
@@ -549,6 +559,7 @@ const ModelManager: React.FC = () => {
   }
 
   const handleCreationModelChange = (id: string, patch: Partial<CreationModelConfig>) => {
+    if (id === REMOTE_CREATION_MODEL_ID && patch.enabled && !remoteModelAllowed) return
     setCreationModelConfig(id, patch)
     void persistCreationModelConfigs()
   }
@@ -660,6 +671,22 @@ const ModelManager: React.FC = () => {
     refreshOllamaSetup()
     refreshLlmConcurrency()
   }, [])
+
+  useEffect(() => {
+    if (!authToken || !currentUser) {
+      setCloudBalance(null)
+      return
+    }
+    let cancelled = false
+    fetchBillingBalance(adminApiBaseUrl, authToken)
+      .then(balance => {
+        if (!cancelled) setCloudBalance(balance)
+      })
+      .catch(() => {
+        if (!cancelled) setCloudBalance(null)
+      })
+    return () => { cancelled = true }
+  }, [adminApiBaseUrl, authToken, currentUser, setCloudBalance])
 
   // 轮询下载进度
   useEffect(() => {
@@ -891,6 +918,8 @@ const ModelManager: React.FC = () => {
           <>
             <CreationModelPanel
               configs={creationModelConfigs}
+              remoteAllowed={remoteModelAllowed}
+              availableCredit={cloudBalance?.available ?? null}
               openId={configuringCreationId}
               onToggleOpen={setConfiguringCreationId}
               onChange={handleCreationModelChange}
@@ -1047,9 +1076,9 @@ const CREATION_MODEL_DEFS = [
   {
     id: 'mbcd-plus-v1',
     name: 'MBCD Plus v1.0',
-    description: 'MemoryBread Create Document Plus 1.0，文本创作模型 Plus v1',
-    provider: 'anthropic',
-    hasBaseUrl: true,
+    description: 'MemoryBread Create Document Plus 1.0，适合更长文本和更高质量的云端创作',
+    provider: 'gateway',
+    hasBaseUrl: false,
   },
   {
     id: 'mbcd-std-v1',
@@ -1061,9 +1090,7 @@ const CREATION_MODEL_DEFS = [
 ] as const
 
 const CREATION_MODEL_ID_TO_NAME: Record<string, string> = {
-  'mbcd-plus-v1': 'claude-opus-4-8',
   'mbcd-std-v1':  'qwen3.5:4b',
-  'claude-opus-4-8': 'claude-opus-4-8',
   'qwen-3-5-4b': 'qwen3.5:4b',
 }
 
@@ -1169,13 +1196,15 @@ const CreationModelChatDialog: React.FC<{ entry: CreationChatEntry; onClose: () 
 
 const CreationModelPanel: React.FC<{
   configs: import('../store/useAppStore').CreationModelConfig[]
+  remoteAllowed: boolean
+  availableCredit: string | null
   openId: string | null
   onToggleOpen: (id: string | null) => void
   onChange: (id: string, patch: Partial<import('../store/useAppStore').CreationModelConfig>) => void
-}> = ({ configs, openId, onToggleOpen, onChange }) => {
+}> = ({ configs, remoteAllowed, availableCredit, openId, onToggleOpen, onChange }) => {
   const [testState, setTestState] = React.useState<Record<string, { loading: boolean; result?: string; error?: string }>>({})
   const [chattingModel, setChattingModel] = React.useState<CreationChatEntry | null>(null)
-  const activeConfig = configs.find(config => config.enabled)
+  const activeConfig = configs.find(config => config.enabled && (remoteAllowed || config.id !== REMOTE_CREATION_MODEL_ID))
   const activeDef = CREATION_MODEL_DEFS.find(def => def.id === activeConfig?.id)
   const activeModelName = activeDef?.name || 'MBCD Std v1.0'
 
@@ -1210,57 +1239,42 @@ const CreationModelPanel: React.FC<{
         <span style={{ fontSize: 12, fontWeight: 600, color: '#333' }}>咨询生成模型</span>
       </div>
       <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 10, lineHeight: 1.5 }}>
-        只能启用一个咨询生成模型。未配置云端 API Key 时，默认使用本地 MBCD Std v1.0。
+        只能启用一个咨询生成模型。未登录或未开启云端创作时，默认使用本地 MBCD Std v1.0。
+        {availableCredit != null ? ` 当前可用 Credit：${availableCredit}` : ''}
       </div>
       {CREATION_MODEL_DEFS.map(def => {
         const cfg = configs.find(c => c.id === def.id) || { id: def.id, enabled: false, apiKey: '' }
         const isOpen = openId === def.id
         const isLocalModel = def.id === LOCAL_CREATION_MODEL_ID
+        const isGatewayModel = def.provider === 'gateway'
+        const disabled = isGatewayModel && !remoteAllowed
         const ts = testState[def.id]
         return (
-          <div key={def.id} style={{ background: 'white', borderRadius: 10, padding: '10px 12px', border: '1px solid rgba(0,0,0,0.07)', marginBottom: 8 }}>
+          <div key={def.id} style={{ background: 'white', borderRadius: 10, padding: '10px 12px', border: '1px solid rgba(0,0,0,0.07)', marginBottom: 8, opacity: disabled ? 0.58 : 1 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ width: 8, height: 8, borderRadius: '50%', background: PROVIDER_COLOR[def.provider] || '#AEAEB2', flexShrink: 0 }} />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 13, fontWeight: 600, color: '#1D1D1F' }}>{def.name}</div>
                 <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 2 }}>{def.description}</div>
               </div>
-              {!isLocalModel && cfg.apiKey && (
+              {!isLocalModel && !isGatewayModel && cfg.apiKey && (
                 <button onClick={() => handleTest(def, cfg)} disabled={ts?.loading} style={btn(ts?.result ? '#34C759' : ts?.error ? '#FF3B30' : '#F2F2F7', ts?.result || ts?.error ? 'white' : '#333', 11)}>
                   {ts?.loading ? '验证中…' : ts?.result ? '已通' : ts?.error ? '失败' : '验证'}
                 </button>
               )}
-              {!isLocalModel && cfg.apiKey && (
+              {!isLocalModel && !isGatewayModel && cfg.apiKey && (
                 <button onClick={() => setChattingModel({ def, cfg })} style={btn('#AF52DE18', '#AF52DE', 11)}>💬 体验</button>
               )}
-              {!isLocalModel && (
-                <button onClick={() => onToggleOpen(isOpen ? null : def.id)} style={btn('#F2F2F7', '#333', 11)}>
-                  {isOpen ? '收起' : '配置'}
-                </button>
-              )}
-              <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
-                <input type="checkbox" checked={cfg.enabled} onChange={() => onChange(def.id, { enabled: !cfg.enabled })} />
-                <span style={{ fontSize: 11, color: cfg.enabled ? '#007AFF' : '#AEAEB2' }}>启用</span>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: disabled ? 'not-allowed' : 'pointer' }}>
+                <input type="checkbox" checked={cfg.enabled && !disabled} disabled={disabled} onChange={() => onChange(def.id, { enabled: !cfg.enabled })} />
+                <span style={{ fontSize: 11, color: cfg.enabled && !disabled ? '#007AFF' : '#AEAEB2' }}>启用</span>
               </label>
             </div>
             {ts?.error && <div style={{ fontSize: 11, color: '#FF3B30', marginTop: 6 }}>{ts.error}</div>}
             {ts?.result && <div style={{ fontSize: 11, color: '#34C759', marginTop: 6 }}>回复：{ts.result}</div>}
-            {isOpen && !isLocalModel && (
-              <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
-                <div>
-                  <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 4 }}>API Key</div>
-                  <input type="password" value={cfg.apiKey} onChange={e => onChange(def.id, { apiKey: e.target.value })}
-                    placeholder="请输入 API Key"
-                    style={{ width: '100%', padding: '6px 8px', border: '1px solid #E5E5EA', borderRadius: 6, fontSize: 12, outline: 'none', boxSizing: 'border-box' }} />
-                </div>
-                {def.hasBaseUrl && (
-                  <div>
-                    <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 4 }}>API URL（可选）</div>
-                    <input value={cfg.baseUrl || ''} onChange={e => onChange(def.id, { baseUrl: e.target.value })}
-                      placeholder="https://api.anthropic.com"
-                      style={{ width: '100%', padding: '6px 8px', border: '1px solid #E5E5EA', borderRadius: 6, fontSize: 12, outline: 'none', boxSizing: 'border-box' }} />
-                  </div>
-                )}
+            {isGatewayModel && (
+              <div style={{ marginTop: 8, fontSize: 11, color: '#8E8E93', lineHeight: 1.5 }}>
+                {disabled ? '登录且有可用 Credit 后可启用云端创作。' : '云端创作会使用账户 Credit，本地记忆和私有快照内容仍留在你的设备上。'}
               </div>
             )}
           </div>

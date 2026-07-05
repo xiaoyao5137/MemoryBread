@@ -40,6 +40,7 @@ const BakeKnowledgeTab: React.FC<{
   onViewSourceTimeline: (timelineId?: string) => void
   sourceTimelineTitle?: string
   onCreateKnowledge?: (knowledge: Partial<BakeKnowledgeItem>) => void
+  focusId?: string | null
 }> = ({
   items,
   total,
@@ -65,6 +66,7 @@ const BakeKnowledgeTab: React.FC<{
   onViewSourceTimeline,
   sourceTimelineTitle,
   onCreateKnowledge,
+  focusId,
 }) => {
   const selected = items.find(item => item.id === selectedKnowledgeId) ?? items[0]
   const selectedSourceCaptureIds = selected?.sourceCaptureIds.length
@@ -74,7 +76,7 @@ const BakeKnowledgeTab: React.FC<{
       : []
   const page = Math.floor(offset / limit) + 1
   const totalPages = Math.max(1, Math.ceil(total / limit))
-  const hasActiveFilters = Boolean(query.trim() || from || to)
+  const hasActiveFilters = Boolean(query.trim() || from || to || focusId)
   const [pageInput, setPageInput] = useState('')
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [newKnowledge, setNewKnowledge] = useState({
@@ -159,7 +161,7 @@ const BakeKnowledgeTab: React.FC<{
                   onChange={(event) => onDraftToChange(event.target.value)}
                 />
               </label>
-              {(draftQuery || query || draftFrom || from || draftTo || to) && (
+              {(draftQuery || query || draftFrom || from || draftTo || to || focusId) && (
                 <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--secondary">
                   <BakeButton compact type="button" onClick={onClearFilters}>清除筛选</BakeButton>
                 </div>
@@ -167,6 +169,12 @@ const BakeKnowledgeTab: React.FC<{
             </div>
           </div>
         </form>
+        {focusId && (
+          <div className="bake-filter-summary">
+            <BakePill text={`仅看知识 #${focusId}`} />
+            <BakeButton compact onClick={onClearFilters}>查看全部</BakeButton>
+          </div>
+        )}
       </BakeCard>
       <div className="bake-split-list-detail bake-split-list-detail--knowledge">
         <BakeCard className="bake-knowledge-list-card">

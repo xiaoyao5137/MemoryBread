@@ -1,14 +1,19 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import ReactMarkdown from 'react-markdown'
-import { Clipboard, Loader2, RefreshCw, Sparkles } from 'lucide-react'
+import { Clipboard, EyeOff, Home, Loader2, MessageSquare, Paperclip, RefreshCw, Send, Sparkles, Square, Trash2, X } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
 import { runRagQueryJob } from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
 import type { RagContext } from '../types'
+import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
 import './SystemFloatingAssist.css'
 
 type AssistPhase = 'idle' | 'capturing' | 'answering' | 'done' | 'error'
+
+const FLOATING_ASSIST_BALL_SIZE = 42
+const FLOATING_ASSIST_CONTEXT_MENU_WIDTH = 214
+const FLOATING_ASSIST_CONTEXT_MENU_HEIGHT = 210
 
 interface FloatingAssistOcrResult {
   text: string
@@ -136,6 +141,19 @@ const buildFloatingAssistQuery = (ocrText: string) => {
   ].join('\n')
 }
 
+const buildManualFloatingAssistQuery = (instruction: string, ocrText?: string) => {
+  const trimmedInstruction = instruction.trim()
+  const trimmedOcr = ocrText?.trim()
+  return [
+    '你是记忆面包的工作场景助手。用户在悬浮咨询面板中手工输入了一条指令。',
+    '请优先回答这条手工指令；如果同时提供了当前屏幕 OCR 内容，请把它作为辅助上下文。',
+    '不要提及供应商模型、密钥、成本或内部实现。',
+    '',
+    `用户手工指令：\n${trimmedInstruction}`,
+    trimmedOcr ? `\n当前屏幕 OCR：\n${trimmedOcr}` : '',
+  ].filter(Boolean).join('\n')
+}
+
 const SystemFloatingAssist: React.FC = () => {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
   const creationModelConfigs = useAppStore((s) => s.creationModelConfigs)
@@ -149,10 +167,16 @@ const SystemFloatingAssist: React.FC = () => {
   const [references, setReferences] = useState<RagContext[]>([])
   const [previewOpen, setPreviewOpen] = useState(false)
   const [canvasOpen, setCanvasOpen] = useState(false)
+  const [contextMenuOpen, setContextMenuOpen] = useState(false)
+  const [manualInstruction, setManualInstruction] = useState('')
+  const [attachments, setAttachments] = useState<UserAttachment[]>([])
+  const [attachmentError, setAttachmentError] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
   const revealTimerRef = useRef<number | null>(null)
   const clickTimerRef = useRef<number | null>(null)
   const progressTimerRef = useRef<number | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const dragRef = useRef({
     active: false,
     dragging: false,
@@ -217,23 +241,39 @@ const SystemFloatingAssist: React.FC = () => {
   }
 
   const hasCanvas = canvasOpen
+  const busy = phase === 'capturing' || phase === 'answering'
+  const collapseExpandedSurface = () => {
+    setCanvasOpen(false)
+    setContextMenuOpen(false)
+    setPreviewOpen(false)
+  }
   const canvasHeight = phase === 'done'
-    ? Math.min(560, Math.max(342, 252 + Math.ceil(answer.length / 2.4) + Math.min(references.length, 3) * 42))
+    ? Math.min(560, Math.max(420, 330 + Math.ceil(answer.length / 2.4) + Math.min(references.length, 3) * 42))
     : phase === 'error'
-      ? 292
+      ? 370
       : phase === 'idle'
-        ? 132
+        ? 220
         : screenshot
-          ? 336
-          : 252
+          ? 414
+          : 330
   useEffect(() => {
     document.documentElement.classList.add('floating-assist-html')
     document.body.classList.add('floating-assist-body')
     let cleanup: (() => void) | null = null
     const stopGlobalDrag = () => stopDrag()
+    const handleWindowBlur = () => {
+      stopDrag()
+      collapseExpandedSurface()
+    }
     window.addEventListener('pointerup', stopGlobalDrag)
     window.addEventListener('mouseup', stopGlobalDrag)
-    window.addEventListener('blur', stopGlobalDrag)
+    window.addEventListener('blur', handleWindowBlur)
+    const closeContextMenu = () => setContextMenuOpen(false)
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') collapseExpandedSurface()
+    }
+    window.addEventListener('click', closeContextMenu)
+    window.addEventListener('keydown', handleKeyDown)
     void listen('floating-assist-reset', () => {
       if (revealTimerRef.current != null) {
         window.clearInterval(revealTimerRef.current)
@@ -247,8 +287,7 @@ const SystemFloatingAssist: React.FC = () => {
       setProgress(0)
       stopDrag(false)
       suppressClickRef.current = false
-      setCanvasOpen(false)
-      setPreviewOpen(false)
+      collapseExpandedSurface()
       setRevealing(false)
     }).then(dispose => {
       cleanup = dispose
@@ -266,16 +305,30 @@ const SystemFloatingAssist: React.FC = () => {
       stopDrag(false)
       window.removeEventListener('pointerup', stopGlobalDrag)
       window.removeEventListener('mouseup', stopGlobalDrag)
-      window.removeEventListener('blur', stopGlobalDrag)
+      window.removeEventListener('blur', handleWindowBlur)
+      window.removeEventListener('click', closeContextMenu)
+      window.removeEventListener('keydown', handleKeyDown)
       cleanup?.()
     }
   }, [])
 
   useEffect(() => {
-    const width = previewOpen ? 720 : hasCanvas ? 392 : 42
-    const height = previewOpen ? 540 : hasCanvas ? 50 + canvasHeight : 42
+    const width = previewOpen
+      ? 720
+      : hasCanvas
+        ? 392
+        : contextMenuOpen
+          ? FLOATING_ASSIST_CONTEXT_MENU_WIDTH
+          : FLOATING_ASSIST_BALL_SIZE
+    const height = previewOpen
+      ? 540
+      : hasCanvas
+        ? Math.max(50 + canvasHeight, contextMenuOpen ? FLOATING_ASSIST_CONTEXT_MENU_HEIGHT : FLOATING_ASSIST_BALL_SIZE)
+        : contextMenuOpen
+          ? FLOATING_ASSIST_CONTEXT_MENU_HEIGHT
+          : FLOATING_ASSIST_BALL_SIZE
     invoke('set_floating_assist_size', { width, height }).catch(() => {})
-  }, [canvasHeight, hasCanvas, previewOpen])
+  }, [canvasHeight, contextMenuOpen, hasCanvas, previewOpen])
 
   const revealAnswer = (content: string) => {
     if (revealTimerRef.current != null) {
@@ -297,9 +350,56 @@ const SystemFloatingAssist: React.FC = () => {
     }, 28)
   }
 
+  const clearAnswerReveal = () => {
+    if (revealTimerRef.current != null) {
+      window.clearInterval(revealTimerRef.current)
+      revealTimerRef.current = null
+    }
+    setRevealing(false)
+  }
+
+  const clearCanvasContent = () => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    clearAnswerReveal()
+    stopProgress()
+    setPhase('idle')
+    setProgress(0)
+    setAnswer('')
+    setError(null)
+    setCopied(false)
+    setScreenshot(null)
+    setScreenshotSrc('')
+    setReferences([])
+    setPreviewOpen(false)
+    setManualInstruction('')
+    setAttachments([])
+    setAttachmentError(null)
+  }
+
+  const stopAssist = () => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    clearAnswerReveal()
+    stopProgress()
+    setPhase(answer ? 'done' : 'idle')
+    setProgress(0)
+  }
+
+  const addFiles = async (files: Iterable<File>) => {
+    setAttachmentError(null)
+    try {
+      const next = await filesToAttachments(files, attachments.length)
+      setAttachments(prev => [...prev, ...next])
+    } catch (err) {
+      setAttachmentError(err instanceof Error ? err.message : '附件读取失败')
+    }
+  }
+
   const runAssist = async () => {
     if (suppressClickRef.current) return
-    if (phase === 'capturing' || phase === 'answering') return
+    if (busy) return
+    setContextMenuOpen(false)
     setCanvasOpen(true)
     if (revealTimerRef.current != null) {
       window.clearInterval(revealTimerRef.current)
@@ -313,6 +413,8 @@ const SystemFloatingAssist: React.FC = () => {
     setScreenshotSrc('')
     setReferences([])
     setPreviewOpen(false)
+    const controller = new AbortController()
+    abortRef.current = controller
     try {
       setPhase('capturing')
       startProgress(8, 34, 9000)
@@ -332,23 +434,93 @@ const SystemFloatingAssist: React.FC = () => {
       setPhase('answering')
       startProgress(35, 92, 60000)
       await waitForPaint()
-      const result = await runRagQueryJob(apiBaseUrl, creationModelConfigs, buildFloatingAssistQuery(text), 5, {
+      const attachmentPrompt = buildAttachmentPrompt(attachments)
+      const query = buildFloatingAssistQuery(text)
+      const queryWithAttachments = attachmentPrompt ? `${query}\n\n${attachmentPrompt}` : query
+      const result = await runRagQueryJob(apiBaseUrl, creationModelConfigs, queryWithAttachments, 5, {
         source: 'floating_assist',
         screenshot_path: ocr.screenshot_path,
         screenshot_width: ocr.width,
         screenshot_height: ocr.height,
         ocr_text: text,
-      })
+        attachments: buildAttachmentMetadata(attachments),
+      }, false, controller.signal)
       setReferences(result.contexts ?? [])
       stopProgress()
       setProgress(100)
       setPhase('done')
       revealAnswer(result.answer?.trim() || '本次没有生成咨询输出，请重试。')
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
       stopProgress()
       setRevealing(false)
       setPhase('error')
       setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null
+    }
+  }
+
+  const runManualAssist = async (event?: { preventDefault: () => void }) => {
+    event?.preventDefault()
+    const instruction = manualInstruction.trim()
+    if (!instruction || busy) return
+    setContextMenuOpen(false)
+    setCanvasOpen(true)
+    if (revealTimerRef.current != null) {
+      window.clearInterval(revealTimerRef.current)
+      revealTimerRef.current = null
+    }
+    setRevealing(false)
+    setCopied(false)
+    setAnswer('')
+    setError(null)
+    setReferences([])
+    setPreviewOpen(false)
+    const controller = new AbortController()
+    abortRef.current = controller
+    try {
+      setPhase('answering')
+      startProgress(12, 92, 60000)
+      await waitForPaint()
+      const attachmentPrompt = buildAttachmentPrompt(attachments)
+      const query = buildManualFloatingAssistQuery(instruction, screenshot?.text)
+      const queryWithAttachments = attachmentPrompt ? `${query}\n\n${attachmentPrompt}` : query
+      const result = await runRagQueryJob(
+        apiBaseUrl,
+        creationModelConfigs,
+        queryWithAttachments,
+        5,
+        screenshot ? {
+          source: 'floating_assist',
+          screenshot_path: screenshot.screenshot_path,
+          screenshot_width: screenshot.width,
+          screenshot_height: screenshot.height,
+          ocr_text: screenshot.text,
+          manual_instruction: instruction,
+          attachments: buildAttachmentMetadata(attachments),
+        } : {
+          source: 'floating_assist',
+          manual_instruction: instruction,
+          attachments: buildAttachmentMetadata(attachments),
+        },
+        false,
+        controller.signal,
+      )
+      setReferences(result.contexts ?? [])
+      stopProgress()
+      setProgress(100)
+      setPhase('done')
+      setManualInstruction('')
+      revealAnswer(result.answer?.trim() || '本次没有生成咨询输出，请重试。')
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      stopProgress()
+      setRevealing(false)
+      setPhase('error')
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null
     }
   }
 
@@ -364,8 +536,15 @@ const SystemFloatingAssist: React.FC = () => {
     setCanvasOpen(value => !value)
   }
 
+  const handleOutsidePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.target === event.currentTarget) {
+      collapseExpandedSurface()
+    }
+  }
+
   const handleBallClick = () => {
     if (suppressClickRef.current) return
+    setContextMenuOpen(false)
     if (clickTimerRef.current != null) {
       window.clearTimeout(clickTimerRef.current)
     }
@@ -373,6 +552,50 @@ const SystemFloatingAssist: React.FC = () => {
       clickTimerRef.current = null
       toggleCanvas()
     }, 220)
+  }
+
+  const handleBallContextMenu = (event: React.MouseEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (suppressClickRef.current) return
+    if (clickTimerRef.current != null) {
+      window.clearTimeout(clickTimerRef.current)
+      clickTimerRef.current = null
+    }
+    setContextMenuOpen(value => !value)
+  }
+
+  const openMainPanel = () => {
+    setContextMenuOpen(false)
+    invoke('set_floating_assist_size', {
+      width: FLOATING_ASSIST_BALL_SIZE,
+      height: FLOATING_ASSIST_BALL_SIZE,
+    })
+      .catch(() => {})
+      .finally(() => {
+        invoke('show_main_panel_from_floating_assist').catch(() => {})
+      })
+  }
+
+  const handleManualWheel = useCallback((event: React.WheelEvent<HTMLTextAreaElement>) => {
+    const el = event.currentTarget
+    if (el.scrollHeight <= el.clientHeight) return
+
+    const scrollingUp = event.deltaY < 0
+    const scrollingDown = event.deltaY > 0
+    const canScrollUp = el.scrollTop > 0
+    const canScrollDown = el.scrollTop + el.clientHeight < el.scrollHeight
+
+    if ((scrollingUp && canScrollUp) || (scrollingDown && canScrollDown)) {
+      event.preventDefault()
+      event.stopPropagation()
+      el.scrollTop += event.deltaY
+    }
+  }, [])
+
+  const hideFloatingAssist = () => {
+    setContextMenuOpen(false)
+    invoke('set_floating_assist_visible', { enabled: false }).catch(() => {})
   }
 
   const handleBallDoubleClick = () => {
@@ -460,9 +683,14 @@ const SystemFloatingAssist: React.FC = () => {
 
   const openReference = (item: RagContext) => {
     const sourceType = item.source_type || item.source || 'capture'
+    const referenceType = ['document', 'bake_knowledge', 'operation', 'action'].includes(sourceType)
+      ? sourceType
+      : item.knowledge_id
+        ? 'knowledge'
+        : sourceType
     invoke('open_floating_assist_reference', {
       detail: {
-        type: item.knowledge_id ? 'knowledge' : sourceType,
+        type: referenceType,
         captureId: item.capture_id,
         knowledgeId: item.knowledge_id,
         artifactId: item.artifact_id,
@@ -477,12 +705,16 @@ const SystemFloatingAssist: React.FC = () => {
   const displayedAnswer = floatingAnswer.responseContent || (floatingAnswer.userQuestionUnderstanding ? '' : answer)
 
   return (
-    <div className={`system-floating-assist ${hasCanvas ? 'system-floating-assist--open' : ''}`}>
+    <div
+      className={`system-floating-assist ${hasCanvas ? 'system-floating-assist--open' : ''} ${hasCanvas || contextMenuOpen ? 'system-floating-assist--dismissable' : ''}`}
+      onPointerDown={handleOutsidePointerDown}
+    >
       <div className="system-floating-assist__dock">
         <button
           className={`system-floating-assist__ball system-floating-assist__ball--${phase}`}
           type="button"
           onClick={handleBallClick}
+          onContextMenu={handleBallContextMenu}
           onDoubleClick={handleBallDoubleClick}
           onPointerDown={startDrag}
           onPointerMove={moveDrag}
@@ -496,6 +728,27 @@ const SystemFloatingAssist: React.FC = () => {
             : <Sparkles size={20} />}
         </button>
       </div>
+
+      {contextMenuOpen && (
+        <div className="system-floating-assist__context-menu" role="menu" onClick={(event) => event.stopPropagation()}>
+          <button type="button" role="menuitem" onClick={openMainPanel}>
+            <Home size={15} />
+            <span>打开主面板</span>
+          </button>
+          <button type="button" role="menuitem" onClick={runAssist} disabled={busy}>
+            <MessageSquare size={15} />
+            <span>识别屏幕咨询</span>
+          </button>
+          <button type="button" role="menuitem" onClick={() => { setCanvasOpen(true); setContextMenuOpen(false) }}>
+            <Sparkles size={15} />
+            <span>展开咨询面板</span>
+          </button>
+          <button type="button" role="menuitem" onClick={hideFloatingAssist}>
+            <EyeOff size={15} />
+            <span>隐藏悬浮球</span>
+          </button>
+        </div>
+      )}
 
       {hasCanvas && (
         <section className="system-floating-assist__canvas" aria-live="polite">
@@ -514,11 +767,30 @@ const SystemFloatingAssist: React.FC = () => {
                 <Clipboard size={14} />
                 {copied ? '已复制' : '复制'}
               </button>
+              {busy && (
+                <button
+                  className="system-floating-assist__small-btn system-floating-assist__small-btn--danger"
+                  type="button"
+                  onClick={stopAssist}
+                >
+                  <Square size={13} />
+                  中止
+                </button>
+              )}
+              <button
+                className="system-floating-assist__small-btn"
+                type="button"
+                onClick={clearCanvasContent}
+                disabled={busy}
+              >
+                <Trash2 size={14} />
+                清空
+              </button>
               <button
                 className="system-floating-assist__small-btn"
                 type="button"
                 onClick={runAssist}
-                disabled={phase === 'capturing' || phase === 'answering'}
+                disabled={busy}
               >
                 <RefreshCw size={14} />
                 重试
@@ -530,15 +802,31 @@ const SystemFloatingAssist: React.FC = () => {
             {screenshotSrc && (
               <div className="system-floating-assist__consult-screen">
                 <div className="system-floating-assist__consult-title">用户咨询：</div>
-                <button
-                  className="system-floating-assist__screenshot"
-                  type="button"
-                  onClick={() => setPreviewOpen(true)}
-                  aria-label="查看本次截屏"
-                  title="查看本次截屏"
-                >
-                  <img src={screenshotSrc} alt="本次截屏缩略图" />
-                </button>
+                <div className="system-floating-assist__screenshot-wrap">
+                  <button
+                    className="system-floating-assist__screenshot"
+                    type="button"
+                    onClick={() => setPreviewOpen(true)}
+                    aria-label="查看本次截屏"
+                    title="查看本次截屏"
+                  >
+                    <img src={screenshotSrc} alt="本次截屏缩略图" />
+                  </button>
+                  <button
+                    className="system-floating-assist__screenshot-remove"
+                    type="button"
+                    onClick={() => {
+                      setScreenshot(null)
+                      setScreenshotSrc('')
+                      setPreviewOpen(false)
+                    }}
+                    aria-label="移除本次截屏"
+                    title="移除本次截屏"
+                    disabled={busy}
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
                 {floatingAnswer.userQuestionUnderstanding && (
                   <div className="system-floating-assist__question-understanding">
                     <MarkdownContent content={floatingAnswer.userQuestionUnderstanding} />
@@ -577,6 +865,78 @@ const SystemFloatingAssist: React.FC = () => {
               </div>
             )}
           </div>
+
+          <form className="system-floating-assist__manual" onSubmit={runManualAssist}>
+            <div className="system-floating-assist__manual-main">
+              <textarea
+                value={manualInstruction}
+                onChange={(event) => setManualInstruction(event.target.value)}
+                onWheel={handleManualWheel}
+                onPaste={(event) => {
+                  const files = Array.from(event.clipboardData.files || [])
+                  if (files.length) void addFiles(files)
+                }}
+                placeholder={screenshot ? '继续输入你的指令，结合当前界面内容咨询' : '输入你的指令，直接向记忆面包咨询'}
+                rows={2}
+                disabled={busy}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                    void runManualAssist(event)
+                  }
+                }}
+              />
+              {attachments.length > 0 && (
+                <div className="system-floating-assist__attachments">
+                  {attachments.map(item => (
+                    <span className="system-floating-assist__attachment" key={item.id}>
+                      <Paperclip size={12} />
+                      <span>{item.name}</span>
+                      <small>{formatAttachmentSize(item.size)}</small>
+                      <button
+                        type="button"
+                        onClick={() => setAttachments(prev => prev.filter(existing => existing.id !== item.id))}
+                        disabled={busy}
+                        aria-label={`移除 ${item.name}`}
+                      >
+                        <X size={12} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {attachmentError && <div className="system-floating-assist__attachment-error">{attachmentError}</div>}
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept="image/*,.pdf,.txt,.md,.doc,.docx"
+              style={{ display: 'none' }}
+              onChange={(event) => {
+                if (event.target.files) void addFiles(event.target.files)
+                event.currentTarget.value = ''
+              }}
+            />
+            <button
+              className="system-floating-assist__manual-attach"
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={busy}
+              aria-label="上传附件"
+              title="上传附件"
+            >
+              <Paperclip size={15} />
+            </button>
+            <button
+              className="system-floating-assist__manual-submit"
+              type="submit"
+              disabled={busy || !manualInstruction.trim()}
+              aria-label="发送手工咨询"
+              title="发送手工咨询"
+            >
+              {busy ? <Loader2 size={15} className="system-floating-assist__spin" /> : <Send size={15} />}
+            </button>
+          </form>
 
           {phase === 'done' && visibleReferences.length > 0 && (
             <div className="system-floating-assist__refs">

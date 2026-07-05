@@ -1,9 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  useFetchBakeMemory,
   useFetchBakeMemories,
   useFetchBakeCaptureDetail,
   useFetchBakeCaptures,
   useFetchBakeKnowledge,
+  useFetchBakeKnowledgeDetail,
+  useFetchBakeSop,
   useFetchBakeSops,
   useFetchBakeTemplates,
   useFetchCaptures,
@@ -54,6 +57,7 @@ const RepositoryPanel: React.FC = () => {
     repositoryCaptureTo,
     repositoryCaptureLimit,
     repositoryCaptureSourceCaptureId,
+    repositoryMemoryFocusId,
     selectedTemplateId,
     selectedSopId,
     selectedKnowledgeId,
@@ -65,6 +69,10 @@ const RepositoryPanel: React.FC = () => {
     setSelectedTemplateId,
     setSelectedSopId,
     setSelectedCaptureId,
+    setRepositoryMemoryFocusId,
+    setBakeTemplateFocusId,
+    setBakeKnowledgeFocusId,
+    setBakeSopFocusId,
     setBakeMemoryOffset,
     setBakeCaptureOffset,
     setRepositoryMemoryLimit,
@@ -77,12 +85,15 @@ const RepositoryPanel: React.FC = () => {
   } = useAppStore()
 
   const fetchMemories = useFetchBakeMemories()
+  const fetchMemory = useFetchBakeMemory()
   const fetchCaptures = useFetchBakeCaptures()
   const fetchCaptureDetail = useFetchBakeCaptureDetail()
   const fetchCapturesRaw = useFetchCaptures()
   const fetchTemplates = useFetchBakeTemplates()
   const fetchKnowledge = useFetchBakeKnowledge()
+  const fetchKnowledgeDetail = useFetchBakeKnowledgeDetail()
   const fetchSops = useFetchBakeSops()
+  const fetchSop = useFetchBakeSop()
 
   const [memories, setMemories] = useState<TimelineItem[]>([])
   const [memoryTotal, setMemoryTotal] = useState(0)
@@ -109,6 +120,22 @@ const RepositoryPanel: React.FC = () => {
 
   useEffect(() => {
     if (repositoryTab !== 'memory') return
+    if (repositoryMemoryFocusId) {
+      const requestSeq = memoryRequestSeqRef.current + 1
+      memoryRequestSeqRef.current = requestSeq
+      void fetchMemory(repositoryMemoryFocusId).then((item) => {
+        if (requestSeq !== memoryRequestSeqRef.current) return
+        setMemories([item])
+        setMemoryTotal(1)
+        setSelectedMemoryId(item.id)
+      }).catch((error) => {
+        if (requestSeq !== memoryRequestSeqRef.current) return
+        setMemories([])
+        setMemoryTotal(0)
+        setStatusMessage(error instanceof Error ? error.message : `未找到时间线 #${repositoryMemoryFocusId}`)
+      })
+      return
+    }
     const requestSeq = memoryRequestSeqRef.current + 1
     memoryRequestSeqRef.current = requestSeq
     void fetchMemories({
@@ -128,11 +155,14 @@ const RepositoryPanel: React.FC = () => {
   }, [
     bakeMemoryOffset,
     fetchMemories,
+    fetchMemory,
+    repositoryMemoryFocusId,
     repositoryMemoryFrom,
     repositoryMemoryLimit,
     repositoryMemoryQuery,
     repositoryMemoryTo,
     repositoryTab,
+    setSelectedMemoryId,
   ])
 
   useEffect(() => {
@@ -236,24 +266,6 @@ const RepositoryPanel: React.FC = () => {
     }
   }, [fetchKnowledge, fetchSops, fetchTemplates, repositoryTab, resolvedMemoryId])
 
-  const fetchedForIdRef = useRef<string | null>(null)
-  useEffect(() => {
-    if (!selectedMemoryId || repositoryTab !== 'memory') return
-    if (repositoryMemoryQuery.trim() || repositoryMemoryFrom || repositoryMemoryTo) return
-    if (memories.some(m => m.id === selectedMemoryId)) return
-    if (fetchedForIdRef.current === selectedMemoryId) return
-    fetchedForIdRef.current = selectedMemoryId
-    void fetchMemories({ limit: 500, offset: 0 }).then(data => setMemories(data.items))
-  }, [
-    selectedMemoryId,
-    repositoryTab,
-    repositoryMemoryQuery,
-    repositoryMemoryFrom,
-    repositoryMemoryTo,
-    memories,
-    fetchMemories,
-  ])
-
   useEffect(() => {
     if (repositoryTab !== 'capture') return
     if (captureItems.length === 0) {
@@ -281,14 +293,17 @@ const RepositoryPanel: React.FC = () => {
   const memoryTotalPages = Math.max(1, Math.ceil(memoryTotal / repositoryMemoryLimit))
   const memoryFilterPills = useMemo(() => {
     const pills: string[] = []
+    if (repositoryMemoryFocusId) pills.push(`仅看时间线 #${repositoryMemoryFocusId}`)
     if (repositoryMemoryFrom) pills.push(`开始：${repositoryMemoryFrom}`)
     if (repositoryMemoryTo) pills.push(`结束：${repositoryMemoryTo}`)
     return pills
-  }, [repositoryMemoryFrom, repositoryMemoryTo])
+  }, [repositoryMemoryFocusId, repositoryMemoryFrom, repositoryMemoryTo])
 
   const handleSearchMemories = () => {
     setSelectedMemoryId(null)
+    setRepositoryMemoryFocusId(null)
     useAppStore.setState({
+      repositoryMemoryFocusId: null,
       repositoryMemoryQuery: draftMemoryQuery,
       repositoryMemoryFrom: draftMemoryFrom,
       repositoryMemoryTo: draftMemoryTo,
@@ -300,7 +315,9 @@ const RepositoryPanel: React.FC = () => {
     setDraftMemoryQuery('')
     setDraftMemoryFrom('')
     setDraftMemoryTo('')
+    setSelectedMemoryId(null)
     useAppStore.setState({
+      repositoryMemoryFocusId: null,
       repositoryMemoryQuery: '',
       repositoryMemoryFrom: '',
       repositoryMemoryTo: '',
@@ -341,6 +358,7 @@ const RepositoryPanel: React.FC = () => {
     selectedSopId,
     selectedKnowledgeId,
     repositoryCaptureSourceCaptureId,
+    repositoryMemoryFocusId,
   })
 
   const restoreNavigationTarget = (target: BakeNavigationTarget) => {
@@ -352,6 +370,10 @@ const RepositoryPanel: React.FC = () => {
     if (target.selectedSopId !== undefined) setSelectedSopId(target.selectedSopId)
     if (target.selectedKnowledgeId !== undefined) setSelectedKnowledgeId(target.selectedKnowledgeId)
     if (target.selectedCaptureId !== undefined) setSelectedCaptureId(target.selectedCaptureId)
+    if (target.repositoryMemoryFocusId !== undefined) setRepositoryMemoryFocusId(target.repositoryMemoryFocusId)
+    if (target.bakeTemplateFocusId !== undefined) setBakeTemplateFocusId(target.bakeTemplateFocusId)
+    if (target.bakeKnowledgeFocusId !== undefined) setBakeKnowledgeFocusId(target.bakeKnowledgeFocusId)
+    if (target.bakeSopFocusId !== undefined) setBakeSopFocusId(target.bakeSopFocusId)
     if (target.repositoryCaptureSourceCaptureId !== undefined) {
       setRepositoryCaptureSourceCaptureId(target.repositoryCaptureSourceCaptureId)
     }
@@ -365,6 +387,7 @@ const RepositoryPanel: React.FC = () => {
     pushBakeNavigationTarget(currentNavigationTarget())
     setWindowMode('bake')
     setBakeTab('knowledge')
+    setBakeKnowledgeFocusId(knowledgeId)
     setSelectedKnowledgeId(knowledgeId)
     setStatusMessage('已切换到关联知识')
   }
@@ -380,6 +403,7 @@ const RepositoryPanel: React.FC = () => {
       pushBakeNavigationTarget(currentNavigationTarget())
       setWindowMode('bake')
       setBakeTab('templates')
+      setBakeTemplateFocusId(relatedDoc.id)
       setSelectedTemplateId(relatedDoc.id)
       setStatusMessage(`已切换到关联文档「${relatedDoc.title}」`)
     } catch (error) {
@@ -395,11 +419,13 @@ const RepositoryPanel: React.FC = () => {
         setStatusMessage('当前时间线还没有关联知识')
         return
       }
+      const focusedKnowledge = await fetchKnowledgeDetail(relatedKnowledge.id).catch(() => relatedKnowledge)
       pushBakeNavigationTarget(currentNavigationTarget())
       setWindowMode('bake')
       setBakeTab('knowledge')
-      setSelectedKnowledgeId(relatedKnowledge.id)
-      setStatusMessage(`已切换到关联知识「${relatedKnowledge.summary}」`)
+      setBakeKnowledgeFocusId(focusedKnowledge.id)
+      setSelectedKnowledgeId(focusedKnowledge.id)
+      setStatusMessage(`已切换到关联知识「${focusedKnowledge.summary}」`)
     } catch {
       setStatusMessage('查询关联知识失败')
     }
@@ -413,11 +439,13 @@ const RepositoryPanel: React.FC = () => {
         setStatusMessage('当前时间线还没有关联操作')
         return
       }
+      const focusedSop = await fetchSop(relatedSop.id).catch(() => relatedSop)
       pushBakeNavigationTarget(currentNavigationTarget())
       setWindowMode('bake')
       setBakeTab('sop')
-      setSelectedSopId(relatedSop.id)
-      setStatusMessage(`已切换到关联操作「${relatedSop.extractedProblem || relatedSop.sourceTitle || relatedSop.id}」`)
+      setBakeSopFocusId(focusedSop.id)
+      setSelectedSopId(focusedSop.id)
+      setStatusMessage(`已切换到关联操作「${focusedSop.extractedProblem || focusedSop.sourceTitle || focusedSop.id}」`)
     } catch {
       setStatusMessage('查询关联操作失败')
     }
@@ -431,6 +459,7 @@ const RepositoryPanel: React.FC = () => {
     pushBakeNavigationTarget(currentNavigationTarget())
     setWindowMode('knowledge')
     setRepositoryTab('memory')
+    setRepositoryMemoryFocusId(timelineId)
     setSelectedMemoryId(timelineId)
     setStatusMessage('已切换到所属时间线')
   }
@@ -514,7 +543,7 @@ const RepositoryPanel: React.FC = () => {
                   />
                 </label>
                 <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--secondary">
-                  {(draftMemoryQuery || draftMemoryFrom || draftMemoryTo || repositoryMemoryQuery || repositoryMemoryFrom || repositoryMemoryTo) && (
+                  {(draftMemoryQuery || draftMemoryFrom || draftMemoryTo || repositoryMemoryQuery || repositoryMemoryFrom || repositoryMemoryTo || repositoryMemoryFocusId) && (
                     <BakeButton compact onClick={handleClearMemoryFilters}>清除筛选</BakeButton>
                   )}
                 </div>
@@ -525,6 +554,7 @@ const RepositoryPanel: React.FC = () => {
           {memoryFilterPills.length > 0 && (
             <div className="bake-filter-summary">
               {memoryFilterPills.map(item => <BakePill key={item} text={item} />)}
+              {repositoryMemoryFocusId && <BakeButton compact onClick={handleClearMemoryFilters}>查看全部</BakeButton>}
             </div>
           )}
         </>

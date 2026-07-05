@@ -36,6 +36,7 @@ const BakeTemplatesTab: React.FC<{
   onDraftToChange: (value: string) => void
   onSearch: () => void
   onClearFilters: () => void
+  focusId?: string | null
 }> = ({
   templates,
   total,
@@ -62,11 +63,12 @@ const BakeTemplatesTab: React.FC<{
   onDraftToChange,
   onSearch,
   onClearFilters,
+  focusId,
 }) => {
   const selected = templates.find(item => item.id === selectedTemplateId) ?? templates[0]
   const [isEditing, setIsEditing] = useState(false)
   const [pageInput, setPageInput] = useState('')
-  const hasActiveFilters = Boolean(query.trim() || from || to)
+  const hasActiveFilters = Boolean(query.trim() || from || to || focusId)
   const page = Math.floor(offset / limit) + 1
   const totalPages = Math.max(1, Math.ceil(total / limit))
 
@@ -174,7 +176,7 @@ const BakeTemplatesTab: React.FC<{
                   onChange={(event) => onDraftToChange(event.target.value)}
                 />
               </label>
-              {(draftQuery || query || draftFrom || from || draftTo || to) && (
+              {(draftQuery || query || draftFrom || from || draftTo || to || focusId) && (
                 <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--secondary">
                   <BakeButton compact type="button" onClick={onClearFilters}>清除筛选</BakeButton>
                 </div>
@@ -182,6 +184,12 @@ const BakeTemplatesTab: React.FC<{
             </div>
           </div>
         </form>
+        {focusId && (
+          <div className="bake-filter-summary">
+            <BakePill text={`仅看文档 #${focusId}`} />
+            <BakeButton compact onClick={onClearFilters}>查看全部</BakeButton>
+          </div>
+        )}
       </BakeCard>
       <div className="bake-split-list-detail bake-split-list-detail--templates">
         <BakeCard className="bake-knowledge-list-card">

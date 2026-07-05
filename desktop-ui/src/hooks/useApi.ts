@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useAppStore }  from '../store/useAppStore'
 import type { CreationModelConfig } from '../store/useAppStore'
+import { LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, getEffectiveCreationModelId } from '../utils/modelSelection'
 import type {
   ArticleTemplate,
   BakeBucket,
@@ -14,6 +15,7 @@ import type {
   TimelineItem,
   PaginatedBakeResponse,
   PreferenceRecord,
+  RagContext,
   RagHistoryItem,
   RagQueryResponse,
   ActionResult,
@@ -43,7 +45,17 @@ export const fetchWithLocalhostFallback = async (input: string, init?: RequestIn
   }
 }
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+  if (signal?.aborted) {
+    reject(new DOMException('Aborted', 'AbortError'))
+    return
+  }
+  const timer = window.setTimeout(resolve, ms)
+  signal?.addEventListener('abort', () => {
+    window.clearTimeout(timer)
+    reject(new DOMException('Aborted', 'AbortError'))
+  }, { once: true })
+})
 
 export const parseApiErrorMessage = async (resp: Response, fallback: string) => {
   let errMsg = fallback
@@ -78,24 +90,13 @@ interface RagJobStatusResponse {
   updated_at_ms: number
 }
 
-const LOCAL_CREATION_MODEL_ID = 'mbcd-std-v1'
-const CREATION_MODEL_NAMES: Record<string, string> = {
-  'mbcd-plus-v1': 'claude-opus-4-8',
-  'mbcd-std-v1': 'qwen3.5:4b',
-  'claude-opus-4-8': 'claude-opus-4-8',
-  'qwen-3-5-4b': 'qwen3.5:4b',
-}
-
-export const getActiveCreationModelPayload = (configs: CreationModelConfig[]) => {
-  const active = configs.find(config =>
-    config.enabled && (config.id === LOCAL_CREATION_MODEL_ID || config.apiKey)
-  )
+export const getActiveCreationModelPayload = (configs: CreationModelConfig[], remoteAllowed = false) => {
+  const effectiveId = getEffectiveCreationModelId(configs, remoteAllowed)
+  if (effectiveId !== LOCAL_CREATION_MODEL_ID) return {}
+  const active = configs.find(config => config.id === LOCAL_CREATION_MODEL_ID)
   if (!active) return {}
   const payload: Record<string, string> = {
-    creation_model: CREATION_MODEL_NAMES[active.id] || active.id,
-  }
-  if (active.id !== LOCAL_CREATION_MODEL_ID && active.apiKey) {
-    payload.creation_api_key = active.apiKey
+    creation_model: 'qwen3.5:4b',
   }
   if (active.baseUrl) {
     payload.creation_base_url = active.baseUrl
@@ -109,15 +110,18 @@ export async function runRagQueryJob(
   query: string,
   topK = 5,
   extraPayload: Record<string, unknown> = {},
+  remoteAllowed = false,
+  signal?: AbortSignal,
 ): Promise<RagQueryResponse> {
   const normalizedApiBaseUrl = normalizeLocalApiBaseUrl(apiBaseUrl)
   const createResp = await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/jobs`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal,
     body:    JSON.stringify({
       query,
       top_k: topK,
-      ...getActiveCreationModelPayload(creationModelConfigs),
+      ...getActiveCreationModelPayload(creationModelConfigs, remoteAllowed),
       ...extraPayload,
     }),
   })
@@ -130,8 +134,8 @@ export async function runRagQueryJob(
   let data: RagQueryResponse | null = null
 
   while (Date.now() < deadline) {
-    await sleep(2000)
-    const statusResp = await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/jobs/${encodeURIComponent(created.job_id)}`)
+    await sleep(2000, signal)
+    const statusResp = await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/jobs/${encodeURIComponent(created.job_id)}`, { signal })
     if (!statusResp.ok) {
       throw new Error(await parseApiErrorMessage(statusResp, `query job status failed: ${statusResp.status}`))
     }
@@ -151,6 +155,100 @@ export async function runRagQueryJob(
   }
 
   return data
+}
+
+async function readGatewayError(response: Response, fallback: string) {
+  try {
+    const text = await response.text()
+    if (!text.trim()) return fallback
+    const data = JSON.parse(text)
+    return data?.error?.message || data?.message || data?.error || fallback
+  } catch {
+    return fallback
+  }
+}
+
+async function fetchRagReferences(apiBaseUrl: string, query: string, signal?: AbortSignal): Promise<RagContext[]> {
+  const normalizedApiBaseUrl = normalizeLocalApiBaseUrl(apiBaseUrl)
+  try {
+    const response = await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/references`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({ query, top_k: 5 }),
+    })
+    if (!response.ok) return []
+    const data: RagQueryResponse = await response.json()
+    return Array.isArray(data.contexts) ? data.contexts : []
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    return []
+  }
+}
+
+export async function runGatewayRagQuery(
+  apiBaseUrl: string,
+  gatewayApiBaseUrl: string,
+  query: string,
+  userId?: string | null,
+  signal?: AbortSignal,
+): Promise<RagQueryResponse> {
+  const startedAt = Date.now()
+  const contexts = await fetchRagReferences(apiBaseUrl, query, signal)
+  const referenceText = contexts.length
+    ? `\n\n本地记忆参考资料：\n${contexts.map((item, index) => {
+      const title = item.title || item.win_title || item.app_name || item.doc_key || `参考资料 ${index + 1}`
+      const rawText = item.summary || item.overview || item.text || ''
+      const text = rawText.length > 800 ? `${rawText.slice(0, 800)}...` : rawText
+      return `R#${index + 1} ${title}\n${text}`.trim()
+    }).join('\n\n')}`
+    : ''
+  const normalizedGateway = gatewayApiBaseUrl.replace(/\/+$/, '')
+  const response = await fetch(`${normalizedGateway}/v1/gateway/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      request_id: `rag-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      user_id: userId || null,
+      brand_model_id: REMOTE_CREATION_MODEL_ID,
+      caller: 'rag',
+      messages: [
+        {
+          role: 'system',
+          content: '你是 MemoryBread 的咨询助手。请用清晰、结构化的中文回答，不要提及底层供应商或模型实现。',
+        },
+        { role: 'user', content: `${query}${referenceText}` },
+      ],
+      stream: false,
+      privacy: { content_logging: false, client_scrubbed: true },
+      limits: { max_output_tokens: 4096, max_credit: '50.0000' },
+    }),
+  })
+  if (!response.ok) {
+    throw new Error(await readGatewayError(response, `云端咨询失败: ${response.status}`))
+  }
+  const data = await response.json()
+  const answer = String(data.content || data.answer || '').trim()
+  if (!answer) throw new Error('云端咨询没有返回内容，请稍后重试或切换本地模型')
+  const result: RagQueryResponse = {
+    answer,
+    contexts,
+    model: REMOTE_CREATION_MODEL_ID,
+  }
+  const normalizedApiBaseUrl = normalizeLocalApiBaseUrl(apiBaseUrl)
+  await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/history`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query,
+      answer,
+      contexts,
+      latency_ms: Date.now() - startedAt,
+      model: REMOTE_CREATION_MODEL_ID,
+    }),
+  }).catch(() => undefined)
+  return result
 }
 
 export interface ModelStatus {
@@ -235,18 +333,29 @@ export function useFetchCaptures() {
 
 export function useRagQuery() {
   const apiBaseUrl   = useAppStore((s) => normalizeLocalApiBaseUrl(s.apiBaseUrl))
+  const gatewayApiBaseUrl = useAppStore((s) => s.gatewayApiBaseUrl)
   const creationModelConfigs = useAppStore((s) => s.creationModelConfigs)
+  const currentUser = useAppStore((s) => s.currentUser)
+  const cloudBalance = useAppStore((s) => s.cloudBalance)
   const setLoading   = useAppStore((s) => s.setRagLoading)
   const setResult    = useAppStore((s) => s.setRagResult)
   const setError     = useAppStore((s) => s.setRagError)
 
-  return useCallback(async (query: string, topK = 5): Promise<RagQueryResponse> => {
+  return useCallback(async (query: string, topK = 5, extraPayload: Record<string, unknown> = {}, signal?: AbortSignal): Promise<RagQueryResponse> => {
     setLoading(true)
     try {
-      const data = await runRagQueryJob(apiBaseUrl, creationModelConfigs, query, topK)
+      const remoteAllowed = Boolean(currentUser) && Number(cloudBalance?.available ?? 0) > 0
+      const activeModelId = getEffectiveCreationModelId(creationModelConfigs, remoteAllowed)
+      const data = activeModelId === REMOTE_CREATION_MODEL_ID
+        ? await runGatewayRagQuery(apiBaseUrl, gatewayApiBaseUrl, query, currentUser?.id, signal)
+        : await runRagQueryJob(apiBaseUrl, creationModelConfigs, query, topK, extraPayload, remoteAllowed, signal)
       setResult(data.answer, data.contexts ?? [])
       return data
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setLoading(false)
+        throw err
+      }
       const rawMsg = err instanceof Error ? err.message : String(err)
       const msg = rawMsg === 'Load failed'
         ? '咨询请求连接失败，请确认本机服务已启动，并稍后重试'
@@ -254,7 +363,7 @@ export function useRagQuery() {
       setError(msg)
       throw err
     }
-  }, [apiBaseUrl, creationModelConfigs, setLoading, setResult, setError])
+  }, [apiBaseUrl, gatewayApiBaseUrl, creationModelConfigs, currentUser, cloudBalance, setLoading, setResult, setError])
 }
 
 export function useFetchRagHistory() {
@@ -453,6 +562,16 @@ export function useFetchBakeMemories() {
   }, [apiBaseUrl])
 }
 
+export function useFetchBakeMemory() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (id: string): Promise<TimelineItem> => {
+    const resp = await fetch(`${apiBaseUrl}/api/knowledge/${encodeURIComponent(id)}`)
+    if (!resp.ok) throw new Error(`timeline fetch failed: ${resp.status}`)
+    return mapKnowledgeEntryToTimeline(await resp.json())
+  }, [apiBaseUrl])
+}
+
 export function useFetchBakeKnowledge() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
@@ -474,6 +593,16 @@ export function useFetchBakeKnowledge() {
       limit: data.limit ?? params.limit ?? 20,
       offset: data.offset ?? params.offset ?? 0,
     }
+  }, [apiBaseUrl])
+}
+
+export function useFetchBakeKnowledgeDetail() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (id: string): Promise<BakeKnowledgeItem> => {
+    const resp = await fetch(`${apiBaseUrl}/api/bake/knowledge/${encodeURIComponent(id)}`)
+    if (!resp.ok) throw new Error(`bake knowledge detail fetch failed: ${resp.status}`)
+    return mapBakeKnowledge(await resp.json())
   }, [apiBaseUrl])
 }
 
@@ -673,6 +802,16 @@ export function useFetchBakeSops() {
       limit: data.limit ?? params.limit ?? 20,
       offset: data.offset ?? params.offset ?? 0,
     }
+  }, [apiBaseUrl])
+}
+
+export function useFetchBakeSop() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (id: string): Promise<SopCandidate> => {
+    const resp = await fetch(`${apiBaseUrl}/api/bake/sops/${encodeURIComponent(id)}`)
+    if (!resp.ok) throw new Error(`bake sop fetch failed: ${resp.status}`)
+    return mapBakeSop(await resp.json())
   }, [apiBaseUrl])
 }
 

@@ -9,6 +9,9 @@ pub struct CreationHistory {
     pub doc_type: Option<String>,
     pub audience: Option<String>,
     pub reference_count: i64,
+    #[serde(default)]
+    pub references_json: Option<String>,
+    pub model: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -20,17 +23,19 @@ pub fn insert(
     doc_type: Option<&str>,
     audience: Option<&str>,
     ref_count: i64,
+    references_json: Option<&str>,
+    model: Option<&str>,
 ) -> Result<i64> {
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
-        "INSERT INTO creation_history (prompt, generated_content, doc_type, audience, reference_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        params![prompt, content, doc_type, audience, ref_count, now, now],
+        "INSERT INTO creation_history (prompt, generated_content, doc_type, audience, reference_count, references_json, model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![prompt, content, doc_type, audience, ref_count, references_json, model, now, now],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
 pub fn list_recent(conn: &Connection, limit: i64) -> Result<Vec<CreationHistory>> {
-    let mut stmt = conn.prepare("SELECT id, prompt, generated_content, doc_type, audience, reference_count, created_at, updated_at FROM creation_history ORDER BY created_at DESC LIMIT ?")?;
+    let mut stmt = conn.prepare("SELECT id, prompt, generated_content, doc_type, audience, reference_count, references_json, model, created_at, updated_at FROM creation_history ORDER BY created_at DESC LIMIT ?")?;
     let rows = stmt.query_map(params![limit], |row| {
         Ok(CreationHistory {
             id: row.get(0)?,
@@ -39,8 +44,10 @@ pub fn list_recent(conn: &Connection, limit: i64) -> Result<Vec<CreationHistory>
             doc_type: row.get(3)?,
             audience: row.get(4)?,
             reference_count: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+            references_json: row.get(6)?,
+            model: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     })?;
     rows.collect()

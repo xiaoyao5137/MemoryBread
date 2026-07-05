@@ -140,6 +140,17 @@ pub async fn delete_bake_sop(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn get_bake_sop(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<BakeSopPayload>, ApiError> {
+    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
+    let sop = tokio::task::spawn_blocking(move || service.get_sop(id))
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    Ok(Json(sop))
+}
+
 pub async fn list_bake_documents(
     State(state): State<Arc<AppState>>,
     Query(params): Query<BakePaginationQuery>,
@@ -291,6 +302,17 @@ pub async fn delete_bake_knowledge(
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))??;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn get_bake_knowledge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<BakeKnowledgePayload>, ApiError> {
+    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
+    let knowledge = tokio::task::spawn_blocking(move || service.get_knowledge(id))
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    Ok(Json(knowledge))
 }
 
 pub async fn list_bake_captures(

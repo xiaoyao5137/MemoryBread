@@ -1,8 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Copy, ExternalLink, FileText, Image, Loader2, Search, Sparkles } from 'lucide-react'
+import { Copy, ExternalLink, FileText, Image, Loader2, Paperclip, Search, Sparkles, Square, X } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import type { CreationReferenceItem, CreationReferencePreview } from '../store/useAppStore'
+import { fetchBillingBalance } from '../utils/authApi'
+import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
+import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
+import ModelSelect from './ModelSelect'
 
 interface CreationPanelProps {
   className?: string
@@ -29,6 +33,8 @@ const readApiErrorMessage = async (response: Response, fallback: string) => {
       if (typeof data === 'string') return data
       if (data?.detail) return typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)
       if (data?.message) return data.message
+      if (data?.error?.message) return data.error.message
+      if (data?.error?.code) return data.error.code
       if (data?.error) return typeof data.error === 'string' ? data.error : JSON.stringify(data.error)
     } catch {
       return text
@@ -42,11 +48,22 @@ const readApiErrorMessage = async (response: Response, fallback: string) => {
 
 const mapCreationHistory = (histories: any[]) => histories.map((h: any) => {
   const fullContent = sanitizeGeneratedContent(h.generated_content)
+  let references: CreationReferenceItem[] = []
+  try {
+    const parsed = typeof h.references_json === 'string' ? JSON.parse(h.references_json || '[]') : h.references_json
+    references = Array.isArray(parsed) ? parsed : []
+  } catch {
+    references = []
+  }
   return {
     prompt: h.prompt,
     timestamp: new Date(h.created_at).toLocaleString('zh-CN'),
     preview: fullContent.slice(0, 100) + (fullContent.length > 100 ? '...' : ''),
-    fullContent
+    fullContent,
+    docType: h.doc_type || '',
+    audience: h.audience || '',
+    references,
+    model: h.model || null,
   }
 })
 
@@ -125,15 +142,25 @@ const parseMarkdownBlocks = (content: string): MarkdownBlock[] => {
 
 const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+  const adminApiBaseUrl = useAppStore((s) => s.adminApiBaseUrl)
+  const gatewayApiBaseUrl = useAppStore((s) => s.gatewayApiBaseUrl)
+  const authToken = useAppStore((s) => s.authToken)
+  const currentUser = useAppStore((s) => s.currentUser)
+  const cloudBalance = useAppStore((s) => s.cloudBalance)
+  const setCloudBalance = useAppStore((s) => s.setCloudBalance)
+  const localDebugModeEnabled = useAppStore((s) => s.localDebugModeEnabled)
   const draft = useAppStore((s) => s.creationDraft)
   const setCreationDraft = useAppStore((s) => s.setCreationDraft)
   const setWindowMode = useAppStore((s) => s.setWindowMode)
   const setBakeTab = useAppStore((s) => s.setBakeTab)
   const setSelectedTemplateId = useAppStore((s) => s.setSelectedTemplateId)
+  const setBakeTemplateFocusId = useAppStore((s) => s.setBakeTemplateFocusId)
   const setBakeTemplateOffset = useAppStore((s) => s.setBakeTemplateOffset)
   const setBakeTemplateQuery = useAppStore((s) => s.setBakeTemplateQuery)
   const setBakeTemplateLimit = useAppStore((s) => s.setBakeTemplateLimit)
   const pushBakeNavigationTarget = useAppStore((s) => s.pushBakeNavigationTarget)
+  const creationModelConfigs = useAppStore((s) => s.creationModelConfigs)
+  const setCreationModelConfig = useAppStore((s) => s.setCreationModelConfig)
 
   const {
     prompt,
@@ -184,9 +211,13 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const [activeBottomTab, setActiveBottomTab] = useState<'reference' | 'config' | null>(null)
   const toggleBottomTab = (tab: 'reference' | 'config') =>
     setActiveBottomTab(prev => prev === tab ? null : tab)
-  const [creationHistory, setCreationHistory] = useState<Array<{ prompt: string; timestamp: string; preview: string; fullContent: string }>>([])
+  const [creationHistory, setCreationHistory] = useState<Array<{ prompt: string; timestamp: string; preview: string; fullContent: string; docType: string; audience: string; references: CreationReferenceItem[]; model?: string | null }>>([])
+  const [attachments, setAttachments] = useState<UserAttachment[]>([])
+  const [attachmentError, setAttachmentError] = useState<string | null>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const startTimer = () => {
     setElapsedSeconds(0)
@@ -211,6 +242,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     setBakeTemplateQuery('')
     setBakeTemplateOffset(0)
     setBakeTemplateLimit(100)
+    setBakeTemplateFocusId(templateId)
     setBakeTab('templates')
     setSelectedTemplateId(templateId)
     setWindowMode('bake')
@@ -219,25 +251,61 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const handleRestoreHistory = (item: typeof creationHistory[0]) => {
     setPrompt(item.prompt)
     setGeneratedContent(item.fullContent)
-    setReferencePreview(null)
+    setReferencePreview({
+      requirement: {
+        topic: item.prompt,
+        doc_type: item.docType || docType,
+        audience: item.audience || audience,
+        style: '',
+        keywords: [],
+      },
+      references: item.references || [],
+    })
     if (contentRef.current) {
       setTimeout(() => contentRef.current?.scrollTo({ top: 0, behavior: 'smooth' }), 100)
     }
   }
 
-  const creationModelConfigs = useAppStore((s) => s.creationModelConfigs)
+  const remoteModelAllowed = canUseRemoteCreationModel(currentUser, cloudBalance)
+  const activeCreationModelId = getEffectiveCreationModelId(creationModelConfigs, remoteModelAllowed)
+  const useGatewayCreation = activeCreationModelId === REMOTE_CREATION_MODEL_ID
+  const promptWithAttachments = () => {
+    const attachmentPrompt = buildAttachmentPrompt(attachments)
+    return attachmentPrompt ? `${prompt.trim()}\n\n${attachmentPrompt}` : prompt
+  }
+
+  const handleSelectModel = (modelId: string) => {
+    if (modelId === REMOTE_CREATION_MODEL_ID && !remoteModelAllowed) return
+    setCreationModelConfig(modelId, { enabled: true })
+  }
+
+  useEffect(() => {
+    if (!authToken || !currentUser) {
+      setCloudBalance(null)
+      return
+    }
+    let cancelled = false
+    fetchBillingBalance(adminApiBaseUrl, authToken)
+      .then(balance => {
+        if (!cancelled) setCloudBalance(balance)
+      })
+      .catch(() => {
+        if (!cancelled) setCloudBalance(null)
+      })
+    return () => { cancelled = true }
+  }, [adminApiBaseUrl, authToken, currentUser, setCloudBalance])
+
+  useEffect(() => {
+    const active = creationModelConfigs.find(config => config.enabled)?.id
+    if (active === REMOTE_CREATION_MODEL_ID && !remoteModelAllowed) {
+      setCreationModelConfig(LOCAL_CREATION_MODEL_ID, { enabled: true })
+    }
+  }, [creationModelConfigs, remoteModelAllowed, setCreationModelConfig])
 
   const buildPayload = () => {
-    const LOCAL_MODEL_ID = 'mbcd-std-v1'
-    const MODEL_NAMES: Record<string, string> = {
-      'mbcd-plus-v1': 'claude-opus-4-8',
-      'mbcd-std-v1': 'qwen3.5:4b',
-      'claude-opus-4-8': 'claude-opus-4-8',
-      'qwen-3-5-4b': 'qwen3.5:4b',
-    }
-    const activeModel = creationModelConfigs.find(c => c.enabled && (c.id === LOCAL_MODEL_ID || c.apiKey))
+    const activeModel = creationModelConfigs.find(c => c.id === LOCAL_CREATION_MODEL_ID)
     return {
-      user_prompt: prompt,
+      user_prompt: promptWithAttachments(),
       design_templates: [],
       design_ids: [],
       timeline_ids: [],
@@ -256,19 +324,132 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       format_weight: formatWeight / 100,
       freshness_weight: freshnessWeight / 100,
       max_references: 6,
-      ...(activeModel ? {
-        creation_model: MODEL_NAMES[activeModel.id] || activeModel.id,
-        ...(activeModel.id !== LOCAL_MODEL_ID && activeModel.apiKey ? { creation_api_key: activeModel.apiKey } : {}),
+      attachments: buildAttachmentMetadata(attachments),
+      ...(activeCreationModelId === LOCAL_CREATION_MODEL_ID && activeModel ? {
+        creation_model: 'qwen3.5:4b',
         creation_base_url: activeModel.baseUrl || undefined,
       } : {}),
     }
   }
 
-  const postReferencePreview = async () => {
+  const buildGatewayMessages = (references: CreationReferenceItem[]) => {
+    const systemPrompt = [
+      '你是 MemoryBread 的咨询创作助手。',
+      '请用专业、结构化的中文输出 Markdown 文档。',
+      '不要提及底层供应商或模型实现。',
+    ].join('\n')
+    const referenceText = references.length
+      ? `\n\n本地记忆参考资料：\n${references.map((item, index) => {
+        const rawText = item.summary || item.reason || ''
+        const text = rawText.length > 900 ? `${rawText.slice(0, 900)}...` : rawText
+        return `R#${index + 1} ${item.title || `参考资料 ${index + 1}`}\n类型：${item.doc_type || '未分类'}\n${text}`.trim()
+      }).join('\n\n')}`
+      : ''
+    const options = [
+      `文档类型：${docType || '建设方案'}`,
+      `目标读者：${audience || '客户'}`,
+      `继承历史格式：${inheritFormat ? '是' : '否'}`,
+      `启用 RAG 参考：${enableRag ? '是' : '否'}，参考数量：${references.length}`,
+      `权重：内容 ${contentWeight}%，质量 ${qualityWeight}%，完整性 ${completenessWeight}%，热度 ${usageWeight}%，格式 ${formatWeight}%，时效 ${freshnessWeight}%`,
+    ].join('\n')
+    return [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: `${options}\n\n创作需求：\n${promptWithAttachments()}${referenceText}` },
+    ]
+  }
+
+  const postGatewayCreation = async (references: CreationReferenceItem[], signal?: AbortSignal) => {
+    const response = await fetch(`${gatewayApiBaseUrl.replace(/\/+$/, '')}/v1/gateway/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({
+        request_id: `creation-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        user_id: currentUser?.id || null,
+        brand_model_id: 'mbcd-plus-v1',
+        caller: 'creation',
+        messages: buildGatewayMessages(references),
+        stream: false,
+        privacy: { content_logging: false, client_scrubbed: true },
+        limits: { max_output_tokens: 8192, max_credit: '100.0000' },
+      }),
+    })
+    if (!response.ok) {
+      throw new Error(await readApiErrorMessage(response, `生成失败: ${response.status}`))
+    }
+    return response.json()
+  }
+
+  const postLocalCreation = async (signal?: AbortSignal) => {
+    const response = await fetch(`${apiBaseUrl}/api/creation/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify(buildPayload()),
+    })
+
+    if (!response.ok) {
+      const message = await readApiErrorMessage(response, `生成失败: ${response.status}`)
+      throw new Error(message.startsWith('生成失败') ? message : `生成失败: ${message}`)
+    }
+
+    const reader = response.body?.getReader()
+    const decoder = new TextDecoder()
+    if (!reader) throw new Error('无法读取响应流')
+
+    let buffer = ''
+    let finalContent = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        const jsonStr = line.slice(6)
+        let event: any
+        try {
+          event = JSON.parse(jsonStr)
+        } catch {
+          finalContent += jsonStr
+          setGeneratedContent(prev => prev + jsonStr)
+          continue
+        }
+
+        if (typeof event === 'string') {
+          finalContent += event
+          setGeneratedContent(prev => prev + event)
+          continue
+        }
+        if (event?.error) {
+          throw new Error(`生成失败: ${event.error}`)
+        }
+        if (event?.done) {
+          continue
+        }
+        const content = typeof event?.content === 'string' ? event.content : ''
+        if (content) {
+          finalContent += content
+          setGeneratedContent(prev => prev + content)
+        }
+      }
+    }
+
+    if (!finalContent.trim()) {
+      throw new Error('生成结束但没有返回内容，请检查本地 Ollama 是否运行、当前创作模型是否已安装')
+    }
+    return finalContent
+  }
+
+  const postReferencePreview = async (signal?: AbortSignal) => {
     const payload = buildPayload()
     const response = await fetch(`${apiBaseUrl}/api/creation/references`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal,
       body: JSON.stringify(payload),
     })
 
@@ -278,8 +459,19 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     return fetch('http://127.0.0.1:8001/creation/references', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal,
       body: JSON.stringify(payload),
     })
+  }
+
+  const addFiles = async (files: Iterable<File>) => {
+    setAttachmentError(null)
+    try {
+      const next = await filesToAttachments(files, attachments.length)
+      setAttachments(prev => [...prev, ...next])
+    } catch (err) {
+      setAttachmentError(err instanceof Error ? err.message : '附件读取失败')
+    }
   }
 
   const handlePreviewReferences = async () => {
@@ -306,94 +498,61 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     setIsGenerating(true)
     setError(null)
     setGeneratedContent('')
+    const controller = new AbortController()
+    abortRef.current = controller
     startTimer()
 
     try {
       let refCount = 0
+      let referencesForHistory: CreationReferenceItem[] = []
+      let finalSaveContent = ''
       if (enableRag) {
         try {
-          const refResponse = await postReferencePreview()
+          const refResponse = await postReferencePreview(controller.signal)
           if (refResponse.ok) {
             const refData = await refResponse.json()
             setReferencePreview(refData)
-            refCount = refData?.references?.length || 0
+            referencesForHistory = Array.isArray(refData?.references) ? refData.references : []
+            refCount = referencesForHistory.length
           }
         } catch (refErr) {
           console.warn('参考资料同步加载失败,继续生成:', refErr)
         }
       }
 
-      const response = await fetch(`${apiBaseUrl}/api/creation/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildPayload()),
-      })
-
-      if (!response.ok) {
-        const message = await readApiErrorMessage(response, `生成失败: ${response.status}`)
-        throw new Error(message.startsWith('生成失败') ? message : `生成失败: ${message}`)
-      }
-
-      const reader = response.body?.getReader()
-      const decoder = new TextDecoder()
-      if (!reader) throw new Error('无法读取响应流')
-
-      let buffer = ''
-      let finalContent = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          const jsonStr = line.slice(6)
-          let event: any
-          try {
-            event = JSON.parse(jsonStr)
-          } catch {
-            finalContent += jsonStr
-            setGeneratedContent(prev => prev + jsonStr)
-            continue
-          }
-
-          if (typeof event === 'string') {
-            finalContent += event
-            setGeneratedContent(prev => prev + event)
-            continue
-          }
-          if (event?.error) {
-            throw new Error(`生成失败: ${event.error}`)
-          }
-          if (event?.done) {
-            continue
-          }
-          const content = typeof event?.content === 'string' ? event.content : ''
-          if (content) {
-            finalContent += content
-            setGeneratedContent(prev => prev + content)
-          }
+      if (useGatewayCreation && currentUser?.id) {
+        if (!localDebugModeEnabled) {
+          console.info('MBCD Plus v1.0 将通过 gateway 调用')
         }
+        try {
+          const data = await postGatewayCreation(referencesForHistory, controller.signal)
+          const content = sanitizeGeneratedContent(data.content || '')
+          if (!content.trim()) throw new Error('生成结束但没有返回内容，请稍后重试或切换为本地创作模型')
+          setGeneratedContent(content)
+          finalSaveContent = content
+        } catch (gatewayErr) {
+          console.warn('云端创作不可用，自动回落本地创作:', gatewayErr)
+          const content = await postLocalCreation(controller.signal)
+          finalSaveContent = content
+        }
+      } else {
+        const content = await postLocalCreation(controller.signal)
+        finalSaveContent = content
       }
 
-      if (!finalContent.trim()) {
-        throw new Error('生成结束但没有返回内容，请检查本地 Ollama 是否运行、当前创作模型是否已安装')
-      }
-
-      if (finalContent) {
+      if (finalSaveContent) {
         try {
           await fetch(`${apiBaseUrl}/api/creation/history`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               prompt: prompt.trim(),
-              generated_content: sanitizeGeneratedContent(finalContent),
+              generated_content: sanitizeGeneratedContent(finalSaveContent),
               doc_type: docType || null,
               audience: audience || null,
               reference_count: refCount,
+              references: referencesForHistory,
+              model: activeCreationModelId,
             }),
           })
           const historyResponse = await fetch(`${apiBaseUrl}/api/creation/history`)
@@ -406,11 +565,23 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         }
       }
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setError('已中止本次创作')
+        return
+      }
       setError(err instanceof Error ? err.message : '生成失败')
     } finally {
+      if (abortRef.current === controller) abortRef.current = null
       setIsGenerating(false)
       stopTimer()
     }
+  }
+
+  const handleStopGenerate = () => {
+    abortRef.current?.abort()
+    setIsGenerating(false)
+    stopTimer()
+    setError('已中止本次创作')
   }
 
   useEffect(() => {
@@ -422,11 +593,15 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
           prompt: prompt.trim(),
           timestamp: new Date().toLocaleString('zh-CN'),
           preview,
-          fullContent: generatedContent
+          fullContent: generatedContent,
+          docType: docType || '',
+          audience: audience || '',
+          references: referencePreview?.references || [],
+          model: activeCreationModelId,
         }, ...prev].slice(0, 10)
       })
     }
-  }, [isGenerating, generatedContent, prompt])
+  }, [isGenerating, generatedContent, prompt, activeCreationModelId, docType, audience, referencePreview])
 
   useEffect(() => {
     const loadHistory = async () => {
@@ -555,7 +730,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                   onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e1e5ea' }}
                 >
                   <div style={{ fontSize: 13, fontWeight: 600, color: '#1f2937', marginBottom: 6 }}>{item.prompt}</div>
-                  <div style={{ fontSize: 11, color: '#667085', marginBottom: 6 }}>{item.timestamp}</div>
+                  <div style={{ fontSize: 11, color: '#667085', marginBottom: 6 }}>{item.timestamp} · {getModelDisplayName(item.model)}</div>
                   <div style={{ fontSize: 12, color: '#475467', lineHeight: 1.5 }}>{item.preview}</div>
                 </div>
               ))}
@@ -570,18 +745,74 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             <textarea
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
+              onPaste={(event) => {
+                const files = Array.from(event.clipboardData.files || [])
+                if (files.length) void addFiles(files)
+              }}
               placeholder={defaultPrompt}
               style={{ ...inputStyle, minHeight: 118, resize: 'vertical', lineHeight: 1.6 }}
               disabled={isGenerating}
             />
+            {attachments.length > 0 && (
+              <div style={{ marginTop: 10, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {attachments.map(item => (
+                  <span key={item.id} style={attachmentPillStyle}>
+                    <Paperclip size={13} />
+                    <span style={{ maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</span>
+                    <small style={{ color: '#667085' }}>{formatAttachmentSize(item.size)}</small>
+                    <button
+                      type="button"
+                      onClick={() => setAttachments(prev => prev.filter(existing => existing.id !== item.id))}
+                      disabled={isGenerating}
+                      style={attachmentRemoveStyle}
+                      aria-label={`移除 ${item.name}`}
+                    >
+                      <X size={13} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+            {attachmentError && <div style={{ marginTop: 8, color: '#b42318', fontSize: 12 }}>{attachmentError}</div>}
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept="image/*,.pdf,.txt,.md,.doc,.docx"
+              style={{ display: 'none' }}
+              onChange={(event) => {
+                if (event.target.files) void addFiles(event.target.files)
+                event.currentTarget.value = ''
+              }}
+            />
             <div style={{ marginTop: 14, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', flex: '1 1 320px' }}>
+                <ModelSelect
+                  label="模型"
+                  value={activeCreationModelId}
+                  options={CREATION_MODEL_DEFS}
+                  disabled={isGenerating}
+                  remoteAllowed={remoteModelAllowed}
+                  onChange={handleSelectModel}
+                  title="选择创作生成模型"
+                />
+                {cloudBalance && (
+                  <span style={{ color: '#667085', fontSize: 12 }}>
+                    Credit {cloudBalance.available}
+                  </span>
+                )}
+              </div>
               <button onClick={handlePreviewReferences} disabled={!prompt.trim() || isPreviewing || isGenerating} style={secondaryButtonStyle}>
                 {isPreviewing ? <Loader2 size={16} className="spin" /> : <FileText size={16} />}
                 预览参考
               </button>
-              <button onClick={handleGenerate} disabled={!prompt.trim() || isGenerating} style={primaryButtonStyle}>
+              <button onClick={() => fileInputRef.current?.click()} disabled={isGenerating} style={secondaryButtonStyle}>
+                <Paperclip size={16} />
+                附件
+              </button>
+              <button onClick={isGenerating ? handleStopGenerate : handleGenerate} disabled={!isGenerating && !prompt.trim()} style={isGenerating ? dangerButtonStyle : primaryButtonStyle}>
                 {isGenerating ? <Loader2 size={16} className="spin" /> : <Sparkles size={16} />}
-                {isGenerating ? '生成中' : '开始创作'}
+                {isGenerating ? '中止' : '开始创作'}
               </button>
             </div>
             {isGenerating && (
@@ -602,6 +833,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                     <span style={{ fontSize: 12, color: '#0f766e', fontWeight: 650 }}>
                       {generationProgress}% · {elapsedSeconds} 秒
                     </span>
+                  )}
+                  {isGenerating && (
+                    <button onClick={handleStopGenerate} style={compactDangerButtonStyle}>
+                      <Square size={14} />
+                      中止
+                    </button>
                   )}
                   <button onClick={handleCopy} disabled={!generatedContent} style={compactButtonStyle}>
                     <Copy size={15} />
@@ -871,11 +1108,50 @@ const secondaryButtonStyle: React.CSSProperties = {
   border: '1px solid #d0d5dd',
 }
 
+const dangerButtonStyle: React.CSSProperties = {
+  ...primaryButtonStyle,
+  background: '#b42318',
+  border: '1px solid #b42318',
+}
+
 const compactButtonStyle: React.CSSProperties = {
   ...secondaryButtonStyle,
   height: 32,
   padding: '0 10px',
   fontSize: 13,
+}
+
+const compactDangerButtonStyle: React.CSSProperties = {
+  ...dangerButtonStyle,
+  height: 32,
+  padding: '0 10px',
+  fontSize: 13,
+}
+
+const attachmentPillStyle: React.CSSProperties = {
+  minHeight: 30,
+  padding: '0 8px',
+  border: '1px solid #d0d5dd',
+  borderRadius: 999,
+  background: '#fff',
+  color: '#344054',
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 6,
+  fontSize: 12,
+}
+
+const attachmentRemoveStyle: React.CSSProperties = {
+  width: 20,
+  height: 20,
+  border: 0,
+  borderRadius: 999,
+  background: '#f2f4f7',
+  color: '#475467',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  cursor: 'pointer',
 }
 
 export default CreationPanel

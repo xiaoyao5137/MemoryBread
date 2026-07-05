@@ -45,6 +45,7 @@ const BakeSopTab: React.FC<{
   onSearch: () => void
   onClearFilters: () => void
   onCreateSop?: (sop: Partial<SopCandidate>) => void
+  focusId?: string | null
 }> = ({
   candidates,
   total,
@@ -69,11 +70,12 @@ const BakeSopTab: React.FC<{
   onSearch,
   onClearFilters,
   onCreateSop,
+  focusId,
 }) => {
   const selected = candidates.find(item => item.id === selectedSopId) ?? candidates[0]
   const [pageInput, setPageInput] = useState('')
   const [showCreateDialog, setShowCreateDialog] = useState(false)
-  const hasActiveFilters = Boolean(query.trim() || from || to)
+  const hasActiveFilters = Boolean(query.trim() || from || to || focusId)
   const [newSop, setNewSop] = useState<{
     extractedProblem: string
     detailedContent: string
@@ -185,7 +187,7 @@ const BakeSopTab: React.FC<{
                   onChange={(event) => onDraftToChange(event.target.value)}
                 />
               </label>
-              {(draftQuery || query || draftFrom || from || draftTo || to) && (
+              {(draftQuery || query || draftFrom || from || draftTo || to || focusId) && (
                 <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--secondary">
                   <BakeButton compact type="button" onClick={onClearFilters}>清除筛选</BakeButton>
                 </div>
@@ -193,6 +195,12 @@ const BakeSopTab: React.FC<{
             </div>
           </div>
         </form>
+        {focusId && (
+          <div className="bake-filter-summary">
+            <BakePill text={`仅看操作 #${focusId}`} />
+            <BakeButton compact onClick={onClearFilters}>查看全部</BakeButton>
+          </div>
+        )}
       </BakeCard>
       <div className="bake-split-list-detail bake-split-list-detail--sop">
         <BakeCard className="bake-knowledge-list-card">

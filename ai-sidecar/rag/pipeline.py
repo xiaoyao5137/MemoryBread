@@ -39,6 +39,10 @@ def _extract_core_retrieval_query(user_query: str) -> str:
     text = (user_query or "").strip()
     for line in text.splitlines():
         line = line.strip()
+        if line.startswith("检索问题：") or line.startswith("检索问题:"):
+            return line.split(":", 1)[1].strip() if ":" in line else line.split("：", 1)[1].strip()
+    for line in text.splitlines():
+        line = line.strip()
         if line.startswith("核心问题：") or line.startswith("核心问题:"):
             return line.split(":", 1)[1].strip() if ":" in line else line.split("：", 1)[1].strip()
     return text
@@ -225,7 +229,7 @@ class RagPipeline:
             "- 无法判断时，按正常流程处理"
         )
 
-    def query(self, user_query: str, top_k: int | None = None, llm=None) -> RagResult:
+    def query(self, user_query: str, top_k: int | None = None, llm=None, references_only: bool = False) -> RagResult:
         """执行完整 RAG 查询，返回 LLM 答案及引用的上下文片段。"""
         effective_top_k = top_k or self._top_k
         intent = self._parse_query_intent(user_query)
@@ -258,9 +262,13 @@ class RagPipeline:
 
         _is_report_task = intent.task_type in ("weekly_report", "daily_report", "project_weekly_report")
         logger.info(f"任务类型: {intent.task_type}, 是否报告任务: {_is_report_task}, start_ts: {intent.start_ts}, end_ts: {intent.end_ts}")
+        knowledge_top_k = effective_top_k * 2
+        if intent.query_mode == "lookup" and not intent.task_type:
+            knowledge_top_k = max(effective_top_k * 6, 24)
+
         knowledge_results = self._knowledge.search(
             retrieval_query if not intent.task_type else "",
-            top_k=effective_top_k * 2,
+            top_k=knowledge_top_k,
             # 周报/日报：start_ts/end_ts 过滤 k.start_time/k.end_time（事件时间），与 created_at 时间段无关，置 None
             start_ts=None if _is_report_task else intent.start_ts,
             end_ts=None if _is_report_task else intent.end_ts,
@@ -351,7 +359,20 @@ class RagPipeline:
             top_k=max(effective_top_k * 2, 6),
             min_score=min_rrf_score,
         )
+        if intent.query_mode == "lookup" and knowledge_results:
+            merged = _append_missing_artifact_candidates(
+                merged,
+                knowledge_results,
+                limit=max(effective_top_k * 3, 12),
+            )
         selected_contexts = self._select_contexts(merged, effective_top_k, query_mode=intent.query_mode)
+
+        if references_only:
+            return RagResult(
+                answer="",
+                contexts=selected_contexts,
+                model="references-only",
+            )
 
         is_report = intent.task_type in ("weekly_report", "daily_report", "project_summary", "project_weekly_report")
         # 报告模式：提前读取身份，用于上下文主语去除
@@ -830,10 +851,11 @@ class RagPipeline:
             key=lambda chunk: (
                 # 报告模式：importance 低的排后面（importance 为 None 按 3 处理）
                 -(chunk.metadata.get("importance") or 3) if is_report_mode else 0,
+                -_retrieval_sort_score(chunk) if not is_report_mode else 0,
                 _source_priority(chunk.metadata.get("source_type") or chunk.source) if not is_report_mode else 0,
                 0 if is_report_mode and chunk.metadata.get("activity_type") not in {"other", None} else 1,
                 0 if is_report_mode and chunk.metadata.get("evidence_strength") in {"high", "medium"} else 1,
-                -float(chunk.score),
+                -float(chunk.score) if is_report_mode else 0,
             ),
         )
 
@@ -1170,6 +1192,48 @@ def _source_ids_of(chunk: RetrievedChunk) -> set[str]:
         elif isinstance(value, str) and value.strip():
             ids.update(re.findall(r"\d+", value))
     return ids
+
+
+def _retrieval_sort_score(chunk: RetrievedChunk) -> float:
+    metadata = chunk.metadata or {}
+    score = metadata.get("retrieval_score")
+    try:
+        return float(score)
+    except (TypeError, ValueError):
+        return float(chunk.score or 0)
+
+
+def _append_missing_artifact_candidates(
+    merged: list[RetrievedChunk],
+    candidates: list[RetrievedChunk],
+    limit: int,
+) -> list[RetrievedChunk]:
+    """Keep high-confidence bake artifacts visible after RRF truncation.
+
+    Keyword artifact search already ranks documents/knowledge/SOPs by title and body matches.
+    When vector results dominate the RRF top slice, a directly matched document can be dropped
+    before _select_contexts has a chance to apply source priority.
+    """
+    if len(merged) >= limit:
+        return merged
+
+    seen = {chunk.doc_key or (chunk.metadata or {}).get("doc_key") for chunk in merged}
+    appended: list[RetrievedChunk] = []
+    for chunk in candidates:
+        source_type = (chunk.metadata or {}).get("source_type") or chunk.source
+        if source_type not in {"document", "bake_knowledge", "operation"}:
+            continue
+        if float(chunk.score or 0) < 5.0:
+            continue
+        doc_key = chunk.doc_key or (chunk.metadata or {}).get("doc_key")
+        if not doc_key or doc_key in seen:
+            continue
+        appended.append(chunk)
+        seen.add(doc_key)
+        if len(merged) + len(appended) >= limit:
+            break
+
+    return [*merged, *appended]
 
 
 def _source_priority(source_type: str | None) -> int:

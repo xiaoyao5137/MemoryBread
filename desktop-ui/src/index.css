@@ -222,6 +222,7 @@ body {
   margin: 12px 16px 0;
   padding: 16px;
   display: flex;
+  flex-direction: column;
   gap: 12px;
   background: #fff;
   border-radius: 14px;
@@ -252,7 +253,21 @@ body {
   color: #a0aec0;
 }
 
+.rag-panel__input-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.rag-panel__credit-balance {
+  color: #667085;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .rag-panel__submit {
+  margin-left: auto;
   padding: 12px 28px;
   background: linear-gradient(135deg, #D4860B 0%, #B86F0A 100%);
   color: white;
@@ -278,6 +293,72 @@ body {
 .rag-panel__submit:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.rag-panel__attach-btn {
+  align-self: flex-end;
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid #d7c5af;
+  border-radius: 8px;
+  background: #fffaf4;
+  color: #6f4a2d;
+  font-size: 14px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.rag-panel__attach-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.rag-panel__attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.rag-panel__attachment {
+  max-width: 100%;
+  min-height: 30px;
+  padding: 0 7px 0 10px;
+  border: 1px solid #ead7c1;
+  border-radius: 999px;
+  background: #fffaf4;
+  color: #5f3b22;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.rag-panel__attachment span {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rag-panel__attachment small {
+  color: #9a7a5d;
+  font-size: 11px;
+}
+
+.rag-panel__attachment button {
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(111, 74, 45, 0.1);
+  color: #6f4a2d;
+  cursor: pointer;
+}
+
+.rag-panel__attachment-error {
+  color: #b42318;
+  font-size: 12px;
 }
 
 .rag-panel__error {

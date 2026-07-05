@@ -20,6 +20,7 @@
         "resizable": true,
         "fullscreen": false,
         "decorations": true,
+        "acceptFirstMouse": true,
         "transparent": false,
         "alwaysOnTop": false,
         "skipTaskbar": false

@@ -362,6 +362,47 @@
   gap: 6px;
 }
 
+.auth-panel__avatar-row {
+  padding: 14px;
+  border: 1px solid rgba(154, 106, 49, 0.16);
+  border-radius: 16px;
+  background: #fffefa;
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.auth-panel__avatar {
+  width: 54px;
+  height: 54px;
+  border-radius: 18px;
+  background: linear-gradient(180deg, #d58a3b, #9f4522);
+  color: #fffaf4;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  font-weight: 850;
+}
+
+.auth-panel__avatar-row div {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.auth-panel__avatar-row strong {
+  color: #241b14;
+  overflow-wrap: anywhere;
+}
+
+.auth-panel__avatar-row span:not(.auth-panel__avatar) {
+  color: #74665a;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .auth-panel__profile span,
 .auth-panel__profile-grid span {
   color: #74665a;
@@ -396,6 +437,93 @@
 .auth-panel__profile-grid strong {
   color: #813f22;
   font-size: 14px;
+}
+
+.auth-panel__wallet {
+  padding: 15px;
+  border: 1px solid rgba(154, 106, 49, 0.16);
+  border-radius: 16px;
+  background: rgba(255, 250, 243, 0.82);
+  display: grid;
+  gap: 12px;
+}
+
+.auth-panel__wallet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.auth-panel__wallet-head span,
+.auth-panel__wallet-head button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.auth-panel__wallet-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.auth-panel__wallet-head span {
+  color: #2f2017;
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.auth-panel__wallet-head button {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid rgba(154, 106, 49, 0.18);
+  border-radius: 10px;
+  background: #fffefa;
+  color: #813f22;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.auth-panel__wallet-head button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.auth-panel__wallet-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.auth-panel__wallet-grid div {
+  min-width: 0;
+  padding: 11px;
+  border-radius: 12px;
+  background: #fffefa;
+  display: grid;
+  gap: 5px;
+}
+
+.auth-panel__wallet-grid span {
+  color: #74665a;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.auth-panel__wallet-grid strong {
+  color: #813f22;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.auth-panel__wallet-error {
+  color: #b42318;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .auth-panel__submit {

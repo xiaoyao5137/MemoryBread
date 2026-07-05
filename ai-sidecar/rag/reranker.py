@@ -66,6 +66,8 @@ def reciprocal_rank_fusion(
             metadata={
                 **best_chunk[doc_key].metadata,
                 "doc_key": doc_key,
+                "retrieval_score": best_chunk[doc_key].score,
+                "rrf_score": rrf_scores[doc_key],
                 "source_type": best_chunk[doc_key].metadata.get("source_type", best_chunk[doc_key].source),
             },
         )

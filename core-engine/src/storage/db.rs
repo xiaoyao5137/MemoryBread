@@ -156,6 +156,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "036_seed_capture_retention_days",
         include_str!("migrations/036_seed_capture_retention_days.sql"),
     ),
+    (
+        "037_add_model_to_history",
+        include_str!("migrations/037_add_model_to_history.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,6 +291,30 @@ impl StorageManager {
 
             if *version == "031_ensure_full_schema" {
                 self.run_ensure_full_schema(&conn)?;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    rusqlite::params![version],
+                    |row| row.get(0),
+                )?;
+                if count == 0 {
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        rusqlite::params![version, current_ts_ms()],
+                    )?;
+                }
+                info!("迁移 {} 执行成功", version);
+                continue;
+            }
+
+            if *version == "037_add_model_to_history" {
+                Self::add_column_if_missing(&conn, "creation_history", "model", "TEXT")?;
+                Self::add_column_if_missing(
+                    &conn,
+                    "creation_history",
+                    "references_json",
+                    "TEXT",
+                )?;
+                Self::add_column_if_missing(&conn, "rag_sessions", "model", "TEXT")?;
                 let count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
                     rusqlite::params![version],

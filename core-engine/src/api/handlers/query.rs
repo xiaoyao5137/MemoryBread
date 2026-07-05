@@ -6,6 +6,7 @@ use crate::api::{
     error::ApiError,
     state::{AppState, RagJobRecord},
 };
+use crate::storage::models::NewRagSession;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -215,13 +216,18 @@ fn enrich_creation_model_from_preferences(
     let Some(id) = selected.get("id").and_then(|value| value.as_str()) else {
         return body;
     };
-
-    body.creation_model = Some(creation_model_name(id).to_string());
-    body.creation_api_key = selected
+    let api_key = selected
         .get("apiKey")
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.to_string());
+
+    if id != "mbcd-std-v1" && api_key.is_none() {
+        return body;
+    }
+
+    body.creation_model = Some(creation_model_name(id).to_string());
+    body.creation_api_key = api_key;
     body.creation_base_url = selected
         .get("baseUrl")
         .and_then(|value| value.as_str())
@@ -396,6 +402,50 @@ pub struct RagHistoryItem {
     pub contexts: Vec<RagContext>,
     pub context_count: usize,
     pub latency_ms: Option<i64>,
+    pub model: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SaveRagHistoryRequest {
+    pub query: String,
+    pub answer: String,
+    #[serde(default)]
+    pub contexts: Vec<RagContext>,
+    #[serde(default)]
+    pub latency_ms: Option<i64>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SaveRagHistoryResponse {
+    pub id: i64,
+}
+
+pub async fn save_rag_history(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SaveRagHistoryRequest>,
+) -> Result<Json<SaveRagHistoryResponse>, ApiError> {
+    if req.query.trim().is_empty() {
+        return Err(ApiError::BadRequest("缺少 query 参数".to_string()));
+    }
+    let contexts = serde_json::to_string(&req.contexts)
+        .map_err(|e| ApiError::Internal(format!("序列化咨询参考失败: {e}")))?;
+    let session = NewRagSession {
+        ts: now_ms(),
+        scene_type: Some("monitor".to_string()),
+        user_query: req.query,
+        retrieved_ids: Some(contexts),
+        prompt_used: None,
+        llm_response: Some(req.answer),
+        latency_ms: req.latency_ms,
+        model: req.model,
+    };
+    let storage = state.storage.clone();
+    let id = tokio::task::spawn_blocking(move || storage.insert_rag_session(&session))
+        .await
+        .map_err(|e| ApiError::Internal(format!("保存咨询记录失败: {e}")))??;
+    Ok(Json(SaveRagHistoryResponse { id }))
 }
 
 /// 最近咨询记录：供咨询页回看历史问答。
@@ -422,6 +472,7 @@ pub async fn rag_history(
                 contexts,
                 context_count,
                 latency_ms: record.latency_ms,
+                model: record.model,
             }
         })
         .collect();
@@ -439,12 +490,32 @@ pub async fn rag_query(
     Ok(Json(rag_response))
 }
 
+pub async fn rag_references(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RagQueryRequest>,
+) -> Result<Json<RagQueryResponse>, ApiError> {
+    if body.query.trim().is_empty() {
+        return Err(ApiError::BadRequest("缺少 query 参数".to_string()));
+    }
+    let rag_response = call_rag_endpoint(&state.sidecar_url, "references", body, 90).await?;
+    Ok(Json(rag_response))
+}
+
 async fn call_rag_service(
     sidecar_url: &str,
     body: RagQueryRequest,
 ) -> Result<RagQueryResponse, ApiError> {
+    call_rag_endpoint(sidecar_url, "query", body, 360).await
+}
+
+async fn call_rag_endpoint(
+    sidecar_url: &str,
+    endpoint: &str,
+    body: RagQueryRequest,
+    timeout_secs: u64,
+) -> Result<RagQueryResponse, ApiError> {
     let client = reqwest::Client::new();
-    let rag_service_url = format!("{}/query", sidecar_url);
+    let rag_service_url = format!("{}/{}", sidecar_url, endpoint);
 
     let request_body = serde_json::json!({
         "query": body.query,
@@ -462,7 +533,7 @@ async fn call_rag_service(
     let response = client
         .post(&rag_service_url)
         .json(&request_body)
-        .timeout(std::time::Duration::from_secs(360))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await
         .map_err(|e| {

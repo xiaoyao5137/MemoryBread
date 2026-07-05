@@ -444,6 +444,34 @@ class TestRagPipeline:
         result = pipeline.query("问题")
         assert len(result.contexts) <= 3
 
+    def test_query_keeps_document_artifact_after_rrf_truncation(self):
+        bake_chunks = [
+            _chunk(
+                i,
+                0.9 - i * 0.01,
+                source="bake_knowledge",
+                doc_key=f"bake_knowledge:{i}",
+                metadata={"source_type": "bake_knowledge", "doc_key": f"bake_knowledge:{i}", "artifact_id": i},
+            )
+            for i in range(1, 11)
+        ]
+        smact_doc = _chunk(
+            0,
+            120.0,
+            source="document",
+            doc_key="document:80",
+            metadata={"source_type": "document", "doc_key": "document:80", "artifact_id": 80, "document_id": 80},
+        )
+        pipeline = _make_pipeline(
+            knowledge_chunks=[*bake_chunks, smact_doc],
+            vector_chunks=bake_chunks[:10],
+            top_k=3,
+        )
+
+        result = pipeline.query("GPU 利用率 SMACT 指标")
+
+        assert any(chunk.doc_key == "document:80" for chunk in result.contexts)
+
     def test_query_intent_passes_time_and_entity_filters(self):
         knowledge = MockFts5Retriever(chunks=[_chunk(1, source="knowledge")])
         vector_r = MockVectorRetriever()
@@ -1054,6 +1082,91 @@ class TestVectorRetriever:
 
 
 class TestSqliteRetrievers:
+    def test_artifact_search_returns_document_and_knowledge_for_gpu_metric_doc_query(self, tmp_path):
+        db_path = str(tmp_path / "artifacts.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE bake_documents (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                doc_type TEXT NOT NULL,
+                summary TEXT,
+                full_content TEXT,
+                sections_json TEXT NOT NULL DEFAULT '[]',
+                source_url TEXT,
+                source_memory_ids TEXT NOT NULL DEFAULT '[]',
+                linked_knowledge_ids TEXT NOT NULL DEFAULT '[]',
+                deleted_at INTEGER,
+                updated_at INTEGER
+            );
+            CREATE TABLE bake_knowledge (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                content TEXT,
+                detailed_content TEXT,
+                entities TEXT,
+                timeline_id INTEGER,
+                source_timeline_ids TEXT DEFAULT '[]',
+                source_capture_ids TEXT NOT NULL DEFAULT '[]',
+                importance INTEGER DEFAULT 3,
+                user_verified BOOLEAN DEFAULT 0,
+                updated_at_ms INTEGER
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO bake_documents
+                (id, title, doc_type, summary, full_content, source_url, source_memory_ids, linked_knowledge_ids, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                80,
+                "容器云 GPU 指标采集项目",
+                "技术文档",
+                "分析 GPUTL、SMACT、SMOCC 三种指标的物理意义与局限性。",
+                "GPUTL 无法反映空间利用率，SMACT 用于衡量空分利用率，SMOCC 衡量饱和度。",
+                "https://docs.example/container-gpu",
+                '["562"]',
+                '["562"]',
+                1_720_000_000_000,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO bake_knowledge
+                (id, title, summary, content, detailed_content, entities, timeline_id, source_timeline_ids, source_capture_ids, importance, user_verified, updated_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                229,
+                "该项目旨在解决现有 GPUTL 指标无法反映硅片内空间分布利用率的缺陷，引入 SMACT 和 SMOCC 指标构建多维度评估模型。",
+                "该项目旨在解决现有 GPUTL 指标无法反映硅片内空间分布利用率的缺陷，引入 SMACT 和 SMOCC 指标构建多维度评估模型。",
+                "GPUTL、SMACT、SMOCC 三类 GPU 利用率指标",
+                "SMACT 表示空分利用率，SMOCC 表示饱和度。",
+                "[]",
+                562,
+                "[]",
+                "[]",
+                3,
+                0,
+                1_720_000_000_000,
+            ),
+        )
+        conn.commit()
+
+        retriever = KnowledgeFts5Retriever(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        results = retriever._search_artifacts(cursor, "关于考量GPU利用率的指标的文档，帮我梳理一下", top_k=5, entity_terms=None)
+        conn.close()
+
+        doc_keys = [chunk.doc_key for chunk in results]
+        assert "document:80" in doc_keys
+        assert "bake_knowledge:229" in doc_keys
+
     def test_fts5_retriever_falls_back_to_app_name_match(self, tmp_path):
         db_path = str(tmp_path / "captures.db")
         _init_captures_db(db_path)

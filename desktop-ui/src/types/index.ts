@@ -111,6 +111,7 @@ export interface RagHistoryItem {
   contexts: RagContext[]
   context_count: number
   latency_ms: number | null
+  model?: string | null
 }
 
 export interface DebugLogFile {
@@ -158,6 +159,10 @@ export type AccountType = 'user' | 'platform_admin'
 
 export interface CloudUser {
   id: string
+  display_name?: string | null
+  username?: string | null
+  name?: string | null
+  nickname?: string | null
   email?: string | null
   phone?: string | null
   status: string
@@ -165,12 +170,32 @@ export interface CloudUser {
   locale: string
   timezone: string
   created_at: string
+  subscription_plan?: string | null
+  plan_name?: string | null
+  membership_plan?: string | null
 }
 
 export interface AuthSession {
   access_token: string
   expires_at: string
   user: CloudUser
+}
+
+export interface CloudBalance {
+  available: string
+  reserved: string
+  currency: string
+  as_of: string
+}
+
+export interface CloudSubscription {
+  id: string
+  status: string
+  starts_at?: string
+  ends_at?: string
+  plan_key: string
+  name: string
+  permission_summary?: string[]
 }
 
 export interface CloudDevice {

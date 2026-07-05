@@ -86,7 +86,7 @@ function formatLlmModelName(model?: string | null): string {
   if (!name) return '模型未记录'
   if (name === 'unavailable') return '模型不可用/未记录'
   if (name === 'qwen3.5:4b' || name === 'mbem-v1-local') return 'MBEM v1.0 / MBCD Std v1.0'
-  if (name === 'claude-opus-4-8' || name.startsWith('claude-opus-4')) return 'MBCD Plus v1.0'
+  if (name === 'mbcd-plus-v1') return 'MBCD Plus v1.0'
   return name
 }
 
@@ -277,6 +277,8 @@ const SparkLine: React.FC<{
   valueFormatter?: (value: number) => string
   axisFormatter?: (ts: number) => string
   xDomain?: { start: number; end: number }
+  bucketMs?: number
+  fillMissingWithZero?: boolean
   detailFormatter?: (point: LinePoint) => string
 }> = ({
   data,
@@ -286,14 +288,37 @@ const SparkLine: React.FC<{
   valueFormatter = (value) => String(value),
   axisFormatter = fmtAxisTs,
   xDomain,
+  bucketMs,
+  fillMissingWithZero = false,
   detailFormatter,
 }) => {
-  const normalizedSeries = (series && series.length > 0)
-    ? series
-        .map(item => ({ ...item, data: sampleLineData(item.data) }))
-        .filter(item => item.data.length > 0)
-    : (data && data.length > 0 ? [{ label: '当前序列', color, data: sampleLineData(data), valueFormatter }] : [])
   const [hoverIndex, setHoverIndex] = useState<number | null>(null)
+
+  const sourceSeries = (series && series.length > 0)
+    ? series
+    : (data && data.length > 0 ? [{ label: '当前序列', color, data, valueFormatter }] : [])
+  const rawDomainStart = xDomain?.start ?? sourceSeries.find((item) => item.data.length > 0)?.data[0]?.ts ?? Date.now()
+  const lastSourceSeries = [...sourceSeries].reverse().find((item) => item.data.length > 0)
+  const rawDomainEnd = xDomain?.end ?? lastSourceSeries?.data[lastSourceSeries.data.length - 1]?.ts ?? rawDomainStart
+  const domainStart = Math.min(rawDomainStart, rawDomainEnd)
+  const domainEnd = Math.max(rawDomainStart, rawDomainEnd)
+  const bucket = Math.max(1, bucketMs ?? 0)
+  const fillTimeline = fillMissingWithZero && bucketMs && xDomain
+  const normalizedSeries = sourceSeries
+    .map(item => {
+      if (!fillTimeline) return { ...item, data: sampleLineData(item.data) }
+      const values = new Map(item.data.map((point) => [Math.floor((point.ts - domainStart) / bucket) * bucket + domainStart, point.value]))
+      const filled: LinePoint[] = []
+      for (let ts = domainStart; ts <= domainEnd + 1; ts += bucket) {
+        filled.push({ ts, value: values.get(ts) ?? 0 })
+        if (filled.length > 360) break
+      }
+      if (filled[filled.length - 1]?.ts !== domainEnd) {
+        filled.push({ ts: domainEnd, value: values.get(domainEnd) ?? 0 })
+      }
+      return { ...item, data: sampleLineData(filled) }
+    })
+    .filter(item => item.data.length > 0)
 
   if (!normalizedSeries.length) return null
 
@@ -306,10 +331,6 @@ const SparkLine: React.FC<{
   const min = Math.min(...allValues, 0)
   const range = Math.max(max - min, 1)
   const axisValueFormatter = normalizedSeries[0].valueFormatter || valueFormatter
-  const rawDomainStart = xDomain?.start ?? baseData[0].ts
-  const rawDomainEnd = xDomain?.end ?? baseData[baseData.length - 1].ts
-  const domainStart = Math.min(rawDomainStart, rawDomainEnd)
-  const domainEnd = Math.max(rawDomainStart, rawDomainEnd)
   const domainRange = Math.max(domainEnd - domainStart, 1)
   const xForTs = (ts: number) => pad + ((ts - domainStart) / domainRange) * (w - pad * 2)
 
@@ -342,7 +363,14 @@ const SparkLine: React.FC<{
           <span>{axisValueFormatter((max + min) / 2)}</span>
           <span>{axisValueFormatter(min)}</span>
         </div>
-        <div style={{ flex: 1 }}>
+        <div style={{
+          flex: 1,
+          border: '1px solid rgba(99,99,102,0.10)',
+          borderRadius: 10,
+          padding: '8px 8px 4px',
+          background: 'linear-gradient(180deg, rgba(255,255,255,0.98), rgba(249,250,252,0.92)), repeating-linear-gradient(0deg, transparent 0 23px, rgba(142,142,147,0.11) 24px), repeating-linear-gradient(90deg, transparent 0 39px, rgba(142,142,147,0.09) 40px)',
+          boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.85)',
+        }}>
           <svg
             width="100%"
             viewBox={`0 0 ${w} ${h}`}
@@ -361,7 +389,7 @@ const SparkLine: React.FC<{
             {seriesPoints.map((item, idx) => (
               <g key={`${item.label}-${item.color}`}>
                 {idx === 0 && <polygon points={item.area} fill={`url(#grad-${item.color.replace('#', '')})`} />}
-                <polyline points={item.pts} fill="none" stroke={item.color} strokeWidth="1.5" strokeLinejoin="round" />
+                <polyline points={item.pts} fill="none" stroke={item.color} strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" />
               </g>
             ))}
             {baseData.map((_, i) => {
@@ -375,6 +403,7 @@ const SparkLine: React.FC<{
                   height={h}
                   fill="transparent"
                   onMouseEnter={() => setHoverIndex(i)}
+                  onFocus={() => setHoverIndex(i)}
                 />
               )
             })}
@@ -729,9 +758,13 @@ const OverviewContent: React.FC<{
               valueFormatter={(value) => `${fmt(value)} tokens`}
               axisFormatter={(ts) => fmtOverviewAxisTs(ts, range)}
               xDomain={chartDomain}
+              bucketMs={getNiceBucketMs(overviewRangeMs)}
+              fillMissingWithZero
               detailFormatter={(point) => {
-                const item = token_usage.trend.find((entry) => entry.ts === point.ts)
-                return item ? `${fmtTs(item.ts)} · ${fmt(item.tokens)} tokens · ${item.calls} 次` : ''
+                const item = token_usage.trend.find((entry) => Math.abs(entry.ts - point.ts) <= getNiceBucketMs(overviewRangeMs) / 2)
+                return item
+                  ? `${fmtTs(item.ts)} · ${fmt(item.tokens)} tokens · ${item.calls} 次`
+                  : `${fmtTs(point.ts)} · ${fmt(point.value)} tokens · ${point.value > 0 ? '调用数未记录' : '0 次'}`
               }}
             />
             {tokenTrendSeries.filter((item) => item.data.length > 0).every((item) => item.data.length === 1) && (
@@ -767,6 +800,8 @@ const OverviewContent: React.FC<{
               height={50}
               axisFormatter={(ts) => fmtOverviewAxisTs(ts, range)}
               xDomain={chartDomain}
+              bucketMs={getNiceBucketMs(overviewRangeMs)}
+              fillMissingWithZero
               detailFormatter={(point) => `${fmtTs(point.ts)} · ${point.value} 条知识`}
             />
             {knowledge_flow.by_time.length === 1 && (
@@ -1763,12 +1798,16 @@ const MonitorPanel: React.FC = () => {
 }
 
 const cardStyle: React.CSSProperties = {
-  background: 'white', borderRadius: 12, padding: '12px 14px',
-  border: '1px solid rgba(0,0,0,0.07)', marginBottom: 10,
+  background: 'linear-gradient(180deg, #FFFFFF 0%, #FBFBFD 100%)',
+  borderRadius: 12,
+  padding: '13px 14px',
+  border: '1px solid rgba(60,60,67,0.10)',
+  boxShadow: '0 1px 2px rgba(0,0,0,0.04), 0 12px 28px rgba(30,41,59,0.05)',
+  marginBottom: 10,
 }
 
 const sectionTitle: React.CSSProperties = {
-  fontSize: 12, fontWeight: 600, color: '#333', marginBottom: 10, display: 'block',
+  fontSize: 12, fontWeight: 700, color: '#1D1D1F', marginBottom: 10, display: 'block',
 }
 
 export default MonitorPanel

@@ -15,9 +15,10 @@ use super::{
         bake::{
             create_bake_document, delete_bake_document, delete_bake_knowledge, delete_bake_sop,
             get_bake_capture, get_bake_capture_screenshot, get_bake_document,
-            get_bake_memory_preview, get_bake_overview, get_bake_style_config, ignore_bake_memory,
-            initialize_bake_memories, list_bake_captures, list_bake_documents, list_bake_knowledge,
-            list_bake_memories, list_bake_sops, promote_bake_memory_to_document,
+            get_bake_knowledge, get_bake_memory_preview, get_bake_overview, get_bake_sop,
+            get_bake_style_config, ignore_bake_memory, initialize_bake_memories,
+            list_bake_captures, list_bake_documents, list_bake_knowledge, list_bake_memories,
+            list_bake_sops, promote_bake_memory_to_document,
             promote_bake_memory_to_sop, run_bake_pipeline, toggle_bake_document_status,
             update_bake_document, update_bake_style_config,
         },
@@ -44,7 +45,9 @@ use super::{
             update_blacklist_enabled, update_filter_config, update_filter_enabled,
         },
         profile::{get_latest_profile, get_profile, list_profiles, update_profile},
-        query::{create_rag_job, get_rag_job, rag_history, rag_query},
+        query::{
+            create_rag_job, get_rag_job, rag_history, rag_query, rag_references, save_rag_history,
+        },
         runtime::{get_runtime_status, update_runtime_status},
         tasks::{
             create_task, delete_task, get_task, list_executions, list_tasks, trigger_task,
@@ -74,7 +77,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/query", post(rag_query))
         .route("/api/rag/jobs", post(create_rag_job))
         .route("/api/rag/jobs/:job_id", get(get_rag_job))
-        .route("/api/rag/history", get(rag_history))
+        .route("/api/rag/references", post(rag_references))
+        .route("/api/rag/history", get(rag_history).post(save_rag_history))
         .route("/action/execute", post(execute_action))
         .route("/preferences", get(list_preferences))
         .route(
@@ -157,7 +161,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_bake_style_config).put(update_bake_style_config),
         )
         .route("/api/bake/sops", get(list_bake_sops))
-        .route("/api/bake/sops/:id", axum::routing::delete(delete_bake_sop))
+        .route(
+            "/api/bake/sops/:id",
+            get(get_bake_sop).delete(delete_bake_sop),
+        )
         .route(
             "/api/bake/documents",
             get(list_bake_documents).post(create_bake_document),
@@ -177,7 +184,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/bake/knowledge", get(list_bake_knowledge))
         .route(
             "/api/bake/knowledge/:id",
-            axum::routing::delete(delete_bake_knowledge),
+            get(get_bake_knowledge).delete(delete_bake_knowledge),
         )
         .route("/api/bake/captures", get(list_bake_captures))
         .route("/api/bake/captures/:id", get(get_bake_capture))

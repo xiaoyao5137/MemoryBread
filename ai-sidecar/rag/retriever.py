@@ -53,7 +53,9 @@ def _extract_query_terms(query: str) -> list[str]:
     stop_terms = {
         "什么", "怎么", "如何", "为什么", "昨天", "今天", "最近", "本周", "那段",
         "提到", "知识", "总结", "里", "了吗", "是否", "有关", "关于",
+        "帮我", "梳理", "一下", "整理", "看看", "相关", "考量",
     }
+    noisy_substrings = ("的", "关于", "帮我", "梳理", "一下")
 
     def _add(term: str) -> None:
         term = term.strip()
@@ -65,10 +67,21 @@ def _extract_query_terms(query: str) -> list[str]:
     for token in tokens:
         if len(token) < 2:
             continue
+        if any(noise in token for noise in ("关于", "帮我", "梳理", "一下")):
+            for phrase in ("利用率", "指标", "文档", "资料", "报告", "方案"):
+                if phrase in token:
+                    _add(phrase)
+            continue
         if re.fullmatch(r"[\u4e00-\u9fff]+", token) and len(token) > 4:
+            for phrase in ("利用率", "指标", "文档", "资料", "报告", "方案"):
+                if phrase in token:
+                    _add(phrase)
             for size in (4, 3, 2):
                 for i in range(0, len(token) - size + 1):
-                    _add(token[i:i + size])
+                    candidate = token[i:i + size]
+                    if any(noise in candidate for noise in noisy_substrings):
+                        continue
+                    _add(candidate)
         else:
             _add(token)
 
@@ -164,6 +177,7 @@ def _merge_chunks(chunks: list["RetrievedChunk"], limit: int, prefer_url: bool =
 
 def _rank_keyword_chunks(chunks: list["RetrievedChunk"], terms: list[str], prefer_url: bool) -> list["RetrievedChunk"]:
     lowered_terms = [term.lower() for term in terms if term]
+    document_query = any(term in lowered_terms for term in ("文档", "资料", "报告", "方案", "doc", "document"))
 
     def _score(chunk: RetrievedChunk) -> tuple[float, float, int]:
         text = chunk.text.lower()
@@ -186,11 +200,13 @@ def _rank_keyword_chunks(chunks: list["RetrievedChunk"], terms: list[str], prefe
             score += 5
         if prefer_url and metadata.get("source_type") == "document":
             score += 4
+        if document_query and metadata.get("source_type") == "document":
+            score += 24
         if metadata.get("source_type") in {"document", "operation", "bake_knowledge"}:
             score += 2
         if "docs.corp.kuaishou.com" in url:
             score += 3
-        score += min(float(chunk.score or 0) / 6.0, 30.0)
+        score += min(float(chunk.score or 0) / 2.0, 80.0)
         time_value = int(metadata.get("time") or metadata.get("ts") or 0)
         return score, chunk.score, time_value
 
@@ -1196,6 +1212,7 @@ class KnowledgeFts5Retriever:
         base = KnowledgeFts5Retriever._keyword_score(text, terms) + 50.0
         title = str(row["title"] or "").lower()
         summary = str(row["summary"] or "").lower()
+        doc_type = str(row["doc_type"] or "").lower()
         full = f"{title} {summary}"
 
         title_hits = sum(1 for term in terms if term.lower() in title)
@@ -1210,6 +1227,30 @@ class KnowledgeFts5Retriever:
             score += 12.0 + title_coverage * 32.0 + long_title_hits * 3.0
         if full_coverage:
             score += full_coverage * 10.0
+        if any(term.lower() in {"文档", "资料", "报告", "方案", "doc", "document"} for term in terms):
+            score += 14.0
+            if "文档" in doc_type or "报告" in doc_type or "方案" in doc_type:
+                score += 6.0
+        return score
+
+    @staticmethod
+    def _bake_artifact_score(row: sqlite3.Row, terms: list[str], text: str) -> float:
+        base = KnowledgeFts5Retriever._keyword_score(text, terms) + 24.0
+        title = str(row["title"] or "").lower()
+        summary = str(row["summary"] or "").lower()
+        full = f"{title} {summary}"
+
+        title_hits = sum(1 for term in terms if term.lower() in title)
+        summary_hits = sum(1 for term in terms if term.lower() in summary)
+        score = base + title_hits * 8.0 + summary_hits * 2.0
+
+        meaningful_terms = [term.lower() for term in terms if len(term) >= 2]
+        title_coverage = title_hits / max(1, min(len(meaningful_terms), 12))
+        full_coverage = sum(1 for term in meaningful_terms if term in full) / max(1, min(len(meaningful_terms), 12))
+        if title_hits:
+            score += 8.0 + title_coverage * 24.0
+        if full_coverage:
+            score += full_coverage * 8.0
         return score
 
     def _document_row_to_chunk(self, row: sqlite3.Row, terms: list[str]) -> RetrievedChunk:
@@ -1254,7 +1295,7 @@ class KnowledgeFts5Retriever:
         return RetrievedChunk(
             capture_id=0,
             text=text,
-            score=self._keyword_score(text, terms) + 20.0,
+            score=self._bake_artifact_score(row, terms, text),
             source="bake_knowledge",
             doc_key=doc_key,
             metadata={
@@ -1282,7 +1323,7 @@ class KnowledgeFts5Retriever:
         return RetrievedChunk(
             capture_id=0,
             text=text,
-            score=self._keyword_score(text, terms) + 20.0,
+            score=self._bake_artifact_score(row, terms, text),
             source="operation",
             doc_key=doc_key,
             metadata={

@@ -23,7 +23,7 @@ import ProfilePanel           from './components/ProfilePanel'
 import OnboardingWizard       from './components/OnboardingWizard'
 import AuthPanel              from './components/AuthPanel'
 import SystemFloatingAssist   from './components/SystemFloatingAssist'
-import { fetchCurrentUser } from './utils/authApi'
+import { fetchConsoleSummary, fetchCurrentUser } from './utils/authApi'
 
 const FLOATING_ASSIST_ENABLED_KEY = 'memoryBread.floatingAssist.enabled'
 
@@ -53,6 +53,10 @@ const App: React.FC = () => {
     setSelectedTemplateId,
     setSelectedKnowledgeId,
     setSelectedSopId,
+    setRepositoryMemoryFocusId,
+    setBakeTemplateFocusId,
+    setBakeKnowledgeFocusId,
+    setBakeSopFocusId,
     setBakeTemplateOffset,
     setBakeTemplateLimit,
     setBakeKnowledgeOffset,
@@ -68,6 +72,8 @@ const App: React.FC = () => {
     authToken,
     setCreationModelConfigs,
     setAuthSession,
+    setCloudBalance,
+    setCloudSubscription,
     clearAuthSession,
   } = useAppStore()
 
@@ -190,13 +196,18 @@ const App: React.FC = () => {
             user,
           })
         }
+        const summary = await fetchConsoleSummary(adminApiBaseUrl, authToken).catch(() => null)
+        if (!cancelled && summary) {
+          setCloudBalance(summary.balance ?? null)
+          setCloudSubscription(summary.current_subscription ?? null)
+        }
       } catch {
         if (!cancelled) clearAuthSession()
       }
     }
     void validateSession()
     return () => { cancelled = true }
-  }, [adminApiBaseUrl, authToken, clearAuthSession, setAuthSession])
+  }, [adminApiBaseUrl, authToken, clearAuthSession, setAuthSession, setCloudBalance, setCloudSubscription])
 
   // 监听查看采集记录事件
   useEffect(() => {
@@ -227,6 +238,7 @@ const App: React.FC = () => {
         setBakeTab('templates')
         setBakeTemplateOffset(0)
         setBakeTemplateLimit(100)
+        setBakeTemplateFocusId(targetId || null)
         setSelectedTemplateId(targetId || null)
         setWindowMode('bake')
         return
@@ -235,6 +247,7 @@ const App: React.FC = () => {
         setBakeTab('knowledge')
         setBakeKnowledgeOffset(0)
         setBakeKnowledgeLimit(1000)
+        setBakeKnowledgeFocusId(targetId || null)
         setSelectedKnowledgeId(targetId || null)
         setWindowMode('bake')
         return
@@ -243,6 +256,7 @@ const App: React.FC = () => {
         setBakeTab('sop')
         setBakeSopOffset(0)
         setBakeSopLimit(1000)
+        setBakeSopFocusId(targetId || null)
         setSelectedSopId(targetId || null)
         setWindowMode('bake')
         return
@@ -250,6 +264,7 @@ const App: React.FC = () => {
       setWindowMode('knowledge')
       if (type === 'knowledge' && knowledgeId) {
         setRepositoryTab('memory')
+        setRepositoryMemoryFocusId(String(knowledgeId))
         setSelectedMemoryId(String(knowledgeId))
         return
       }
@@ -286,12 +301,16 @@ const App: React.FC = () => {
     setBakeTemplateLimit,
     setBakeTemplateOffset,
     setRepositoryCaptureSourceCaptureId,
+    setRepositoryMemoryFocusId,
     setRepositoryTab,
+    setBakeKnowledgeFocusId,
     setSelectedCaptureId,
     setSelectedKnowledgeId,
     setSelectedMemoryId,
     setSelectedSopId,
     setSelectedTemplateId,
+    setBakeSopFocusId,
+    setBakeTemplateFocusId,
     setWindowMode,
   ])
 

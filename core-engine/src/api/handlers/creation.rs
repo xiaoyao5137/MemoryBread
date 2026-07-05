@@ -346,13 +346,18 @@ fn enrich_creation_model_from_preferences(state: &Arc<AppState>, req: &mut Gener
     let Some(id) = selected.get("id").and_then(|value| value.as_str()) else {
         return;
     };
-
-    req.creation_model = Some(creation_model_name(id).to_string());
-    req.creation_api_key = selected
+    let api_key = selected
         .get("apiKey")
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.to_string());
+
+    if id != "mbcd-std-v1" && api_key.is_none() {
+        return;
+    }
+
+    req.creation_model = Some(creation_model_name(id).to_string());
+    req.creation_api_key = api_key;
     req.creation_base_url = selected
         .get("baseUrl")
         .and_then(|value| value.as_str())
@@ -367,6 +372,9 @@ pub struct SaveHistoryRequest {
     pub doc_type: Option<String>,
     pub audience: Option<String>,
     pub reference_count: i64,
+    #[serde(default)]
+    pub references: Vec<serde_json::Value>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -381,6 +389,7 @@ pub async fn save_history(
     let id = state
         .storage
         .with_conn(|conn| {
+            let references_json = serde_json::to_string(&req.references)?;
             crate::storage::repo::creation_history::insert(
                 conn,
                 &req.prompt,
@@ -388,6 +397,8 @@ pub async fn save_history(
                 req.doc_type.as_deref(),
                 req.audience.as_deref(),
                 req.reference_count,
+                Some(&references_json),
+                req.model.as_deref(),
             )
             .map_err(Into::into)
         })

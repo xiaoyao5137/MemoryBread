@@ -3,7 +3,10 @@ import { renderHook } from '@testing-library/react'
 import {
   useFetchBakeCaptures,
   useFetchBakeKnowledge,
+  useFetchBakeKnowledgeDetail,
+  useFetchBakeMemory,
   useFetchBakeMemories,
+  useFetchBakeSop,
   useFetchBakeSops,
   useFetchBakeTemplates,
 } from '../hooks/useApi'
@@ -83,6 +86,34 @@ describe('useFetchBakeMemories', () => {
       'http://localhost:7070/api/knowledge?limit=10&offset=0',
     )
   })
+
+  it('请求单条时间线详情并映射为时间线条目', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        id: 7,
+        summary: '目标时间线',
+        overview: '目标概览',
+        capture_id: 72,
+        importance: 5,
+        occurrence_count: 1,
+        created_at: '2026-04-11 10:00',
+        created_at_ms: 1712800800000,
+        capture_ids: [72],
+      }))
+
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { result } = renderHook(() => useFetchBakeMemory())
+    const data = await result.current('7')
+
+    expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/knowledge/7')
+    expect(data).toMatchObject({
+      id: '7',
+      title: '目标时间线',
+      sourceCaptureId: '72',
+      captureIds: [72],
+    })
+  })
 })
 
 describe('useFetchBakeKnowledge', () => {
@@ -133,6 +164,35 @@ describe('useFetchBakeKnowledge', () => {
     expect(data.total).toBe(1)
     expect(data.limit).toBe(50)
     expect(data.offset).toBe(10)
+  })
+
+  it('请求单条 bake knowledge 详情', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({
+      id: 9,
+      capture_id: 12,
+      summary: '已提炼知识',
+      overview: '概述',
+      details: '{"source_capture_ids":["12"]}',
+      entities: ['芝士'],
+      category: 'bake_knowledge',
+      importance: 4,
+      occurrence_count: 2,
+      updated_at: '2026-04-11 10:00:00',
+      updated_at_ms: 456,
+    }))
+
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { result } = renderHook(() => useFetchBakeKnowledgeDetail())
+    const data = await result.current('9')
+
+    expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/knowledge/9')
+    expect(data).toMatchObject({
+      id: '9',
+      captureId: '12',
+      sourceCaptureIds: ['12'],
+      summary: '已提炼知识',
+    })
   })
 })
 
@@ -231,6 +291,38 @@ describe('useFetchBakeSops', () => {
     )
     expect(data.items[0]).toMatchObject({
       id: '5',
+      extractedProblem: '导出文档',
+    })
+  })
+
+  it('请求单条操作详情', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({
+      id: 5,
+      source_capture_id: '2',
+      source_timeline_id: '8',
+      trigger_keywords: ['导出'],
+      confidence: 'medium',
+      extracted_problem: '导出文档',
+      detailed_content: '',
+      steps: ['点击导出'],
+      linked_knowledge_ids: [],
+      linked_knowledge_summaries: [],
+      status: 'confirmed',
+      created_at: '2026-04-11 10:00:00',
+      created_at_ms: 100,
+      updated_at: '2026-04-11 10:00:00',
+      updated_at_ms: 100,
+    }))
+
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { result } = renderHook(() => useFetchBakeSop())
+    const data = await result.current('5')
+
+    expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/sops/5')
+    expect(data).toMatchObject({
+      id: '5',
+      sourceTimelineId: '8',
       extractedProblem: '导出文档',
     })
   })
