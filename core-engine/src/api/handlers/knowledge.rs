@@ -12,7 +12,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::{error::ApiError, state::AppState};
+use crate::{
+    api::{error::ApiError, state::AppState},
+    storage::TimelineRecord,
+};
 
 const FALLBACK_NOISE_OVERVIEW_PREFIX: &str = "低价值工作片段（";
 
@@ -439,6 +442,63 @@ fn keyword_terms(query: &str) -> Vec<String> {
         .filter(|term| !term.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+/// GET /api/knowledge/:id - 获取单条时间线详情
+pub async fn get_knowledge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut record = state
+        .storage
+        .get_timeline_entry(id)?
+        .ok_or_else(|| ApiError::NotFound(format!("timeline {id} not found")))?;
+
+    if !matches!(record.category.as_str(), "bake_knowledge" | "bake_sop") {
+        let capture_ids = state.storage.get_timeline_capture_ids(id)?;
+        if !capture_ids.is_empty() {
+            record.capture_ids =
+                Some(serde_json::to_string(&capture_ids).unwrap_or_else(|_| "[]".to_string()));
+        }
+    }
+
+    Ok(Json(timeline_record_to_knowledge_entry(record)))
+}
+
+fn timeline_record_to_knowledge_entry(record: TimelineRecord) -> KnowledgeEntry {
+    KnowledgeEntry {
+        id: record.id,
+        capture_id: record.capture_id,
+        summary: record.summary,
+        overview: record.overview,
+        details: record.details,
+        entities: serde_json::from_str(&record.entities).unwrap_or_default(),
+        category: record.category,
+        importance: record.importance,
+        occurrence_count: record.occurrence_count,
+        observed_at: record.observed_at,
+        event_time_start: record.event_time_start,
+        event_time_end: record.event_time_end,
+        history_view: record.history_view,
+        content_origin: record.content_origin,
+        activity_type: record.activity_type,
+        is_self_generated: record.is_self_generated,
+        evidence_strength: record.evidence_strength,
+        user_verified: record.user_verified,
+        user_edited: record.user_edited,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
+        capture_ids: record
+            .capture_ids
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
+        key_timestamps: record
+            .key_timestamps
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
+    }
 }
 
 /// POST /api/knowledge/:id/verify - 验证知识条目

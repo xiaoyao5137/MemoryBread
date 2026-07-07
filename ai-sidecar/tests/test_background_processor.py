@@ -32,13 +32,15 @@ def _init_db(db_path: str) -> None:
             ocr_text TEXT,
             ax_text TEXT,
             timeline_id INTEGER,
+            url TEXT,
+            webpage_title TEXT,
             is_sensitive INTEGER NOT NULL DEFAULT 0
         )
         """
     )
     conn.execute(
         """
-        CREATE TABLE knowledge_entries (
+        CREATE TABLE timelines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             capture_id INTEGER NOT NULL,
             summary TEXT,
@@ -54,6 +56,9 @@ def _init_db(db_path: str) -> None:
             duration_minutes INTEGER,
             frag_app_name TEXT,
             frag_win_title TEXT,
+            time_range_start INTEGER,
+            time_range_end INTEGER,
+            key_timestamps TEXT,
             observed_at INTEGER,
             event_time_start INTEGER,
             event_time_end INTEGER,
@@ -61,7 +66,9 @@ def _init_db(db_path: str) -> None:
             content_origin TEXT,
             activity_type TEXT,
             is_self_generated INTEGER NOT NULL DEFAULT 0,
-            evidence_strength TEXT
+            evidence_strength TEXT,
+            created_at_ms INTEGER,
+            updated_at_ms INTEGER
         )
         """
     )
@@ -131,12 +138,172 @@ def test_save_knowledge_persists_semantic_fields(tmp_path) -> None:
 
     knowledge_id = processor._save_knowledge(conn, knowledge)
     row = conn.execute(
-        "SELECT observed_at, event_time_start, event_time_end, history_view, content_origin, activity_type, is_self_generated, evidence_strength FROM knowledge_entries WHERE id = ?",
+        "SELECT observed_at, event_time_start, event_time_end, history_view, content_origin, activity_type, is_self_generated, evidence_strength FROM timelines WHERE id = ?",
         (knowledge_id,),
     ).fetchone()
     conn.close()
 
     assert row == (2000, 500, 800, 1, "historical_content", "reviewing_history", 0, "high")
+
+
+class _ImmediateQueue:
+    def submit_sync(self, _priority, fn, timeout=None, lane=None):
+        return fn()
+
+
+class _SimilarExtractor:
+    def __init__(self, similar_id: int) -> None:
+        self.similar_id = similar_id
+
+    def extract_merged(self, captures, preempt_check=None):
+        capture_ids = [capture["id"] for capture in captures]
+        return {
+            "capture_ids": json.dumps(capture_ids),
+            "summary": "万擎平台稳定性设计",
+            "overview": "整理万擎平台稳定性设计与调度策略",
+            "details": "补充新的文档内容",
+            "entities": json.dumps(["万擎", "SLO"]),
+            "category": "文档",
+            "importance": 4,
+            "occurrence_count": 1,
+            "start_time": captures[0]["ts"],
+            "end_time": captures[-1]["ts"],
+            "duration_minutes": 0,
+            "time_range_start": captures[0]["ts"],
+            "time_range_end": captures[-1]["ts"],
+            "key_timestamps": json.dumps([]),
+            "frag_app_name": captures[-1].get("app_name"),
+            "frag_win_title": captures[-1].get("window_title"),
+            "observed_at": captures[-1]["ts"],
+            "content_origin": "document_reference",
+            "activity_type": "reading",
+            "is_self_generated": False,
+            "evidence_strength": "high",
+        }
+
+    def _find_similar_knowledge(self, overview, db_conn, **kwargs):
+        return self.similar_id
+
+
+def _seed_timeline(conn: sqlite3.Connection, doc_url: str) -> int:
+    conn.execute(
+        """
+        INSERT INTO captures (id, ts, app_name, win_title, ocr_text, ax_text, timeline_id, url, webpage_title)
+        VALUES (1, 1000, 'Chrome', 'Doc A', 'doc a', '', 1, ?, 'Doc A')
+        """,
+        (doc_url,),
+    )
+    conn.execute(
+        """
+        INSERT INTO timelines (
+            id, capture_id, summary, overview, details, entities, category, importance,
+            occurrence_count, capture_ids, start_time, end_time, time_range_start,
+            time_range_end, observed_at, content_origin, activity_type, evidence_strength,
+            created_at_ms, updated_at_ms
+        )
+        VALUES (1, 1, 'Doc A', '万擎平台稳定性设计', '已有内容', '[]', '文档', 4,
+                1, '[1]', 1000, 1000, 1000, 1000, 1000, 'document_reference',
+                'reading', 'high', 1000, 1000)
+        """
+    )
+    conn.commit()
+    return 1
+
+
+async def _skip_vectorization(*_args, **_kwargs):
+    return True
+
+
+def test_similar_merge_rejects_different_document_url(tmp_path, monkeypatch) -> None:
+    db_path = str(tmp_path / "captures.db")
+    _init_db(db_path)
+    doc_a = "https://docs.corp.kuaishou.com/k/home/docA/fcAAAAAA"
+    doc_b = "https://docs.corp.kuaishou.com/k/home/docB/fcBBBBBB"
+    conn = sqlite3.connect(db_path)
+    _seed_timeline(conn, doc_a)
+    conn.execute(
+        """
+        INSERT INTO captures (id, ts, app_name, win_title, ocr_text, ax_text, timeline_id, url, webpage_title)
+        VALUES (2, 2000, 'Chrome', 'Doc B', 'doc b', '', NULL, ?, 'Doc B')
+        """,
+        (doc_b,),
+    )
+    conn.commit()
+    conn.close()
+
+    processor = BackgroundProcessor(db_path=db_path)
+    monkeypatch.setattr(processor, "_get_knowledge_extractor", lambda: _SimilarExtractor(1))
+    monkeypatch.setattr(processor, "_process_knowledge_vectorization", _skip_vectorization)
+    monkeypatch.setattr("inference_queue.get_global_queue", lambda: _ImmediateQueue())
+
+    ok = asyncio.run(processor._process_capture_group([
+        {
+            "id": 2,
+            "ts": 2000,
+            "app_name": "Chrome",
+            "window_title": "Doc B",
+            "ocr_text": "doc b",
+            "ax_text": "",
+            "url": doc_b,
+        }
+    ]))
+
+    conn = sqlite3.connect(db_path)
+    linked_timeline = conn.execute("SELECT timeline_id FROM captures WHERE id = 2").fetchone()[0]
+    timeline_count = conn.execute("SELECT COUNT(*) FROM timelines").fetchone()[0]
+    original_capture_ids = conn.execute("SELECT capture_ids FROM timelines WHERE id = 1").fetchone()[0]
+    conn.close()
+
+    assert ok is True
+    assert linked_timeline != 1
+    assert timeline_count == 2
+    assert json.loads(original_capture_ids) == [1]
+
+
+def test_similar_merge_allows_same_document_and_syncs_capture_ids(tmp_path, monkeypatch) -> None:
+    db_path = str(tmp_path / "captures.db")
+    _init_db(db_path)
+    doc_a = "https://docs.corp.kuaishou.com/k/home/docA/fcAAAAAA"
+    conn = sqlite3.connect(db_path)
+    _seed_timeline(conn, doc_a)
+    conn.execute(
+        """
+        INSERT INTO captures (id, ts, app_name, win_title, ocr_text, ax_text, timeline_id, url, webpage_title)
+        VALUES (2, 2000, 'Chrome', 'Doc A', 'doc a part 2', '', NULL, ?, 'Doc A')
+        """,
+        (doc_a,),
+    )
+    conn.commit()
+    conn.close()
+
+    processor = BackgroundProcessor(db_path=db_path)
+    monkeypatch.setattr(processor, "_get_knowledge_extractor", lambda: _SimilarExtractor(1))
+    monkeypatch.setattr(processor, "_process_knowledge_vectorization", _skip_vectorization)
+    monkeypatch.setattr("inference_queue.get_global_queue", lambda: _ImmediateQueue())
+
+    ok = asyncio.run(processor._process_capture_group([
+        {
+            "id": 2,
+            "ts": 2000,
+            "app_name": "Chrome",
+            "window_title": "Doc A",
+            "ocr_text": "doc a part 2",
+            "ax_text": "",
+            "url": doc_a,
+        }
+    ]))
+
+    conn = sqlite3.connect(db_path)
+    linked_timeline = conn.execute("SELECT timeline_id FROM captures WHERE id = 2").fetchone()[0]
+    capture_ids, end_time = conn.execute(
+        "SELECT capture_ids, end_time FROM timelines WHERE id = 1"
+    ).fetchone()
+    conn.close()
+
+    assert ok is True
+    assert linked_timeline == 1
+    assert json.loads(capture_ids) == [1, 2]
+    assert end_time == 2000
 
 
 def test_process_knowledge_vectorization_passes_semantic_metadata(tmp_path, monkeypatch) -> None:

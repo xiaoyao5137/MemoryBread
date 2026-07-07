@@ -852,6 +852,129 @@ class BackgroundProcessor:
         )
         conn.commit()
 
+    def _timeline_member_capture_ids(
+        self, conn: sqlite3.Connection, timeline_id: int
+    ) -> list[int]:
+        """返回 timeline 的成员 capture ids，兼容旧 capture_ids 字段与 captures.timeline_id 反向链接。"""
+
+        member_ids: list[int] = []
+
+        def add_id(value) -> None:
+            try:
+                cid = int(value)
+            except (TypeError, ValueError):
+                return
+            if cid not in member_ids:
+                member_ids.append(cid)
+
+        row = conn.execute(
+            "SELECT capture_id, capture_ids FROM timelines WHERE id = ?",
+            (timeline_id,),
+        ).fetchone()
+        if row:
+            add_id(row[0])
+            try:
+                for cid in json.loads(row[1] or "[]"):
+                    add_id(cid)
+            except (TypeError, json.JSONDecodeError):
+                pass
+
+        try:
+            linked_rows = conn.execute(
+                "SELECT id FROM captures WHERE timeline_id = ? ORDER BY ts ASC, id ASC",
+                (timeline_id,),
+            ).fetchall()
+            for linked_row in linked_rows:
+                add_id(linked_row[0])
+        except sqlite3.OperationalError:
+            # 兼容极旧测试库或迁移中间态，无法反查时保留旧字段结果。
+            pass
+
+        return member_ids
+
+    def _document_identities_for_capture_ids(
+        self, conn: sqlite3.Connection, capture_ids: list[int]
+    ) -> Optional[set[str]]:
+        """读取一组 capture 的文档 URL identity；查不到 url 列时返回 None 表示无法判定。"""
+        if not capture_ids:
+            return set()
+        from knowledge.fragment_grouper import _document_identity
+
+        placeholders = ','.join('?' * len(capture_ids))
+        try:
+            rows = conn.execute(
+                f"SELECT url FROM captures WHERE id IN ({placeholders})",
+                capture_ids,
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("文档边界守卫查询 capture url 失败: %s，放行", e)
+            return None
+        return {doc for doc in (_document_identity(row[0]) for row in rows) if doc}
+
+    def _merge_group_into_existing_timeline(
+        self,
+        conn: sqlite3.Connection,
+        timeline_id: int,
+        capture_ids: list[int],
+        group: list[dict],
+        merged_details: str,
+    ) -> None:
+        """语义去重合并：同步 timeline 成员、时间范围和 details。"""
+        row = conn.execute(
+            """
+            SELECT start_time, end_time, time_range_start, time_range_end, observed_at
+            FROM timelines WHERE id = ?
+            """,
+            (timeline_id,),
+        ).fetchone()
+        existing_ids = self._timeline_member_capture_ids(conn, timeline_id)
+        merged_ids = existing_ids + [cid for cid in capture_ids if cid not in existing_ids]
+
+        group_times = []
+        for capture in group:
+            try:
+                group_times.append(int(capture.get('ts')))
+            except (TypeError, ValueError):
+                pass
+
+        existing_start = row[0] if row else None
+        existing_end = row[1] if row else None
+        existing_range_start = row[2] if row else None
+        existing_range_end = row[3] if row else None
+        existing_observed = row[4] if row else None
+
+        start_candidates = [v for v in (existing_start, existing_range_start, *group_times) if v]
+        end_candidates = [v for v in (existing_end, existing_range_end, existing_observed, *group_times) if v]
+        next_start = min(start_candidates) if start_candidates else None
+        next_end = max(end_candidates) if end_candidates else None
+
+        conn.execute(
+            """
+            UPDATE timelines SET
+                occurrence_count = occurrence_count + 1,
+                details = ?,
+                capture_ids = ?,
+                start_time = COALESCE(?, start_time),
+                end_time = COALESCE(?, end_time),
+                time_range_start = COALESCE(?, time_range_start),
+                time_range_end = COALESCE(?, time_range_end),
+                observed_at = COALESCE(?, observed_at),
+                updated_at_ms = ?
+            WHERE id = ?
+            """,
+            (
+                merged_details,
+                json.dumps(merged_ids, ensure_ascii=False),
+                next_start,
+                next_end,
+                next_start,
+                next_end,
+                next_end,
+                int(time.time() * 1000),
+                timeline_id,
+            ),
+        )
+
     def _doc_compatible_with_timeline(self, group: list[dict], timeline_id: int) -> bool:
         """文档边界守卫：判断 group 是否可跨批合并进 timeline_id。
 
@@ -865,25 +988,18 @@ class BackgroundProcessor:
         try:
             conn = sqlite3.connect(self.db_path)
             try:
-                row = conn.execute(
-                    "SELECT capture_ids FROM timelines WHERE id = ?", (timeline_id,)
-                ).fetchone()
-                if not row or not row[0]:
-                    return True
-                member_ids = json.loads(row[0])
+                member_ids = self._timeline_member_capture_ids(conn, timeline_id)
                 if not member_ids:
                     return True
-                placeholders = ','.join('?' * len(member_ids))
-                urls = conn.execute(
-                    f"SELECT url FROM captures WHERE id IN ({placeholders})", member_ids
-                ).fetchall()
+                tl_docs = self._document_identities_for_capture_ids(conn, member_ids)
+                if tl_docs is None:
+                    return True
             finally:
                 conn.close()
         except Exception as e:
             logger.warning("文档边界守卫查询失败 timeline_id=%d: %s，放行", timeline_id, e)
             return True
 
-        tl_docs = {d for d in (_document_identity(u[0]) for u in urls) if d}
         grp_docs = {d for d in (_document_identity(c.get('url')) for c in group) if d}
 
         if tl_docs:
@@ -1024,6 +1140,14 @@ class BackgroundProcessor:
             ) if overview else None
 
             if similar_id:
+                if not self._doc_compatible_with_timeline(group, similar_id):
+                    logger.info(
+                        "🚫 相似时间线合并被文档边界拦截: group 与 timeline_id=%d 文档不一致，改为新建时间线",
+                        similar_id,
+                    )
+                    similar_id = None
+
+            if similar_id:
                 # 合并：occurrence_count+1，追加 details（去重保留新信息）
                 existing = conn.execute(
                     "SELECT details FROM timelines WHERE id = ?", (similar_id,)
@@ -1035,9 +1159,12 @@ class BackgroundProcessor:
                     merged_details = existing_details + f"\n\n--- 补充 ({_dt.now().strftime('%Y-%m-%d %H:%M')}) ---\n{new_details}"
                 else:
                     merged_details = existing_details
-                conn.execute(
-                    "UPDATE timelines SET occurrence_count = occurrence_count + 1, details = ? WHERE id = ?",
-                    (merged_details, similar_id),
+                self._merge_group_into_existing_timeline(
+                    conn,
+                    similar_id,
+                    capture_ids,
+                    group,
+                    merged_details,
                 )
                 conn.commit()
                 self._mark_captures_processed(conn, capture_ids, similar_id)

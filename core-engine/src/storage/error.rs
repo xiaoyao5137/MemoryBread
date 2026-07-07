@@ -10,6 +10,9 @@ pub enum StorageError {
     #[error("JSON 序列化错误: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("文件系统错误: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("记录不存在: {0}")]
     NotFound(String),
 

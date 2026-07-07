@@ -21,10 +21,21 @@ describe('FloatingBuddy', () => {
     expect(useAppStore.getState().windowMode).toBe('settings')
   })
 
-  it('收藏菜单排在第二位，采集排在第三位', () => {
+  it('普通菜单导航会清除关联返回栈', () => {
+    useAppStore.getState().pushBakeNavigationTarget({ windowMode: 'rag' })
+
+    render(<FloatingBuddy />)
+    fireEvent.click(screen.getByTestId('settings-btn'))
+
+    expect(useAppStore.getState().bakeNavigationStack).toHaveLength(0)
+    expect(useAppStore.getState().captureBackTarget).toBeNull()
+  })
+
+  it('记忆菜单排在第二位，采集排在第三位', () => {
     render(<FloatingBuddy />)
     const buttonTestIds = screen.getAllByRole('button').map(button => button.getAttribute('data-testid'))
     expect(buttonTestIds.indexOf('knowledge-btn')).toBe(buttonTestIds.indexOf('bake-btn') + 1)
+    expect(screen.getByText('记忆')).toBeInTheDocument()
   })
 
   it('平台管理员可以切换测试和正式环境并持久化', () => {
@@ -46,7 +57,8 @@ describe('FloatingBuddy', () => {
       expires_at: new Date(Date.now() + 86400_000).toISOString(),
       user: {
         id: '018f0000-0000-7000-8000-000000000002',
-        display_name: '土豆',
+        username: '烘焙师土豆',
+        display_name: '土豆账户',
         email: 'tudou@memorybread.local',
         status: 'active',
         roles: ['user'],
@@ -64,8 +76,9 @@ describe('FloatingBuddy', () => {
 
     render(<FloatingBuddy />)
 
-    expect(screen.getByText('土豆')).toBeInTheDocument()
-    expect(screen.getByText('黄金')).toBeInTheDocument()
+    expect(screen.getByText('烘焙师土豆')).toBeInTheDocument()
+    expect(screen.queryByText('土豆账户')).not.toBeInTheDocument()
+    expect(screen.getByText('Plus')).toBeInTheDocument()
     expect(screen.queryByText('云账户已连接')).not.toBeInTheDocument()
   })
 })

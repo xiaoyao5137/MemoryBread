@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import { Copy, ExternalLink, FileText, Image, Loader2, Paperclip, Search, Sparkles, Square, X } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import type { CreationReferenceItem, CreationReferencePreview } from '../store/useAppStore'
+import { fetchWithLocalhostFallback } from '../hooks/useApi'
 import { fetchBillingBalance } from '../utils/authApi'
 import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
@@ -14,6 +15,17 @@ interface CreationPanelProps {
 
 type ReferenceItem = CreationReferenceItem
 type ReferencePreview = CreationReferencePreview
+interface CreationHistoryItem {
+  prompt: string
+  timestamp: string
+  preview: string
+  fullContent: string
+  docType: string
+  audience: string
+  references: CreationReferenceItem[]
+  model?: string | null
+  latencyMs?: number | null
+}
 type MarkdownBlock =
   | { type: 'markdown'; content: string }
   | { type: 'table'; headers: string[]; alignments: Array<'left' | 'center' | 'right'>; rows: string[][] }
@@ -46,7 +58,18 @@ const readApiErrorMessage = async (response: Response, fallback: string) => {
   }
 }
 
-const mapCreationHistory = (histories: any[]) => histories.map((h: any) => {
+const normalizeLatencyMs = (value: unknown): number | null => {
+  const numeric = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : null
+}
+
+const formatInferenceLatency = (latencyMs?: number | null) => {
+  if (latencyMs == null) return '未记录'
+  if (latencyMs < 1000) return `${latencyMs} ms`
+  return `${(latencyMs / 1000).toFixed(latencyMs < 10_000 ? 1 : 0)} 秒`
+}
+
+const mapCreationHistory = (histories: any[]): CreationHistoryItem[] => histories.map((h: any) => {
   const fullContent = sanitizeGeneratedContent(h.generated_content)
   let references: CreationReferenceItem[] = []
   try {
@@ -64,6 +87,7 @@ const mapCreationHistory = (histories: any[]) => histories.map((h: any) => {
     audience: h.audience || '',
     references,
     model: h.model || null,
+    latencyMs: normalizeLatencyMs(h.latency_ms),
   }
 })
 
@@ -211,7 +235,8 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const [activeBottomTab, setActiveBottomTab] = useState<'reference' | 'config' | null>(null)
   const toggleBottomTab = (tab: 'reference' | 'config') =>
     setActiveBottomTab(prev => prev === tab ? null : tab)
-  const [creationHistory, setCreationHistory] = useState<Array<{ prompt: string; timestamp: string; preview: string; fullContent: string; docType: string; audience: string; references: CreationReferenceItem[]; model?: string | null }>>([])
+  const [creationHistory, setCreationHistory] = useState<CreationHistoryItem[]>([])
+  const [lastInferenceMeta, setLastInferenceMeta] = useState<{ model: string; latencyMs: number | null } | null>(null)
   const [attachments, setAttachments] = useState<UserAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
   const contentRef = useRef<HTMLDivElement>(null)
@@ -498,6 +523,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     setIsGenerating(true)
     setError(null)
     setGeneratedContent('')
+    setLastInferenceMeta(null)
     const controller = new AbortController()
     abortRef.current = controller
     startTimer()
@@ -506,6 +532,8 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       let refCount = 0
       let referencesForHistory: CreationReferenceItem[] = []
       let finalSaveContent = ''
+      let usedModelId = activeCreationModelId
+      let inferenceLatencyMs: number | null = null
       if (enableRag) {
         try {
           const refResponse = await postReferencePreview(controller.signal)
@@ -525,24 +553,34 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
           console.info('MBCD Plus v1.0 将通过 gateway 调用')
         }
         try {
+          usedModelId = REMOTE_CREATION_MODEL_ID
+          const inferenceStartedAt = Date.now()
           const data = await postGatewayCreation(referencesForHistory, controller.signal)
           const content = sanitizeGeneratedContent(data.content || '')
           if (!content.trim()) throw new Error('生成结束但没有返回内容，请稍后重试或切换为本地创作模型')
           setGeneratedContent(content)
           finalSaveContent = content
+          inferenceLatencyMs = Date.now() - inferenceStartedAt
         } catch (gatewayErr) {
           console.warn('云端创作不可用，自动回落本地创作:', gatewayErr)
+          usedModelId = LOCAL_CREATION_MODEL_ID
+          const inferenceStartedAt = Date.now()
           const content = await postLocalCreation(controller.signal)
           finalSaveContent = content
+          inferenceLatencyMs = Date.now() - inferenceStartedAt
         }
       } else {
+        usedModelId = LOCAL_CREATION_MODEL_ID
+        const inferenceStartedAt = Date.now()
         const content = await postLocalCreation(controller.signal)
         finalSaveContent = content
+        inferenceLatencyMs = Date.now() - inferenceStartedAt
       }
 
       if (finalSaveContent) {
+        setLastInferenceMeta({ model: usedModelId, latencyMs: inferenceLatencyMs })
         try {
-          await fetch(`${apiBaseUrl}/api/creation/history`, {
+          await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -552,10 +590,11 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
               audience: audience || null,
               reference_count: refCount,
               references: referencesForHistory,
-              model: activeCreationModelId,
+              model: usedModelId,
+              latency_ms: inferenceLatencyMs,
             }),
           })
-          const historyResponse = await fetch(`${apiBaseUrl}/api/creation/history`)
+          const historyResponse = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`)
           if (historyResponse.ok) {
             const histories = await historyResponse.json()
             setCreationHistory(mapCreationHistory(histories))
@@ -597,16 +636,17 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
           docType: docType || '',
           audience: audience || '',
           references: referencePreview?.references || [],
-          model: activeCreationModelId,
+          model: lastInferenceMeta?.model ?? activeCreationModelId,
+          latencyMs: lastInferenceMeta?.latencyMs ?? null,
         }, ...prev].slice(0, 10)
       })
     }
-  }, [isGenerating, generatedContent, prompt, activeCreationModelId, docType, audience, referencePreview])
+  }, [isGenerating, generatedContent, prompt, activeCreationModelId, docType, audience, referencePreview, lastInferenceMeta])
 
   useEffect(() => {
     const loadHistory = async () => {
       try {
-        const response = await fetch(`${apiBaseUrl}/api/creation/history`)
+        const response = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`)
         if (response.ok) {
           const histories = await response.json()
           setCreationHistory(mapCreationHistory(histories))
@@ -730,7 +770,9 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                   onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e1e5ea' }}
                 >
                   <div style={{ fontSize: 13, fontWeight: 600, color: '#1f2937', marginBottom: 6 }}>{item.prompt}</div>
-                  <div style={{ fontSize: 11, color: '#667085', marginBottom: 6 }}>{item.timestamp} · {getModelDisplayName(item.model)}</div>
+                  <div style={{ fontSize: 11, color: '#667085', marginBottom: 6 }}>
+                    {item.timestamp} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latencyMs)}
+                  </div>
                   <div style={{ fontSize: 12, color: '#475467', lineHeight: 1.5 }}>{item.preview}</div>
                 </div>
               ))}
@@ -796,7 +838,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                   onChange={handleSelectModel}
                   title="选择创作生成模型"
                 />
-                {cloudBalance && (
+                {activeCreationModelId === REMOTE_CREATION_MODEL_ID && cloudBalance && (
                   <span style={{ color: '#667085', fontSize: 12 }}>
                     Credit {cloudBalance.available}
                   </span>

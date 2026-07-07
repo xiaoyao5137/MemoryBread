@@ -46,11 +46,19 @@ class OllamaBackend(LlmBackend):
 
     def complete(self, prompt: str, system: str = "", **kwargs) -> LlmResponse:
         url = f"{self._base_url}/api/generate"
+        options = {
+            "num_predict": kwargs.pop("num_predict", self._num_predict),
+        }
+        for key in ("temperature", "top_p", "seed"):
+            if key in kwargs:
+                options[key] = kwargs[key]
+
         body: dict = {
             "model":       self._model,
             "prompt":      prompt,
             "stream":      False,
-            "num_predict": kwargs.pop("num_predict", self._num_predict),
+            "options":     options,
+            "think":       False,
             # keep_alive=10m：请求完成后模型在内存中保留 10 分钟，
             # 避免频繁调用时 Ollama 反复加载/卸载模型（默认 5 分钟太短）。
             # 对于 RAG 查询 + 时间线提炼交替使用的场景，10 分钟可以覆盖大部分间隔。
@@ -58,10 +66,6 @@ class OllamaBackend(LlmBackend):
         }
         if system:
             body["system"] = system
-        # 透传支持的模型参数
-        for key in ("temperature", "top_p", "seed"):
-            if key in kwargs:
-                body[key] = kwargs[key]
 
         data = json.dumps(body).encode("utf-8")
         req  = urllib.request.Request(
@@ -77,10 +81,19 @@ class OllamaBackend(LlmBackend):
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Ollama 服务不可达: {exc}") from exc
 
+        done_reason = result.get("done_reason") or result.get("finish_reason")
+        if not done_reason:
+            try:
+                if result.get("eval_count", 0) >= int(options.get("num_predict", 0) or 0):
+                    done_reason = "length"
+            except Exception:
+                done_reason = None
+
         return LlmResponse(
             text   = result.get("response", ""),
             model  = result.get("model", self._model),
             tokens = result.get("eval_count", 0),
+            done_reason=done_reason,
         )
 
     @property

@@ -156,6 +156,15 @@ _rag_pipeline_lock = __import__('threading').Lock()
 _bake_extractor = None
 _bake_extractor_lock = __import__('threading').Lock()
 DB_PATH = str(Path.home() / ".memory-bread" / "memory-bread.db")
+RAG_REFERENCE_LIMIT = 10
+
+
+def _coerce_rag_top_k(value, default: int = RAG_REFERENCE_LIMIT) -> int:
+    try:
+        top_k = int(value)
+    except (TypeError, ValueError):
+        top_k = default
+    return max(1, min(top_k, RAG_REFERENCE_LIMIT))
 
 
 def _read_user_identity() -> str:
@@ -208,7 +217,7 @@ def _with_floating_assist_context(contexts: list[dict], metadata: dict | None = 
     )
     if not has_floating_context and metadata.get('source') == 'floating_assist' and metadata.get('screenshot_path'):
         ocr_text = (metadata.get('ocr_text') or '').strip()
-        saved_contexts.insert(0, {
+        floating_context = {
             'capture_id': 0,
             'doc_key': f"floating-assist:{int(time.time() * 1000)}",
             'text': ocr_text[:1200] if ocr_text else '悬浮球截屏识别',
@@ -219,7 +228,19 @@ def _with_floating_assist_context(contexts: list[dict], metadata: dict | None = 
             'screenshot_path': metadata.get('screenshot_path'),
             'screenshot_width': metadata.get('screenshot_width'),
             'screenshot_height': metadata.get('screenshot_height'),
-        })
+        }
+        if metadata.get('trigger'):
+            floating_context['trigger'] = metadata.get('trigger')
+        auto_task_detection = metadata.get('auto_task_detection')
+        if isinstance(auto_task_detection, dict):
+            floating_context['auto_task_detection'] = {
+                'score': auto_task_detection.get('score'),
+                'reasons': auto_task_detection.get('reasons') or [],
+                'fingerprint': auto_task_detection.get('fingerprint'),
+                'snippets': auto_task_detection.get('snippets') or [],
+                'requires_confirmation': bool(auto_task_detection.get('requires_confirmation')),
+            }
+        saved_contexts.insert(0, floating_context)
     return saved_contexts
 
 
@@ -606,7 +627,7 @@ def get_rag_pipeline():
                         fts5_retriever=Fts5Retriever(db_path=db_path),
                         knowledge_retriever=KnowledgeFts5Retriever(db_path=db_path),
                         llm=OllamaBackend(model=ollama_model, timeout=360, num_predict=1536),
-                        top_k=5,
+                        top_k=RAG_REFERENCE_LIMIT,
                         db_path=db_path,
                     )
                     _log_model_event("load_done", "llm", f"RAG LLM · {ollama_model}", memory_mb=2500)
@@ -1240,14 +1261,14 @@ def rag_query():
     """RAG 查询接口，与模型管理 API 共用 7071 端口。"""
     start_ms = int(time.time() * 1000)
     query = None
-    top_k = 5
+    top_k = RAG_REFERENCE_LIMIT
     try:
         data = request.get_json()
         if not data or 'query' not in data:
             return jsonify({'error': '缺少 query 参数'}), 400
 
         query = data['query']
-        top_k = data.get('top_k', 5)
+        top_k = _coerce_rag_top_k(data.get('top_k'))
         logger.info(f"收到 RAG 查询: {query}")
         data = _floating_assist_metadata(query, data)
         rag_query_text = _build_floating_assist_rag_query(query, data)
@@ -1360,12 +1381,15 @@ def rag_query():
             completion_tokens=completion_tokens,
             latency_ms=latency_ms,
             caller_id=str(session_id) if session_id is not None else None,
+            done_reason=result.done_reason,
         )
 
         return jsonify({
             'answer': result.answer,
             'contexts': response_contexts,
             'model': result.model,
+            'done_reason': result.done_reason,
+            'output_truncated': bool(result.output_truncated),
         })
     except Exception as e:
         latency_ms = int(time.time() * 1000) - start_ms
@@ -1405,7 +1429,7 @@ def rag_references():
             return jsonify({'error': '缺少 query 参数'}), 400
 
         query = data['query']
-        top_k = data.get('top_k', 5)
+        top_k = _coerce_rag_top_k(data.get('top_k'))
         logger.info(f"收到 RAG 参考资料召回: {query}")
 
         if _rag_pipeline is None:

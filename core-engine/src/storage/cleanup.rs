@@ -110,8 +110,10 @@ impl StorageManager {
     /// 清理过期采集记录。
     ///
     /// 只删除原始 captures、其向量索引元数据和对应截图文件；时间线、知识、
-    /// 操作记录等提炼物不会被删除。历史 schema 中 timelines.capture_id 是外键，
-    /// 因此这里临时关闭外键检查以允许“原始证据过期，提炼物保留”的产品语义。
+    /// 操作记录等提炼物不会被删除。快照恢复生成的 `snapshot_ref` 只是跨设备
+    /// 重建引用占位，不包含原始采集内容，也不应被采集保留期清理掉。历史 schema
+    /// 中 timelines.capture_id 是外键，因此这里临时关闭外键检查以允许“原始证据
+    /// 过期，提炼物保留”的产品语义。
     ///
     /// 返回 `(deleted_capture_count, deleted_screenshot_count, freed_bytes)`。
     pub fn run_old_captures_cleanup(
@@ -122,7 +124,8 @@ impl StorageManager {
         let rows = self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, screenshot_path FROM captures
-                 WHERE ts < ?1",
+                 WHERE ts < ?1
+                   AND (event_type IS NULL OR event_type <> 'snapshot_ref')",
             )?;
             let result = stmt
                 .query_map(params![older_than_ms], |row| {
@@ -166,10 +169,23 @@ impl StorageManager {
         }
 
         let affected = self.with_conn(|conn| {
-            conn.execute("DELETE FROM vector_index WHERE capture_id IN (SELECT id FROM captures WHERE ts < ?1)", params![older_than_ms])?;
+            conn.execute(
+                "DELETE FROM vector_index
+                 WHERE capture_id IN (
+                    SELECT id FROM captures
+                    WHERE ts < ?1
+                      AND (event_type IS NULL OR event_type <> 'snapshot_ref')
+                 )",
+                params![older_than_ms],
+            )?;
 
             conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-            let delete_result = conn.execute("DELETE FROM captures WHERE ts < ?1", params![older_than_ms]);
+            let delete_result = conn.execute(
+                "DELETE FROM captures
+                 WHERE ts < ?1
+                   AND (event_type IS NULL OR event_type <> 'snapshot_ref')",
+                params![older_than_ms],
+            );
             let restore_result = conn.execute_batch("PRAGMA foreign_keys = ON;");
 
             match (delete_result, restore_result) {
@@ -335,6 +351,47 @@ mod tests {
         assert!(!logs.is_empty());
         assert_eq!(logs[0].cleanup_type, "old_captures");
         assert_eq!(logs[0].affected_count, 1);
+    }
+
+    #[test]
+    fn test_old_captures_cleanup_keeps_snapshot_refs() {
+        let mgr = make_mgr();
+        let dir = tempdir().unwrap();
+        let old_ts = current_ts_ms() - 180 * 24 * 3600 * 1000 - 1;
+
+        mgr.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO captures (ts, event_type, is_sensitive, pii_scrubbed)
+                 VALUES (?1, 'snapshot_ref', 1, 1)",
+                params![old_ts],
+            )?;
+            conn.execute(
+                "INSERT INTO captures (ts, event_type, ax_text)
+                 VALUES (?1, 'auto', 'raw')",
+                params![old_ts],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cutoff = current_ts_ms() - 180 * 24 * 3600 * 1000;
+        let (deleted, deleted_screenshots, freed) =
+            mgr.run_old_captures_cleanup(cutoff, dir.path()).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(deleted_screenshots, 0);
+        assert_eq!(freed, 0);
+
+        let snapshot_refs: i64 = mgr
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM captures WHERE event_type = 'snapshot_ref'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(StorageError::Sqlite)
+            })
+            .unwrap();
+        assert_eq!(snapshot_refs, 1);
     }
 
     #[test]

@@ -175,9 +175,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 启动 API 服务器
-    let addr = "127.0.0.1:7070";
+    let addr =
+        std::env::var("MEMORY_BREAD_CORE_BIND").unwrap_or_else(|_| "127.0.0.1:7070".to_string());
     tracing::info!("启动 REST API 服务器: http://{}", addr);
-    start_server(state, addr).await?;
+    start_server(state, &addr).await?;
 
     Ok(())
 }

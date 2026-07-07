@@ -160,6 +160,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "037_add_model_to_history",
         include_str!("migrations/037_add_model_to_history.sql"),
     ),
+    (
+        "038_add_latency_to_creation_history",
+        include_str!("migrations/038_add_latency_to_creation_history.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -308,13 +312,25 @@ impl StorageManager {
 
             if *version == "037_add_model_to_history" {
                 Self::add_column_if_missing(&conn, "creation_history", "model", "TEXT")?;
-                Self::add_column_if_missing(
-                    &conn,
-                    "creation_history",
-                    "references_json",
-                    "TEXT",
-                )?;
+                Self::add_column_if_missing(&conn, "creation_history", "references_json", "TEXT")?;
                 Self::add_column_if_missing(&conn, "rag_sessions", "model", "TEXT")?;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    rusqlite::params![version],
+                    |row| row.get(0),
+                )?;
+                if count == 0 {
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        rusqlite::params![version, current_ts_ms()],
+                    )?;
+                }
+                info!("迁移 {} 执行成功", version);
+                continue;
+            }
+
+            if *version == "038_add_latency_to_creation_history" {
+                Self::add_column_if_missing(&conn, "creation_history", "latency_ms", "INTEGER")?;
                 let count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
                     rusqlite::params![version],
@@ -354,7 +370,30 @@ impl StorageManager {
             info!("迁移 {} 执行成功", version);
         }
 
+        self.run_compatibility_schema_repairs(&conn)?;
+
         Ok(())
+    }
+
+    fn run_compatibility_schema_repairs(&self, conn: &Connection) -> Result<(), StorageError> {
+        // 部分本地库在 references_json 出现前就已登记 037 迁移完成。
+        // 这里做一次幂等修复，避免创作历史 API 因缺列无法读写旧记录。
+        if self.table_exists(conn, "creation_history")? {
+            Self::add_column_if_missing(conn, "creation_history", "model", "TEXT")?;
+            Self::add_column_if_missing(conn, "creation_history", "references_json", "TEXT")?;
+            Self::add_column_if_missing(conn, "creation_history", "latency_ms", "INTEGER")?;
+        }
+
+        Ok(())
+    }
+
+    fn table_exists(&self, conn: &Connection, table: &str) -> Result<bool, StorageError> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            rusqlite::params![table],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool, StorageError> {
@@ -524,4 +563,68 @@ pub fn current_ts_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_repairs_creation_history_schema_when_old_migration_was_marked_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("legacy.db");
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at INTEGER NOT NULL
+                );
+                CREATE TABLE creation_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prompt TEXT NOT NULL,
+                    generated_content TEXT NOT NULL,
+                    doc_type TEXT,
+                    audience TEXT,
+                    reference_count INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    model TEXT,
+                    latency_ms INTEGER
+                );",
+            )
+            .unwrap();
+
+            for (version, _) in MIGRATIONS {
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    rusqlite::params![version, current_ts_ms()],
+                )
+                .unwrap();
+            }
+        }
+
+        let storage = StorageManager::open(&db).unwrap();
+        storage
+            .with_conn(|conn| {
+                assert!(StorageManager::has_column(
+                    conn,
+                    "creation_history",
+                    "references_json"
+                )?);
+                assert!(StorageManager::has_column(
+                    conn,
+                    "creation_history",
+                    "model"
+                )?);
+                assert!(StorageManager::has_column(
+                    conn,
+                    "creation_history",
+                    "latency_ms"
+                )?);
+                Ok(())
+            })
+            .unwrap();
+    }
 }

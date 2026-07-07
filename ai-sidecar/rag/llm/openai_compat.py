@@ -74,9 +74,10 @@ class OpenAICompatBackend(LlmBackend):
         except urllib.error.URLError as exc:
             raise RuntimeError(f"OpenAI API 请求失败: {exc}") from exc
 
-        text   = result["choices"][0]["message"]["content"]
+        choice = result["choices"][0]
+        text   = choice["message"]["content"]
         tokens = result.get("usage", {}).get("total_tokens", 0)
-        return LlmResponse(text=text, model=self._model, tokens=tokens)
+        return LlmResponse(text=text, model=self._model, tokens=tokens, done_reason=choice.get("finish_reason"))
 
     @property
     def model_name(self) -> str:

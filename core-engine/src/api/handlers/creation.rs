@@ -375,6 +375,8 @@ pub struct SaveHistoryRequest {
     #[serde(default)]
     pub references: Vec<serde_json::Value>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub latency_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -399,6 +401,7 @@ pub async fn save_history(
                 req.reference_count,
                 Some(&references_json),
                 req.model.as_deref(),
+                req.latency_ms,
             )
             .map_err(Into::into)
         })

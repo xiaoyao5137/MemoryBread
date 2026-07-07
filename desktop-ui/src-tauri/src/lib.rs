@@ -22,11 +22,13 @@ static QUITTING: AtomicBool = AtomicBool::new(false);
 const FLOATING_ASSIST_LABEL: &str = "floating-assist";
 const FLOATING_ASSIST_DEFAULT_MARGIN: i32 = 24;
 const FLOATING_ASSIST_DEFAULT_TOP: i32 = 140;
-const FLOATING_ASSIST_DEFAULT_SIZE: i32 = 42;
+const FLOATING_ASSIST_DEFAULT_SIZE: i32 = 82;
+const TRAY_TEMPLATE_ICON_SIZE: u32 = 64;
 
 struct TrayMenuState {
     capture: CheckMenuItem<tauri::Wry>,
     floating_assist: CheckMenuItem<tauri::Wry>,
+    floating_assist_auto_task: CheckMenuItem<tauri::Wry>,
     autostart: CheckMenuItem<tauri::Wry>,
 }
 
@@ -37,6 +39,10 @@ struct FloatingAssistOcrResult {
     screenshot_path: String,
     width: u32,
     height: u32,
+    screenshot_source: String,
+    app_bundle_id: Option<String>,
+    app_name: Option<String>,
+    window_title: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +85,10 @@ struct FloatingAssistScreenCapture {
     ocr_paths: Vec<PathBuf>,
     width: u32,
     height: u32,
+    source: String,
+    app_bundle_id: Option<String>,
+    app_name: Option<String>,
+    window_title: Option<String>,
 }
 
 trait ReadWrite: Read + Write {}
@@ -103,8 +113,14 @@ fn ensure_floating_assist_window(app: &AppHandle) -> Result<tauri::WebviewWindow
         WebviewUrl::App("index.html?view=floating-assist".into()),
     )
     .title("记忆面包悬浮球")
-    .inner_size(42.0, 42.0)
-    .min_inner_size(40.0, 40.0)
+    .inner_size(
+        FLOATING_ASSIST_DEFAULT_SIZE as f64,
+        FLOATING_ASSIST_DEFAULT_SIZE as f64,
+    )
+    .min_inner_size(
+        FLOATING_ASSIST_DEFAULT_SIZE as f64,
+        FLOATING_ASSIST_DEFAULT_SIZE as f64,
+    )
     .resizable(false)
     .decorations(false)
     .transparent(true)
@@ -247,21 +263,41 @@ fn set_floating_assist_position_clamped(
 
 fn set_floating_assist_visible_inner(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let window = ensure_floating_assist_window(app)?;
+    let menu_state = app.state::<TrayMenuState>();
     if enabled {
-        let _ = window.set_size(LogicalSize::new(42.0, 42.0));
+        let _ = window.set_size(LogicalSize::new(
+            FLOATING_ASSIST_DEFAULT_SIZE as f64,
+            FLOATING_ASSIST_DEFAULT_SIZE as f64,
+        ));
         let _ = set_floating_assist_position_clamped(
             app,
             &window,
             default_floating_assist_position(app, &window),
-            Some((42.0, 42.0)),
+            Some((
+                FLOATING_ASSIST_DEFAULT_SIZE as f64,
+                FLOATING_ASSIST_DEFAULT_SIZE as f64,
+            )),
         );
         window.show().map_err(|error| error.to_string())?;
         let _ = window.set_always_on_top(true);
         let _ = app.emit("floating-assist-reset", ());
+        menu_state
+            .floating_assist_auto_task
+            .set_enabled(true)
+            .map_err(|error| error.to_string())?;
     } else {
         window.hide().map_err(|error| error.to_string())?;
+        menu_state
+            .floating_assist_auto_task
+            .set_checked(false)
+            .map_err(|error| error.to_string())?;
+        menu_state
+            .floating_assist_auto_task
+            .set_enabled(false)
+            .map_err(|error| error.to_string())?;
+        let _ = app.emit("floating-assist-auto-task-changed", false);
     }
-    app.state::<TrayMenuState>()
+    menu_state
         .floating_assist
         .set_checked(enabled)
         .map_err(|error| error.to_string())?;
@@ -354,7 +390,94 @@ fn capture_all_screens_for_floating_assist() -> Result<FloatingAssistScreenCaptu
         ocr_paths,
         width,
         height,
+        source: "fullscreen".to_string(),
+        app_bundle_id: None,
+        app_name: None,
+        window_title: None,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn frontmost_bundle_id_for_floating_assist() -> Option<String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to get bundle identifier of first application process whose frontmost is true")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn frontmost_bundle_id_for_floating_assist() -> Option<String> {
+    None
+}
+
+fn capture_focused_window_for_floating_assist() -> Result<FloatingAssistScreenCapture, String> {
+    use xcap::Window;
+
+    const MIN_WINDOW_WIDTH: u32 = 200;
+    const MIN_WINDOW_HEIGHT: u32 = 150;
+
+    let windows = Window::all().map_err(|error| format!("读取窗口列表失败：{error}"))?;
+    let mut candidates: Vec<(Window, u32, u32, u64)> = Vec::new();
+    for window in windows {
+        if !window.is_focused().unwrap_or(false) || window.is_minimized().unwrap_or(false) {
+            continue;
+        }
+        let width = window.width().unwrap_or(0);
+        let height = window.height().unwrap_or(0);
+        let area = (width as u64) * (height as u64);
+        candidates.push((window, width, height, area));
+    }
+
+    candidates.sort_by(|left, right| right.3.cmp(&left.3));
+    let (window, width, height, _) = candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| "未找到前台窗口".to_string())?;
+
+    let app_name = window
+        .app_name()
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let app_bundle_id = frontmost_bundle_id_for_floating_assist();
+    let window_title = window.title().ok().filter(|value| !value.trim().is_empty());
+    if width < MIN_WINDOW_WIDTH || height < MIN_WINDOW_HEIGHT {
+        return Err(format!(
+            "前台窗口过小，跳过 app={app_name:?} title={window_title:?} {width}x{height}"
+        ));
+    }
+
+    let image = window.capture_image().map_err(|error| {
+        format!("前台窗口截图失败 app={app_name:?} title={window_title:?}：{error}")
+    })?;
+    let timestamp = now_ms();
+    let temp_dir = floating_assist_temp_dir()?;
+    let preview_path = save_rgba_jpeg(
+        temp_dir.join(format!("{timestamp}-window.jpg")),
+        image.clone(),
+    )?;
+    let ocr_path = save_rgba_jpeg(temp_dir.join(format!("{timestamp}-window-ocr.jpg")), image)?;
+
+    Ok(FloatingAssistScreenCapture {
+        preview_path,
+        ocr_paths: vec![ocr_path],
+        width,
+        height,
+        source: "window".to_string(),
+        app_bundle_id,
+        app_name,
+        window_title,
+    })
+}
+
+fn capture_screen_for_floating_assist() -> Result<FloatingAssistScreenCapture, String> {
+    capture_focused_window_for_floating_assist()
+        .or_else(|_| capture_all_screens_for_floating_assist())
 }
 
 fn run_floating_assist_ocr(paths: &[PathBuf]) -> Result<IpcOcrResult, String> {
@@ -536,9 +659,39 @@ fn set_capture_menu_state(app: AppHandle, enabled: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn set_floating_assist_menu_state(app: AppHandle, enabled: bool) -> Result<(), String> {
-    app.state::<TrayMenuState>()
+    let menu_state = app.state::<TrayMenuState>();
+    menu_state
         .floating_assist
         .set_checked(enabled)
+        .map_err(|error| error.to_string())?;
+    menu_state
+        .floating_assist_auto_task
+        .set_enabled(enabled)
+        .map_err(|error| error.to_string())?;
+    if !enabled {
+        menu_state
+            .floating_assist_auto_task
+            .set_checked(false)
+            .map_err(|error| error.to_string())?;
+        let _ = app.emit("floating-assist-auto-task-changed", false);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_floating_assist_auto_task_menu_state(
+    app: AppHandle,
+    checked: bool,
+    enabled: bool,
+) -> Result<(), String> {
+    let menu_state = app.state::<TrayMenuState>();
+    menu_state
+        .floating_assist_auto_task
+        .set_enabled(enabled)
+        .map_err(|error| error.to_string())?;
+    menu_state
+        .floating_assist_auto_task
+        .set_checked(checked && enabled)
         .map_err(|error| error.to_string())
 }
 
@@ -628,7 +781,7 @@ async fn capture_screen_ocr_for_floating_assist(
         let _ = window.set_always_on_top(true);
 
         let capture_result = tauri::async_runtime::spawn_blocking(|| {
-            let capture = capture_all_screens_for_floating_assist()?;
+            let capture = capture_screen_for_floating_assist()?;
             let result = run_floating_assist_ocr(&capture.ocr_paths)?;
             Ok::<_, String>((capture, result))
         })
@@ -646,11 +799,15 @@ async fn capture_screen_ocr_for_floating_assist(
             screenshot_path,
             width: capture.width,
             height: capture.height,
+            screenshot_source: capture.source,
+            app_bundle_id: capture.app_bundle_id,
+            app_name: capture.app_name,
+            window_title: capture.window_title,
         });
     }
 
     let (capture, result) = tauri::async_runtime::spawn_blocking(|| {
-        let capture = capture_all_screens_for_floating_assist()?;
+        let capture = capture_screen_for_floating_assist()?;
         let result = run_floating_assist_ocr(&capture.ocr_paths)?;
         Ok::<_, String>((capture, result))
     })
@@ -663,6 +820,10 @@ async fn capture_screen_ocr_for_floating_assist(
         screenshot_path,
         width: capture.width,
         height: capture.height,
+        screenshot_source: capture.source,
+        app_bundle_id: capture.app_bundle_id,
+        app_name: capture.app_name,
+        window_title: capture.window_title,
     })
 }
 
@@ -677,6 +838,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             set_capture_menu_state,
             set_floating_assist_menu_state,
+            set_floating_assist_auto_task_menu_state,
             set_floating_assist_visible,
             show_main_panel_from_floating_assist,
             set_floating_assist_position,
@@ -702,6 +864,14 @@ pub fn run() {
                 false,
                 None::<&str>,
             )?;
+            let floating_assist_auto_task = CheckMenuItem::with_id(
+                app,
+                "floating-assist-auto-task",
+                "自动识别任务",
+                false,
+                false,
+                None::<&str>,
+            )?;
             let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
             let autostart = CheckMenuItem::with_id(
                 app,
@@ -720,6 +890,7 @@ pub fn run() {
                     &main_panel,
                     &capture,
                     &floating_assist,
+                    &floating_assist_auto_task,
                     &autostart,
                     &settings,
                     &separator,
@@ -730,6 +901,7 @@ pub fn run() {
             app.manage(TrayMenuState {
                 capture: capture.clone(),
                 floating_assist: floating_assist.clone(),
+                floating_assist_auto_task: floating_assist_auto_task.clone(),
                 autostart: autostart.clone(),
             });
 
@@ -763,6 +935,21 @@ pub fn run() {
                                 .set_checked(!enabled);
                         }
                     }
+                    "floating-assist-auto-task" => {
+                        let state = app.state::<TrayMenuState>();
+                        let floating_enabled = state.floating_assist.is_checked().unwrap_or(false);
+                        let requested = state
+                            .floating_assist_auto_task
+                            .is_checked()
+                            .unwrap_or(false);
+                        if !floating_enabled {
+                            let _ = state.floating_assist_auto_task.set_checked(false);
+                            let _ = state.floating_assist_auto_task.set_enabled(false);
+                            let _ = app.emit("floating-assist-auto-task-changed", false);
+                        } else {
+                            let _ = app.emit("floating-assist-auto-task-changed", requested);
+                        }
+                    }
                     "autostart" => {
                         let state = app.state::<TrayMenuState>();
                         let requested = state.autostart.is_checked().unwrap_or(false);
@@ -788,12 +975,20 @@ pub fn run() {
                     _ => {}
                 });
 
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
-            }
             #[cfg(target_os = "macos")]
             {
-                tray = tray.icon_as_template(true);
+                let tray_icon = tauri::image::Image::new(
+                    include_bytes!("../icons/tray-template.rgba"),
+                    TRAY_TEMPLATE_ICON_SIZE,
+                    TRAY_TEMPLATE_ICON_SIZE,
+                );
+                tray = tray.icon(tray_icon).icon_as_template(true);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
+                }
             }
             tray.build(app)?;
 

@@ -262,6 +262,7 @@ function sampleLineData<T extends { ts: number }>(data: T[], maxPoints = 120): T
 }
 
 type LinePoint = { ts: number; value: number }
+type PlottedLinePoint = LinePoint & { x: number; y: number }
 type MultiLineSeries = {
   label: string
   color: string
@@ -269,7 +270,7 @@ type MultiLineSeries = {
   valueFormatter?: (value: number) => string
 }
 
-const SparkLine: React.FC<{
+export const SparkLine: React.FC<{
   data?: LinePoint[]
   series?: MultiLineSeries[]
   color?: string
@@ -292,7 +293,7 @@ const SparkLine: React.FC<{
   fillMissingWithZero = false,
   detailFormatter,
 }) => {
-  const [hoverIndex, setHoverIndex] = useState<number | null>(null)
+  const [hoverX, setHoverX] = useState<number | null>(null)
 
   const sourceSeries = (series && series.length > 0)
     ? series
@@ -333,6 +334,7 @@ const SparkLine: React.FC<{
   const axisValueFormatter = normalizedSeries[0].valueFormatter || valueFormatter
   const domainRange = Math.max(domainEnd - domainStart, 1)
   const xForTs = (ts: number) => pad + ((ts - domainStart) / domainRange) * (w - pad * 2)
+  const clampChartX = (x: number) => Math.min(w - pad, Math.max(pad, x))
 
   const seriesPoints = normalizedSeries.map(item => {
     const points = item.data.map((d) => {
@@ -348,12 +350,33 @@ const SparkLine: React.FC<{
     }
   })
 
-  const maxLength = Math.max(...normalizedSeries.map(item => item.data.length), 0)
-  const safeHoverIndex = hoverIndex !== null ? Math.min(hoverIndex, Math.max(maxLength - 1, 0)) : null
-  const hoverPoints = safeHoverIndex !== null
-    ? seriesPoints.map(item => item.points[Math.min(safeHoverIndex, item.points.length - 1)]).filter(Boolean)
+  const nearestPointByX = <T extends { x: number }>(points: T[], targetX: number): T | null => {
+    if (points.length === 0) return null
+    return points.reduce((nearest, point) => (
+      Math.abs(point.x - targetX) < Math.abs(nearest.x - targetX) ? point : nearest
+    ), points[0])
+  }
+  const hoverAxisPoint = hoverX !== null ? nearestPointByX(seriesPoints[0].points, hoverX) : null
+  const hoverTargetX = hoverAxisPoint?.x ?? null
+  const hoverPoints = hoverTargetX !== null
+    ? seriesPoints.map(item => nearestPointByX(item.points, hoverTargetX))
     : []
-  const hoverAxisTs = hoverPoints[0]?.ts ?? baseData[baseData.length - 1]?.ts ?? 0
+  const visibleHoverPoints = hoverPoints.reduce<Array<{ point: PlottedLinePoint; seriesIndex: number }>>((points, point, seriesIndex) => {
+    if (point) points.push({ point, seriesIndex })
+    return points
+  }, [])
+  const latestPoints = seriesPoints.reduce<PlottedLinePoint[]>((points, item) => {
+    const point = item.points[item.points.length - 1]
+    if (point) points.push(point)
+    return points
+  }, [])
+  const hoverAxisTs = hoverAxisPoint?.ts ?? baseData[baseData.length - 1]?.ts ?? 0
+
+  const handlePointerMove = (event: React.PointerEvent<SVGSVGElement> | React.MouseEvent<SVGSVGElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect()
+    if (rect.width <= 0) return
+    setHoverX(clampChartX(((event.clientX - rect.left) / rect.width) * w))
+  }
 
   return (
     <div>
@@ -376,7 +399,10 @@ const SparkLine: React.FC<{
             viewBox={`0 0 ${w} ${h}`}
             preserveAspectRatio="none"
             style={{ display: 'block', overflow: 'visible' }}
-            onMouseLeave={() => setHoverIndex(null)}
+            onPointerMove={handlePointerMove}
+            onMouseMove={handlePointerMove}
+            onPointerLeave={() => setHoverX(null)}
+            onMouseLeave={() => setHoverX(null)}
           >
             <defs>
               {seriesPoints.map(item => (
@@ -402,16 +428,15 @@ const SparkLine: React.FC<{
                   width={12}
                   height={h}
                   fill="transparent"
-                  onMouseEnter={() => setHoverIndex(i)}
-                  onFocus={() => setHoverIndex(i)}
+                  onFocus={() => setHoverX(x)}
                 />
               )
             })}
-            {hoverPoints.length > 0 && (
-              <line x1={hoverPoints[0].x} y1={pad} x2={hoverPoints[0].x} y2={h - pad} stroke={hoverPoints[0] ? '#AEAEB2' : color} strokeOpacity="0.35" strokeDasharray="2 2" />
+            {visibleHoverPoints.length > 0 && (
+              <line x1={visibleHoverPoints[0].point.x} y1={pad} x2={visibleHoverPoints[0].point.x} y2={h - pad} stroke="#AEAEB2" strokeOpacity="0.35" strokeDasharray="2 2" />
             )}
-            {hoverPoints.map((point, idx) => (
-              <circle key={`${point.ts}-${idx}`} cx={point.x} cy={point.y} r={3} fill={seriesPoints[idx].color} />
+            {visibleHoverPoints.map(({ point, seriesIndex }) => (
+              <circle key={`${point.ts}-${seriesIndex}`} cx={point.x} cy={point.y} r={3} fill={seriesPoints[seriesIndex].color} />
             ))}
           </svg>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: 10, color: '#AEAEB2' }}>
@@ -425,15 +450,15 @@ const SparkLine: React.FC<{
         {normalizedSeries.length === 1
           ? (() => {
               const singleData = normalizedSeries[0].data
-              const singleHoverPoint = safeHoverIndex !== null ? singleData[Math.min(safeHoverIndex, singleData.length - 1)] : null
+              const singleHoverPoint = hoverPoints[0] ?? null
               return singleHoverPoint
                 ? (detailFormatter ? detailFormatter(singleHoverPoint) : `${fmtTs(singleHoverPoint.ts)} · ${valueFormatter(singleHoverPoint.value)}`)
                 : (detailFormatter
                     ? detailFormatter(singleData[singleData.length - 1])
                     : `最近: ${fmtTs(singleData[singleData.length - 1].ts)} · ${valueFormatter(singleData[singleData.length - 1].value)}`)
             })()
-          : `${safeHoverIndex !== null ? fmtTs(hoverAxisTs) : `最近: ${fmtTs(hoverAxisTs)}`} · ${normalizedSeries.map((item) => {
-              const point = item.data[Math.min(safeHoverIndex ?? item.data.length - 1, item.data.length - 1)]
+          : `${hoverTargetX !== null ? fmtTs(hoverAxisTs) : `最近: ${fmtTs(hoverAxisTs)}`} · ${normalizedSeries.map((item, index) => {
+              const point = (hoverTargetX !== null ? hoverPoints[index] : latestPoints[index]) ?? item.data[item.data.length - 1]
               const formatter = item.valueFormatter || valueFormatter
               return `${item.label} ${formatter(point.value)}`
             }).join(' · ')}`}

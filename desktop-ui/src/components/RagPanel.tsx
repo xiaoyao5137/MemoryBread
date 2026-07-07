@@ -9,7 +9,7 @@
 
 import React, { useCallback, useRef, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
-import { useRagQuery } from '../hooks/useApi'
+import { RAG_REFERENCE_LIMIT, useRagQuery } from '../hooks/useApi'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
 
 function CopyButton({ text }: { text: string }) {
@@ -101,7 +101,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
       const attachmentPrompt = buildAttachmentPrompt(attachments)
       const queryWithAttachments = attachmentPrompt ? `${q}\n\n${attachmentPrompt}` : q
       try {
-        await doQuery(queryWithAttachments, 5, attachments.length ? { attachments: buildAttachmentMetadata(attachments) } : {}, controller.signal)
+        await doQuery(queryWithAttachments, RAG_REFERENCE_LIMIT, attachments.length ? { attachments: buildAttachmentMetadata(attachments) } : {}, controller.signal)
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') return
         // error is set in store by useRagQuery

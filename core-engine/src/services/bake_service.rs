@@ -191,6 +191,8 @@ pub struct BakeDocumentPayload {
     pub evidence_summary: Option<String>,
     pub generation_version: Option<String>,
     pub deleted_at: Option<i64>,
+    pub created_at: String,
+    pub created_at_ms: i64,
     pub updated_at: String,
 }
 
@@ -257,6 +259,7 @@ pub struct BakeOverviewPayload {
     pub memory_count: i64,
     pub knowledge_count: i64,
     pub template_count: i64,
+    pub sop_count: i64,
     pub pending_candidates: i64,
     pub auto_created_today: i64,
     pub candidate_today: i64,
@@ -268,6 +271,18 @@ pub struct BakeOverviewPayload {
     pub template_auto_count: i64,
     pub sop_auto_count: i64,
     pub recent_activities: Vec<String>,
+    pub inventory_trend: Vec<BakeInventoryTrendBucketPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BakeInventoryTrendBucketPayload {
+    pub label: String,
+    pub start_ts: i64,
+    pub end_ts: i64,
+    pub memory_count: i64,
+    pub knowledge_count: i64,
+    pub template_count: i64,
+    pub sop_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -788,7 +803,7 @@ impl BakeService {
 
     pub fn list_memories(&self) -> Result<Vec<BakeMemoryPayload>, ApiError> {
         self.storage
-            .list_timelines_by_category(CATEGORY_BAKE_ARTICLE)?
+            .list_timelines_paginated(None, 5000, 0)?
             .into_iter()
             .map(|record| self.map_memory_record_with_capture_url(record))
             .collect()
@@ -2217,9 +2232,7 @@ impl BakeService {
             conn.query_row("SELECT COUNT(*) FROM captures", [], |row| row.get(0))
                 .map_err(StorageError::Sqlite)
         })?;
-        let memory_entries = self
-            .storage
-            .list_timelines_by_category(CATEGORY_BAKE_ARTICLE)?;
+        let memory_entries = self.storage.list_timelines_paginated(None, 5000, 0)?;
         let knowledge_entries = self
             .storage
             .list_bake_knowledge_paginated(None, 5000, 0)?
@@ -2232,8 +2245,20 @@ impl BakeService {
             .into_iter()
             .filter(is_current_bake_document)
             .collect::<Vec<_>>();
+        let sop_entries = self
+            .storage
+            .list_timelines_by_category(CATEGORY_BAKE_SOP)?
+            .into_iter()
+            .filter(is_current_bake_entry)
+            .collect::<Vec<_>>();
         let latest_run = self.storage.get_latest_bake_run()?;
-        let memory_count = memory_entries.len() as i64;
+        let memory_count = self.storage.count_timelines(None)?;
+        let inventory_trend = build_inventory_trend(
+            &memory_entries,
+            &knowledge_entries,
+            &templates,
+            &sop_entries,
+        );
 
         let pending_candidates = 0;
 
@@ -2268,6 +2293,7 @@ impl BakeService {
             memory_count,
             knowledge_count: knowledge_entries.len() as i64,
             template_count: templates.len() as i64,
+            sop_count: sop_entries.len() as i64,
             pending_candidates,
             auto_created_today: latest_run
                 .as_ref()
@@ -2306,6 +2332,7 @@ impl BakeService {
             memory_count: overview.memory_count,
             knowledge_count: overview.knowledge_count,
             template_count: overview.template_count,
+            sop_count: overview.sop_count,
             pending_candidates: overview.pending_candidates,
             auto_created_today: overview.auto_created_today,
             candidate_today: overview.candidate_today,
@@ -2321,6 +2348,7 @@ impl BakeService {
                 .into_iter()
                 .map(|item| item.message)
                 .collect(),
+            inventory_trend,
         })
     }
 
@@ -2923,6 +2951,9 @@ fn bake_document_record_to_new(record: BakeDocumentRecord) -> NewBakeDocument {
 
 fn map_document_record(record: BakeDocumentRecord) -> BakeDocumentPayload {
     use chrono::{DateTime, Utc};
+    let created_at = DateTime::<Utc>::from_timestamp(record.created_at / 1000, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| record.created_at.to_string());
     let updated_at = DateTime::<Utc>::from_timestamp(record.updated_at / 1000, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| record.updated_at.to_string());
@@ -2955,6 +2986,8 @@ fn map_document_record(record: BakeDocumentRecord) -> BakeDocumentPayload {
         evidence_summary: record.evidence_summary,
         generation_version: record.generation_version,
         deleted_at: record.deleted_at,
+        created_at,
+        created_at_ms: record.created_at,
         updated_at,
     }
 }
@@ -3230,6 +3263,103 @@ fn is_high_value_candidate(record: &TimelineRecord) -> bool {
     );
 
     strong_evidence && (preferred_activity || preferred_origin)
+}
+
+fn build_inventory_trend(
+    memories: &[TimelineRecord],
+    knowledge_entries: &[TimelineRecord],
+    documents: &[BakeDocumentRecord],
+    sops: &[TimelineRecord],
+) -> Vec<BakeInventoryTrendBucketPayload> {
+    const DAY_MS: i64 = 86_400_000;
+    const MAX_BUCKETS: i64 = 8;
+
+    let timestamps = memories
+        .iter()
+        .map(|record| record.created_at_ms)
+        .chain(knowledge_entries.iter().map(|record| record.created_at_ms))
+        .chain(documents.iter().map(|record| record.created_at))
+        .chain(sops.iter().map(|record| record.created_at_ms))
+        .filter(|ts| *ts > 0)
+        .collect::<Vec<_>>();
+
+    let Some(min_ts) = timestamps.iter().min().copied() else {
+        return Vec::new();
+    };
+    let Some(max_ts) = timestamps.iter().max().copied() else {
+        return Vec::new();
+    };
+
+    let start_day = (min_ts / DAY_MS) * DAY_MS;
+    let end_day = (max_ts / DAY_MS) * DAY_MS;
+    let total_days = ((end_day - start_day) / DAY_MS + 1).max(1);
+    let bucket_count = total_days.min(MAX_BUCKETS).max(1);
+    let days_per_bucket = ((total_days + bucket_count - 1) / bucket_count).max(1);
+    let bucket_ms = days_per_bucket * DAY_MS;
+
+    (0..bucket_count)
+        .map(|index| {
+            let start_ts = start_day + index * bucket_ms;
+            let raw_end_ts = if index == bucket_count - 1 {
+                i64::MAX
+            } else {
+                start_ts + bucket_ms
+            };
+            BakeInventoryTrendBucketPayload {
+                label: format_trend_bucket_label(start_ts, bucket_ms),
+                start_ts,
+                end_ts: if raw_end_ts == i64::MAX {
+                    start_ts + bucket_ms - 1
+                } else {
+                    raw_end_ts - 1
+                },
+                memory_count: count_records_in_bucket(
+                    memories.iter().map(|record| record.created_at_ms),
+                    start_ts,
+                    raw_end_ts,
+                ),
+                knowledge_count: count_records_in_bucket(
+                    knowledge_entries.iter().map(|record| record.created_at_ms),
+                    start_ts,
+                    raw_end_ts,
+                ),
+                template_count: count_records_in_bucket(
+                    documents.iter().map(|record| record.created_at),
+                    start_ts,
+                    raw_end_ts,
+                ),
+                sop_count: count_records_in_bucket(
+                    sops.iter().map(|record| record.created_at_ms),
+                    start_ts,
+                    raw_end_ts,
+                ),
+            }
+        })
+        .collect()
+}
+
+fn count_records_in_bucket<I>(timestamps: I, start_ts: i64, end_ts: i64) -> i64
+where
+    I: Iterator<Item = i64>,
+{
+    timestamps
+        .filter(|ts| *ts > 0 && *ts >= start_ts && *ts < end_ts)
+        .count() as i64
+}
+
+fn format_trend_bucket_label(start_ts: i64, bucket_ms: i64) -> String {
+    let Some(start) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(start_ts) else {
+        return "未知".to_string();
+    };
+    if bucket_ms <= 86_400_000 {
+        return start.format("%Y-%m-%d").to_string();
+    }
+
+    let end_ts = start_ts + bucket_ms - 86_400_000;
+    let Some(end) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(end_ts) else {
+        return start.format("%Y-%m-%d").to_string();
+    };
+    format!("{}-{}", start.format("%Y-%m-%d"), end.format("%Y-%m-%d"))
 }
 
 fn parse_details(value: Option<&str>) -> Value {

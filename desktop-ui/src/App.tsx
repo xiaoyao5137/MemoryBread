@@ -24,8 +24,12 @@ import OnboardingWizard       from './components/OnboardingWizard'
 import AuthPanel              from './components/AuthPanel'
 import SystemFloatingAssist   from './components/SystemFloatingAssist'
 import { fetchConsoleSummary, fetchCurrentUser } from './utils/authApi'
-
-const FLOATING_ASSIST_ENABLED_KEY = 'memoryBread.floatingAssist.enabled'
+import {
+  FLOATING_ASSIST_ENABLED_KEY,
+  readFloatingAssistAutoTaskConfig,
+  type FloatingAssistAutoTaskConfig,
+  writeFloatingAssistAutoTaskConfig,
+} from './utils/floatingAssistAutoTask'
 
 const hasConfiguredCreationModel = (configs: Array<{ enabled?: boolean; apiKey?: string }>) =>
   configs.some(config => Boolean(config.enabled || config.apiKey))
@@ -65,6 +69,7 @@ const App: React.FC = () => {
     setBakeSopLimit,
     setRepositoryCaptureSourceCaptureId,
     pushBakeNavigationTarget,
+    clearBakeNavigationStack,
     hasCompletedSetup,
     setupSkipped,
     apiBaseUrl,
@@ -108,7 +113,13 @@ const App: React.FC = () => {
     const registerTrayEvents = async () => {
       try {
         const floatingAssistEnabled = localStorage.getItem(FLOATING_ASSIST_ENABLED_KEY) === 'true'
+        const autoTaskConfig = readFloatingAssistAutoTaskConfig()
+        const autoTaskDetectionEnabled = floatingAssistEnabled && autoTaskConfig.enabled
         await invoke('set_floating_assist_menu_state', { enabled: floatingAssistEnabled })
+        await invoke('set_floating_assist_auto_task_menu_state', {
+          checked: autoTaskDetectionEnabled,
+          enabled: floatingAssistEnabled,
+        })
         if (floatingAssistEnabled) {
           await invoke('set_floating_assist_visible', { enabled: true })
         }
@@ -117,6 +128,26 @@ const App: React.FC = () => {
         }))
         cleanups.push(await listen<boolean>('tray-floating-assist-changed', event => {
           localStorage.setItem(FLOATING_ASSIST_ENABLED_KEY, String(event.payload))
+          if (!event.payload) {
+            writeFloatingAssistAutoTaskConfig({
+              ...readFloatingAssistAutoTaskConfig(),
+              enabled: false,
+            })
+          }
+          invoke('set_floating_assist_auto_task_menu_state', {
+            checked: event.payload && readFloatingAssistAutoTaskConfig().enabled,
+            enabled: event.payload,
+          }).catch(() => {})
+        }))
+        cleanups.push(await listen<boolean | FloatingAssistAutoTaskConfig>('floating-assist-auto-task-changed', event => {
+          if (typeof event.payload === 'boolean') {
+            writeFloatingAssistAutoTaskConfig({
+              ...readFloatingAssistAutoTaskConfig(),
+              enabled: Boolean(event.payload),
+            })
+          } else {
+            writeFloatingAssistAutoTaskConfig(event.payload)
+          }
         }))
         cleanups.push(await listen<boolean>('tray-capture-changed', async event => {
           const requested = event.payload
@@ -232,9 +263,17 @@ const App: React.FC = () => {
       const { type, captureId, knowledgeId, artifactId, documentId, docKey } = detail || {}
       const parsedTargetId = parseReferenceId(docKey)
       const targetId = String(documentId ?? artifactId ?? parsedTargetId ?? '')
-      pushBakeNavigationTarget({ windowMode: 'rag' })
+      const hasTargetId = targetId.trim().length > 0
+      const setRagBackTarget = (enabled: boolean) => {
+        if (enabled) {
+          pushBakeNavigationTarget({ windowMode: 'rag' })
+        } else {
+          clearBakeNavigationStack()
+        }
+      }
 
       if (type === 'document') {
+        setRagBackTarget(hasTargetId)
         setBakeTab('templates')
         setBakeTemplateOffset(0)
         setBakeTemplateLimit(100)
@@ -244,6 +283,7 @@ const App: React.FC = () => {
         return
       }
       if (type === 'bake_knowledge') {
+        setRagBackTarget(hasTargetId)
         setBakeTab('knowledge')
         setBakeKnowledgeOffset(0)
         setBakeKnowledgeLimit(1000)
@@ -253,6 +293,7 @@ const App: React.FC = () => {
         return
       }
       if (type === 'operation' || type === 'action') {
+        setRagBackTarget(hasTargetId)
         setBakeTab('sop')
         setBakeSopOffset(0)
         setBakeSopLimit(1000)
@@ -261,14 +302,17 @@ const App: React.FC = () => {
         setWindowMode('bake')
         return
       }
-      setWindowMode('knowledge')
       if (type === 'knowledge' && knowledgeId) {
+        pushBakeNavigationTarget({ windowMode: 'rag' })
+        setWindowMode('knowledge')
         setRepositoryTab('memory')
         setRepositoryMemoryFocusId(String(knowledgeId))
         setSelectedMemoryId(String(knowledgeId))
         return
       }
       if (captureId) {
+        pushBakeNavigationTarget({ windowMode: 'rag' })
+        setWindowMode('knowledge')
         setRepositoryTab('capture')
         setRepositoryCaptureSourceCaptureId(String(captureId))
         setSelectedCaptureId(String(captureId))
@@ -292,6 +336,7 @@ const App: React.FC = () => {
       tauriCleanup?.()
     }
   }, [
+    clearBakeNavigationStack,
     pushBakeNavigationTarget,
     setBakeKnowledgeLimit,
     setBakeKnowledgeOffset,

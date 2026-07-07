@@ -15,4 +15,5 @@ pub mod privacy;
 pub mod profile;
 pub mod query;
 pub mod runtime;
+pub mod snapshot;
 pub mod tasks;

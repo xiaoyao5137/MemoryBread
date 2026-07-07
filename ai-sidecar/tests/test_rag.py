@@ -54,13 +54,16 @@ class MockLlmBackend(LlmBackend):
         response: str = "模拟回答",
         available: bool = True,
         model_name: str = "mock-llm",
+        done_reason: str | None = None,
     ) -> None:
         self._response  = response
         self._available = available
         self._model_name = model_name
+        self._done_reason = done_reason
         self.call_count = 0
         self.last_prompt: str = ""
         self.last_system: str = ""
+        self.last_kwargs: dict = {}
 
     def is_available(self) -> bool:
         return self._available
@@ -69,7 +72,8 @@ class MockLlmBackend(LlmBackend):
         self.call_count += 1
         self.last_prompt = prompt
         self.last_system = system
-        return LlmResponse(text=self._response, model=self._model_name, tokens=10)
+        self.last_kwargs = kwargs
+        return LlmResponse(text=self._response, model=self._model_name, tokens=10, done_reason=self._done_reason)
 
     @property
     def model_name(self) -> str:
@@ -434,6 +438,43 @@ class TestRagPipeline:
         )
         pipeline.query("问题")
         assert llm.call_count == 1
+
+    def test_floating_assist_answer_uses_room_for_complete_output(self):
+        llm = MockLlmBackend()
+        pipeline = RagPipeline(
+            embedding_model  = EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever = MockVectorRetriever(),  # type: ignore[arg-type]
+            fts5_retriever   = MockFts5Retriever(),    # type: ignore[arg-type]
+            knowledge_retriever = MockFts5Retriever(chunks=[_chunk(1, source="knowledge")]),  # type: ignore[arg-type]
+            llm              = llm,
+        )
+
+        pipeline.query(
+            "核心问题：大模型成本效率怎么拉齐\n"
+            "检索问题：大模型 成本 效率 GPU 资源\n"
+            "输出格式：\n"
+            "## 用户问题理解\n"
+            "用一句话说明用户当前真正想问什么。\n"
+            "## 回答\n"
+            "给结论和依据。"
+        )
+
+        assert llm.last_kwargs["num_predict"] == 8192
+
+    def test_length_done_reason_marks_output_truncated(self):
+        llm = MockLlmBackend(done_reason="length")
+        pipeline = RagPipeline(
+            embedding_model  = EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever = MockVectorRetriever(),  # type: ignore[arg-type]
+            fts5_retriever   = MockFts5Retriever(),    # type: ignore[arg-type]
+            knowledge_retriever = MockFts5Retriever(chunks=[_chunk(1, source="knowledge")]),  # type: ignore[arg-type]
+            llm              = llm,
+        )
+
+        result = pipeline.query("问题")
+
+        assert result.done_reason == "length"
+        assert result.output_truncated is True
 
     def test_top_k_limits_contexts(self):
         knowledge = [

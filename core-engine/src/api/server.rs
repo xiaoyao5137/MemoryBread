@@ -14,13 +14,12 @@ use super::{
         action::execute_action,
         bake::{
             create_bake_document, delete_bake_document, delete_bake_knowledge, delete_bake_sop,
-            get_bake_capture, get_bake_capture_screenshot, get_bake_document,
-            get_bake_knowledge, get_bake_memory_preview, get_bake_overview, get_bake_sop,
-            get_bake_style_config, ignore_bake_memory, initialize_bake_memories,
-            list_bake_captures, list_bake_documents, list_bake_knowledge, list_bake_memories,
-            list_bake_sops, promote_bake_memory_to_document,
-            promote_bake_memory_to_sop, run_bake_pipeline, toggle_bake_document_status,
-            update_bake_document, update_bake_style_config,
+            get_bake_capture, get_bake_capture_screenshot, get_bake_document, get_bake_knowledge,
+            get_bake_memory_preview, get_bake_overview, get_bake_sop, get_bake_style_config,
+            ignore_bake_memory, initialize_bake_memories, list_bake_captures, list_bake_documents,
+            list_bake_knowledge, list_bake_memories, list_bake_sops,
+            promote_bake_memory_to_document, promote_bake_memory_to_sop, run_bake_pipeline,
+            toggle_bake_document_status, update_bake_document, update_bake_style_config,
         },
         captures::list_captures,
         config_checks::{
@@ -31,7 +30,9 @@ use super::{
             clear_extraction_queue, debug_log_content, debug_log_files, system_stats, vector_status,
         },
         health::health_handler,
-        knowledge::{delete_knowledge, extract_knowledge, list_knowledge, verify_knowledge},
+        knowledge::{
+            delete_knowledge, extract_knowledge, get_knowledge, list_knowledge, verify_knowledge,
+        },
         monitor::{
             monitor_extraction_live, monitor_overview, monitor_pipeline_dag, monitor_system,
         },
@@ -49,6 +50,10 @@ use super::{
             create_rag_job, get_rag_job, rag_history, rag_query, rag_references, save_rag_history,
         },
         runtime::{get_runtime_status, update_runtime_status},
+        snapshot::{
+            backup_asset_snapshot_to_cloud, export_asset_snapshot, import_asset_snapshot,
+            restore_asset_snapshot_from_cloud,
+        },
         tasks::{
             create_task, delete_task, get_task, list_executions, list_tasks, trigger_task,
             update_task,
@@ -71,6 +76,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/runtime/status",
             get(get_runtime_status).put(update_runtime_status),
+        )
+        .route("/api/snapshots/assets/export", post(export_asset_snapshot))
+        .route("/api/snapshots/assets/import", post(import_asset_snapshot))
+        .route(
+            "/api/snapshots/cloud/backup",
+            post(backup_asset_snapshot_to_cloud),
+        )
+        .route(
+            "/api/snapshots/cloud/restore",
+            post(restore_asset_snapshot_from_cloud),
         )
         .route("/api/captures", get(list_captures))
         .route("/captures", get(list_captures))
@@ -112,7 +127,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/knowledge/:id/verify", post(verify_knowledge))
         .route(
             "/api/knowledge/:id",
-            axum::routing::delete(delete_knowledge),
+            get(get_knowledge).delete(delete_knowledge),
         )
         // 定时任务
         .route("/api/tasks", get(list_tasks).post(create_task))

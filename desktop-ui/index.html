@@ -5,6 +5,21 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>记忆面包</title>
+    <style>
+      html.floating-assist-html,
+      html.floating-assist-html body,
+      html.floating-assist-html #root {
+        background: transparent !important;
+        background-color: transparent !important;
+        overflow: hidden;
+      }
+    </style>
+    <script>
+      if (new URLSearchParams(window.location.search).get('view') === 'floating-assist') {
+        document.documentElement.classList.add('floating-assist-html')
+        document.documentElement.style.background = 'transparent'
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -94,7 +94,8 @@ describe('AuthPanel', () => {
       expires_at: new Date(Date.now() + 86400_000).toISOString(),
       user: {
         id: '018f0000-0000-7000-8000-000000000003',
-        display_name: '土豆',
+        username: '烘焙师土豆',
+        display_name: '土豆账户',
         email: 'tudou@memorybread.local',
         status: 'active',
         roles: ['user'],
@@ -126,8 +127,9 @@ describe('AuthPanel', () => {
 
     render(<AuthPanel />)
 
-    expect(screen.getByText('土豆')).toBeInTheDocument()
-    expect(await screen.findByText('黄金')).toBeInTheDocument()
+    expect(screen.getByText('烘焙师土豆')).toBeInTheDocument()
+    expect(screen.queryByText('土豆账户')).not.toBeInTheDocument()
+    expect(await screen.findAllByText('Plus')).not.toHaveLength(0)
     expect(await screen.findByText('120.0000')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '充值' }))

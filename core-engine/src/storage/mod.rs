@@ -11,6 +11,7 @@ pub mod error;
 pub mod models;
 pub mod models_bake;
 pub mod repo;
+pub mod snapshot;
 
 pub use db::StorageManager;
 pub use error::StorageError;

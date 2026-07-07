@@ -82,6 +82,7 @@ const RepositoryPanel: React.FC = () => {
     bakeNavigationStack,
     pushBakeNavigationTarget,
     popBakeNavigationTarget,
+    clearBakeNavigationStack,
   } = useAppStore()
 
   const fetchMemories = useFetchBakeMemories()
@@ -300,6 +301,7 @@ const RepositoryPanel: React.FC = () => {
   }, [repositoryMemoryFocusId, repositoryMemoryFrom, repositoryMemoryTo])
 
   const handleSearchMemories = () => {
+    clearBakeNavigationStack()
     setSelectedMemoryId(null)
     setRepositoryMemoryFocusId(null)
     useAppStore.setState({
@@ -312,6 +314,7 @@ const RepositoryPanel: React.FC = () => {
   }
 
   const handleClearMemoryFilters = () => {
+    clearBakeNavigationStack()
     setDraftMemoryQuery('')
     setDraftMemoryFrom('')
     setDraftMemoryTo('')
@@ -326,6 +329,7 @@ const RepositoryPanel: React.FC = () => {
   }
 
   const handleSearchCaptures = () => {
+    clearBakeNavigationStack()
     setSelectedCaptureId(null)
     setCaptureDetail(null)
     useAppStore.setState({
@@ -337,6 +341,7 @@ const RepositoryPanel: React.FC = () => {
   }
 
   const handleClearCaptureFilters = () => {
+    clearBakeNavigationStack()
     setDraftCaptureQuery('')
     setDraftCaptureFrom('')
     setDraftCaptureTo('')
@@ -347,6 +352,12 @@ const RepositoryPanel: React.FC = () => {
       repositoryCaptureSourceCaptureId: null,
       bakeCaptureOffset: 0,
     })
+  }
+
+  const handleRepositoryTabChange = (tab: RepositoryTab) => {
+    if (tab === repositoryTab) return
+    clearBakeNavigationStack()
+    setRepositoryTab(tab)
   }
 
   const currentNavigationTarget = () => ({
@@ -493,7 +504,7 @@ const RepositoryPanel: React.FC = () => {
       {statusMessage && <div className="bake-inline-message">{statusMessage}</div>}
       <section className="bake-tabs bake-tabs--scroll">
         {tabs.map(tab => (
-          <BakeButton key={tab.key} active={repositoryTab === tab.key} onClick={() => setRepositoryTab(tab.key)}>
+          <BakeButton key={tab.key} active={repositoryTab === tab.key} onClick={() => handleRepositoryTabChange(tab.key)}>
             {tab.label}
           </BakeButton>
         ))}
@@ -840,7 +851,10 @@ const RepositoryPanel: React.FC = () => {
             onDraftToChange={setDraftCaptureTo}
             onSearch={handleSearchCaptures}
             onClearFilters={handleClearCaptureFilters}
-            onClearScope={() => setRepositoryCaptureSourceCaptureId(null)}
+            onClearScope={() => {
+              clearBakeNavigationStack()
+              setRepositoryCaptureSourceCaptureId(null)
+            }}
             onViewLinkedTimeline={handleViewLinkedTimeline}
             canGoBack={Boolean(captureBackTarget)}
             onGoBack={handleCaptureGoBack}

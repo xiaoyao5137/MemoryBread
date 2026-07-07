@@ -1,5 +1,5 @@
 import React, { FormEvent, useEffect, useState } from 'react'
-import { ArrowRight, CheckCircle2, CreditCard, KeyRound, LogOut, LockKeyhole, Mail, RefreshCw, Server, ShieldCheck, Smartphone, WalletCards } from 'lucide-react'
+import { ArrowRight, CheckCircle2, CreditCard, KeyRound, LogOut, LockKeyhole, Mail, RefreshCw, Server, Smartphone, UserRound, WalletCards } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { authenticateWithPassword, authenticateWithPhoneCode, fetchConsoleSummary, logoutSession, sendPhoneVerificationCode } from '../utils/authApi'
 import { getMembershipPlanLabel, getUserDisplayName } from '../utils/accountDisplay'
@@ -32,6 +32,7 @@ const AuthPanel: React.FC = () => {
   } = useAppStore()
   const [mode, setMode] = useState<AuthMode>('login')
   const [loginMethod, setLoginMethod] = useState<LoginMethod>('email')
+  const [username, setUsername] = useState('')
   const [email, setEmail] = useState('')
   const [phone, setPhone] = useState('')
   const [phoneCode, setPhoneCode] = useState('')
@@ -69,11 +70,16 @@ const AuthPanel: React.FC = () => {
     setError(null)
     try {
       if (loginMethod !== 'email') {
-        const session = await authenticateWithPhoneCode(adminApiBaseUrl, phone, phoneCode)
+        const session = await authenticateWithPhoneCode(
+          adminApiBaseUrl,
+          phone,
+          phoneCode,
+          mode === 'register' ? username : undefined,
+        )
         setAuthSession(session)
         return
       }
-      const session = await authenticateWithPassword(adminApiBaseUrl, mode, email, password)
+      const session = await authenticateWithPassword(adminApiBaseUrl, mode, email, password, username)
       setAuthSession(session)
     } catch (err) {
       setError(err instanceof Error ? err.message : '登录失败，请检查网络或账户信息')
@@ -108,22 +114,6 @@ const AuthPanel: React.FC = () => {
     }
     return (
       <main className="auth-panel auth-panel--signed-in" data-testid="auth-panel">
-        <section className="auth-panel__copy">
-          <div className="auth-panel__mark">
-            <img src="/logo.png" alt="" />
-          </div>
-          <p className="auth-panel__eyebrow">User account</p>
-          <h1>你的账户已经连接。</h1>
-          <p className="auth-panel__lead">
-            本地记忆继续留在设备上。账户用于管理云能力、Credit、设备和加密快照。
-          </p>
-          <div className="auth-panel__facts" aria-label="账户边界">
-            <span><ShieldCheck size={16} /> 本地优先</span>
-            <span><CheckCircle2 size={16} /> {currentUser.roles.includes('platform_admin') ? '平台管理员' : '普通用户'}</span>
-            <span><LockKeyhole size={16} /> 登录状态已保存</span>
-          </div>
-        </section>
-
         <section className="auth-panel__form" aria-label="用户信息">
           <div className="auth-panel__form-head">
             <span className="auth-panel__form-icon" aria-hidden="true"><CheckCircle2 size={18} /></span>
@@ -146,7 +136,6 @@ const AuthPanel: React.FC = () => {
             <strong>{planLabel}</strong>
           </div>
           <div className="auth-panel__profile-grid">
-            <div><span>角色</span><strong>{currentUser.roles.includes('platform_admin') ? '平台管理员' : '普通用户'}</strong></div>
             <div><span>状态</span><strong>{accountStatusLabel[currentUser.status] ?? '正常'}</strong></div>
             <div><span>区域</span><strong>{currentUser.locale}</strong></div>
             <div><span>时区</span><strong>{currentUser.timezone}</strong></div>
@@ -249,6 +238,24 @@ const AuthPanel: React.FC = () => {
                 onChange={(event) => setAdminApiBaseUrl(event.target.value)}
                 value={adminApiBaseUrl}
                 spellCheck={false}
+              />
+            </div>
+          </label>
+        )}
+
+        {mode === 'register' && (
+          <label>
+            <span>用户名</span>
+            <div className="auth-panel__input-with-icon">
+              <UserRound size={16} aria-hidden />
+              <input
+                autoComplete="nickname"
+                maxLength={30}
+                minLength={2}
+                onChange={(event) => setUsername(event.target.value)}
+                placeholder="注册后显示在用户卡片"
+                required
+                value={username}
               />
             </div>
           </label>

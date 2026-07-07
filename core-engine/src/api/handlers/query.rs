@@ -118,6 +118,10 @@ pub struct RagQueryResponse {
     pub answer: String,
     pub contexts: Vec<RagContext>,
     pub model: String,
+    #[serde(default)]
+    pub done_reason: Option<String>,
+    #[serde(default)]
+    pub output_truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -415,6 +419,10 @@ pub struct SaveRagHistoryRequest {
     pub latency_ms: Option<i64>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub scene_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -431,9 +439,13 @@ pub async fn save_rag_history(
     }
     let contexts = serde_json::to_string(&req.contexts)
         .map_err(|e| ApiError::Internal(format!("序列化咨询参考失败: {e}")))?;
+    let scene_type = match req.scene_type.as_deref().or(req.source.as_deref()) {
+        Some("floating_assist") => "floating_assist",
+        _ => "monitor",
+    };
     let session = NewRagSession {
         ts: now_ms(),
-        scene_type: Some("monitor".to_string()),
+        scene_type: Some(scene_type.to_string()),
         user_query: req.query,
         retrieved_ids: Some(contexts),
         prompt_used: None,

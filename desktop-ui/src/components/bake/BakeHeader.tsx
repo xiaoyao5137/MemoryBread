@@ -5,8 +5,8 @@ const BakeHeader: React.FC<{
   title?: string
   subtitle?: string
 }> = ({
-  title = '收藏',
-  subtitle = '把高频 capture 和记忆 knowledge 烤成可复用内容资产',
+  title = '记忆',
+  subtitle = '把高频时间线和知识烤成可复用内容资产',
 }) => {
   return (
     <BakeCard>

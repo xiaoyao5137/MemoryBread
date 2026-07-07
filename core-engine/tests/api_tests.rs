@@ -2076,3 +2076,34 @@ async fn test_knowledge_api_returns_semantic_fields() {
     assert_eq!(entry["is_self_generated"], false);
     assert_eq!(entry["evidence_strength"], "high");
 }
+
+#[tokio::test]
+async fn test_knowledge_detail_api_returns_timeline_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("test.db");
+    let sm = StorageManager::open(&db).unwrap();
+    let timeline_id = seed_knowledge_entry(
+        &sm,
+        "聊天",
+        "目标时间线",
+        "目标概览",
+        serde_json::json!({"note": "detail"}),
+    );
+
+    let router = memory_bread_core::api::create_router(AppState::new(sm));
+    let req = Request::builder()
+        .uri(format!("/api/knowledge/{timeline_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = oneshot(router, req).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(json["id"], timeline_id);
+    assert_eq!(json["summary"], "目标时间线");
+    assert_eq!(json["overview"], "目标概览");
+    assert_eq!(json["category"], "聊天");
+    assert!(json["capture_ids"]
+        .as_array()
+        .is_some_and(|ids| !ids.is_empty()));
+}

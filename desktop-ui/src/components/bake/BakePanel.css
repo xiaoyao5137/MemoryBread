@@ -841,6 +841,199 @@ button.bake-list-item.bake-list-item--active {
   color: #111111;
 }
 
+.bake-trend-header-tools {
+  display: grid;
+  justify-items: end;
+  gap: 10px;
+}
+
+.bake-trend-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 14px;
+  background: #F1F3F6;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.bake-trend-range .bake-btn {
+  min-height: 28px;
+  border-radius: 10px;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.bake-trend-range .bake-btn:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.bake-trend-range .bake-btn--active,
+.bake-trend-range .bake-btn--active:hover {
+  background: #FFFFFF;
+  color: #111111;
+  border-color: rgba(0, 0, 0, 0.08);
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+}
+
+.bake-trend-legend {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.bake-trend-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #3A3A3C;
+}
+
+.bake-trend-legend__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+
+.bake-trend-chart {
+  width: 100%;
+  height: clamp(190px, 28vw, 260px);
+  min-width: 0;
+  position: relative;
+}
+
+.bake-trend-chart svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  overflow: visible;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.bake-trend-chart__grid {
+  stroke: rgba(0, 0, 0, 0.08);
+  stroke-width: 1;
+}
+
+.bake-trend-chart__axis {
+  fill: #8E8E93;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.bake-trend-chart__tick {
+  stroke: rgba(0, 0, 0, 0.16);
+  stroke-width: 1;
+}
+
+.bake-trend-chart__point {
+  transition: r 0.14s ease;
+}
+
+.bake-trend-chart__hover-band {
+  fill: rgba(0, 122, 255, 0.06);
+}
+
+.bake-trend-chart__hover-line {
+  stroke: rgba(0, 0, 0, 0.28);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
+
+.bake-trend-chart__hover-point {
+  stroke: #FFFFFF;
+  stroke-width: 2;
+  filter: drop-shadow(0 2px 4px rgba(15, 23, 42, 0.22));
+}
+
+.bake-trend-chart__hit-area {
+  fill: transparent;
+  cursor: crosshair;
+}
+
+.bake-trend-tooltip {
+  position: absolute;
+  top: 10px;
+  width: min(190px, calc(100% - 20px));
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow: 0 14px 32px rgba(15, 23, 42, 0.16);
+  color: #111111;
+  pointer-events: none;
+  transform: translateX(-50%);
+  z-index: 2;
+}
+
+.bake-trend-tooltip--start {
+  transform: translateX(0);
+}
+
+.bake-trend-tooltip--middle {
+  transform: translateX(-50%);
+}
+
+.bake-trend-tooltip--end {
+  transform: translateX(-100%);
+}
+
+.bake-trend-tooltip__title {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  margin-bottom: 4px;
+}
+
+.bake-trend-tooltip__total {
+  color: #6E6E73;
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.bake-trend-tooltip__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.bake-trend-tooltip__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: #3A3A3C;
+  font-weight: 600;
+}
+
+.bake-trend-tooltip__value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.bake-trend-empty {
+  min-height: 160px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed rgba(0, 0, 0, 0.12);
+  border-radius: 12px;
+  background: #F8F9FB;
+  color: #6E6E73;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .bake-kv {
   display: grid;
   gap: 12px;
@@ -1204,8 +1397,14 @@ button.bake-list-item.bake-list-item--active {
   }
 
   .bake-inline-pills,
-  .bake-section-header__actions {
+  .bake-section-header__actions,
+  .bake-trend-legend,
+  .bake-trend-header-tools {
     justify-content: flex-start;
+  }
+
+  .bake-trend-header-tools {
+    justify-items: start;
   }
 
   .bake-capture-lightbox {
@@ -1274,6 +1473,11 @@ button.bake-list-item.bake-list-item--active {
   .bake-stat-value {
     font-size: 24px;
   }
+
+  .bake-trend-range {
+    max-width: 100%;
+    overflow-x: auto;
+  }
 }
 
 @media (prefers-color-scheme: dark) {
@@ -1335,6 +1539,61 @@ button.bake-list-item.bake-list-item--active {
   .bake-muted,
   .bake-section-subtitle {
     color: #9CA3AF;
+  }
+
+  .bake-trend-range {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .bake-trend-range .bake-btn {
+    background: transparent;
+    color: #D1D5DB;
+    border-color: transparent;
+  }
+
+  .bake-trend-range .bake-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .bake-trend-range .bake-btn--active,
+  .bake-trend-range .bake-btn--active:hover {
+    background: #F3F4F6;
+    color: #111111;
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .bake-trend-chart__grid,
+  .bake-trend-chart__tick {
+    stroke: rgba(255, 255, 255, 0.14);
+  }
+
+  .bake-trend-chart__axis {
+    fill: #9CA3AF;
+  }
+
+  .bake-trend-chart__hover-band {
+    fill: rgba(10, 132, 255, 0.12);
+  }
+
+  .bake-trend-chart__hover-line {
+    stroke: rgba(255, 255, 255, 0.36);
+  }
+
+  .bake-trend-chart__hover-point {
+    stroke: #1C1C1E;
+  }
+
+  .bake-trend-tooltip {
+    background: rgba(28, 28, 30, 0.96);
+    border-color: rgba(255, 255, 255, 0.1);
+    color: #F3F4F6;
+    box-shadow: 0 14px 32px rgba(0, 0, 0, 0.32);
+  }
+
+  .bake-trend-tooltip__total,
+  .bake-trend-tooltip__label {
+    color: #D1D5DB;
   }
 
   .bake-btn,

@@ -17,11 +17,14 @@ import {
   useUpdateBakeTemplate,
   useModelStatus,
 } from '../hooks/useApi'
+import type { BakeOverviewResponse } from '../hooks/useApi'
 import { useAppStore, type BakeNavigationTarget } from '../store/useAppStore'
 import type {
   ArticleTemplate,
   BakeKnowledgeItem,
+  BakeInventoryTrendBucket,
   BakeOverview,
+  BakeTab,
   SopCandidate,
   TimelineItem,
 } from '../types'
@@ -66,8 +69,98 @@ const defaultOverview: BakeOverview = {
   memoryCount: 0,
   knowledgeCount: 0,
   templateCount: 0,
+  sopCount: 0,
   pendingCandidates: 0,
   recentActivities: [],
+  inventoryTrend: [],
+}
+
+const mapBakeOverview = (data: BakeOverviewResponse): BakeOverview => {
+  const overview = {
+    captureCount: data.capture_count,
+    memoryCount: data.memory_count,
+    knowledgeCount: data.knowledge_count,
+    templateCount: data.template_count,
+    sopCount: data.sop_count ?? 0,
+    pendingCandidates: data.pending_candidates,
+    recentActivities: data.recent_activities ?? [],
+  }
+  const inventoryTrend = (data.inventory_trend ?? []).map(bucket => ({
+    label: bucket.label,
+    startTs: bucket.start_ts,
+    endTs: bucket.end_ts,
+    memoryCount: bucket.memory_count,
+    knowledgeCount: bucket.knowledge_count,
+    templateCount: bucket.template_count,
+    sopCount: bucket.sop_count,
+  }))
+
+  return {
+    ...overview,
+    inventoryTrend,
+  }
+}
+
+const DAY_MS = 86_400_000
+const MAX_TREND_BUCKETS = 30
+const OVERVIEW_TREND_LIMIT = 5000
+
+const formatTrendDate = (timestamp: number) => {
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return '未知'
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+const buildLocalInventoryTrend = (sources: {
+  memories: TimelineItem[]
+  knowledge: BakeKnowledgeItem[]
+  templates: ArticleTemplate[]
+  sops: SopCandidate[]
+}): BakeInventoryTrendBucket[] => {
+  const timestamps = [
+    ...sources.memories.map(item => item.createdAtMs),
+    ...sources.knowledge.map(item => item.createdAtMs),
+    ...sources.templates.map(item => item.createdAtMs ?? 0),
+    ...sources.sops.map(item => item.createdAtMs ?? 0),
+  ].filter(timestamp => timestamp > 0)
+
+  if (timestamps.length === 0) return []
+
+  const minDay = Math.floor(Math.min(...timestamps) / DAY_MS) * DAY_MS
+  const maxDay = Math.floor(Math.max(...timestamps) / DAY_MS) * DAY_MS
+  const totalDays = Math.max(1, Math.floor((maxDay - minDay) / DAY_MS) + 1)
+  const bucketCount = Math.max(1, Math.min(MAX_TREND_BUCKETS, totalDays))
+  const daysPerBucket = Math.max(1, Math.ceil(totalDays / bucketCount))
+  const bucketMs = daysPerBucket * DAY_MS
+
+  const countInBucket = (items: Array<{ createdAtMs?: number }>, startTs: number, endTs: number) => (
+    items.filter(item => {
+      const timestamp = item.createdAtMs ?? 0
+      return timestamp > 0 && timestamp >= startTs && timestamp < endTs
+    }).length
+  )
+
+  return Array.from({ length: bucketCount }, (_, index) => {
+    const startTs = minDay + index * bucketMs
+    const rawEndTs = index === bucketCount - 1 ? Number.POSITIVE_INFINITY : startTs + bucketMs
+    const endTs = Number.isFinite(rawEndTs) ? rawEndTs - 1 : startTs + bucketMs - 1
+    const label = daysPerBucket === 1
+      ? formatTrendDate(startTs)
+      : `${formatTrendDate(startTs)}-${formatTrendDate(endTs)}`
+
+    return {
+      label,
+      startTs,
+      endTs,
+      memoryCount: countInBucket(sources.memories, startTs, rawEndTs),
+      knowledgeCount: countInBucket(sources.knowledge, startTs, rawEndTs),
+      templateCount: countInBucket(sources.templates, startTs, rawEndTs),
+      sopCount: countInBucket(sources.sops, startTs, rawEndTs),
+    }
+  })
 }
 
 const BakePanel: React.FC = () => {
@@ -101,6 +194,7 @@ const BakePanel: React.FC = () => {
     bakeNavigationStack,
     pushBakeNavigationTarget,
     popBakeNavigationTarget,
+    clearBakeNavigationStack,
     setSelectedMemoryId,
     setSelectedTemplateId,
     setSelectedSopId,
@@ -160,18 +254,51 @@ const BakePanel: React.FC = () => {
 
   useEffect(() => {
     void fetchOverview().then((data) => {
-      setOverview({
-        captureCount: data.capture_count,
-        memoryCount: data.memory_count,
-        knowledgeCount: data.knowledge_count,
-        templateCount: data.template_count,
-        pendingCandidates: data.pending_candidates,
-        recentActivities: data.recent_activities ?? [],
-      })
+      setOverview(mapBakeOverview(data))
     }).catch((error) => {
-      setStatusMessage(error instanceof Error ? error.message : '收藏数据加载失败')
+      setStatusMessage(error instanceof Error ? error.message : '记忆数据加载失败')
     })
   }, [fetchOverview])
+
+  useEffect(() => {
+    if (bakeTab !== 'overview') return
+    let cancelled = false
+
+    const loadOverviewTrend = async () => {
+      const [memoriesResult, knowledgeResult, templatesResult, sopsResult] = await Promise.allSettled([
+        fetchMemories({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
+        fetchKnowledge({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
+        fetchTemplates({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
+        fetchSops({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
+      ])
+      if (cancelled) return
+
+      const memories = memoriesResult.status === 'fulfilled' ? memoriesResult.value.items : []
+      const knowledge = knowledgeResult.status === 'fulfilled' ? knowledgeResult.value.items : []
+      const templateItems = templatesResult.status === 'fulfilled' ? templatesResult.value.items : []
+      const sops = sopsResult.status === 'fulfilled' ? sopsResult.value.items : []
+      const inventoryTrend = buildLocalInventoryTrend({
+        memories,
+        knowledge,
+        templates: templateItems,
+        sops,
+      })
+
+      setOverview(prev => ({
+        ...prev,
+        memoryCount: memoriesResult.status === 'fulfilled' ? memoriesResult.value.total : prev.memoryCount,
+        knowledgeCount: knowledgeResult.status === 'fulfilled' ? knowledgeResult.value.total : prev.knowledgeCount,
+        templateCount: templatesResult.status === 'fulfilled' ? templatesResult.value.total : prev.templateCount,
+        sopCount: sopsResult.status === 'fulfilled' ? sopsResult.value.total : prev.sopCount,
+        inventoryTrend: inventoryTrend.length > 0 ? inventoryTrend : prev.inventoryTrend,
+      }))
+    }
+
+    void loadOverviewTrend().catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [bakeTab, fetchKnowledge, fetchMemories, fetchSops, fetchTemplates])
 
   useEffect(() => {
     if (!['templates', 'knowledge', 'sop'].includes(bakeTab)) return
@@ -335,14 +462,7 @@ const BakePanel: React.FC = () => {
 
   const refreshOverview = async () => {
     const data = await fetchOverview()
-    setOverview({
-      captureCount: data.capture_count,
-      memoryCount: data.memory_count,
-      knowledgeCount: data.knowledge_count,
-      templateCount: data.template_count,
-      pendingCandidates: data.pending_candidates,
-      recentActivities: data.recent_activities ?? [],
-    })
+    setOverview(mapBakeOverview(data))
   }
 
   const refreshKnowledge = async (offset = bakeKnowledgeOffset) => {
@@ -422,6 +542,7 @@ const BakePanel: React.FC = () => {
   }
 
   const handleSearchKnowledge = () => {
+    clearBakeNavigationStack()
     setSelectedKnowledgeId(null)
     setBakeKnowledgeFocusId(null)
     useAppStore.setState({
@@ -433,6 +554,7 @@ const BakePanel: React.FC = () => {
   }
 
   const handleClearKnowledgeFilters = () => {
+    clearBakeNavigationStack()
     setDraftKnowledgeQuery('')
     setDraftKnowledgeFrom('')
     setDraftKnowledgeTo('')
@@ -447,6 +569,7 @@ const BakePanel: React.FC = () => {
   }
 
   const handleSearchTemplate = () => {
+    clearBakeNavigationStack()
     setSelectedTemplateId(null)
     setBakeTemplateFocusId(null)
     useAppStore.setState({
@@ -458,6 +581,7 @@ const BakePanel: React.FC = () => {
   }
 
   const handleClearTemplateFilters = () => {
+    clearBakeNavigationStack()
     setDraftTemplateQuery('')
     setDraftTemplateFrom('')
     setDraftTemplateTo('')
@@ -472,6 +596,7 @@ const BakePanel: React.FC = () => {
   }
 
   const handleSearchSop = () => {
+    clearBakeNavigationStack()
     setSelectedSopId(null)
     setBakeSopFocusId(null)
     useAppStore.setState({
@@ -483,6 +608,7 @@ const BakePanel: React.FC = () => {
   }
 
   const handleClearSopFilters = () => {
+    clearBakeNavigationStack()
     setDraftSopQuery('')
     setDraftSopFrom('')
     setDraftSopTo('')
@@ -494,6 +620,18 @@ const BakePanel: React.FC = () => {
       bakeSopTo: '',
       bakeSopOffset: 0,
     })
+  }
+
+  const handleBakeTabChange = (tab: BakeTab) => {
+    if (tab === bakeTab) return
+    clearBakeNavigationStack()
+    setBakeTab(tab)
+  }
+
+  const handleOpenRepositoryFromOverview = (tab: 'memory' | 'capture') => {
+    clearBakeNavigationStack()
+    setWindowMode('knowledge')
+    setRepositoryTab(tab)
   }
 
   const handleCreateTemplate = async () => {
@@ -726,18 +864,14 @@ const BakePanel: React.FC = () => {
         </div>
       )}
 
-      <BakeTabs current={bakeTab} onChange={setBakeTab} />
+      <BakeTabs current={bakeTab} onChange={handleBakeTabChange} />
 
       <div className="bake-tab-content">
         {bakeTab === 'overview' && (
           <BakeOverviewTab
             overview={overview}
-            onOpenTab={setBakeTab}
-            onOpenRepository={(tab) => {
-              pushBakeNavigationTarget(currentNavigationTarget())
-              setWindowMode('knowledge')
-              setRepositoryTab(tab)
-            }}
+            onOpenTab={handleBakeTabChange}
+            onOpenRepository={handleOpenRepositoryFromOverview}
           />
         )}
         {bakeTab === 'knowledge' && (

@@ -64,6 +64,8 @@ export interface RagQueryResponse {
   answer:   string
   contexts: RagContext[]
   model:    string
+  done_reason?: string | null
+  output_truncated?: boolean
 }
 
 export interface RagContext {
@@ -244,8 +246,20 @@ export interface BakeOverview {
   memoryCount: number
   knowledgeCount: number
   templateCount: number
+  sopCount: number
   pendingCandidates: number
   recentActivities: string[]
+  inventoryTrend: BakeInventoryTrendBucket[]
+}
+
+export interface BakeInventoryTrendBucket {
+  label: string
+  startTs: number
+  endTs: number
+  memoryCount: number
+  knowledgeCount: number
+  templateCount: number
+  sopCount: number
 }
 
 export interface TimelineItem {
@@ -375,6 +389,8 @@ export interface ArticleTemplate {
   reviewStatus: string
   matchScore?: number
   matchLevel?: string
+  createdAt?: string
+  createdAtMs?: number
   updatedAt?: string
 }
 

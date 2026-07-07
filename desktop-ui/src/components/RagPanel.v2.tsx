@@ -13,13 +13,14 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { convertFileSrc } from '@tauri-apps/api/core'
-import { BookOpen, ChevronDown, Copy, ExternalLink, History, Loader2, MessageSquare, Send } from 'lucide-react'
+import { ChevronDown, ExternalLink, Loader2 } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { useFetchRagHistory, useModelStatus, useRagQuery } from '../hooks/useApi'
 import { fetchBillingBalance } from '../utils/authApi'
 import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
 import { BUILTIN_TEMPLATES, CATEGORY_COLORS, groupTemplatesByCategory } from '../data/taskTemplates'
 import ModelSelect from './ModelSelect'
+import { BreadAppIcon, BreadToolIcon } from './icons/BreadIcons'
 import type { RagContext, RagHistoryItem } from '../types'
 
 
@@ -113,6 +114,12 @@ const formatTs = (ts?: number | string | null) => {
   return String(ts)
 }
 
+const formatInferenceLatency = (latencyMs?: number | null) => {
+  if (latencyMs == null) return '未记录'
+  if (latencyMs < 1000) return `${latencyMs} ms`
+  return `${(latencyMs / 1000).toFixed(latencyMs < 10_000 ? 1 : 0)} 秒`
+}
+
 const sanitizeRagAnswer = (content: string) => {
   if (!content) return content
   const cutMarkers = [
@@ -169,7 +176,8 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   } = useAppStore()
 
   const [inputValue, setInputValue] = useState(ragQuery)
-  const [activeBottomTab, setActiveBottomTab] = useState<'references' | 'history' | 'templates' | null>(null)
+  const [topTab, setTopTab] = useState<'consult' | 'history'>('consult')
+  const [activeBottomTab, setActiveBottomTab] = useState<'references' | 'templates' | null>(null)
   const [ragHistory, setRagHistory] = useState<RagHistoryItem[]>([])
   const [copySuccess, setCopySuccess] = useState(false)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
@@ -338,6 +346,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
     setRagQuery(item.query)
     setInputValue(item.query)
     useAppStore.getState().setRagResult(sanitizeRagAnswer(item.answer), item.contexts ?? [])
+    setTopTab('consult')
     setActiveBottomTab('references')
     setTimeout(() => answerRef.current?.scrollTo({ top: 0, behavior: 'smooth' }), 100)
   }
@@ -345,7 +354,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   const historyScreenshot = (item: RagHistoryItem) =>
     (item.contexts ?? []).find(ctx => ctx.source_type === 'floating_assist' && ctx.screenshot_path)
 
-  const toggleBottomTab = (tab: 'references' | 'history' | 'templates') =>
+  const toggleBottomTab = (tab: 'references' | 'templates') =>
     setActiveBottomTab(prev => prev === tab ? null : tab)
   const thinkingProgress = ragLoading
     ? Math.min(95, Math.max(5, Math.round((elapsedSeconds / 120) * 100)))
@@ -365,6 +374,50 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
     ),
   }
 
+  const renderHistoryList = (emptyClassName = 'rag-panel__bottom-empty') => (
+    ragHistory.length ? (
+      <div className="rag-panel__history-list">
+        {ragHistory.map((item) => {
+          const shot = historyScreenshot(item)
+          const shotSrc = shot?.screenshot_path ? convertFileSrc(shot.screenshot_path) : ''
+          return (
+            <button key={item.id} className="rag-panel__history-item" onClick={() => handleRestoreHistory(item)}>
+              {shotSrc && (
+                <span
+                  role="button"
+                  tabIndex={0}
+                  className="rag-panel__history-shot"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setScreenshotPreview(shotSrc)
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      setScreenshotPreview(shotSrc)
+                    }
+                  }}
+                  aria-label="查看悬浮球截屏"
+                >
+                  <img src={shotSrc} alt="悬浮球截屏缩略图" />
+                </span>
+              )}
+              <span className="rag-panel__history-main">
+                <span className="rag-panel__history-query">{item.query}</span>
+                <span className="rag-panel__history-meta">
+                  {formatTs(item.ts)} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latency_ms)} · {shotSrc ? '悬浮截屏 · ' : ''}{item.context_count} 条参考
+                </span>
+              </span>
+            </button>
+          )
+        })}
+      </div>
+    ) : (
+      <div className={emptyClassName}>暂无咨询记录。</div>
+    )
+  )
+
   return (
     <div
       className={`rag-panel ${className}`}
@@ -372,14 +425,28 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
       role="dialog"
       aria-label="记忆面包问答面板"
     >
-      {/* 标题栏 */}
-      <div className="rag-panel__header" data-testid="rag-panel-header">
-        <div className="rag-panel__title-group">
-          <h2 className="rag-panel__title">咨询</h2>
-          <p className="rag-panel__header-subtitle">向记忆面包提问，获取基于你的知识库的回答</p>
-        </div>
+      <div className="rag-panel__top-tabs" data-testid="rag-panel-header">
+        {([
+          { key: 'consult', label: '咨询' },
+          { key: 'history', label: `咨询记录${ragHistory.length ? ` (${ragHistory.length})` : ''}` },
+        ] as const).map(({ key, label }) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setTopTab(key)}
+            className={`rag-panel__top-tab${topTab === key ? ' rag-panel__top-tab--active' : ''}`}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
+      {topTab === 'history' ? (
+        <div className="rag-panel__history-page">
+          {renderHistoryList('rag-panel__history-empty')}
+        </div>
+      ) : (
+        <>
       {/* 模型未就绪提示 */}
       {!modelStatusLoading && !modelsReady && (
         <div style={{
@@ -431,7 +498,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
             onChange={handleSelectModel}
             title="选择咨询生成模型"
           />
-          {cloudBalance && (
+          {activeModelId === REMOTE_CREATION_MODEL_ID && cloudBalance && (
             <span className="rag-panel__credit-balance">
               Credit {cloudBalance.available}
             </span>
@@ -462,20 +529,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
               </>
             ) : (
               <>
-                {/* 发送图标 */}
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="m22 2-7 20-4-9-9-4Z" />
-                  <path d="M22 2 11 13" />
-                </svg>
+                <BreadToolIcon name="send" size={16} framed={false} />
                 提问
               </>
             )}
@@ -517,7 +571,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
 
       <section className="rag-panel__document" data-testid="rag-panel-answer">
         <div className="rag-panel__document-header">
-          <span className="rag-panel__document-title"><MessageSquare size={18} />咨询输出</span>
+          <span className="rag-panel__document-title"><BreadAppIcon name="consult" size={20} />咨询输出</span>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             {ragLoading && (
               <span style={{ fontSize: 12, color: '#0f766e', fontWeight: 650 }}>
@@ -525,7 +579,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
               </span>
             )}
             <button onClick={handleCopy} disabled={!ragAnswer} style={compactButtonStyle}>
-              <Copy size={15} />
+              <BreadToolIcon name="copy" size={16} />
               {copySuccess ? '已复制' : '复制'}
             </button>
           </div>
@@ -549,9 +603,8 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
 
       <div className="rag-panel__bottom-tabs">
         {([
-          { key: 'references', label: '参考资料', badge: ragContexts.length, icon: <BookOpen size={15} /> },
-          { key: 'history', label: '咨询记录', badge: ragHistory.length, icon: <History size={15} /> },
-          { key: 'templates', label: '任务模板', badge: BUILTIN_TEMPLATES.length, icon: <Send size={15} /> },
+          { key: 'references', label: '参考资料', badge: ragContexts.length, icon: <BreadAppIcon name="memory" size={18} /> },
+          { key: 'templates', label: '任务模板', badge: BUILTIN_TEMPLATES.length, icon: <BreadAppIcon name="creation" size={18} /> },
         ] as const).map(({ key, label, badge, icon }) => (
           <button
             key={key}
@@ -576,49 +629,6 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
               </div>
             ) : (
               <div className="rag-panel__bottom-empty">暂无参考资料。完成一次咨询后会显示召回来源。</div>
-            )
-          )}
-          {activeBottomTab === 'history' && (
-            ragHistory.length ? (
-              <div className="rag-panel__history-list">
-                {ragHistory.map((item) => {
-                  const shot = historyScreenshot(item)
-                  const shotSrc = shot?.screenshot_path ? convertFileSrc(shot.screenshot_path) : ''
-                  return (
-                    <button key={item.id} className="rag-panel__history-item" onClick={() => handleRestoreHistory(item)}>
-                      {shotSrc && (
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          className="rag-panel__history-shot"
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            setScreenshotPreview(shotSrc)
-                          }}
-                          onKeyDown={(event) => {
-                            if (event.key === 'Enter' || event.key === ' ') {
-                              event.preventDefault()
-                              event.stopPropagation()
-                              setScreenshotPreview(shotSrc)
-                            }
-                          }}
-                          aria-label="查看悬浮球截屏"
-                        >
-                          <img src={shotSrc} alt="悬浮球截屏缩略图" />
-                        </span>
-                      )}
-                      <span className="rag-panel__history-main">
-                        <span className="rag-panel__history-query">{item.query}</span>
-                        <span className="rag-panel__history-meta">
-                          {formatTs(item.ts)} · {getModelDisplayName(item.model)} · {shotSrc ? '悬浮截屏 · ' : ''}{item.context_count} 条参考
-                        </span>
-                      </span>
-                    </button>
-                  )
-                })}
-              </div>
-            ) : (
-              <div className="rag-panel__bottom-empty">暂无咨询记录。</div>
             )
           )}
           {activeBottomTab === 'templates' && (
@@ -650,6 +660,8 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
             </div>
           )}
         </div>
+      )}
+        </>
       )}
 
       {screenshotPreview && (

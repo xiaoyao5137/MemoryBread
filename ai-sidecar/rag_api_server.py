@@ -17,6 +17,15 @@ CORS(app)
 
 # 懒加载 RAG pipeline
 _rag_pipeline = None
+RAG_REFERENCE_LIMIT = 10
+
+
+def coerce_rag_top_k(value, default: int = RAG_REFERENCE_LIMIT) -> int:
+    try:
+        top_k = int(value)
+    except (TypeError, ValueError):
+        top_k = default
+    return max(1, min(top_k, RAG_REFERENCE_LIMIT))
 
 def get_rag_pipeline():
     """懒加载 RAG pipeline"""
@@ -49,7 +58,7 @@ def get_rag_pipeline():
             fts5_retriever=fts5_retriever,
             knowledge_retriever=knowledge_retriever,
             llm=llm,
-            top_k=5,
+            top_k=RAG_REFERENCE_LIMIT,
             db_path=db_path,
         )
         logger.info("RAG pipeline 初始化完成")
@@ -69,7 +78,7 @@ def rag_query():
             return jsonify({'error': '缺少 query 参数'}), 400
 
         query = data['query']
-        top_k = data.get('top_k', 5)
+        top_k = coerce_rag_top_k(data.get('top_k'))
 
         logger.info(f"收到 RAG 查询: {query}")
 

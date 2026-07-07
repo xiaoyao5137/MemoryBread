@@ -75,6 +75,7 @@ class CloudChatBackend(LlmBackend):
             text=message.get("content", ""),
             model=data.get("model", self._model),
             tokens=usage.get("completion_tokens", 0),
+            done_reason=choice.get("finish_reason"),
         )
 
     def _complete_anthropic(self, prompt: str, system: str = "", **kwargs) -> LlmResponse:
@@ -101,6 +102,7 @@ class CloudChatBackend(LlmBackend):
             text=text,
             model=data.get("model", self._model),
             tokens=usage.get("output_tokens", 0),
+            done_reason=data.get("stop_reason"),
         )
 
     def _post_json(self, url: str, payload: dict, headers: dict) -> dict:

@@ -14,6 +14,7 @@ import { useAppStore } from '../store/useAppStore'
 import { type WindowMode } from '../types'
 import { getMembershipPlanLabel, getUserDisplayName } from '../utils/accountDisplay'
 import EnvironmentSwitch from './admin/EnvironmentSwitch'
+import { BreadAppIcon, type BreadAppIconName } from './icons/BreadIcons'
 import './FloatingBuddy.v2.css'
 
 interface FloatingBuddyProps {
@@ -24,7 +25,7 @@ interface MenuItem {
   mode: WindowMode
   label: string
   testId: string
-  icon: React.ReactNode
+  icon: BreadAppIconName
 }
 
 interface MenuGroup {
@@ -40,33 +41,19 @@ const MENU_GROUPS: MenuGroup[] = [
         mode: 'rag',
         label: '咨询',
         testId: 'buddy-avatar',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-          </svg>
-        )
+        icon: 'consult'
       },
       {
         mode: 'creation',
         label: '创作',
         testId: 'creation-btn',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12 20h9"/>
-            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
-          </svg>
-        )
+        icon: 'creation'
       },
       {
         mode: 'tasks',
         label: '任务',
         testId: 'tasks-btn',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="10"/>
-            <polyline points="12 6 12 12 16 14"/>
-          </svg>
-        )
+        icon: 'tasks'
       },
     ]
   },
@@ -75,40 +62,21 @@ const MENU_GROUPS: MenuGroup[] = [
     items: [
       {
         mode: 'bake',
-        label: '收藏',
+        label: '记忆',
         testId: 'bake-btn',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M6 10V8a6 6 0 0 1 12 0v2" />
-            <path d="M4 10h16v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5v-5Z" />
-            <path d="M9 14h.01" />
-            <path d="M12 14h.01" />
-            <path d="M15 14h.01" />
-          </svg>
-        )
+        icon: 'memory'
       },
       {
         mode: 'knowledge',
         label: '采集',
         testId: 'knowledge-btn',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/>
-            <path d="M8 7h6"/>
-            <path d="M8 11h8"/>
-          </svg>
-        )
+        icon: 'capture'
       },
       {
         mode: 'profile',
         label: '画像',
         testId: 'profile-btn',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>
-            <circle cx="12" cy="7" r="4"/>
-          </svg>
-        )
+        icon: 'profile'
       },
     ]
   },
@@ -119,58 +87,38 @@ const MENU_GROUPS: MenuGroup[] = [
         mode: 'models',
         label: '模型',
         testId: 'models-btn',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <rect width="16" height="16" x="4" y="4" rx="2"/>
-            <rect width="6" height="6" x="9" y="9" rx="1"/>
-            <path d="M15 2v2"/><path d="M15 20v2"/>
-            <path d="M2 15h2"/><path d="M2 9h2"/>
-            <path d="M20 15h2"/><path d="M20 9h2"/>
-            <path d="M9 2v2"/><path d="M9 20v2"/>
-          </svg>
-        )
+        icon: 'models'
       },
       {
         mode: 'privacy',
         label: '隐私',
         testId: 'privacy-btn',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-          </svg>
-        )
+        icon: 'privacy'
       },
       {
         mode: 'monitor',
         label: '监控',
         testId: 'monitor-btn',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="18" y1="20" x2="18" y2="10"/>
-            <line x1="12" y1="20" x2="12" y2="4"/>
-            <line x1="6" y1="20" x2="6" y2="14"/>
-          </svg>
-        )
+        icon: 'monitor'
       },
       {
         mode: 'settings',
         label: '配置',
         testId: 'settings-btn',
-        icon: (
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
-            <circle cx="12" cy="12" r="3"/>
-          </svg>
-        )
+        icon: 'settings'
       },
     ]
   }
 ]
 
 const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
-  const { windowMode, setWindowMode, currentUser, cloudSubscription } = useAppStore()
+  const { windowMode, setWindowMode, clearBakeNavigationStack, currentUser, cloudSubscription } = useAppStore()
   const accountLabel = getUserDisplayName(currentUser)
   const planLabel = getMembershipPlanLabel(currentUser, cloudSubscription)
+  const handleNavigate = (mode: WindowMode) => {
+    clearBakeNavigationStack()
+    setWindowMode(mode)
+  }
 
   return (
     <aside
@@ -200,12 +148,14 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
                   key={item.mode}
                   className={`buddy-action-btn ${isActive ? 'buddy-action-btn--active' : ''}`}
                   data-testid={item.testId}
-                  onClick={() => setWindowMode(item.mode)}
+                  onClick={() => handleNavigate(item.mode)}
                   aria-label={item.label}
                   title={item.label}
                   type="button"
                 >
-                  <span className="buddy-action-btn__icon" aria-hidden="true">{item.icon}</span>
+                  <span className="buddy-action-btn__icon" aria-hidden="true">
+                    <BreadAppIcon name={item.icon} size={24} />
+                  </span>
                   <span className="buddy-action-btn__label">{item.label}</span>
                 </button>
               )
@@ -218,14 +168,14 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
         className={`buddy-account-pill ${windowMode === 'account' ? 'buddy-account-pill--active' : ''}`}
         type="button"
         aria-label={currentUser ? '打开用户账户' : '未登录，打开登录'}
-        onClick={() => setWindowMode('account')}
+        onClick={() => handleNavigate('account')}
       >
         <span className="buddy-account-pill__icon" aria-hidden="true">
           {currentUser ? <CircleUserRound size={17} /> : <LogIn size={17} />}
         </span>
         <span className="buddy-account-pill__text">
-          <span>{planLabel}</span>
           <strong>{accountLabel}</strong>
+          <span>{planLabel}</span>
         </span>
         <ChevronRight className="buddy-account-pill__chevron" size={15} aria-hidden="true" />
       </button>

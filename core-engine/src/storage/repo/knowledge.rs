@@ -408,7 +408,7 @@ impl StorageManager {
                         k.created_at_ms, k.updated_at_ms, k.capture_ids, k.start_time, k.end_time, k.duration_minutes,
                         k.frag_app_name, k.frag_win_title, k.time_range_start, k.time_range_end, k.key_timestamps
                  FROM timelines k
-                 WHERE k.category = 'bake_article'",
+                 WHERE 1 = 1",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             let query_terms = query.map(keyword_terms).unwrap_or_default();
@@ -465,7 +465,7 @@ impl StorageManager {
             let mut sql = String::from(
                 "SELECT COUNT(*)
                  FROM timelines k
-                 WHERE k.category = 'bake_article'",
+                 WHERE 1 = 1",
             );
             let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = vec![];
             let query_terms = query.map(keyword_terms).unwrap_or_default();

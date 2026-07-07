@@ -32,11 +32,16 @@ export async function authenticateWithPassword(
   mode: 'login' | 'register',
   email: string,
   password: string,
+  username?: string,
 ): Promise<AuthSession> {
   const response = await fetch(`${adminApiBaseUrl}/v1/auth/${mode}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({
+      email,
+      password,
+      username: mode === 'register' ? username?.trim() || undefined : undefined,
+    }),
   }).catch((error) => {
     throw normalizeAuthFetchError(error, adminApiBaseUrl)
   })
@@ -69,11 +74,12 @@ export async function authenticateWithPhoneCode(
   adminApiBaseUrl: string,
   phone: string,
   code: string,
+  username?: string,
 ): Promise<AuthSession> {
   const response = await fetch(`${adminApiBaseUrl}/v1/auth/phone/verify`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ phone, code }),
+    body: JSON.stringify({ phone, code, username: username?.trim() || undefined }),
   }).catch((error) => {
     throw normalizeAuthFetchError(error, adminApiBaseUrl)
   })

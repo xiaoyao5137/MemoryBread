@@ -1,19 +1,40 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import ReactMarkdown from 'react-markdown'
-import { Clipboard, EyeOff, Home, Loader2, MessageSquare, Paperclip, RefreshCw, Send, Sparkles, Square, Trash2, X } from 'lucide-react'
+import { EyeOff, Home, Loader2, MessageSquare, Sparkles, X } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
-import { runRagQueryJob } from '../hooks/useApi'
+import { RAG_REFERENCE_LIMIT, runGatewayRagQuery, runRagQueryJob } from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
 import type { RagContext } from '../types'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
+import { fetchBillingBalance } from '../utils/authApi'
+import {
+  FLOATING_ASSIST_AUTO_TASK_KEY,
+  FLOATING_ASSIST_ENABLED_KEY,
+  detectFloatingAssistTaskFromOcr,
+  readFloatingAssistAutoTaskConfig,
+  writeFloatingAssistAutoTaskConfig,
+  type FloatingAssistAutoTaskConfig,
+  type FloatingAssistTaskDetection,
+} from '../utils/floatingAssistAutoTask'
+import { REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId } from '../utils/modelSelection'
+import { BreadToolIcon } from './icons/BreadIcons'
+import breadRollAsset from '../assets/floating-assist/bread-roll.png'
+import capybaraEmptyAsset from '../assets/floating-assist/capybara-empty.png'
 import './SystemFloatingAssist.css'
 
-type AssistPhase = 'idle' | 'capturing' | 'answering' | 'done' | 'error'
+type AssistPhase = 'idle' | 'receiving' | 'capturing' | 'answering' | 'done' | 'error'
 
-const FLOATING_ASSIST_BALL_SIZE = 42
+const FLOATING_ASSIST_BALL_SIZE = 82
 const FLOATING_ASSIST_CONTEXT_MENU_WIDTH = 214
 const FLOATING_ASSIST_CONTEXT_MENU_HEIGHT = 210
+const FLOATING_ASSIST_DONE_IDLE_DELAY_MS = 5 * 60 * 1000
+const AUTO_TASK_SCAN_INITIAL_DELAY_MS = 2_000
+const AUTO_TASK_SCAN_INTERVAL_MS = 30_000
+const AUTO_TASK_DEDUP_CACHE_LIMIT = 64
+
+const isAssistPhase = (value: string | null): value is AssistPhase =>
+  value === 'idle' || value === 'receiving' || value === 'capturing' || value === 'answering' || value === 'done' || value === 'error'
 
 interface FloatingAssistOcrResult {
   text: string
@@ -21,11 +42,39 @@ interface FloatingAssistOcrResult {
   screenshot_path: string
   width: number
   height: number
+  screenshot_source?: string
+  app_bundle_id?: string | null
+  app_name?: string | null
+  window_title?: string | null
 }
 
 interface FloatingAssistDragOrigin {
   offset_x: number
   offset_y: number
+}
+
+interface RunAssistOptions {
+  automatic?: boolean
+  detection?: FloatingAssistTaskDetection
+}
+
+interface PendingFloatingAssistTask {
+  ocr: FloatingAssistOcrResult
+  detection: FloatingAssistTaskDetection
+}
+
+const hasSeenAutoTaskFingerprint = (seen: Map<string, number>, fingerprint: string) =>
+  seen.has(fingerprint)
+
+const rememberAutoTaskFingerprint = (seen: Map<string, number>, fingerprint: string, ts: number) => {
+  if (!fingerprint) return
+  seen.delete(fingerprint)
+  seen.set(fingerprint, ts)
+  while (seen.size > AUTO_TASK_DEDUP_CACHE_LIMIT) {
+    const oldest = seen.keys().next().value
+    if (!oldest) break
+    seen.delete(oldest)
+  }
 }
 
 type MarkdownBlock =
@@ -155,16 +204,36 @@ const buildManualFloatingAssistQuery = (instruction: string, ocrText?: string) =
 }
 
 const SystemFloatingAssist: React.FC = () => {
+  const debugParams = useMemo(() => new URLSearchParams(window.location.search), [])
+  const debugPreviewEnabled = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost'
+  const debugPhaseValue = debugParams.get('debugPhase')
+  const debugPhase: AssistPhase | null = debugPreviewEnabled && isAssistPhase(debugPhaseValue)
+    ? debugPhaseValue
+    : null
+  const debugBackground = debugPreviewEnabled && debugParams.get('debugBg') === 'checker'
+  const debugAnswer = debugPreviewEnabled ? debugParams.get('debugAnswer') : null
+  const debugDoneIdleMsParam = debugParams.get('debugDoneIdleMs')
+  const debugDoneIdleMs = debugDoneIdleMsParam == null ? NaN : Number(debugDoneIdleMsParam)
+  const doneIdleDelayMs = debugPreviewEnabled && Number.isFinite(debugDoneIdleMs) && debugDoneIdleMs >= 0
+    ? debugDoneIdleMs
+    : FLOATING_ASSIST_DONE_IDLE_DELAY_MS
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+  const adminApiBaseUrl = useAppStore((s) => s.adminApiBaseUrl)
+  const gatewayApiBaseUrl = useAppStore((s) => s.gatewayApiBaseUrl)
+  const authToken = useAppStore((s) => s.authToken)
+  const currentUser = useAppStore((s) => s.currentUser)
+  const cloudBalance = useAppStore((s) => s.cloudBalance)
+  const setCloudBalance = useAppStore((s) => s.setCloudBalance)
   const creationModelConfigs = useAppStore((s) => s.creationModelConfigs)
-  const [phase, setPhase] = useState<AssistPhase>('idle')
-  const [answer, setAnswer] = useState('')
+  const [phase, setPhase] = useState<AssistPhase>(debugPhase ?? 'idle')
+  const [answer, setAnswer] = useState(debugAnswer ?? '')
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const [revealing, setRevealing] = useState(false)
   const [screenshot, setScreenshot] = useState<FloatingAssistOcrResult | null>(null)
   const [screenshotSrc, setScreenshotSrc] = useState('')
   const [references, setReferences] = useState<RagContext[]>([])
+  const [outputTruncated, setOutputTruncated] = useState(false)
   const [previewOpen, setPreviewOpen] = useState(false)
   const [canvasOpen, setCanvasOpen] = useState(false)
   const [contextMenuOpen, setContextMenuOpen] = useState(false)
@@ -172,9 +241,15 @@ const SystemFloatingAssist: React.FC = () => {
   const [attachments, setAttachments] = useState<UserAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
+  const [autoTaskConfig, setAutoTaskConfig] = useState(readFloatingAssistAutoTaskConfig)
+  const [pendingAutoTask, setPendingAutoTask] = useState<PendingFloatingAssistTask | null>(null)
   const revealTimerRef = useRef<number | null>(null)
   const clickTimerRef = useRef<number | null>(null)
   const progressTimerRef = useRef<number | null>(null)
+  const doneIdleTimerRef = useRef<number | null>(null)
+  const autoTaskScanInFlightRef = useRef(false)
+  const seenAutoTasksRef = useRef<Map<string, number>>(new Map())
+  const activeAssistTaskRef = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const dragRef = useRef({
@@ -190,13 +265,29 @@ const SystemFloatingAssist: React.FC = () => {
   const suppressClickRef = useRef(false)
 
   const statusText = useMemo(() => {
+    if (phase === 'receiving') return '接住新任务'
     if (phase === 'capturing') return `正在识别屏幕 ${progress}%`
     if (phase === 'answering') return `正在整理答案 ${progress}%`
     if (revealing) return '正在生成'
     if (phase === 'done') return '已生成'
     if (phase === 'error') return '需要处理'
+    if (answer.trim()) return '已生成'
+    if (pendingAutoTask) return '发现可能任务'
+    if (autoTaskConfig.enabled) return '自动识别中'
     return '待咨询'
-  }, [phase, progress, revealing])
+  }, [answer, autoTaskConfig.enabled, pendingAutoTask, phase, progress, revealing])
+
+  const clearDoneIdleTimer = useCallback(() => {
+    if (doneIdleTimerRef.current != null) {
+      window.clearTimeout(doneIdleTimerRef.current)
+      doneIdleTimerRef.current = null
+    }
+  }, [])
+
+  const resetDoneMascotToIdle = useCallback(() => {
+    clearDoneIdleTimer()
+    setPhase(current => current === 'done' ? 'idle' : current)
+  }, [clearDoneIdleTimer])
 
   const stopProgress = () => {
     if (progressTimerRef.current != null) {
@@ -241,25 +332,44 @@ const SystemFloatingAssist: React.FC = () => {
   }
 
   const hasCanvas = canvasOpen
-  const busy = phase === 'capturing' || phase === 'answering'
+  const busy = phase === 'receiving' || phase === 'capturing' || phase === 'answering'
+  const hasGeneratedAnswer = answer.trim().length > 0
+  const remoteModelAllowed = canUseRemoteCreationModel(currentUser, cloudBalance)
+  const activeModelId = getEffectiveCreationModelId(creationModelConfigs, remoteModelAllowed)
   const collapseExpandedSurface = () => {
     setCanvasOpen(false)
     setContextMenuOpen(false)
     setPreviewOpen(false)
   }
-  const canvasHeight = phase === 'done'
+  const canvasHeight = phase === 'done' || (phase === 'idle' && hasGeneratedAnswer)
     ? Math.min(560, Math.max(420, 330 + Math.ceil(answer.length / 2.4) + Math.min(references.length, 3) * 42))
     : phase === 'error'
       ? 370
       : phase === 'idle'
-        ? 220
+        ? pendingAutoTask ? 330 : 220
         : screenshot
           ? 414
           : 330
   useEffect(() => {
+    if (!authToken || !currentUser) {
+      setCloudBalance(null)
+      return
+    }
+    let cancelled = false
+    fetchBillingBalance(adminApiBaseUrl, authToken)
+      .then(balance => {
+        if (!cancelled) setCloudBalance(balance)
+      })
+      .catch(() => {
+        if (!cancelled) setCloudBalance(null)
+      })
+    return () => { cancelled = true }
+  }, [adminApiBaseUrl, authToken, currentUser, setCloudBalance])
+
+  useEffect(() => {
     document.documentElement.classList.add('floating-assist-html')
     document.body.classList.add('floating-assist-body')
-    let cleanup: (() => void) | null = null
+    const tauriCleanups: Array<() => void> = []
     const stopGlobalDrag = () => stopDrag()
     const handleWindowBlur = () => {
       stopDrag()
@@ -283,6 +393,7 @@ const SystemFloatingAssist: React.FC = () => {
         window.clearTimeout(clickTimerRef.current)
         clickTimerRef.current = null
       }
+      clearDoneIdleTimer()
       stopProgress()
       setProgress(0)
       stopDrag(false)
@@ -290,7 +401,37 @@ const SystemFloatingAssist: React.FC = () => {
       collapseExpandedSurface()
       setRevealing(false)
     }).then(dispose => {
-      cleanup = dispose
+      tauriCleanups.push(dispose)
+    }).catch(() => {})
+    void listen<boolean | FloatingAssistAutoTaskConfig>('floating-assist-auto-task-changed', event => {
+      const nextConfig = typeof event.payload === 'boolean'
+        ? writeFloatingAssistAutoTaskConfig({
+          ...readFloatingAssistAutoTaskConfig(),
+          enabled: Boolean(event.payload),
+        })
+        : writeFloatingAssistAutoTaskConfig(event.payload)
+      try {
+        localStorage.setItem(FLOATING_ASSIST_AUTO_TASK_KEY, String(nextConfig.enabled))
+      } catch {
+        // ignore
+      }
+      setAutoTaskConfig(nextConfig)
+    }).then(dispose => {
+      tauriCleanups.push(dispose)
+    }).catch(() => {})
+    void listen<boolean>('tray-floating-assist-changed', event => {
+      if (event.payload) return
+      try {
+        writeFloatingAssistAutoTaskConfig({
+          ...readFloatingAssistAutoTaskConfig(),
+          enabled: false,
+        })
+      } catch {
+        // ignore
+      }
+      setAutoTaskConfig(readFloatingAssistAutoTaskConfig())
+    }).then(dispose => {
+      tauriCleanups.push(dispose)
     }).catch(() => {})
     return () => {
       document.documentElement.classList.remove('floating-assist-html')
@@ -301,6 +442,7 @@ const SystemFloatingAssist: React.FC = () => {
       if (clickTimerRef.current != null) {
         window.clearTimeout(clickTimerRef.current)
       }
+      clearDoneIdleTimer()
       stopProgress()
       stopDrag(false)
       window.removeEventListener('pointerup', stopGlobalDrag)
@@ -308,9 +450,24 @@ const SystemFloatingAssist: React.FC = () => {
       window.removeEventListener('blur', handleWindowBlur)
       window.removeEventListener('click', closeContextMenu)
       window.removeEventListener('keydown', handleKeyDown)
-      cleanup?.()
+      tauriCleanups.forEach(cleanup => cleanup())
     }
   }, [])
+
+  useEffect(() => {
+    if (phase !== 'done') {
+      clearDoneIdleTimer()
+      return
+    }
+
+    clearDoneIdleTimer()
+    doneIdleTimerRef.current = window.setTimeout(() => {
+      doneIdleTimerRef.current = null
+      setPhase(current => current === 'done' ? 'idle' : current)
+    }, doneIdleDelayMs)
+
+    return clearDoneIdleTimer
+  }, [clearDoneIdleTimer, doneIdleDelayMs, phase])
 
   useEffect(() => {
     const width = previewOpen
@@ -323,7 +480,7 @@ const SystemFloatingAssist: React.FC = () => {
     const height = previewOpen
       ? 540
       : hasCanvas
-        ? Math.max(50 + canvasHeight, contextMenuOpen ? FLOATING_ASSIST_CONTEXT_MENU_HEIGHT : FLOATING_ASSIST_BALL_SIZE)
+        ? Math.max(FLOATING_ASSIST_BALL_SIZE + 8 + canvasHeight, contextMenuOpen ? FLOATING_ASSIST_CONTEXT_MENU_HEIGHT : FLOATING_ASSIST_BALL_SIZE)
         : contextMenuOpen
           ? FLOATING_ASSIST_CONTEXT_MENU_HEIGHT
           : FLOATING_ASSIST_BALL_SIZE
@@ -361,6 +518,8 @@ const SystemFloatingAssist: React.FC = () => {
   const clearCanvasContent = () => {
     abortRef.current?.abort()
     abortRef.current = null
+    activeAssistTaskRef.current = false
+    clearDoneIdleTimer()
     clearAnswerReveal()
     stopProgress()
     setPhase('idle')
@@ -371,15 +530,18 @@ const SystemFloatingAssist: React.FC = () => {
     setScreenshot(null)
     setScreenshotSrc('')
     setReferences([])
+    setOutputTruncated(false)
     setPreviewOpen(false)
     setManualInstruction('')
     setAttachments([])
     setAttachmentError(null)
+    setPendingAutoTask(null)
   }
 
   const stopAssist = () => {
     abortRef.current?.abort()
     abortRef.current = null
+    activeAssistTaskRef.current = false
     clearAnswerReveal()
     stopProgress()
     setPhase(answer ? 'done' : 'idle')
@@ -396,9 +558,12 @@ const SystemFloatingAssist: React.FC = () => {
     }
   }
 
-  const runAssist = async () => {
-    if (suppressClickRef.current) return
-    if (busy) return
+  const runAssistWithOcr = async (preparedOcr?: FloatingAssistOcrResult, options: RunAssistOptions = {}) => {
+    if (!options.automatic && suppressClickRef.current) return false
+    if (activeAssistTaskRef.current || busy) return false
+    activeAssistTaskRef.current = true
+    setPendingAutoTask(null)
+    clearDoneIdleTimer()
     setContextMenuOpen(false)
     setCanvasOpen(true)
     if (revealTimerRef.current != null) {
@@ -412,15 +577,22 @@ const SystemFloatingAssist: React.FC = () => {
     setScreenshot(null)
     setScreenshotSrc('')
     setReferences([])
+    setOutputTruncated(false)
     setPreviewOpen(false)
     const controller = new AbortController()
     abortRef.current = controller
     try {
-      setPhase('capturing')
-      startProgress(8, 34, 9000)
+      setPhase('receiving')
+      startProgress(4, 12, 900)
       await waitForPaint()
-      const ocr = await invoke<FloatingAssistOcrResult>('capture_screen_ocr_for_floating_assist')
-      const text = ocr.text.trim()
+      await new Promise(resolve => window.setTimeout(resolve, 900))
+      setPhase('capturing')
+      startProgress(12, 34, 9000)
+      await waitForPaint()
+      const ocr = preparedOcr ?? await invoke<FloatingAssistOcrResult>('capture_screen_ocr_for_floating_assist')
+      const rawText = ocr.text.trim()
+      const detectedSnippets = options.automatic ? options.detection?.snippets.filter(Boolean) ?? [] : []
+      const text = detectedSnippets.length > 0 ? detectedSnippets.join('\n') : rawText
       setScreenshot(ocr)
       try {
         setScreenshotSrc(await invoke<string>('read_floating_assist_image_data_url', { path: ocr.screenshot_path }))
@@ -437,34 +609,188 @@ const SystemFloatingAssist: React.FC = () => {
       const attachmentPrompt = buildAttachmentPrompt(attachments)
       const query = buildFloatingAssistQuery(text)
       const queryWithAttachments = attachmentPrompt ? `${query}\n\n${attachmentPrompt}` : query
-      const result = await runRagQueryJob(apiBaseUrl, creationModelConfigs, queryWithAttachments, 5, {
+      const metadata = {
         source: 'floating_assist',
-        screenshot_path: ocr.screenshot_path,
+        screenshot_path: options.automatic ? undefined : ocr.screenshot_path,
         screenshot_width: ocr.width,
         screenshot_height: ocr.height,
+        screenshot_source: ocr.screenshot_source,
+        app_bundle_id: ocr.app_bundle_id,
+        app_name: ocr.app_name,
+        window_title: ocr.window_title,
         ocr_text: text,
+        trigger: options.automatic ? 'auto_task_detection' : 'screen_recognition',
+        auto_task_detection: options.detection
+          ? {
+            score: options.detection.score,
+            reasons: options.detection.reasons,
+            fingerprint: options.detection.fingerprint,
+            snippets: options.detection.snippets,
+            requires_confirmation: options.detection.requiresConfirmation,
+          }
+          : undefined,
         attachments: buildAttachmentMetadata(attachments),
-      }, false, controller.signal)
+      }
+      const result = activeModelId === REMOTE_CREATION_MODEL_ID && currentUser?.id
+        ? await runGatewayRagQuery(apiBaseUrl, gatewayApiBaseUrl, queryWithAttachments, currentUser.id, controller.signal, {
+          source: 'floating_assist',
+          metadata,
+        })
+        : await runRagQueryJob(apiBaseUrl, creationModelConfigs, queryWithAttachments, RAG_REFERENCE_LIMIT, metadata, remoteModelAllowed, controller.signal)
       setReferences(result.contexts ?? [])
+      setOutputTruncated(Boolean(result.output_truncated))
       stopProgress()
       setProgress(100)
       setPhase('done')
       revealAnswer(result.answer?.trim() || '本次没有生成咨询输出，请重试。')
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') return
+      if (err instanceof DOMException && err.name === 'AbortError') return true
       stopProgress()
       setRevealing(false)
       setPhase('error')
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       if (abortRef.current === controller) abortRef.current = null
+      activeAssistTaskRef.current = false
+    }
+    return true
+  }
+
+  const runAssist = async () => {
+    await runAssistWithOcr()
+  }
+
+  const showPendingAutoTask = async (ocr: FloatingAssistOcrResult, detection: FloatingAssistTaskDetection) => {
+    clearDoneIdleTimer()
+    setContextMenuOpen(false)
+    setPreviewOpen(false)
+    setCanvasOpen(true)
+    setPhase('idle')
+    setError(null)
+    setCopied(false)
+    setAnswer('')
+    setReferences([])
+    setOutputTruncated(false)
+    setScreenshot(ocr)
+    setPendingAutoTask({ ocr, detection })
+    try {
+      setScreenshotSrc(await invoke<string>('read_floating_assist_image_data_url', { path: ocr.screenshot_path }))
+    } catch {
+      setScreenshotSrc('')
     }
   }
+
+  const confirmPendingAutoTask = async () => {
+    const pending = pendingAutoTask
+    if (!pending || busy) return
+    setPendingAutoTask(null)
+    await runAssistWithOcr(pending.ocr, { automatic: true, detection: pending.detection })
+  }
+
+  const dismissPendingAutoTask = () => {
+    setPendingAutoTask(null)
+    setScreenshot(null)
+    setScreenshotSrc('')
+    setPreviewOpen(false)
+  }
+
+  useEffect(() => {
+    if (!autoTaskConfig.enabled) return
+
+    let cancelled = false
+    const scanForTask = async () => {
+      if (cancelled || autoTaskScanInFlightRef.current) return
+      if (
+        activeAssistTaskRef.current
+        || busy
+        || canvasOpen
+        || contextMenuOpen
+        || previewOpen
+        || revealing
+        || phase !== 'idle'
+        || manualInstruction.trim()
+        || attachments.length > 0
+      ) {
+        return
+      }
+
+      autoTaskScanInFlightRef.current = true
+      try {
+        const ocr = await invoke<FloatingAssistOcrResult>('capture_screen_ocr_for_floating_assist')
+        if (cancelled) return
+        const detection = detectFloatingAssistTaskFromOcr(ocr.text, {
+          requireImWindow: true,
+          screenshotSource: ocr.screenshot_source,
+          appBundleId: ocr.app_bundle_id,
+          appName: ocr.app_name,
+          windowTitle: ocr.window_title,
+          appTargets: autoTaskConfig.appTargets,
+          triggerWords: autoTaskConfig.triggerWords,
+        })
+
+        const now = Date.now()
+        if (hasSeenAutoTaskFingerprint(seenAutoTasksRef.current, detection.fingerprint)) {
+          return
+        }
+
+        if (!detection.matched) {
+          if (detection.requiresConfirmation) {
+            rememberAutoTaskFingerprint(seenAutoTasksRef.current, detection.fingerprint, now)
+            await showPendingAutoTask(ocr, detection)
+          }
+          return
+        }
+        if (activeAssistTaskRef.current) return
+
+        const started = await runAssistWithOcr(ocr, { automatic: true, detection })
+        if (started) {
+          rememberAutoTaskFingerprint(seenAutoTasksRef.current, detection.fingerprint, now)
+        }
+      } catch (err) {
+        console.warn('floating assist auto task scan failed', err)
+      } finally {
+        autoTaskScanInFlightRef.current = false
+      }
+    }
+
+    const initialTimer = window.setTimeout(() => {
+      void scanForTask()
+    }, AUTO_TASK_SCAN_INITIAL_DELAY_MS)
+    const interval = window.setInterval(() => {
+      void scanForTask()
+    }, AUTO_TASK_SCAN_INTERVAL_MS)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(initialTimer)
+      window.clearInterval(interval)
+    }
+  }, [
+    activeModelId,
+    apiBaseUrl,
+    attachments,
+    autoTaskConfig,
+    busy,
+    canvasOpen,
+    contextMenuOpen,
+    creationModelConfigs,
+    currentUser?.id,
+    gatewayApiBaseUrl,
+    manualInstruction,
+    pendingAutoTask,
+    phase,
+    previewOpen,
+    remoteModelAllowed,
+    revealing,
+  ])
 
   const runManualAssist = async (event?: { preventDefault: () => void }) => {
     event?.preventDefault()
     const instruction = manualInstruction.trim()
-    if (!instruction || busy) return
+    if (!instruction || activeAssistTaskRef.current || busy) return
+    activeAssistTaskRef.current = true
+    setPendingAutoTask(null)
+    clearDoneIdleTimer()
     setContextMenuOpen(false)
     setCanvasOpen(true)
     if (revealTimerRef.current != null) {
@@ -476,38 +802,50 @@ const SystemFloatingAssist: React.FC = () => {
     setAnswer('')
     setError(null)
     setReferences([])
+    setOutputTruncated(false)
     setPreviewOpen(false)
     const controller = new AbortController()
     abortRef.current = controller
     try {
+      setPhase('receiving')
+      startProgress(8, 18, 900)
+      await waitForPaint()
+      await new Promise(resolve => window.setTimeout(resolve, 900))
       setPhase('answering')
-      startProgress(12, 92, 60000)
+      startProgress(18, 92, 60000)
       await waitForPaint()
       const attachmentPrompt = buildAttachmentPrompt(attachments)
       const query = buildManualFloatingAssistQuery(instruction, screenshot?.text)
       const queryWithAttachments = attachmentPrompt ? `${query}\n\n${attachmentPrompt}` : query
-      const result = await runRagQueryJob(
-        apiBaseUrl,
-        creationModelConfigs,
-        queryWithAttachments,
-        5,
-        screenshot ? {
+      const metadata = screenshot ? {
+        source: 'floating_assist',
+        screenshot_path: screenshot.screenshot_path,
+        screenshot_width: screenshot.width,
+        screenshot_height: screenshot.height,
+        ocr_text: screenshot.text,
+        manual_instruction: instruction,
+        attachments: buildAttachmentMetadata(attachments),
+      } : {
+        source: 'floating_assist',
+        manual_instruction: instruction,
+        attachments: buildAttachmentMetadata(attachments),
+      }
+      const result = activeModelId === REMOTE_CREATION_MODEL_ID && currentUser?.id
+        ? await runGatewayRagQuery(apiBaseUrl, gatewayApiBaseUrl, queryWithAttachments, currentUser.id, controller.signal, {
           source: 'floating_assist',
-          screenshot_path: screenshot.screenshot_path,
-          screenshot_width: screenshot.width,
-          screenshot_height: screenshot.height,
-          ocr_text: screenshot.text,
-          manual_instruction: instruction,
-          attachments: buildAttachmentMetadata(attachments),
-        } : {
-          source: 'floating_assist',
-          manual_instruction: instruction,
-          attachments: buildAttachmentMetadata(attachments),
-        },
-        false,
-        controller.signal,
-      )
+          metadata,
+        })
+        : await runRagQueryJob(
+          apiBaseUrl,
+          creationModelConfigs,
+          queryWithAttachments,
+          RAG_REFERENCE_LIMIT,
+          metadata,
+          remoteModelAllowed,
+          controller.signal,
+        )
       setReferences(result.contexts ?? [])
+      setOutputTruncated(Boolean(result.output_truncated))
       stopProgress()
       setProgress(100)
       setPhase('done')
@@ -521,6 +859,7 @@ const SystemFloatingAssist: React.FC = () => {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       if (abortRef.current === controller) abortRef.current = null
+      activeAssistTaskRef.current = false
     }
   }
 
@@ -533,7 +872,14 @@ const SystemFloatingAssist: React.FC = () => {
 
   const toggleCanvas = () => {
     if (suppressClickRef.current) return
+    if (!canvasOpen) resetDoneMascotToIdle()
     setCanvasOpen(value => !value)
+  }
+
+  const expandCanvas = () => {
+    resetDoneMascotToIdle()
+    setCanvasOpen(true)
+    setContextMenuOpen(false)
   }
 
   const handleOutsidePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -703,10 +1049,11 @@ const SystemFloatingAssist: React.FC = () => {
   const visibleReferences = references.filter(item => (item.source_type || item.source) !== 'floating_assist')
   const floatingAnswer = useMemo(() => splitFloatingAssistAnswer(answer), [answer])
   const displayedAnswer = floatingAnswer.responseContent || (floatingAnswer.userQuestionUnderstanding ? '' : answer)
+  const showAnswer = Boolean(displayedAnswer) && (phase === 'done' || phase === 'idle')
 
   return (
     <div
-      className={`system-floating-assist ${hasCanvas ? 'system-floating-assist--open' : ''} ${hasCanvas || contextMenuOpen ? 'system-floating-assist--dismissable' : ''}`}
+      className={`system-floating-assist ${debugBackground ? 'system-floating-assist--debug-bg' : ''} ${hasCanvas ? 'system-floating-assist--open' : ''} ${hasCanvas || contextMenuOpen ? 'system-floating-assist--dismissable' : ''}`}
       onPointerDown={handleOutsidePointerDown}
     >
       <div className="system-floating-assist__dock">
@@ -723,9 +1070,25 @@ const SystemFloatingAssist: React.FC = () => {
           aria-label="识别当前屏幕并咨询记忆面包"
           title="识别当前屏幕并咨询记忆面包"
         >
-          {phase === 'capturing' || phase === 'answering'
-            ? <Loader2 size={20} className="system-floating-assist__spin" />
-            : <Sparkles size={20} />}
+          {autoTaskConfig.enabled && (
+            <span className="system-floating-assist__auto-mark" aria-hidden="true">auto</span>
+          )}
+          <span className="system-floating-assist__mascot" aria-hidden="true">
+            <img className="system-floating-assist__mascot-img" src={capybaraEmptyAsset} alt="" draggable={false} />
+            <span className="system-floating-assist__idle-ear system-floating-assist__idle-ear--left" />
+            <span className="system-floating-assist__idle-ear system-floating-assist__idle-ear--right" />
+            <span className="system-floating-assist__idle-blush system-floating-assist__idle-blush--left" />
+            <span className="system-floating-assist__idle-blush system-floating-assist__idle-blush--right" />
+            <span className="system-floating-assist__idle-muzzle" />
+            <img className="system-floating-assist__falling-bread" src={breadRollAsset} alt="" draggable={false} />
+            <img className="system-floating-assist__held-bread" src={breadRollAsset} alt="" draggable={false} />
+            <span className="system-floating-assist__crumbs" />
+            <span className="system-floating-assist__sparkles" />
+          </span>
+          <span className="system-floating-assist__ball-badge" aria-hidden="true">
+            <span className="system-floating-assist__ball-check" />
+            <span className="system-floating-assist__ball-alert" />
+          </span>
         </button>
       </div>
 
@@ -739,7 +1102,7 @@ const SystemFloatingAssist: React.FC = () => {
             <MessageSquare size={15} />
             <span>识别屏幕咨询</span>
           </button>
-          <button type="button" role="menuitem" onClick={() => { setCanvasOpen(true); setContextMenuOpen(false) }}>
+          <button type="button" role="menuitem" onClick={expandCanvas}>
             <Sparkles size={15} />
             <span>展开咨询面板</span>
           </button>
@@ -764,7 +1127,7 @@ const SystemFloatingAssist: React.FC = () => {
                 onClick={copyAnswer}
                 disabled={!answer}
               >
-                <Clipboard size={14} />
+                <BreadToolIcon name="copy" size={16} />
                 {copied ? '已复制' : '复制'}
               </button>
               {busy && (
@@ -773,7 +1136,7 @@ const SystemFloatingAssist: React.FC = () => {
                   type="button"
                   onClick={stopAssist}
                 >
-                  <Square size={13} />
+                  <BreadToolIcon name="stop" size={15} />
                   中止
                 </button>
               )}
@@ -783,7 +1146,7 @@ const SystemFloatingAssist: React.FC = () => {
                 onClick={clearCanvasContent}
                 disabled={busy}
               >
-                <Trash2 size={14} />
+                <BreadToolIcon name="clear" size={16} />
                 清空
               </button>
               <button
@@ -792,7 +1155,7 @@ const SystemFloatingAssist: React.FC = () => {
                 onClick={runAssist}
                 disabled={busy}
               >
-                <RefreshCw size={14} />
+                <BreadToolIcon name="retry" size={16} />
                 重试
               </button>
             </div>
@@ -835,7 +1198,7 @@ const SystemFloatingAssist: React.FC = () => {
               </div>
             )}
 
-            {(phase === 'capturing' || phase === 'answering') && (
+            {(phase === 'receiving' || phase === 'capturing' || phase === 'answering') && (
               <div className="system-floating-assist__thinking">
                 <div className="system-floating-assist__thinking-row">
                   <Loader2 size={18} className="system-floating-assist__spin" />
@@ -853,13 +1216,40 @@ const SystemFloatingAssist: React.FC = () => {
               </div>
             )}
 
-            {phase === 'done' && displayedAnswer && (
+            {pendingAutoTask && phase === 'idle' && !showAnswer && (
+              <div className="system-floating-assist__auto-confirm">
+                <strong>发现可能任务</strong>
+                <p>当前页面像是文档或资料页，确认后再交给记忆面包咨询。</p>
+                {pendingAutoTask.detection.snippets.length > 0 && (
+                  <div className="system-floating-assist__auto-confirm-snippets">
+                    {pendingAutoTask.detection.snippets.slice(0, 3).map((snippet, index) => (
+                      <span key={`${snippet}-${index}`}>{snippet}</span>
+                    ))}
+                  </div>
+                )}
+                <div className="system-floating-assist__auto-confirm-actions">
+                  <button type="button" onClick={confirmPendingAutoTask} disabled={busy}>
+                    咨询
+                  </button>
+                  <button type="button" onClick={dismissPendingAutoTask} disabled={busy}>
+                    忽略
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {showAnswer && (
               <div className="system-floating-assist__answer">
                 <div className="system-floating-assist__output-title">咨询输出</div>
+                {outputTruncated && (
+                  <div className="system-floating-assist__answer-notice">
+                    本次回答触达输出长度上限，已返回可用部分。请点击重试生成更完整版本。
+                  </div>
+                )}
                 <MarkdownContent content={displayedAnswer} />
               </div>
             )}
-            {phase === 'idle' && (
+            {phase === 'idle' && !displayedAnswer && !pendingAutoTask && (
               <div className="system-floating-assist__empty">
                 <strong>暂无咨询内容</strong>
               </div>
@@ -889,7 +1279,7 @@ const SystemFloatingAssist: React.FC = () => {
                 <div className="system-floating-assist__attachments">
                   {attachments.map(item => (
                     <span className="system-floating-assist__attachment" key={item.id}>
-                      <Paperclip size={12} />
+                      <BreadToolIcon name="attach" size={12} framed={false} />
                       <span>{item.name}</span>
                       <small>{formatAttachmentSize(item.size)}</small>
                       <button
@@ -925,7 +1315,7 @@ const SystemFloatingAssist: React.FC = () => {
               aria-label="上传附件"
               title="上传附件"
             >
-              <Paperclip size={15} />
+              <BreadToolIcon name="attach" size={16} framed={false} />
             </button>
             <button
               className="system-floating-assist__manual-submit"
@@ -934,11 +1324,11 @@ const SystemFloatingAssist: React.FC = () => {
               aria-label="发送手工咨询"
               title="发送手工咨询"
             >
-              {busy ? <Loader2 size={15} className="system-floating-assist__spin" /> : <Send size={15} />}
+              {busy ? <Loader2 size={15} className="system-floating-assist__spin" /> : <BreadToolIcon name="send" size={16} framed={false} />}
             </button>
           </form>
 
-          {phase === 'done' && visibleReferences.length > 0 && (
+          {showAnswer && visibleReferences.length > 0 && (
             <div className="system-floating-assist__refs">
               <div className="system-floating-assist__refs-title">参考资料</div>
               {visibleReferences.slice(0, 4).map((item, index) => (

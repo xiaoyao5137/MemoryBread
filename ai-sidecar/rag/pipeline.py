@@ -141,6 +141,20 @@ class RagResult:
     contexts: list[RetrievedChunk] = field(default_factory=list)
     model: str = ""
     tokens: int = 0
+    done_reason: str | None = None
+    output_truncated: bool = False
+
+
+def _is_output_truncated(done_reason: str | None) -> bool:
+    reason = str(done_reason or "").lower()
+    if not reason:
+        return False
+    return (
+        reason == "length"
+        or "max_tokens" in reason
+        or "max_output" in reason
+        or "token_limit" in reason
+    )
 
 
 @dataclass
@@ -495,8 +509,9 @@ class RagPipeline:
                 "用户正在询问地址/链接/网址。若上下文中包含 URL，请在回答中直接给出完整 URL，并用 Markdown 链接格式展示。\n"
                 if _is_link_query(user_query) else ""
             )
+            is_floating_assist_query = "## 用户问题理解" in user_query and "## 回答" in user_query
             floating_format_rule = ""
-            if "## 用户问题理解" in user_query and "## 回答" in user_query:
+            if is_floating_assist_query:
                 floating_format_rule = (
                     "必须严格按以下 Markdown 结构输出，不能省略任何章节：\n"
                     "## 用户问题理解\n"
@@ -530,6 +545,10 @@ class RagPipeline:
                 llm_kwargs["num_predict"] = 640
             else:
                 llm_kwargs["num_predict"] = 896
+        elif "## 用户问题理解" in user_query and "## 回答" in user_query:
+            llm_kwargs["num_predict"] = 8192
+            llm_kwargs["temperature"] = 0.2
+            llm_kwargs["top_p"] = 0.8
 
         primary_llm = llm or self._llm
         # 报告模式不再切换为硬编码的 qwen2.5:3b，避免 Ollama 频繁 swap 模型
@@ -555,6 +574,8 @@ class RagPipeline:
             contexts=selected_contexts,
             model=llm_resp.model,
             tokens=llm_resp.tokens,
+            done_reason=llm_resp.done_reason,
+            output_truncated=_is_output_truncated(llm_resp.done_reason),
         )
 
     def _fetch_top_n_details(self, chunks: list[RetrievedChunk], top_n: int = 3) -> str:

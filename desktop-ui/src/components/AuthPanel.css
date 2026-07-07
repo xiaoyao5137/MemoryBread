@@ -18,7 +18,13 @@
 }
 
 .auth-panel--signed-in {
+  display: flex;
   align-items: center;
+  justify-content: center;
+}
+
+.auth-panel--signed-in .auth-panel__form {
+  width: min(100%, 520px);
 }
 
 .auth-panel--login {

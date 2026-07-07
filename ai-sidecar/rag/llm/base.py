@@ -14,6 +14,7 @@ class LlmResponse:
     text:   str
     model:  str
     tokens: int = 0
+    done_reason: str | None = None
 
 
 class LlmBackend(ABC):

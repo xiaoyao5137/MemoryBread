@@ -1,7 +1,16 @@
 import React, { useEffect, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
+import { emit } from '@tauri-apps/api/event'
 import type { ScheduledTask, TaskExecution, TaskTemplate } from '../types'
 import { useAppStore } from '../store/useAppStore'
 import { BUILTIN_TEMPLATES, CATEGORY_COLORS, groupTemplatesByCategory } from '../data/taskTemplates'
+import {
+  FLOATING_ASSIST_ENABLED_KEY,
+  readFloatingAssistAutoTaskConfig,
+  writeFloatingAssistAutoTaskConfig,
+  type FloatingAssistAutoTaskAppTarget,
+  type FloatingAssistAutoTaskConfig,
+} from '../utils/floatingAssistAutoTask'
 
 const API = 'http://localhost:7070'
 
@@ -124,6 +133,10 @@ const ScheduledTasksPanel: React.FC = () => {
   const [selectedTask, setSelectedTask] = useState<ScheduledTask | null>(null)
   const [executions, setExecutions] = useState<TaskExecution[]>([])
   const [toast, setToast] = useState<string | null>(null)
+  const [autoTaskConfig, setAutoTaskConfig] = useState<FloatingAssistAutoTaskConfig>(readFloatingAssistAutoTaskConfig)
+  const [autoTaskDraft, setAutoTaskDraft] = useState(() => readFloatingAssistAutoTaskConfig())
+  const [autoTaskAppDraft, setAutoTaskAppDraft] = useState<FloatingAssistAutoTaskAppTarget>({ bundleId: '', appName: '' })
+  const [triggerWordDraft, setTriggerWordDraft] = useState('')
 
   // 创建表单状态
   const [form, setForm] = useState({ name: '', user_instruction: '', cron_expression: '0 20 * * *' })
@@ -131,6 +144,80 @@ const ScheduledTasksPanel: React.FC = () => {
   const showToast = (msg: string) => {
     setToast(msg)
     setTimeout(() => setToast(null), 3000)
+  }
+
+  const persistAutoTaskConfig = async (next: FloatingAssistAutoTaskConfig) => {
+    const saved = writeFloatingAssistAutoTaskConfig(next)
+    setAutoTaskConfig(saved)
+    setAutoTaskDraft(saved)
+    try {
+      if (saved.enabled) {
+        localStorage.setItem(FLOATING_ASSIST_ENABLED_KEY, 'true')
+        await invoke('set_floating_assist_menu_state', { enabled: true })
+        await invoke('set_floating_assist_visible', { enabled: true })
+      }
+      await invoke('set_floating_assist_auto_task_menu_state', {
+        checked: saved.enabled,
+        enabled: localStorage.getItem(FLOATING_ASSIST_ENABLED_KEY) === 'true',
+      })
+      await emit('floating-assist-auto-task-changed', saved)
+    } catch {
+      // 浏览器预览或 Tauri runtime 不可用时，本地配置仍然生效。
+    }
+  }
+
+  const handleAutoTaskToggle = async () => {
+    await persistAutoTaskConfig({
+      ...autoTaskConfig,
+      enabled: !autoTaskConfig.enabled,
+    })
+    showToast(!autoTaskConfig.enabled ? '自动识别任务已开启' : '自动识别任务已关闭')
+  }
+
+  const handleAutoTaskSave = async () => {
+    await persistAutoTaskConfig({
+      ...autoTaskConfig,
+      appTargets: autoTaskDraft.appTargets,
+      triggerWords: autoTaskDraft.triggerWords,
+    })
+    showToast('自动识别任务配置已保存')
+  }
+
+  const handleAddAutoTaskApp = () => {
+    const bundleId = autoTaskAppDraft.bundleId.trim()
+    const appName = autoTaskAppDraft.appName.trim()
+    if (!bundleId && !appName) {
+      showToast('请填写 Bundle ID 或应用名称')
+      return
+    }
+    setAutoTaskDraft(value => ({
+      ...value,
+      appTargets: [...value.appTargets, { bundleId, appName }],
+    }))
+    setAutoTaskAppDraft({ bundleId: '', appName: '' })
+  }
+
+  const handleRemoveAutoTaskApp = (index: number) => {
+    setAutoTaskDraft(value => ({
+      ...value,
+      appTargets: value.appTargets.filter((_, itemIndex) => itemIndex !== index),
+    }))
+  }
+
+  const handleAddTriggerWord = () => {
+    const word = triggerWordDraft.trim()
+    if (!word) return
+    setAutoTaskDraft(value => value.triggerWords.some(item => item.toLocaleLowerCase() === word.toLocaleLowerCase())
+      ? value
+      : { ...value, triggerWords: [...value.triggerWords, word] })
+    setTriggerWordDraft('')
+  }
+
+  const handleRemoveTriggerWord = (word: string) => {
+    setAutoTaskDraft(value => ({
+      ...value,
+      triggerWords: value.triggerWords.filter(item => item !== word),
+    }))
   }
 
   const loadTasks = async () => {
@@ -241,6 +328,148 @@ const ScheduledTasksPanel: React.FC = () => {
         {/* 任务列表 */}
         {view === 'list' && (
           <>
+            <div style={{
+              background: 'white', borderRadius: 12, padding: 16,
+              border: '1px solid rgba(0,0,0,0.08)', marginBottom: 12,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginBottom: 14 }}>
+                <button
+                  onClick={handleAutoTaskToggle}
+                  style={{
+                    width: 38, height: 22, borderRadius: 11, border: 'none', cursor: 'pointer',
+                    background: autoTaskConfig.enabled ? '#34C759' : '#E5E5EA', flexShrink: 0,
+                    position: 'relative', transition: 'background 0.2s',
+                  }}
+                  title={autoTaskConfig.enabled ? '关闭自动识别任务' : '开启自动识别任务'}
+                >
+                  <span style={{
+                    position: 'absolute', top: 2, left: autoTaskConfig.enabled ? 18 : 2,
+                    width: 18, height: 18, borderRadius: '50%', background: 'white',
+                    transition: 'left 0.2s', display: 'block',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.18)',
+                  }} />
+                </button>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                    <span style={{ fontWeight: 600, fontSize: 14, color: '#000' }}>自动识别任务</span>
+                    <span style={{
+                      fontSize: 11, padding: '1px 6px', borderRadius: 4,
+                      background: autoTaskConfig.enabled ? 'rgba(52,199,89,0.1)' : 'rgba(142,142,147,0.12)',
+                      color: autoTaskConfig.enabled ? '#248A3D' : '#6E6E73',
+                    }}>{autoTaskConfig.enabled ? '运行中' : '已关闭'}</span>
+                  </div>
+                  <p style={{ fontSize: 12, color: '#6E6E73', margin: 0, lineHeight: 1.5 }}>
+                    只在配置的软件窗口里扫描疑似任务片段，命中关键词或待办语气后再交给记忆面包咨询。
+                  </p>
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <label style={labelStyle}>识别软件</label>
+                <div style={{ display: 'grid', gap: 8 }}>
+                  {autoTaskDraft.appTargets.map((item, index) => (
+                    <div key={`${item.bundleId}-${item.appName}-${index}`} style={{
+                      display: 'grid', gridTemplateColumns: 'minmax(0, 1.1fr) minmax(0, 0.9fr) auto',
+                      gap: 8, alignItems: 'center',
+                    }}>
+                      <input
+                        value={item.bundleId}
+                        onChange={event => setAutoTaskDraft(value => ({
+                          ...value,
+                          appTargets: value.appTargets.map((target, itemIndex) => itemIndex === index
+                            ? { ...target, bundleId: event.target.value }
+                            : target),
+                        }))}
+                        placeholder="Bundle ID (如 com.tencent.xinWeChat)"
+                        style={inputStyle}
+                      />
+                      <input
+                        value={item.appName}
+                        onChange={event => setAutoTaskDraft(value => ({
+                          ...value,
+                          appTargets: value.appTargets.map((target, itemIndex) => itemIndex === index
+                            ? { ...target, appName: event.target.value }
+                            : target),
+                        }))}
+                        placeholder="应用名称 (如 微信)"
+                        style={inputStyle}
+                      />
+                      <button type="button" onClick={() => handleRemoveAutoTaskApp(index)} style={smallDangerButtonStyle}>
+                        删除
+                      </button>
+                    </div>
+                  ))}
+                  <div style={{
+                    display: 'grid', gridTemplateColumns: 'minmax(0, 1.1fr) minmax(0, 0.9fr) auto',
+                    gap: 8, alignItems: 'center',
+                  }}>
+                    <input
+                      value={autoTaskAppDraft.bundleId}
+                      onChange={event => setAutoTaskAppDraft(value => ({ ...value, bundleId: event.target.value }))}
+                      placeholder="Bundle ID (如 com.bytedance.lark)"
+                      style={inputStyle}
+                    />
+                    <input
+                      value={autoTaskAppDraft.appName}
+                      onChange={event => setAutoTaskAppDraft(value => ({ ...value, appName: event.target.value }))}
+                      placeholder="应用名称 (如 飞书)"
+                      style={inputStyle}
+                    />
+                    <button type="button" onClick={handleAddAutoTaskApp} style={smallPrimaryButtonStyle}>
+                      添加
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <label style={labelStyle}>触发词</label>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+                  {autoTaskDraft.triggerWords.map(word => (
+                    <span key={word} style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 6,
+                      fontSize: 12, color: '#3A2A1A', background: 'rgba(181,122,43,0.12)',
+                      border: '1px solid rgba(181,122,43,0.18)', borderRadius: 999,
+                      padding: '4px 8px',
+                    }}>
+                      {word}
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveTriggerWord(word)}
+                        style={{ border: 'none', background: 'transparent', color: '#8A5A1F', cursor: 'pointer', padding: 0 }}
+                        title="删除触发词"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 8 }}>
+                  <input
+                    value={triggerWordDraft}
+                    onChange={event => setTriggerWordDraft(event.target.value)}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        handleAddTriggerWord()
+                      }
+                    }}
+                    placeholder="输入触发词后回车或点击添加"
+                    style={inputStyle}
+                  />
+                  <button type="button" onClick={handleAddTriggerWord} style={smallPrimaryButtonStyle}>
+                    添加触发词
+                  </button>
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 12 }}>
+                <button onClick={handleAutoTaskSave} style={{
+                  fontSize: 12, padding: '7px 12px', borderRadius: 8, border: 'none',
+                  background: '#007AFF', color: 'white', cursor: 'pointer',
+                }}>保存配置</button>
+              </div>
+            </div>
+
             {loading && <div style={{ textAlign: 'center', color: '#AEAEB2', padding: 20 }}>加载中...</div>}
             {!loading && tasks.length === 0 && (
               <div style={{ textAlign: 'center', color: '#AEAEB2', padding: 40 }}>
@@ -371,6 +600,28 @@ const inputStyle: React.CSSProperties = {
   width: '100%', padding: '8px 10px', borderRadius: 8, fontSize: 13,
   border: '1px solid rgba(0,0,0,0.15)', outline: 'none', boxSizing: 'border-box',
   fontFamily: 'inherit',
+}
+
+const smallPrimaryButtonStyle: React.CSSProperties = {
+  fontSize: 12,
+  padding: '7px 10px',
+  borderRadius: 8,
+  border: 'none',
+  background: '#007AFF',
+  color: 'white',
+  cursor: 'pointer',
+  whiteSpace: 'nowrap',
+}
+
+const smallDangerButtonStyle: React.CSSProperties = {
+  fontSize: 12,
+  padding: '7px 10px',
+  borderRadius: 8,
+  border: '1px solid rgba(255,59,48,0.18)',
+  background: 'rgba(255,59,48,0.08)',
+  color: '#D70015',
+  cursor: 'pointer',
+  whiteSpace: 'nowrap',
 }
 
 function btnStyle(bg: string): React.CSSProperties {

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  authenticateWithPassword,
   completeCloudSnapshotUpload,
   fetchCloudDevices,
   fetchCloudSnapshots,
@@ -16,6 +17,44 @@ afterEach(() => {
 })
 
 describe('cloud device and snapshot API', () => {
+  it('sends username when registering with password auth', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({
+      data: {
+        access_token: 'mbs_token',
+        expires_at: '2026-07-08T00:00:00Z',
+        user: {
+          id: '018f0000-0000-7000-8000-000000000004',
+          username: '烘焙师土豆',
+          email: 'tudou@memorybread.local',
+          status: 'active',
+          roles: ['user'],
+          locale: 'zh-CN',
+          timezone: 'Asia/Shanghai',
+          created_at: '2026-07-07T00:00:00Z',
+        },
+      },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await authenticateWithPassword(
+      'http://127.0.0.1:8080',
+      'register',
+      'tudou@memorybread.local',
+      'MemoryBread@2026!',
+      ' 烘焙师土豆 ',
+    )
+
+    expect(fetchMock).toHaveBeenCalledWith('http://127.0.0.1:8080/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'tudou@memorybread.local',
+        password: 'MemoryBread@2026!',
+        username: '烘焙师土豆',
+      }),
+    })
+  })
+
   it('registers the current device with the account token', async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({
       data: {

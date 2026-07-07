@@ -25,6 +25,7 @@ import type {
 
 const LOCAL_CORE_API = 'http://127.0.0.1:7070'
 const LOCAL_MODEL_API = 'http://127.0.0.1:7071'
+export const RAG_REFERENCE_LIMIT = 10
 
 export const normalizeLocalApiBaseUrl = (baseUrl: string) =>
   baseUrl.replace(/^http:\/\/localhost(?::7070)?$/i, LOCAL_CORE_API)
@@ -108,7 +109,7 @@ export async function runRagQueryJob(
   apiBaseUrl: string,
   creationModelConfigs: CreationModelConfig[],
   query: string,
-  topK = 5,
+  topK = RAG_REFERENCE_LIMIT,
   extraPayload: Record<string, unknown> = {},
   remoteAllowed = false,
   signal?: AbortSignal,
@@ -175,7 +176,7 @@ async function fetchRagReferences(apiBaseUrl: string, query: string, signal?: Ab
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal,
-      body: JSON.stringify({ query, top_k: 5 }),
+      body: JSON.stringify({ query, top_k: RAG_REFERENCE_LIMIT }),
     })
     if (!response.ok) return []
     const data: RagQueryResponse = await response.json()
@@ -186,12 +187,38 @@ async function fetchRagReferences(apiBaseUrl: string, query: string, signal?: Ab
   }
 }
 
+interface GatewayRagHistoryOptions {
+  source?: string
+  metadata?: Record<string, unknown>
+}
+
+const optionalNumber = (value: unknown): number | null => {
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : null
+}
+
+const buildFloatingAssistHistoryContext = (metadata?: Record<string, unknown>): RagContext | null => {
+  if (metadata?.source !== 'floating_assist') return null
+  return {
+    capture_id: 0,
+    doc_key: `floating-assist:${Date.now()}`,
+    text: String(metadata.ocr_text || metadata.manual_instruction || '悬浮球咨询'),
+    score: 1,
+    source: 'floating_assist',
+    source_type: 'floating_assist',
+    screenshot_path: typeof metadata.screenshot_path === 'string' ? metadata.screenshot_path : null,
+    screenshot_width: optionalNumber(metadata.screenshot_width),
+    screenshot_height: optionalNumber(metadata.screenshot_height),
+  }
+}
+
 export async function runGatewayRagQuery(
   apiBaseUrl: string,
   gatewayApiBaseUrl: string,
   query: string,
   userId?: string | null,
   signal?: AbortSignal,
+  historyOptions?: GatewayRagHistoryOptions,
 ): Promise<RagQueryResponse> {
   const startedAt = Date.now()
   const contexts = await fetchRagReferences(apiBaseUrl, query, signal)
@@ -237,15 +264,19 @@ export async function runGatewayRagQuery(
     model: REMOTE_CREATION_MODEL_ID,
   }
   const normalizedApiBaseUrl = normalizeLocalApiBaseUrl(apiBaseUrl)
+  const floatingContext = buildFloatingAssistHistoryContext(historyOptions?.metadata)
+  const historyContexts = floatingContext ? [floatingContext, ...contexts] : contexts
   await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/history`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       query,
       answer,
-      contexts,
+      contexts: historyContexts,
       latency_ms: Date.now() - startedAt,
       model: REMOTE_CREATION_MODEL_ID,
+      source: historyOptions?.source,
+      scene_type: historyOptions?.source === 'floating_assist' ? 'floating_assist' : undefined,
     }),
   }).catch(() => undefined)
   return result
@@ -341,7 +372,7 @@ export function useRagQuery() {
   const setResult    = useAppStore((s) => s.setRagResult)
   const setError     = useAppStore((s) => s.setRagError)
 
-  return useCallback(async (query: string, topK = 5, extraPayload: Record<string, unknown> = {}, signal?: AbortSignal): Promise<RagQueryResponse> => {
+  return useCallback(async (query: string, topK = RAG_REFERENCE_LIMIT, extraPayload: Record<string, unknown> = {}, signal?: AbortSignal): Promise<RagQueryResponse> => {
     setLoading(true)
     try {
       const remoteAllowed = Boolean(currentUser) && Number(cloudBalance?.available ?? 0) > 0
@@ -509,8 +540,18 @@ export interface BakeOverviewResponse {
   memory_count: number
   knowledge_count: number
   template_count: number
+  sop_count?: number
   pending_candidates: number
   recent_activities: string[]
+  inventory_trend?: Array<{
+    label: string
+    start_ts: number
+    end_ts: number
+    memory_count: number
+    knowledge_count: number
+    template_count: number
+    sop_count: number
+  }>
 }
 
 export function useFetchBakeOverview() {
@@ -998,7 +1039,19 @@ function mapBakeCapture(item: any): BakeCaptureItem {
   }
 }
 
+function toTimestampMs(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const numeric = Number(value)
+    if (Number.isFinite(numeric) && numeric > 0) return numeric
+    const parsed = Date.parse(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return 0
+}
+
 function mapBakeTemplate(item: any): ArticleTemplate {
+  const createdAtMs = toTimestampMs(item.created_at_ms ?? item.created_at ?? item.updated_at)
   return {
     id: String(item.id),
     title: item.title,
@@ -1023,6 +1076,8 @@ function mapBakeTemplate(item: any): ArticleTemplate {
     reviewStatus: item.review_status ?? '',
     matchScore: item.match_score ?? undefined,
     matchLevel: item.match_level ?? undefined,
+    createdAt: item.created_at ?? '',
+    createdAtMs,
     updatedAt: item.updated_at,
   }
 }
@@ -1055,6 +1110,7 @@ function serializeBakeTemplate(template: ArticleTemplate) {
 }
 
 function mapBakeSop(item: any): SopCandidate {
+  const createdAtMs = toTimestampMs(item.created_at_ms ?? item.created_at ?? item.updated_at)
   return {
     id: String(item.id),
     sourceCaptureId: item.source_capture_id ?? '',
@@ -1069,7 +1125,7 @@ function mapBakeSop(item: any): SopCandidate {
     linkedKnowledgeSummaries: item.linked_knowledge_summaries ?? [],
     status: item.status,
     createdAt: item.created_at ?? '',
-    createdAtMs: item.created_at_ms ?? 0,
+    createdAtMs,
     updatedAt: item.updated_at ?? '',
     updatedAtMs: item.updated_at_ms ?? 0,
   }

@@ -115,6 +115,14 @@ impl AppState {
             .flatten()
             .map(|preference| preference.value != "false")
             .unwrap_or(true);
+        let capture_enabled = std::env::var("MEMORY_BREAD_CAPTURE_ENABLED")
+            .ok()
+            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Some(true),
+                "false" | "0" | "no" | "off" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(capture_enabled);
 
         Arc::new(Self {
             storage,
