@@ -117,6 +117,45 @@ impl TaskRepo {
         })
     }
 
+    /// 将历史五段 cron 规范化，并把下一次执行时间推进到未来。
+    pub fn repair_schedule(
+        storage: &StorageManager,
+        id: i64,
+        cron_expression: &str,
+        next_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        storage.with_conn(|conn| {
+            conn.execute(
+                "UPDATE scheduled_tasks
+                 SET cron_expression = ?1, next_run_at = ?2, updated_at = ?3
+                 WHERE id = ?4",
+                params![cron_expression, next_ms, now_ms, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 无效 cron 必须停止调度，避免 next_run_at 卡在过去并持续重试。
+    pub fn disable_invalid_schedule(
+        storage: &StorageManager,
+        id: i64,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        storage.with_conn(|conn| {
+            conn.execute(
+                "UPDATE scheduled_tasks
+                 SET enabled = 0,
+                     last_run_status = 'invalid_schedule',
+                     next_run_at = NULL,
+                     updated_at = ?1
+                 WHERE id = ?2",
+                params![now_ms, id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// 查询任务的执行历史
     pub fn list_executions(
         storage: &StorageManager,

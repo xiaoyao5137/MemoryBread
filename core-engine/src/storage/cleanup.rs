@@ -8,12 +8,127 @@
 //! - 旧采集记录（old_captures）：按用户配置删除过期采集行及其截图文件；时间线、知识和操作记录不参与删除
 //! - VACUUM：整理 SQLite 碎片空间，建议每周运行一次
 
-use std::path::Path;
+use std::{
+    collections::HashSet,
+    path::{Component, Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use rusqlite::params;
 use tracing::{info, warn};
 
 use super::{db::current_ts_ms, error::StorageError, StorageManager};
+
+fn safe_capture_file_path(captures_dir: &Path, rel_path: &str) -> Option<PathBuf> {
+    let rel = Path::new(rel_path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(captures_dir.join(rel))
+}
+
+fn capture_relative_path(captures_dir: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(captures_dir).ok()?;
+    let mut parts = Vec::new();
+    for part in rel.components() {
+        let Component::Normal(value) = part else {
+            return None;
+        };
+        parts.push(value.to_string_lossy().to_string());
+    }
+    Some(parts.join("/"))
+}
+
+fn cutoff_system_time(older_than_ms: i64) -> SystemTime {
+    if older_than_ms <= 0 {
+        return UNIX_EPOCH;
+    }
+    UNIX_EPOCH + Duration::from_millis(older_than_ms as u64)
+}
+
+fn delete_capture_file(
+    captures_dir: &Path,
+    rel_path: &str,
+    count_missing_as_cleaned: bool,
+) -> Result<(usize, u64), StorageError> {
+    let Some(full_path) = safe_capture_file_path(captures_dir, rel_path) else {
+        warn!("跳过不安全的截图路径: {}", rel_path);
+        return Ok((0, 0));
+    };
+
+    match std::fs::metadata(&full_path) {
+        Ok(meta) => {
+            let size = meta.len();
+            if let Err(e) = std::fs::remove_file(&full_path) {
+                warn!("删除截图文件失败 {:?}: {}", full_path, e);
+                return Ok((0, 0));
+            }
+            Ok((1, size))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((usize::from(count_missing_as_cleaned), 0))
+        }
+        Err(e) => Err(StorageError::Io(e)),
+    }
+}
+
+fn cleanup_orphan_capture_files(
+    captures_dir: &Path,
+    referenced_paths: &HashSet<String>,
+    older_than_ms: i64,
+) -> Result<(usize, u64), StorageError> {
+    let screenshot_dir = captures_dir.join("screenshots");
+    if !screenshot_dir.exists() {
+        return Ok((0, 0));
+    }
+
+    let cutoff = cutoff_system_time(older_than_ms);
+    let mut deleted_count = 0usize;
+    let mut freed_bytes = 0u64;
+
+    for entry in std::fs::read_dir(&screenshot_dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!("读取截图目录项失败: {}", e);
+                continue;
+            }
+        };
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn!("读取截图文件元信息失败 {:?}: {}", path, e);
+                continue;
+            }
+        };
+        if !meta.is_file() {
+            continue;
+        }
+
+        let Some(rel_path) = capture_relative_path(captures_dir, &path) else {
+            continue;
+        };
+        if referenced_paths.contains(&rel_path) {
+            continue;
+        }
+
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        if modified > cutoff {
+            continue;
+        }
+
+        let (deleted, freed) = delete_capture_file(captures_dir, &rel_path, false)?;
+        deleted_count += deleted;
+        freed_bytes += freed;
+    }
+
+    Ok((deleted_count, freed_bytes))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 清理入口
@@ -54,21 +169,9 @@ impl StorageManager {
         let mut freed_bytes = 0u64;
 
         for (id, rel_path) in &rows {
-            let full_path = captures_dir.join(rel_path);
-            match std::fs::metadata(&full_path) {
-                Ok(meta) => {
-                    freed_bytes += meta.len();
-                    if let Err(e) = std::fs::remove_file(&full_path) {
-                        warn!("删除截图文件失败 {:?}: {}", full_path, e);
-                        continue;
-                    }
-                    deleted_count += 1;
-                }
-                Err(_) => {
-                    // 文件已不存在，直接清除路径
-                    deleted_count += 1;
-                }
-            }
+            let (deleted, freed) = delete_capture_file(captures_dir, rel_path, true)?;
+            deleted_count += deleted;
+            freed_bytes += freed;
 
             // 将数据库中的路径置为 NULL
             self.with_conn(|conn| {
@@ -135,16 +238,6 @@ impl StorageManager {
             Ok(result)
         })?;
 
-        if rows.is_empty() {
-            self.write_cleanup_log(
-                "old_captures",
-                0,
-                0,
-                format!("older_than_ms={older_than_ms}"),
-            )?;
-            return Ok((0, 0, 0));
-        }
-
         let mut deleted_screenshot_count = 0usize;
         let mut freed_bytes = 0u64;
 
@@ -152,48 +245,57 @@ impl StorageManager {
             let Some(rel_path) = rel_path else {
                 continue;
             };
-            let full_path = captures_dir.join(rel_path);
-            match std::fs::metadata(&full_path) {
-                Ok(meta) => {
-                    freed_bytes += meta.len();
-                    if let Err(e) = std::fs::remove_file(&full_path) {
-                        warn!("删除过期采集截图文件失败 {:?}: {}", full_path, e);
-                        continue;
-                    }
-                    deleted_screenshot_count += 1;
-                }
-                Err(_) => {
-                    deleted_screenshot_count += 1;
-                }
-            }
+            let (deleted, freed) = delete_capture_file(captures_dir, rel_path, true)?;
+            deleted_screenshot_count += deleted;
+            freed_bytes += freed;
         }
 
-        let affected = self.with_conn(|conn| {
-            conn.execute(
-                "DELETE FROM vector_index
+        let affected = if rows.is_empty() {
+            0
+        } else {
+            self.with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM vector_index
                  WHERE capture_id IN (
                     SELECT id FROM captures
                     WHERE ts < ?1
                       AND (event_type IS NULL OR event_type <> 'snapshot_ref')
                  )",
-                params![older_than_ms],
-            )?;
+                    params![older_than_ms],
+                )?;
 
-            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-            let delete_result = conn.execute(
-                "DELETE FROM captures
+                conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+                let delete_result = conn.execute(
+                    "DELETE FROM captures
                  WHERE ts < ?1
                    AND (event_type IS NULL OR event_type <> 'snapshot_ref')",
-                params![older_than_ms],
-            );
-            let restore_result = conn.execute_batch("PRAGMA foreign_keys = ON;");
+                    params![older_than_ms],
+                );
+                let restore_result = conn.execute_batch("PRAGMA foreign_keys = ON;");
 
-            match (delete_result, restore_result) {
-                (Ok(n), Ok(())) => Ok(n),
-                (Err(err), _) => Err(StorageError::Sqlite(err)),
-                (Ok(_), Err(err)) => Err(StorageError::Sqlite(err)),
-            }
+                match (delete_result, restore_result) {
+                    (Ok(n), Ok(())) => Ok(n),
+                    (Err(err), _) => Err(StorageError::Sqlite(err)),
+                    (Ok(_), Err(err)) => Err(StorageError::Sqlite(err)),
+                }
+            })?
+        };
+
+        let referenced_screenshot_paths = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT screenshot_path FROM captures WHERE screenshot_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<HashSet<_>, _>>()
+                .map_err(StorageError::Sqlite)
         })?;
+        let (orphan_screenshot_count, orphan_freed_bytes) = cleanup_orphan_capture_files(
+            captures_dir,
+            &referenced_screenshot_paths,
+            older_than_ms,
+        )?;
+        deleted_screenshot_count += orphan_screenshot_count;
+        freed_bytes += orphan_freed_bytes;
 
         let now = current_ts_ms();
         self.with_conn(|conn| {
@@ -205,7 +307,7 @@ impl StorageManager {
                     affected as i64,
                     freed_bytes as i64,
                     format!(
-                        "older_than_ms={older_than_ms}; deleted_screenshots={deleted_screenshot_count}; freed_bytes={freed_bytes}"
+                        "older_than_ms={older_than_ms}; deleted_screenshots={deleted_screenshot_count}; orphan_screenshots={orphan_screenshot_count}; freed_bytes={freed_bytes}"
                     ),
                 ],
             )?;
@@ -213,28 +315,10 @@ impl StorageManager {
         })?;
 
         info!(
-            "old_captures 清理完成: 删除 {} 行，清理 {} 个截图文件，释放 {} bytes",
-            affected, deleted_screenshot_count, freed_bytes
+            "old_captures 清理完成: 删除 {} 行，清理 {} 个截图文件（孤儿 {} 个），释放 {} bytes",
+            affected, deleted_screenshot_count, orphan_screenshot_count, freed_bytes
         );
         Ok((affected, deleted_screenshot_count, freed_bytes))
-    }
-
-    fn write_cleanup_log(
-        &self,
-        cleanup_type: &str,
-        affected_count: i64,
-        freed_bytes: i64,
-        detail: String,
-    ) -> Result<(), StorageError> {
-        let now = current_ts_ms();
-        self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO data_cleanup_log (ts, cleanup_type, affected_count, freed_bytes, detail)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![now, cleanup_type, affected_count, freed_bytes, detail],
-            )?;
-            Ok(())
-        })
     }
 
     /// 执行 VACUUM，释放碎片空间。
@@ -313,6 +397,14 @@ mod tests {
         StorageManager::open_in_memory().expect("内存数据库初始化失败")
     }
 
+    fn write_screenshot(captures_dir: &Path, rel_path: &str, bytes: &[u8]) {
+        let full_path = captures_dir.join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(full_path, bytes).unwrap();
+    }
+
     #[test]
     fn test_old_captures_cleanup() {
         let mgr = make_mgr();
@@ -351,6 +443,73 @@ mod tests {
         assert!(!logs.is_empty());
         assert_eq!(logs[0].cleanup_type, "old_captures");
         assert_eq!(logs[0].affected_count, 1);
+    }
+
+    #[test]
+    fn test_old_captures_cleanup_deletes_associated_screenshot_file() {
+        let mgr = make_mgr();
+        let dir = tempdir().unwrap();
+        let rel_path = "screenshots/old-associated.jpg";
+        let bytes = b"associated screenshot";
+        write_screenshot(dir.path(), rel_path, bytes);
+
+        let old_ts = current_ts_ms() - 15 * 24 * 3600 * 1000;
+        mgr.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO captures (ts, event_type, screenshot_path)
+                 VALUES (?1, 'auto', ?2)",
+                params![old_ts, rel_path],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cutoff = current_ts_ms() - 14 * 24 * 3600 * 1000;
+        let (deleted, deleted_screenshots, freed) =
+            mgr.run_old_captures_cleanup(cutoff, dir.path()).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(deleted_screenshots, 1);
+        assert_eq!(freed, bytes.len() as u64);
+        assert!(!dir.path().join(rel_path).exists());
+    }
+
+    #[test]
+    fn test_old_captures_cleanup_deletes_orphan_screenshot_files() {
+        let mgr = make_mgr();
+        let dir = tempdir().unwrap();
+        let orphan_path = "screenshots/orphan.jpg";
+        let referenced_path = "screenshots/still-referenced.jpg";
+        let orphan_bytes = b"orphan screenshot";
+        write_screenshot(dir.path(), orphan_path, orphan_bytes);
+        write_screenshot(dir.path(), referenced_path, b"keep me");
+
+        mgr.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO captures (ts, event_type, screenshot_path, is_sensitive, pii_scrubbed)
+                 VALUES (?1, 'snapshot_ref', ?2, 1, 1)",
+                params![current_ts_ms(), referenced_path],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cutoff = current_ts_ms() + 1_000;
+        let (deleted, deleted_screenshots, freed) =
+            mgr.run_old_captures_cleanup(cutoff, dir.path()).unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(deleted_screenshots, 1);
+        assert_eq!(freed, orphan_bytes.len() as u64);
+        assert!(!dir.path().join(orphan_path).exists());
+        assert!(dir.path().join(referenced_path).exists());
+
+        let logs = mgr.list_cleanup_logs(1).unwrap();
+        assert!(logs[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("orphan_screenshots=1"));
     }
 
     #[test]

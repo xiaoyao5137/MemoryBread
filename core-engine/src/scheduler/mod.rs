@@ -5,6 +5,7 @@
 //! 2. 用 tokio 定时器轮询，到期时通过 HTTP 调用 Python TaskExecutor
 //! 3. 提供增删改查接口供 API handler 调用
 
+pub(crate) mod cron_expression;
 pub mod models;
 pub mod profile_task;
 pub mod repo;

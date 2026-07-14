@@ -9,12 +9,54 @@ import {
   useFetchBakeSop,
   useFetchBakeSops,
   useFetchBakeTemplates,
+  useFetchRagHistory,
 } from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
 
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
   status,
   headers: { 'Content-Type': 'application/json' },
+})
+
+describe('useFetchRagHistory', () => {
+  beforeEach(() => {
+    useAppStore.getState().reset()
+    useAppStore.getState().setApiBaseUrl('http://localhost:7070')
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('把关键词与分页参数传给咨询记录接口，并返回总数', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({
+      items: [{
+        id: 21,
+        ts: 1_720_000_000_000,
+        query: '年度规划',
+        answer: '规划内容',
+        contexts: [],
+        context_count: 0,
+        latency_ms: 1000,
+      }],
+      total: 37,
+      limit: 20,
+      offset: 20,
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+
+    const { result } = renderHook(() => useFetchRagHistory())
+    const data = await result.current({ limit: 20, offset: 20, query: '年度规划' }, controller.signal)
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:7070/api/rag/history?limit=20&offset=20&q=%E5%B9%B4%E5%BA%A6%E8%A7%84%E5%88%92',
+      { signal: controller.signal },
+    )
+    expect(data.total).toBe(37)
+    expect(data.items[0].query).toBe('年度规划')
+  })
 })
 
 describe('useFetchBakeMemories', () => {

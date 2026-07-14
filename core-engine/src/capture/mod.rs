@@ -17,7 +17,7 @@ pub mod screenshot;
 pub use blacklist::BlacklistChecker;
 pub use engine::{CaptureConfig, CaptureEngine, CaptureEvent};
 pub use filter::PrivacyFilter;
-pub use listener::{start_listener, ListenerConfig};
+pub use listener::{start_context_watcher, start_listener, ListenerConfig};
 pub use screenshot::ScreenshotResult;
 
 use thiserror::Error;

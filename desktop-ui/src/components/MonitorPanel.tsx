@@ -26,6 +26,32 @@ const EMPTY_OVERVIEW: MonitorOverview = {
     trend: [],
     trend_by_model: [],
   },
+  ocr_backfill: {
+    submitted_total: 0,
+    completed_total: 0,
+    succeeded_total: 0,
+    failed_total: 0,
+    timed_out_total: 0,
+    empty_total: 0,
+    skipped_offline_total: 0,
+    skipped_backpressure_total: 0,
+    queued_count: 0,
+    in_progress_count: 0,
+    backlog_count: 0,
+    period_completed: 0,
+    period_succeeded: 0,
+    period_failed: 0,
+    period_timed_out: 0,
+    period_empty: 0,
+    period_skipped_offline: 0,
+    period_skipped_backpressure: 0,
+    period_success_rate: 0,
+    period_throughput_per_min: 0,
+    avg_latency_ms: 0,
+    last_submitted_at_ms: null,
+    last_completed_at_ms: null,
+    recent: [],
+  },
   capture_flow: {
     today_count: 0,
     period_count: 0,
@@ -232,6 +258,22 @@ function fmtMs(ms: number | null): string {
   if (!ms) return '—'
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
   return `${ms}ms`
+}
+
+function fmtRatePerMin(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0/min'
+  if (value < 1) return `${value.toFixed(2)}/min`
+  if (value < 10) return `${value.toFixed(1)}/min`
+  return `${Math.round(value)}/min`
+}
+
+const OCR_STATUS_META: Record<string, { label: string; color: string }> = {
+  success: { label: '成功', color: '#34C759' },
+  empty: { label: '空文本', color: '#8E8E93' },
+  failed: { label: '失败', color: '#FF3B30' },
+  timeout: { label: '超时', color: '#FF9500' },
+  skipped_offline: { label: '离线跳过', color: '#6E6E73' },
+  skipped_backpressure: { label: '队列限流', color: '#FF9500' },
 }
 
 function fmtElapsed(deltaMs: number): string {
@@ -632,6 +674,99 @@ const ExtractionQueueCard: React.FC<{
   )
 }
 
+const OcrBackfillCard: React.FC<{
+  metrics: MonitorOverview['ocr_backfill']
+  rangeLabel: string
+}> = ({ metrics, rangeLabel }) => {
+  const totalProblem = metrics.period_failed
+    + metrics.period_timed_out
+    + metrics.period_empty
+    + metrics.period_skipped_offline
+    + metrics.period_skipped_backpressure
+  const statusColor = metrics.backlog_count > 10
+    ? '#FF9500'
+    : totalProblem > 0
+      ? '#FF9500'
+      : '#34C759'
+
+  return (
+    <div style={cardStyle}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'flex-start', marginBottom: 10 }}>
+        <div>
+          <div style={{ ...sectionTitle, marginBottom: 3 }}>后台 OCR 补写</div>
+          <div style={{ fontSize: 11, color: '#6E6E73' }}>{rangeLabel} · 仅 AX 正文为空时截图，OCR 后台单并发补全文本</div>
+        </div>
+        <div style={{
+          fontSize: 11, color: statusColor, background: `${statusColor}14`,
+          border: `1px solid ${statusColor}24`, borderRadius: 6, padding: '3px 8px', fontWeight: 600,
+        }}>
+          积压 {metrics.backlog_count}
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(108px, 1fr))', gap: 8, marginBottom: 10 }}>
+        <div style={{ background: 'rgba(0,122,255,0.08)', borderRadius: 8, padding: '8px 10px' }}>
+          <div style={{ fontSize: 11, color: '#6E6E73' }}>吞吐</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#007AFF', marginTop: 2 }}>{fmtRatePerMin(metrics.period_throughput_per_min)}</div>
+          <div style={{ fontSize: 10, color: '#8E8E93', marginTop: 2 }}>完成 {fmt(metrics.period_completed)}</div>
+        </div>
+        <div style={{ background: 'rgba(52,199,89,0.08)', borderRadius: 8, padding: '8px 10px' }}>
+          <div style={{ fontSize: 11, color: '#6E6E73' }}>成功率</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#34C759', marginTop: 2 }}>{metrics.period_success_rate.toFixed(0)}%</div>
+          <div style={{ fontSize: 10, color: '#8E8E93', marginTop: 2 }}>成功 {fmt(metrics.period_succeeded)}</div>
+        </div>
+        <div style={{ background: 'rgba(255,149,0,0.08)', borderRadius: 8, padding: '8px 10px' }}>
+          <div style={{ fontSize: 11, color: '#6E6E73' }}>队列</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#FF9500', marginTop: 2 }}>{fmt(metrics.queued_count)}</div>
+          <div style={{ fontSize: 10, color: '#8E8E93', marginTop: 2 }}>执行中 {fmt(metrics.in_progress_count)}</div>
+        </div>
+        <div style={{ background: 'rgba(94,92,230,0.08)', borderRadius: 8, padding: '8px 10px' }}>
+          <div style={{ fontSize: 11, color: '#6E6E73' }}>平均耗时</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#5E5CE6', marginTop: 2 }}>{fmtMs(metrics.avg_latency_ms)}</div>
+          <div style={{ fontSize: 10, color: '#8E8E93', marginTop: 2 }}>上次 {fmtRelativeTs(metrics.last_completed_at_ms)}</div>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: metrics.recent.length > 0 ? 10 : 0 }}>
+        {[
+          { label: '失败', value: metrics.period_failed, color: '#FF3B30' },
+          { label: '超时', value: metrics.period_timed_out, color: '#FF9500' },
+          { label: '空文本', value: metrics.period_empty, color: '#8E8E93' },
+          { label: '离线跳过', value: metrics.period_skipped_offline, color: '#6E6E73' },
+          { label: '队列限流', value: metrics.period_skipped_backpressure, color: '#FF9500' },
+          { label: '累计完成', value: metrics.completed_total, color: '#007AFF' },
+        ].map((item) => (
+          <span key={item.label} style={{
+            fontSize: 11, color: item.color, background: `${item.color}10`,
+            borderRadius: 999, padding: '2px 8px',
+          }}>{item.label} {fmt(item.value)}</span>
+        ))}
+      </div>
+
+      {metrics.recent.length > 0 && (
+        <div>
+          <div style={{ fontSize: 11, color: '#6E6E73', marginBottom: 5 }}>最近 OCR 补写</div>
+          {metrics.recent.map((item, index) => {
+            const meta = OCR_STATUS_META[item.status] ?? { label: item.status, color: '#6E6E73' }
+            return (
+              <div key={`${item.ts}-${index}`} style={{
+                display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center',
+                padding: '5px 0', borderTop: index === 0 ? '1px solid rgba(0,0,0,0.05)' : 'none',
+              }}>
+                <span style={{ fontSize: 11, color: '#8E8E93' }}>{fmtTs(item.ts)}</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, color: meta.color }}>
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: meta.color }} />
+                  {meta.label} · {fmtMs(item.latency_ms)}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 const RuntimeBreakdownCard: React.FC<{
   items: SystemResources['model_runtime_breakdown']
 }> = ({ items }) => {
@@ -697,6 +832,11 @@ const OverviewContent: React.FC<{
     by_app: data?.capture_flow?.by_app ?? [],
     recent: data?.capture_flow?.recent ?? [],
   }
+  const ocr_backfill = {
+    ...EMPTY_OVERVIEW.ocr_backfill,
+    ...(data?.ocr_backfill ?? {}),
+    recent: data?.ocr_backfill?.recent ?? [],
+  }
   const rag_sessions = {
     ...EMPTY_OVERVIEW.rag_sessions,
     ...(data?.rag_sessions ?? {}),
@@ -761,6 +901,10 @@ const OverviewContent: React.FC<{
           extractingCount={knowledge_flow.extracting.length}
           lastExtractionAtMs={knowledge_flow.last_extraction_at_ms}
         />
+        <StatCard label="OCR 积压" value={fmt(ocr_backfill.backlog_count)}
+          sub={`队列 ${fmt(ocr_backfill.queued_count)} · 执行中 ${fmt(ocr_backfill.in_progress_count)}`} color="#FF9500" />
+        <StatCard label="OCR 成功率" value={`${ocr_backfill.period_success_rate.toFixed(0)}%`}
+          sub={`吞吐 ${fmtRatePerMin(ocr_backfill.period_throughput_per_min)} · 超时 ${fmt(ocr_backfill.period_timed_out)}`} color="#007AFF" />
         <StatCard label="向量化率" value={`${(capture_flow.vectorization_rate * 100).toFixed(0)}%`}
           sub={`已入索引 ${fmt(capture_flow.vectorized_count)}/${fmt(capture_flow.eligible_count)}`} color="#5E5CE6" />
         <StatCard label="知识化率" value={`${(capture_flow.knowledge_generation_rate * 100).toFixed(0)}%`}
@@ -835,6 +979,8 @@ const OverviewContent: React.FC<{
           </>
         ) : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无知识趋势数据</div>}
       </div>
+
+      <OcrBackfillCard metrics={ocr_backfill} rangeLabel={rangeLabel} />
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
         <div style={{ ...cardStyle, flex: 1 }}>

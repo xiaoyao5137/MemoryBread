@@ -88,6 +88,10 @@ pub struct ScreenshotResult {
     pub file_size: u64,
     /// 截图来源：`window`（前台窗口截图）或 `fullscreen`（全屏回退）
     pub source: ScreenshotSource,
+    /// 前台窗口所属应用名。仅窗口截图可用，用于在 AX 标题缺失时补齐采集上下文。
+    pub app_name: Option<String>,
+    /// 前台窗口标题。仅窗口截图可用，用于在 AX 标题缺失时补齐采集上下文。
+    pub window_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,7 +269,24 @@ fn pick_active_monitor() -> Result<xcap::Monitor, CaptureError> {
 }
 
 #[cfg(not(test))]
-fn capture_focused_window_image() -> Result<image::RgbaImage, String> {
+struct FocusedWindowCapture {
+    image: image::RgbaImage,
+    app_name: Option<String>,
+    window_title: Option<String>,
+}
+
+#[cfg(not(test))]
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(not(test))]
+fn capture_focused_window_image() -> Result<FocusedWindowCapture, String> {
     use xcap::Window;
 
     let windows = Window::all().map_err(|e| format!("Window::all 失败: {e}"))?;
@@ -336,8 +357,14 @@ fn capture_focused_window_image() -> Result<image::RgbaImage, String> {
         ));
     }
 
-    win.capture_image().map_err(|e| {
+    let image = win.capture_image().map_err(|e| {
         format!("Window::capture_image 失败 app={app_name:?} title={win_title:?}: {e}")
+    })?;
+
+    Ok(FocusedWindowCapture {
+        image,
+        app_name: non_empty_string(app_name),
+        window_title: non_empty_string(win_title),
     })
 }
 
@@ -360,15 +387,20 @@ fn capture_real(
     use std::io::BufWriter;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let (rgba_image, source) = match capture_focused_window_image() {
-        Ok(img) => (img, ScreenshotSource::Window),
+    let (rgba_image, source, app_name, window_title) = match capture_focused_window_image() {
+        Ok(capture) => (
+            capture.image,
+            ScreenshotSource::Window,
+            capture.app_name,
+            capture.window_title,
+        ),
         Err(reason) => {
             tracing::warn!(
                 fallback_reason = %reason,
                 "前台窗口截图失败，回退到全屏截图（OCR 可能扫到非目标窗口内容）"
             );
             match capture_fullscreen_image() {
-                Ok(img) => (img, ScreenshotSource::Fullscreen),
+                Ok(img) => (img, ScreenshotSource::Fullscreen, None, None),
                 Err(e) => {
                     record_screenshot_failure();
                     return Err(e);
@@ -416,6 +448,8 @@ fn capture_real(
         height,
         file_size,
         source,
+        app_name,
+        window_title,
     }))
 }
 
@@ -475,6 +509,8 @@ fn capture_test(
         height,
         file_size,
         source: ScreenshotSource::Fullscreen,
+        app_name: None,
+        window_title: None,
     }))
 }
 

@@ -325,6 +325,10 @@ pub async fn get_rag_job(
 pub struct RagHistoryParams {
     #[serde(default = "default_history_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub q: Option<String>,
 }
 
 fn default_history_limit() -> usize {
@@ -395,6 +399,9 @@ fn parse_saved_contexts(raw: Option<&str>) -> Vec<RagContext> {
 #[derive(Serialize)]
 pub struct RagHistoryResponse {
     pub items: Vec<RagHistoryItem>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
 }
 
 #[derive(Serialize)]
@@ -466,10 +473,17 @@ pub async fn rag_history(
     Query(params): Query<RagHistoryParams>,
 ) -> Result<Json<RagHistoryResponse>, ApiError> {
     let limit = params.limit.clamp(1, 100);
+    let offset = params.offset.min(1_000_000);
+    let query = params
+        .q
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let storage = state.storage.clone();
-    let records = tokio::task::spawn_blocking(move || storage.list_rag_sessions(limit, 0))
-        .await
-        .map_err(|e| ApiError::Internal(format!("读取咨询记录失败: {e}")))??;
+    let (records, total) = tokio::task::spawn_blocking(move || {
+        storage.list_rag_sessions_page(query.as_deref(), limit, offset)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("读取咨询记录失败: {e}")))??;
 
     let items = records
         .into_iter()
@@ -489,7 +503,12 @@ pub async fn rag_history(
         })
         .collect();
 
-    Ok(Json(RagHistoryResponse { items }))
+    Ok(Json(RagHistoryResponse {
+        items,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 /// RAG 查询实现：调用 ai-sidecar 的 RAG 服务

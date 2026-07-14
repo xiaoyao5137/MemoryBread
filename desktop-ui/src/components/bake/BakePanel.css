@@ -9,6 +9,10 @@
   min-width: 0;
 }
 
+.bake-panel--repository > * {
+  flex-shrink: 0;
+}
+
 .bake-tab-content {
   display: grid;
   gap: 16px;
@@ -780,6 +784,237 @@ button.bake-list-item.bake-list-item--active {
   text-decoration: underline;
 }
 
+.bake-memory-package-card {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 16px;
+  overflow: hidden;
+}
+
+.bake-memory-package-card .bake-section-header {
+  margin-bottom: 0;
+}
+
+.bake-memory-package-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.78fr) minmax(360px, 1.22fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+.bake-memory-package-group {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 14px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid rgba(153, 101, 53, 0.14);
+  border-radius: 12px;
+  background: #FFFCF8;
+}
+
+.bake-memory-package-group__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.bake-memory-package-group__icon,
+.bake-memory-package-access-state__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: rgba(191, 122, 58, 0.12);
+  color: #8A4A18;
+}
+
+.bake-memory-package-group__title {
+  margin-bottom: 4px;
+  color: #2F241D;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.bake-memory-package-group .bake-muted {
+  line-height: 1.5;
+}
+
+.bake-memory-package-actions {
+  align-self: end;
+  align-items: center;
+  padding-top: 0;
+}
+
+.bake-memory-package-actions .bake-btn {
+  white-space: nowrap;
+}
+
+.bake-memory-package-card .bake-btn--primary {
+  background: #0066CC;
+  color: #F8FBFF;
+  border-color: #0066CC;
+}
+
+.bake-memory-package-card .bake-btn--primary:hover:not(:disabled) {
+  background: #004F9E;
+}
+
+.bake-memory-package-card .bake-btn:focus-visible,
+.bake-memory-package-card .bake-input:focus-visible {
+  outline: 3px solid rgba(0, 102, 204, 0.28);
+  outline-offset: 2px;
+}
+
+.bake-memory-package-card .bake-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.bake-memory-package-access-state {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  padding: 12px;
+  border: 1px solid rgba(153, 101, 53, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.bake-memory-package-access-state__body {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.bake-memory-package-access-state__body strong {
+  color: #33261D;
+  font-size: 13px;
+}
+
+.bake-memory-package-access-state__body span {
+  color: #6E6258;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bake-memory-package-cloud {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.bake-memory-package-privacy-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: 9px;
+  background: rgba(191, 122, 58, 0.1);
+  color: #69401E;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bake-memory-package-privacy-note svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.bake-memory-package-fields {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.9fr) minmax(220px, 1.1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.bake-memory-package-key,
+.bake-memory-package-select {
+  min-width: 0;
+}
+
+.bake-memory-package-field-help {
+  color: #7B6E64;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.bake-memory-package-list-state {
+  display: flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 1px dashed rgba(110, 98, 88, 0.24);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.68);
+  color: #6E6258;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.bake-memory-package-list-state--loading {
+  border-style: solid;
+  background: linear-gradient(90deg, rgba(191, 122, 58, 0.06), rgba(191, 122, 58, 0.13), rgba(191, 122, 58, 0.06));
+}
+
+.bake-memory-package-list-state--error {
+  border-color: rgba(180, 62, 62, 0.24);
+  background: rgba(180, 62, 62, 0.08);
+  color: #923B3B;
+}
+
+.bake-memory-package-file {
+  display: none;
+}
+
+.bake-memory-package-generated-key {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.72fr) minmax(320px, 1.28fr);
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(191, 122, 58, 0.24);
+  border-radius: 12px;
+  background: rgba(191, 122, 58, 0.08);
+}
+
+.bake-memory-package-generated-key > div {
+  display: grid;
+  gap: 4px;
+}
+
+.bake-memory-package-generated-key strong {
+  color: #5F3515;
+  font-size: 13px;
+}
+
+.bake-memory-package-generated-key span {
+  color: #765C47;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.bake-memory-package-report {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.bake-memory-package-report span {
+  padding: 6px 9px;
+  border-radius: 999px;
+  background: rgba(191, 122, 58, 0.1);
+  color: #6f3e17;
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .bake-stat-chip--button {
   border: none;
   cursor: pointer;
@@ -1340,6 +1575,14 @@ button.bake-list-item.bake-list-item--active {
 }
 
 @media (max-width: 980px) {
+  .bake-memory-package-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .bake-memory-package-cloud .bake-actions {
+    justify-content: flex-start;
+  }
+
   .bake-list-toolbar__filters {
     grid-template-columns: 1fr;
   }
@@ -1466,6 +1709,24 @@ button.bake-list-item.bake-list-item--active {
     flex: 1 1 140px;
   }
 
+  .bake-memory-package-fields,
+  .bake-memory-package-generated-key {
+    grid-template-columns: 1fr;
+  }
+
+  .bake-memory-package-access-state {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .bake-memory-package-access-state .bake-btn {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .bake-memory-package-actions .bake-btn {
+    flex: 1 1 140px;
+  }
+
   .bake-title {
     font-size: 22px;
   }
@@ -1520,6 +1781,67 @@ button.bake-list-item.bake-list-item--active {
   .bake-memory-action-card--secondary {
     background: #1C1C1E;
     border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .bake-memory-package-group {
+    background: #23201E;
+    border-color: rgba(255, 196, 141, 0.12);
+  }
+
+  .bake-memory-package-group__title,
+  .bake-memory-package-access-state__body strong {
+    color: #F3EAE2;
+  }
+
+  .bake-memory-package-group__icon,
+  .bake-memory-package-access-state__icon {
+    background: rgba(255, 159, 67, 0.16);
+    color: #FFC48D;
+  }
+
+  .bake-memory-package-access-state,
+  .bake-memory-package-list-state {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .bake-memory-package-access-state__body span,
+  .bake-memory-package-field-help,
+  .bake-memory-package-list-state {
+    color: #B8ACA2;
+  }
+
+  .bake-memory-package-privacy-note {
+    background: rgba(255, 159, 67, 0.13);
+    color: #FFD6B0;
+  }
+
+  .bake-memory-package-list-state--loading {
+    background: linear-gradient(90deg, rgba(255, 159, 67, 0.06), rgba(255, 159, 67, 0.14), rgba(255, 159, 67, 0.06));
+  }
+
+  .bake-memory-package-list-state--error {
+    border-color: rgba(255, 120, 120, 0.24);
+    background: rgba(255, 120, 120, 0.1);
+    color: #FFB4B4;
+  }
+
+  .bake-memory-package-generated-key {
+    border-color: rgba(255, 159, 67, 0.24);
+    background: rgba(255, 159, 67, 0.1);
+  }
+
+  .bake-memory-package-generated-key strong {
+    color: #FFD6B0;
+  }
+
+  .bake-memory-package-generated-key span {
+    color: #C9B7A8;
+  }
+
+  .bake-memory-package-report span {
+    background: rgba(255, 159, 67, 0.14);
+    color: #FFD6B0;
   }
 
   .bake-stat-chip {
@@ -1602,6 +1924,16 @@ button.bake-list-item.bake-list-item--active {
     background: #2C2C2E;
     color: #F3F4F6;
     border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .bake-memory-package-card .bake-btn--primary {
+    background: #0066CC;
+    color: #F8FBFF;
+    border-color: #0066CC;
+  }
+
+  .bake-memory-package-card .bake-btn--primary:hover:not(:disabled) {
+    background: #0878D1;
   }
 
   .bake-list-toolbar--repository .bake-input:hover {

@@ -28,16 +28,25 @@ function formatTs(ms: number | null): string {
 }
 
 function cronHint(expr: string): string {
+  const fields = expr.trim().split(/\s+/)
+  const canonicalDayToFiveField: Record<string, string> = {
+    '1': '0', '2': '1', '3': '2', '4': '3', '5': '4', '6': '5', '7': '6',
+    '2,3,4,5,6': '1-5',
+  }
+  const displayExpr = fields.length === 6 && fields[0] === '0'
+    ? [...fields.slice(1, 5), canonicalDayToFiveField[fields[5]] || fields[5]].join(' ')
+    : fields.join(' ')
   const map: Record<string, string> = {
     '0 20 * * *': '每天 20:00', '0 18 * * 5': '每周五 18:00',
     '0 18 28 * *': '每月28日 18:00', '0 21 * * *': '每天 21:00',
-    '0 10 * * 0': '每周日 10:00', '0 9 * * 1': '每周一 09:00',
+    '0 9 * * *': '每天 09:00', '0 10 * * 0': '每周日 10:00', '0 9 * * 1': '每周一 09:00',
+    '0 9 1 * *': '每月1日 09:00',
     '0 17 * * 1-5': '工作日 17:00', '0 20 * * 0': '每周日 20:00',
     '0 19 * * 1-5': '工作日 19:00', '0 12 * * 3': '每周三 12:00',
     '0 17 * * 5': '每周五 17:00', '0 18 * * 1-5': '工作日 18:00',
     '0 9 * * 1-5': '工作日 09:00', '0 16 * * 5': '每周五 16:00',
   }
-  return map[expr] || expr
+  return map[displayExpr] || displayExpr
 }
 
 // ── 子组件：任务卡片 ─────────────────────────────────────────────────────────

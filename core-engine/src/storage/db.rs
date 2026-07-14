@@ -164,6 +164,30 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "038_add_latency_to_creation_history",
         include_str!("migrations/038_add_latency_to_creation_history.sql"),
     ),
+    (
+        "039_create_diaries",
+        include_str!("migrations/039_create_diaries.sql"),
+    ),
+    (
+        "040_update_default_capture_interval",
+        include_str!("migrations/040_update_default_capture_interval.sql"),
+    ),
+    (
+        "041_due_diary_catchup_tasks",
+        include_str!("migrations/041_due_diary_catchup_tasks.sql"),
+    ),
+    (
+        "042_seed_default_diary_tasks",
+        include_str!("migrations/042_seed_default_diary_tasks.sql"),
+    ),
+    (
+        "043_normalize_scheduled_task_cron",
+        include_str!("migrations/043_normalize_scheduled_task_cron.sql"),
+    ),
+    (
+        "044_correct_weekday_semantics",
+        include_str!("migrations/044_correct_weekday_semantics.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -382,6 +406,12 @@ impl StorageManager {
             Self::add_column_if_missing(conn, "creation_history", "model", "TEXT")?;
             Self::add_column_if_missing(conn, "creation_history", "references_json", "TEXT")?;
             Self::add_column_if_missing(conn, "creation_history", "latency_ms", "INTEGER")?;
+        }
+
+        // 极少数残缺旧库只保留了迁移记录和部分业务表；039 会更新
+        // scheduled_tasks，因此仅在其基础表存在时执行兼容修复。
+        if self.table_exists(conn, "scheduled_tasks")? {
+            conn.execute_batch(include_str!("migrations/039_create_diaries.sql"))?;
         }
 
         Ok(())
@@ -626,5 +656,104 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn default_diary_cron_expressions_include_seconds() {
+        let storage = StorageManager::open_in_memory().unwrap();
+        storage
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT cron_expression
+                     FROM scheduled_tasks
+                     WHERE template_id IN ('daily_journal', 'weekly_report', 'monthly_summary')",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                assert_eq!(rows.len(), 3);
+                assert!(rows.iter().all(|cron| cron.split_whitespace().count() == 6));
+                let weekly_cron: String = conn.query_row(
+                    "SELECT cron_expression FROM scheduled_tasks WHERE template_id = 'weekly_report'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(weekly_cron, "0 0 9 * * 2");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn normalization_migration_clears_stuck_due_time() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+             );
+             CREATE TABLE scheduled_tasks (
+                id INTEGER PRIMARY KEY,
+                cron_expression TEXT NOT NULL,
+                next_run_at INTEGER,
+                updated_at INTEGER NOT NULL
+             );
+             INSERT INTO scheduled_tasks (id, cron_expression, next_run_at, updated_at)
+             VALUES (1, '0 9 * * *', 0, 0);",
+        )
+        .unwrap();
+
+        conn.execute_batch(include_str!(
+            "migrations/043_normalize_scheduled_task_cron.sql"
+        ))
+        .unwrap();
+
+        let (cron, next_run): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT cron_expression, next_run_at FROM scheduled_tasks WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cron, "0 0 9 * * *");
+        assert!(next_run.is_none());
+    }
+
+    #[test]
+    fn weekday_semantics_migration_moves_weekly_report_to_monday() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+             );
+             CREATE TABLE scheduled_tasks (
+                id INTEGER PRIMARY KEY,
+                template_id TEXT,
+                cron_expression TEXT NOT NULL,
+                next_run_at INTEGER,
+                updated_at INTEGER NOT NULL
+             );
+             INSERT INTO scheduled_tasks
+                (id, template_id, cron_expression, next_run_at, updated_at)
+             VALUES (1, 'weekly_report', '0 0 9 * * 1', 0, 0);",
+        )
+        .unwrap();
+
+        conn.execute_batch(include_str!(
+            "migrations/044_correct_weekday_semantics.sql"
+        ))
+        .unwrap();
+
+        let (cron, next_run): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT cron_expression, next_run_at FROM scheduled_tasks WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cron, "0 0 9 * * 2");
+        assert!(next_run.is_none());
     }
 }

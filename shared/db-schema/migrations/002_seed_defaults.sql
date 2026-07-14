@@ -34,7 +34,7 @@ INSERT OR IGNORE INTO user_preferences (key, value, source, confidence, updated_
     -- ——— 隐私与采集策略 ———
     ('privacy.capture_mode',    '"event_driven"',   'manual', 1.0, CAST(strftime('%s','now')*1000 AS INTEGER), 0),
                                                     -- 'event_driven'事件驱动 / 'interval'定时（备用）
-    ('privacy.capture_interval_sec', '30',          'manual', 1.0, CAST(strftime('%s','now')*1000 AS INTEGER), 0),
+    ('privacy.capture_interval_sec', '90',          'manual', 1.0, CAST(strftime('%s','now')*1000 AS INTEGER), 0),
                                                     -- 定时模式下的采集间隔（秒）
     ('privacy.keyboard_capture','true',             'manual', 1.0, CAST(strftime('%s','now')*1000 AS INTEGER), 0),
     ('privacy.audio_capture',   'false',            'manual', 1.0, CAST(strftime('%s','now')*1000 AS INTEGER), 0),

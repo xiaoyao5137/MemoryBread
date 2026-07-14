@@ -27,7 +27,8 @@ pub struct ExportAssetSnapshotRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct ImportAssetSnapshotRequest {
-    pub path: String,
+    pub path: Option<String>,
+    pub content: Option<String>,
     /// Defaults to true. Set to false explicitly to write into the active DB.
     pub dry_run: Option<bool>,
 }
@@ -128,18 +129,22 @@ pub async fn import_asset_snapshot(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ImportAssetSnapshotRequest>,
 ) -> Result<Json<AssetSnapshotImportReport>, ApiError> {
-    if body.path.trim().is_empty() {
-        return Err(ApiError::BadRequest("path 不能为空".to_string()));
-    }
-
     let dry_run = body.dry_run.unwrap_or(true);
     let storage = state.storage.clone();
-    let path = PathBuf::from(body.path);
-    let result = tokio::task::spawn_blocking(move || {
-        storage.import_asset_snapshot_from_path(&path, dry_run)
-    })
-    .await
-    .map_err(|error| ApiError::Internal(error.to_string()))??;
+    let result = if let Some(content) = body.content.filter(|value| !value.trim().is_empty()) {
+        tokio::task::spawn_blocking(move || {
+            storage.import_asset_snapshot_from_bytes(content.as_bytes(), dry_run)
+        })
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))??
+    } else if let Some(path) = body.path.filter(|value| !value.trim().is_empty()) {
+        let path = PathBuf::from(path);
+        tokio::task::spawn_blocking(move || storage.import_asset_snapshot_from_path(&path, dry_run))
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))??
+    } else {
+        return Err(ApiError::BadRequest("path 或 content 不能为空".to_string()));
+    };
 
     Ok(Json(result))
 }
@@ -335,10 +340,7 @@ fn default_asset_snapshot_path() -> PathBuf {
     PathBuf::from(home)
         .join(".memory-bread")
         .join("backups")
-        .join(format!(
-            "asset-snapshot-{}.mbsnapshot.json",
-            current_ts_ms()
-        ))
+        .join(format!("memory-package-{}.mbmemory.json", current_ts_ms()))
 }
 
 fn default_cloud_encrypted_path() -> PathBuf {
@@ -347,7 +349,7 @@ fn default_cloud_encrypted_path() -> PathBuf {
         .join(".memory-bread")
         .join("backups")
         .join(format!(
-            "cloud-asset-snapshot-{}.mbsnapshot.enc.json",
+            "cloud-memory-package-{}.mbmemory.enc.json",
             current_ts_ms()
         ))
 }
@@ -358,7 +360,7 @@ fn default_restored_encrypted_path() -> PathBuf {
         .join(".memory-bread")
         .join("backups")
         .join(format!(
-            "restored-asset-snapshot-{}.mbsnapshot.enc.json",
+            "restored-memory-package-{}.mbmemory.enc.json",
             current_ts_ms()
         ))
 }
@@ -369,7 +371,7 @@ fn default_restored_decrypted_path() -> PathBuf {
         .join(".memory-bread")
         .join("backups")
         .join(format!(
-            "restored-asset-snapshot-{}.mbsnapshot.json",
+            "restored-memory-package-{}.mbmemory.json",
             current_ts_ms()
         ))
 }

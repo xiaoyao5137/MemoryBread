@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,11 +19,39 @@ use tauri::{
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
+static LAST_FLOATING_ASSIST_TEMP_CLEANUP_MS: AtomicI64 = AtomicI64::new(0);
 const FLOATING_ASSIST_LABEL: &str = "floating-assist";
 const FLOATING_ASSIST_DEFAULT_MARGIN: i32 = 24;
 const FLOATING_ASSIST_DEFAULT_TOP: i32 = 140;
 const FLOATING_ASSIST_DEFAULT_SIZE: i32 = 82;
+const FLOATING_ASSIST_TEMP_KEEP_SECS: u64 = 24 * 60 * 60;
+const FLOATING_ASSIST_TEMP_CLEANUP_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 const TRAY_TEMPLATE_ICON_SIZE: u32 = 64;
+
+#[cfg(target_os = "macos")]
+fn configure_floating_assist_macos_window(window: &tauri::WebviewWindow) {
+    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+
+    let Ok(ns_window_ptr) = window.ns_window() else {
+        return;
+    };
+    if ns_window_ptr.is_null() {
+        return;
+    }
+
+    let ns_window: &NSWindow = unsafe { &*ns_window_ptr.cast() };
+    ns_window.setIgnoresMouseEvents(false);
+    ns_window.setAcceptsMouseMovedEvents(true);
+    ns_window.setCollectionBehavior(
+        ns_window.collectionBehavior()
+            | NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::Stationary
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_floating_assist_macos_window(_window: &tauri::WebviewWindow) {}
 
 struct TrayMenuState {
     capture: CheckMenuItem<tauri::Wry>,
@@ -49,6 +77,11 @@ struct FloatingAssistOcrResult {
 struct FloatingAssistDragOrigin {
     offset_x: f64,
     offset_y: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct FloatingAssistPointerState {
+    hovering_ball: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,10 +137,11 @@ fn show_main_window(app: &AppHandle) {
 
 fn ensure_floating_assist_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(FLOATING_ASSIST_LABEL) {
+        configure_floating_assist_macos_window(&window);
         return Ok(window);
     }
 
-    WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         app,
         FLOATING_ASSIST_LABEL,
         WebviewUrl::App("index.html?view=floating-assist".into()),
@@ -127,12 +161,14 @@ fn ensure_floating_assist_window(app: &AppHandle) -> Result<tauri::WebviewWindow
     .shadow(false)
     .always_on_top(true)
     .accept_first_mouse(true)
-    .content_protected(true)
+    .content_protected(false)
     .skip_taskbar(true)
     .visible(false)
     .position(960.0, 140.0)
     .build()
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    configure_floating_assist_macos_window(&window);
+    Ok(window)
 }
 
 fn default_floating_assist_position(
@@ -279,6 +315,7 @@ fn set_floating_assist_visible_inner(app: &AppHandle, enabled: bool) -> Result<(
             )),
         );
         window.show().map_err(|error| error.to_string())?;
+        let _ = window.set_content_protected(false);
         let _ = window.set_always_on_top(true);
         let _ = app.emit("floating-assist-reset", ());
         menu_state
@@ -319,6 +356,75 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn cleanup_floating_assist_temp_files() -> Result<(usize, u64), String> {
+    let dir = floating_assist_temp_dir()?;
+    let now = SystemTime::now();
+    let keep_duration = Duration::from_secs(FLOATING_ASSIST_TEMP_KEEP_SECS);
+    let entries = fs::read_dir(&dir).map_err(|error| error.to_string())?;
+    let mut deleted_count = 0usize;
+    let mut freed_bytes = 0u64;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < keep_duration {
+            continue;
+        }
+
+        let path = entry.path();
+        let size = metadata.len();
+        if fs::remove_file(&path).is_ok() {
+            deleted_count += 1;
+            freed_bytes += size;
+        }
+    }
+
+    Ok((deleted_count, freed_bytes))
+}
+
+fn schedule_floating_assist_temp_cleanup(force: bool) {
+    let now = now_ms();
+    if force {
+        LAST_FLOATING_ASSIST_TEMP_CLEANUP_MS.store(now, Ordering::Relaxed);
+    } else {
+        let last = LAST_FLOATING_ASSIST_TEMP_CLEANUP_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < FLOATING_ASSIST_TEMP_CLEANUP_INTERVAL_MS {
+            return;
+        }
+        if LAST_FLOATING_ASSIST_TEMP_CLEANUP_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let _ = tauri::async_runtime::spawn_blocking(|| match cleanup_floating_assist_temp_files() {
+        Ok((deleted_count, freed_bytes)) if deleted_count > 0 => {
+            eprintln!("悬浮球临时截图清理完成: deleted={deleted_count}, freed_bytes={freed_bytes}");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("悬浮球临时截图清理失败: {error}");
+        }
+    });
 }
 
 fn save_rgba_jpeg(path: PathBuf, image: RgbaImage) -> Result<PathBuf, String> {
@@ -744,6 +850,43 @@ fn update_floating_assist_drag(app: AppHandle, offset_x: f64, offset_y: f64) -> 
 }
 
 #[tauri::command]
+fn get_floating_assist_pointer_state(app: AppHandle) -> Result<FloatingAssistPointerState, String> {
+    let Some(window) = app.get_webview_window(FLOATING_ASSIST_LABEL) else {
+        return Ok(FloatingAssistPointerState {
+            hovering_ball: false,
+        });
+    };
+
+    configure_floating_assist_macos_window(&window);
+
+    if !window.is_visible().unwrap_or(false) {
+        return Ok(FloatingAssistPointerState {
+            hovering_ball: false,
+        });
+    }
+
+    let window_position = window.outer_position().map_err(|error| error.to_string())?;
+    let cursor_position = app.cursor_position().map_err(|error| error.to_string())?;
+    let scale_factor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(1.0);
+    let ball_margin = 8.0 * scale_factor;
+    let ball_size = 72.0 * scale_factor;
+    let relative_x = cursor_position.x - f64::from(window_position.x);
+    let relative_y = cursor_position.y - f64::from(window_position.y);
+
+    Ok(FloatingAssistPointerState {
+        hovering_ball: relative_x >= ball_margin
+            && relative_x <= ball_margin + ball_size
+            && relative_y >= ball_margin
+            && relative_y <= ball_margin + ball_size,
+    })
+}
+
+#[tauri::command]
 fn set_floating_assist_size(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
     let window = ensure_floating_assist_window(&app)?;
     window
@@ -775,6 +918,8 @@ fn open_floating_assist_reference(app: AppHandle, detail: serde_json::Value) -> 
 async fn capture_screen_ocr_for_floating_assist(
     app: AppHandle,
 ) -> Result<FloatingAssistOcrResult, String> {
+    schedule_floating_assist_temp_cleanup(false);
+
     let floating_window = app.get_webview_window(FLOATING_ASSIST_LABEL);
     if let Some(window) = floating_window.as_ref() {
         let _ = window.set_content_protected(true);
@@ -788,6 +933,7 @@ async fn capture_screen_ocr_for_floating_assist(
         .await
         .map_err(|error| format!("悬浮球截图任务失败：{error}"));
 
+        let _ = window.set_content_protected(false);
         let _ = window.show();
         let _ = window.set_always_on_top(true);
 
@@ -844,6 +990,7 @@ pub fn run() {
             set_floating_assist_position,
             begin_floating_assist_drag,
             update_floating_assist_drag,
+            get_floating_assist_pointer_state,
             set_floating_assist_size,
             read_floating_assist_image_data_url,
             open_floating_assist_reference,
@@ -906,6 +1053,7 @@ pub fn run() {
             });
 
             let _ = ensure_floating_assist_window(app.handle());
+            schedule_floating_assist_temp_cleanup(true);
 
             let mut tray = TrayIconBuilder::with_id("memory-bread")
                 .menu(&menu)

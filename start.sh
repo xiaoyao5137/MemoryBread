@@ -80,6 +80,7 @@ MODEL_API_PORT=7071
 CREATION_PORT=8001
 UI_PORT=1420
 OLLAMA_PORT=11434
+DEBUG_MODE=false
 
 # 打印带颜色的消息
 log_info() {
@@ -98,12 +99,87 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on|debug)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+set_debug_mode_from_env() {
+    if is_truthy "${MEMORYBREAD_DEBUG_MODE:-}"; then
+        DEBUG_MODE=true
+    else
+        DEBUG_MODE=false
+    fi
+}
+
+parse_start_options() {
+    set_debug_mode_from_env
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            debug|--debug|--debug-mode|--debug=true|--debug-mode=true)
+                DEBUG_MODE=true
+                ;;
+            normal|release|nodebug|no-debug|--no-debug|--debug=false|--debug-mode=false)
+                DEBUG_MODE=false
+                ;;
+            *)
+                log_error "未知启动参数: $1"
+                echo "用法: $0 {start|stop|restart|status|logs} [--debug|--no-debug]"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+require_no_extra_args() {
+    local command="$1"
+    shift
+    if [ "$#" -gt 0 ]; then
+        log_error "${command} 不支持额外参数: $*"
+        echo "用法: $0 {start|stop|restart|status|logs} [--debug|--no-debug]"
+        exit 1
+    fi
+}
+
 # 检查进程是否运行
+process_cwd() {
+    local pid=$1
+    lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1 || true
+}
+
+pid_belongs_to_project() {
+    local pid=$1
+    local cwd
+
+    if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    cwd=$(process_cwd "$pid")
+    case "$cwd" in
+        "$PROJECT_ROOT"|"$PROJECT_ROOT"/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 is_running() {
     local pid_file=$1
     if [ -f "$pid_file" ]; then
-        local pid=$(cat "$pid_file")
-        if ps -p "$pid" > /dev/null 2>&1; then
+        local pid
+        pid=$(tr -d '[:space:]' < "$pid_file")
+        if [[ "$pid" =~ ^[0-9]+$ ]] && ps -p "$pid" > /dev/null 2>&1 && pid_belongs_to_project "$pid"; then
             return 0
         fi
     fi
@@ -156,25 +232,51 @@ ensure_ollama_running() {
 cleanup_port() {
     local port=$1
     local label=$2
-    local pids=$(lsof -ti :"$port" 2>/dev/null || true)
-    if [ -n "$pids" ]; then
-        log_info "清理占用 ${port} 端口的进程（${label}）: $pids"
-        echo "$pids" | xargs kill 2>/dev/null || true
-        sleep 1
-        pids=$(lsof -ti :"$port" 2>/dev/null || true)
-        if [ -n "$pids" ]; then
-            echo "$pids" | xargs kill -9 2>/dev/null || true
+    local pid
+    local listeners
+    local project_pids=()
+    local foreign_pids=()
+
+    # 只匹配本机监听端口。`lsof -ti :PORT` 还会命中连接到远端同名端口的
+    # 客户端进程（例如微信连接远端 8080），不能用于进程清理。
+    listeners=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u || true)
+    if [ -z "$listeners" ]; then
+        return 0
+    fi
+
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        if pid_belongs_to_project "$pid"; then
+            project_pids+=("$pid")
+        else
+            foreign_pids+=("$pid")
         fi
+    done <<< "$listeners"
+
+    if [ "${#foreign_pids[@]}" -gt 0 ]; then
+        log_error "${label} 端口 ${port} 被非本项目进程占用 (PID: ${foreign_pids[*]})，为避免误杀已停止启动"
+        return 1
+    fi
+
+    if [ "${#project_pids[@]}" -gt 0 ]; then
+        log_info "清理占用 ${port} 端口的本项目进程（${label}）: ${project_pids[*]}"
+        kill "${project_pids[@]}" 2>/dev/null || true
+        sleep 1
+        for pid in "${project_pids[@]}"; do
+            if ps -p "$pid" > /dev/null 2>&1 && pid_belongs_to_project "$pid"; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
     fi
 }
 
 cleanup_desktop_app() {
-    local pids=$(pgrep -f "/target/debug/memory-bread-desktop|target/debug/memory-bread-desktop" || true)
+    local pids=$(find_desktop_app_pids)
     if [ -n "$pids" ]; then
         log_info "清理残留 Desktop UI 窗口进程: $pids"
         echo "$pids" | xargs kill 2>/dev/null || true
         sleep 1
-        pids=$(pgrep -f "/target/debug/memory-bread-desktop|target/debug/memory-bread-desktop" || true)
+        pids=$(find_desktop_app_pids)
         if [ -n "$pids" ]; then
             echo "$pids" | xargs kill -9 2>/dev/null || true
         fi
@@ -183,7 +285,13 @@ cleanup_desktop_app() {
 }
 
 find_desktop_app_pids() {
-    pgrep -f "/target/debug/memory-bread-desktop|target/debug/memory-bread-desktop" || true
+    local pid
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        if pid_belongs_to_project "$pid"; then
+            printf '%s\n' "$pid"
+        fi
+    done < <(pgrep -f "/target/debug/memory-bread-desktop|target/debug/memory-bread-desktop" || true)
 }
 
 warn_if_multiple_desktop_apps() {
@@ -210,6 +318,11 @@ record_desktop_app_pid() {
                 echo "$pid" > "$UI_APP_PID_FILE"
                 return 0
             fi
+        fi
+
+        # 启动器已退出时立即返回，避免失败场景仍固定等待三分钟。
+        if ! is_running "$UI_PID_FILE"; then
+            return 1
         fi
         sleep "$delay"
     done
@@ -477,9 +590,14 @@ clean_stale_tauri_cache() {
     local tauri_root="$PROJECT_ROOT/desktop-ui/src-tauri"
     local tauri_target="$tauri_root/target"
     local stale_marker=""
+    local dependency_file
     local old_paths=(
         "/Users/xianjiaqi/Documents/mygit/MemoryBread/desktop-ui/src-tauri"
         "/Users/xianjiaqi/Documents/mygit/cy/gzdz/desktop-ui/src-tauri"
+    )
+    local dependency_files=(
+        "$tauri_target/debug/memory-bread-desktop.d"
+        "$tauri_target/debug/libmemory_bread_desktop_lib.d"
     )
 
     if [ ! -d "$tauri_target" ]; then
@@ -491,10 +609,14 @@ clean_stale_tauri_cache() {
             continue
         fi
 
-        if grep -R -m 1 -F "$old_path" "$tauri_target" > /dev/null 2>&1; then
-            stale_marker="$old_path"
-            break
-        fi
+        # Cargo 的 .d 文件已经记录本 crate 的绝对源码与生成物路径。
+        # 检查它们即可判断仓库是否迁移，无需递归扫描数 GB 的 target。
+        for dependency_file in "${dependency_files[@]}"; do
+            if [ -f "$dependency_file" ] && grep -Fq "$old_path" "$dependency_file"; then
+                stale_marker="$old_path"
+                break 2
+            fi
+        done
     done
 
     if [ -z "$stale_marker" ] && [ -f "$UI_LOG" ]; then
@@ -653,12 +775,13 @@ start_core() {
 # 启动 Desktop UI
 start_ui() {
     if is_running "$UI_PID_FILE"; then
-        log_info "Desktop UI 已在运行，复用现有进程"
+        log_info "Desktop UI 已在运行，复用现有进程；如需切换调试模式请执行 restart"
         wait_for_http "http://localhost:${UI_PORT}" "Desktop UI / Vite" 10 1 || log_warn "现有 Desktop UI 进程健康检查失败，建议执行 ./start.sh restart"
         return 0
     fi
 
     log_info "启动 Desktop UI..."
+    log_info "Desktop UI 调试模式: ${DEBUG_MODE}"
 
     cd "$PROJECT_ROOT/desktop-ui"
 
@@ -677,7 +800,7 @@ start_ui() {
 
     # 启动 Tauri 开发服务器（后台运行）
     log_info "启动 Tauri 开发服务器..."
-    nohup npm run tauri:dev > "$UI_LOG" 2>&1 &
+    VITE_MEMORYBREAD_DEBUG_MODE="$DEBUG_MODE" nohup npm run tauri:dev > "$UI_LOG" 2>&1 &
     echo $! > "$UI_PID_FILE"
     disown "$(cat "$UI_PID_FILE")" 2>/dev/null || true
 
@@ -705,6 +828,11 @@ start_ui() {
 
 # 主函数
 main() {
+    local command="${1:-start}"
+    if [ "$#" -gt 0 ]; then
+        shift
+    fi
+
     echo ""
     echo "╔════════════════════════════════════════╗"
     echo "║     记忆面包 启动脚本 v1.0           ║"
@@ -712,8 +840,9 @@ main() {
     echo ""
 
     # 解析命令行参数
-    case "${1:-start}" in
+    case "$command" in
         start)
+            parse_start_options "$@"
             check_path_leaks
             check_dependencies
             ensure_ollama_running
@@ -724,6 +853,7 @@ main() {
             show_status
             ;;
         start-backends)
+            require_no_extra_args "$command" "$@"
             check_path_leaks
             check_dependencies
             ensure_ollama_running
@@ -732,12 +862,14 @@ main() {
             start_core
             ;;
         stop)
+            require_no_extra_args "$command" "$@"
             stop_all
             ;;
         stop-after-app)
-            stop_after_app "${2:-}"
+            stop_after_app "${1:-}"
             ;;
         restart)
+            parse_start_options "$@"
             log_info "执行全组件 restart（AI Sidecar → Core Engine → Desktop UI）..."
             warn_if_multiple_desktop_apps
             stop_all
@@ -753,21 +885,23 @@ main() {
             log_info "联调测试前请优先使用 ./start.sh restart，7071 由 model_api_server.py 统一提供 /api/models + /query，避免旧进程状态污染测试结果"
             ;;
         status)
+            require_no_extra_args "$command" "$@"
             show_status
             ;;
         logs)
+            require_no_extra_args "$command" "$@"
             log_info "查看日志 (Ctrl+C 退出)..."
             tail -f "$SIDECAR_LOG" "$MODEL_API_LOG" "$CREATION_LOG" "$CORE_LOG" "$UI_LOG" 2>/dev/null
             ;;
         *)
-            echo "用法: $0 {start|stop|restart|status|logs}"
+            echo "用法: $0 {start|stop|restart|status|logs} [--debug|--no-debug]"
             echo ""
             echo "命令说明:"
-            echo "  start   - 启动所有服务"
-            echo "  stop    - 停止所有服务"
-            echo "  restart - 重启所有服务"
-            echo "  status  - 查看服务状态"
-            echo "  logs    - 查看实时日志"
+            echo "  start [--debug]   - 启动所有服务"
+            echo "  stop              - 停止所有服务"
+            echo "  restart [--debug] - 重启所有服务"
+            echo "  status            - 查看服务状态"
+            echo "  logs              - 查看实时日志"
             exit 1
             ;;
     esac

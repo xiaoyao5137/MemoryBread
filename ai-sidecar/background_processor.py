@@ -194,7 +194,7 @@ class BackgroundProcessor:
         self._status_file = Path.home() / ".memory-bread" / "state" / "extraction_status.json"
         self._status_file.parent.mkdir(parents=True, exist_ok=True)
         # 初始化时立即写一次，保证 core-engine 拿得到 running=true 信号
-        self._write_status_file()
+        self._touch_status_file()
 
     def _capture_and_extraction_enabled(self) -> bool:
         """读取与 Core Engine 共用的持久化运行开关；缺失或读取失败时保持默认开启。"""
@@ -241,6 +241,11 @@ class BackgroundProcessor:
             tmp.replace(self._status_file)
         except Exception as e:
             logger.warning("写入 extraction_status.json 失败: %s", e)
+
+    def _touch_status_file(self) -> None:
+        """刷新提炼状态心跳，避免空转等待时被监控页误判为未启动。"""
+        with self._extracting_lock:
+            self._write_status_file()
 
     def _mark_group_extracting(self, group: list[dict]) -> int:
         """登记一组 captures 进入提炼，返回 group_id 用于结束时移除。"""
@@ -1546,12 +1551,15 @@ class BackgroundProcessor:
 
         while self.running:
             try:
+                self._touch_status_file()
+
                 if not self._capture_and_extraction_enabled():
                     logger.debug("采集与自动提炼已暂停，跳过本轮后台处理")
                     await asyncio.sleep(self.interval)
                     continue
 
                 processed = await self._process_batch()
+                self._touch_status_file()
 
                 if processed > 0:
                     logger.info(f"✅ 本轮处理完成: {processed} 条记录")
@@ -1567,6 +1575,7 @@ class BackgroundProcessor:
 
             except Exception as e:
                 logger.error(f"后台处理循环异常: {e}")
+                self._touch_status_file()
                 await asyncio.sleep(self.interval)
 
     def stop(self):

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS captures (
     event_type      TEXT NOT NULL DEFAULT 'auto',
                                                 -- 触发事件类型：
                                                 --   'app_switch'   应用切换
+                                                --   'browser_navigation' 浏览器 URL / 标签页切换
                                                 --   'mouse_click'  鼠标点击
                                                 --   'scroll'       页面滚动
                                                 --   'key_pause'    键盘停顿(>2s)

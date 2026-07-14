@@ -14,7 +14,10 @@ use axum::{
 use chrono::{Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{error::ApiError, state::AppState};
+use crate::{
+    api::{error::ApiError, state::AppState},
+    capture::engine::{ocr_backfill_metrics_snapshot, OcrBackfillMetricsSnapshot},
+};
 
 const SELF_GENERATED_APP_KEYWORDS: [&str; 2] = ["memory-bread", "记忆面包"];
 const SELF_GENERATED_WINDOW_KEYWORDS: [&str; 5] = [
@@ -147,6 +150,7 @@ pub struct MonitorOverview {
     pub capture_total_count: i64,
     pub service_health: ServiceHealth,
     pub token_usage: TokenUsage,
+    pub ocr_backfill: OcrBackfillMetricsSnapshot,
     pub capture_flow: CaptureFlow,
     pub knowledge_flow: KnowledgeFlow,
     pub rag_sessions: RagSessionStats,
@@ -681,6 +685,7 @@ pub async fn monitor_overview(
                 trend,
                 trend_by_model,
             },
+            ocr_backfill: ocr_backfill_metrics_snapshot(range_ms, now_ms),
             capture_flow: CaptureFlow {
                 today_count,
                 period_count,

@@ -30,8 +30,10 @@ vi.mock('../utils/authApi', () => ({
 const mockedInvoke = vi.mocked(invoke)
 const mockedRunRagQueryJob = vi.mocked(runRagQueryJob)
 const assistButton = () => screen.getByRole('button', { name: '识别当前屏幕并咨询记忆面包' })
+const AUTO_TASK_SCAN_INITIAL_DELAY_MS = 10_000
+const AUTO_TASK_SCAN_INTERVAL_MS = 120_000
 const taskOcrResult = {
-  text: 'TODO\n- [ ] 修复登录验证码异常\n截止：明天下午前',
+  text: '飞书\n老板：帮我修复登录验证码异常，明天下午前给结论',
   confidence: 0.92,
   screenshot_path: '/tmp/floating-task.jpg',
   width: 1440,
@@ -42,7 +44,7 @@ const taskOcrResult = {
   window_title: '项目群',
 }
 const anotherTaskOcrResult = {
-  text: 'TODO\n- [ ] 整理项目风险清单\n截止：本周内',
+  text: '飞书\n老板：帮我整理项目风险清单，本周内给一版',
   confidence: 0.93,
   screenshot_path: '/tmp/floating-task-another.jpg',
   width: 1440,
@@ -167,15 +169,18 @@ afterEach(() => {
 })
 
 describe('SystemFloatingAssist', () => {
-  it('闲置态使用脸红覆盖层且不渲染突兀帧或灰色背景层', () => {
+  it('闲置态渲染面包人角色且不再使用旧图片层', () => {
     const { container } = render(<SystemFloatingAssist />)
     const button = assistButton()
 
     expect(button).toHaveClass('system-floating-assist__ball--idle')
+    expect(container.querySelector('.system-floating-assist__bread-person')).toBeInTheDocument()
+    expect(container.querySelector('.system-floating-assist__bread-body')).toBeInTheDocument()
+    expect(container.querySelector('.system-floating-assist__mascot-img')).not.toBeInTheDocument()
     expect(container.querySelector('.system-floating-assist__idle-snack')).not.toBeInTheDocument()
     expect(container.querySelector('.system-floating-assist__idle-eye')).not.toBeInTheDocument()
     expect(container.querySelector('.system-floating-assist__idle-shadow')).not.toBeInTheDocument()
-    expect(container.querySelectorAll('.system-floating-assist__idle-blush')).toHaveLength(2)
+    expect(container.querySelectorAll('.system-floating-assist__bread-cheek')).toHaveLength(2)
   })
 
   it('完成态 5 分钟后自动切回闲置态', () => {
@@ -212,7 +217,53 @@ describe('SystemFloatingAssist', () => {
     expect(screen.getByText('已生成的咨询输出')).toBeInTheDocument()
   })
 
-  it('自动识别任务开启后在卡皮巴拉左上角显示 auto 标识', () => {
+  it('默认显示 5 条参考资料并支持展开和收起更多资料', async () => {
+    mockedRunRagQueryJob.mockResolvedValue({
+      answer: '已生成的咨询输出',
+      contexts: Array.from({ length: 7 }, (_, index) => ({
+        capture_id: index + 1,
+        doc_key: `document:${index + 1}`,
+        title: `参考资料 ${index + 1}`,
+        text: `参考内容 ${index + 1}`,
+        score: 1 - index / 10,
+        source: 'document',
+        source_type: 'document',
+      })),
+      output_truncated: false,
+    } as any)
+
+    render(<SystemFloatingAssist />)
+    fireEvent.click(assistButton())
+    act(() => {
+      vi.advanceTimersByTime(220)
+    })
+
+    const textarea = screen.getByPlaceholderText('输入你的指令，直接向记忆面包咨询')
+    fireEvent.change(textarea, { target: { value: '分析当前资料' } })
+    await act(async () => {
+      fireEvent.submit(textarea.closest('form')!)
+      await flushMicrotasks()
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(900)
+      await flushMicrotasks()
+    })
+    act(() => {
+      vi.advanceTimersByTime(28)
+    })
+
+    expect(screen.getByText('参考资料 5')).toBeInTheDocument()
+    expect(screen.queryByText('参考资料 6')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '展开更多（2）' }))
+    expect(screen.getByText('参考资料 6')).toBeInTheDocument()
+    expect(screen.getByText('参考资料 7')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '收起' }))
+    expect(screen.queryByText('参考资料 6')).not.toBeInTheDocument()
+  })
+
+  it('自动识别任务开启后在面包人左上角显示 auto 标识', () => {
     render(<SystemFloatingAssist />)
     expect(screen.queryByText('auto')).not.toBeInTheDocument()
 
@@ -224,7 +275,7 @@ describe('SystemFloatingAssist', () => {
     expect(screen.getByText('auto')).toBeInTheDocument()
   })
 
-  it('自动识别命中任务后进入卡皮巴拉接任务动画', async () => {
+  it('自动识别命中任务后进入面包人接任务动画', async () => {
     window.localStorage.setItem(FLOATING_ASSIST_ENABLED_KEY, 'true')
     window.localStorage.setItem(FLOATING_ASSIST_AUTO_TASK_KEY, 'true')
     mockedRunRagQueryJob.mockImplementation(() => new Promise(() => {}) as any)
@@ -232,7 +283,7 @@ describe('SystemFloatingAssist', () => {
     render(<SystemFloatingAssist />)
 
     await act(async () => {
-      vi.advanceTimersByTime(2000)
+      vi.advanceTimersByTime(AUTO_TASK_SCAN_INITIAL_DELAY_MS)
       await flushMicrotasks()
     })
 
@@ -247,7 +298,7 @@ describe('SystemFloatingAssist', () => {
       if (command === 'capture_screen_ocr_for_floating_assist') {
         return {
           ...taskOcrResult,
-          text: '飞书\n闲聊：这个账号密码稍后私发\nTODO\n- [ ] 修复登录验证码异常\n截止：明天下午前',
+          text: '飞书\n闲聊：这个账号密码稍后私发\n老板：帮我修复登录验证码异常，明天下午前给结论',
         }
       }
       if (command === 'read_floating_assist_image_data_url') return ''
@@ -256,7 +307,7 @@ describe('SystemFloatingAssist', () => {
 
     render(<SystemFloatingAssist />)
 
-    await completeNextAutoScan(2000)
+    await completeNextAutoScan(AUTO_TASK_SCAN_INITIAL_DELAY_MS)
 
     const sentQuery = mockedRunRagQueryJob.mock.calls[0]?.[2] as string
     expect(sentQuery).toContain('修复登录验证码异常')
@@ -275,7 +326,7 @@ describe('SystemFloatingAssist', () => {
     render(<SystemFloatingAssist />)
 
     await act(async () => {
-      vi.advanceTimersByTime(2000)
+      vi.advanceTimersByTime(AUTO_TASK_SCAN_INITIAL_DELAY_MS)
       await flushMicrotasks()
     })
 
@@ -305,7 +356,7 @@ describe('SystemFloatingAssist', () => {
     expect(assistButton()).toHaveClass('system-floating-assist__ball--receiving')
 
     await act(async () => {
-      vi.advanceTimersByTime(2000)
+      vi.advanceTimersByTime(AUTO_TASK_SCAN_INITIAL_DELAY_MS)
       await flushMicrotasks()
     })
 
@@ -327,16 +378,16 @@ describe('SystemFloatingAssist', () => {
 
     render(<SystemFloatingAssist />)
 
-    await completeNextAutoScan(2000)
+    await completeNextAutoScan(AUTO_TASK_SCAN_INITIAL_DELAY_MS)
     expect(mockedRunRagQueryJob).toHaveBeenCalledTimes(1)
 
     await closeDoneSurfaceAndReturnIdle()
-    await completeNextAutoScan(30_000)
+    await completeNextAutoScan(AUTO_TASK_SCAN_INTERVAL_MS)
     expect(mockedRunRagQueryJob).toHaveBeenCalledTimes(2)
 
     await closeDoneSurfaceAndReturnIdle()
     await act(async () => {
-      vi.advanceTimersByTime(30_000)
+      vi.advanceTimersByTime(AUTO_TASK_SCAN_INTERVAL_MS)
       await flushMicrotasks()
     })
 

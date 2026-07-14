@@ -19,7 +19,7 @@ import DebugPanel             from './components/DebugPanel'
 import ScheduledTasksPanel    from './components/ScheduledTasksPanel'
 import MonitorPanel           from './components/MonitorPanel'
 import BakePanel              from './components/BakePanel'
-import ProfilePanel           from './components/ProfilePanel'
+import DiaryPanel             from './components/DiaryPanel'
 import OnboardingWizard       from './components/OnboardingWizard'
 import AuthPanel              from './components/AuthPanel'
 import SystemFloatingAssist   from './components/SystemFloatingAssist'
@@ -383,7 +383,7 @@ const App: React.FC = () => {
         {windowMode === 'tasks'     && <ScheduledTasksPanel />}
         {windowMode === 'monitor'   && <MonitorPanel />}
         {windowMode === 'bake'      && <BakePanel />}
-        {windowMode === 'profile'   && <ProfilePanel />}
+        {windowMode === 'diary'     && <DiaryPanel />}
         {windowMode === 'account'   && <AuthPanel />}
       </main>
 

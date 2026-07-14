@@ -1,7 +1,7 @@
-//! 事件监听器 — 定时触发采集
+//! 事件监听器 — 前台上下文变化触发 + 定时兜底采集
 //!
-//! 这是一个简化版本，使用定时器定期触发采集。
-//! 未来可以扩展为监听真实的系统事件（应用切换、鼠标点击等）。
+//! 变化监听先轻量比较前台应用和浏览器 URL，仅在发生变化时触发完整采集；
+//! 低频定时路径继续负责 90 秒兜底采集。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
-use super::CaptureEvent;
+use super::{ax::get_frontmost_context_snapshot_async, ax::AXInfo, CaptureEvent};
 
 /// 内存压力等级
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub struct ListenerConfig {
 impl Default for ListenerConfig {
     fn default() -> Self {
         Self {
-            interval_secs: 60, // 默认 60 秒
+            interval_secs: 90, // 默认 90 秒兜底采集
             enabled: Arc::new(AtomicBool::new(true)),
             idle_threshold_secs: 300, // 5 分钟无操作暂停
         }
@@ -43,6 +43,163 @@ impl Default for ListenerConfig {
 
 const MAX_BACKOFF_SECS: u64 = 300;
 const LOW_MEMORY_THRESHOLD_MB: u64 = 500;
+const CONTEXT_WATCH_INTERVAL_SECS: u64 = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedContext {
+    app_name: String,
+    bundle_id: Option<String>,
+    win_title: Option<String>,
+    url: Option<String>,
+    webpage_title: Option<String>,
+}
+
+impl ObservedContext {
+    fn from_ax_info(info: AXInfo) -> Option<Self> {
+        let app_name = info.app_name?.trim().to_string();
+        if app_name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            app_name,
+            bundle_id: non_empty(info.app_bundle_id),
+            win_title: non_empty(info.win_title),
+            url: non_empty(info.url),
+            webpage_title: non_empty(info.webpage_title),
+        })
+    }
+
+    fn same_app(&self, other: &Self) -> bool {
+        match (self.bundle_id.as_deref(), other.bundle_id.as_deref()) {
+            (Some(left), Some(right)) => left == right,
+            _ => self.app_name == other.app_name,
+        }
+    }
+
+    fn retain_transient_browser_metadata(&mut self, previous: &Self) {
+        if !self.same_app(previous) || self.url.is_some() || previous.url.is_none() {
+            return;
+        }
+        self.url = previous.url.clone();
+        if self.webpage_title.is_none() {
+            self.webpage_title = previous.webpage_title.clone();
+        }
+        if self.win_title.is_none() {
+            self.win_title = previous.win_title.clone();
+        }
+    }
+
+    fn app_switch_event(&self) -> CaptureEvent {
+        CaptureEvent::AppSwitch {
+            app_name: self.app_name.clone(),
+            bundle_id: self.bundle_id.clone(),
+            win_title: self.win_title.clone().unwrap_or_default(),
+        }
+    }
+
+    fn browser_navigation_event(&self) -> Option<CaptureEvent> {
+        Some(CaptureEvent::BrowserNavigation {
+            app_name: self.app_name.clone(),
+            bundle_id: self.bundle_id.clone(),
+            win_title: self.win_title.clone(),
+            url: self.url.clone()?,
+            webpage_title: self.webpage_title.clone(),
+        })
+    }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn context_change_event(
+    previous: Option<&ObservedContext>,
+    current: &ObservedContext,
+) -> Option<CaptureEvent> {
+    let Some(previous) = previous else {
+        return current
+            .browser_navigation_event()
+            .or_else(|| Some(current.app_switch_event()));
+    };
+
+    if !current.same_app(previous) {
+        return current
+            .browser_navigation_event()
+            .or_else(|| Some(current.app_switch_event()));
+    }
+
+    match (previous.url.as_deref(), current.url.as_deref()) {
+        (_, Some(current_url)) if previous.url.as_deref() != Some(current_url) => {
+            current.browser_navigation_event()
+        }
+        _ => None,
+    }
+}
+
+/// 启动前台上下文变化监听。
+///
+/// 每 5 秒读取应用身份和浏览器 URL；应用或 URL 变化时触发完整 AX 采集，
+/// AX 正文为空时再由采集引擎截图并异步 OCR。
+pub async fn start_context_watcher(enabled: Arc<AtomicBool>, tx: mpsc::Sender<CaptureEvent>) {
+    info!(
+        interval_secs = CONTEXT_WATCH_INTERVAL_SECS,
+        "启动前台上下文变化监听器"
+    );
+    let mut ticker = interval(Duration::from_secs(CONTEXT_WATCH_INTERVAL_SECS));
+    let mut previous: Option<ObservedContext> = None;
+
+    loop {
+        ticker.tick().await;
+
+        if !enabled.load(Ordering::Relaxed) {
+            previous = None;
+            continue;
+        }
+
+        let Some(info) = get_frontmost_context_snapshot_async().await else {
+            continue;
+        };
+        let Some(mut current) = ObservedContext::from_ax_info(info) else {
+            continue;
+        };
+        if let Some(previous) = previous.as_ref() {
+            current.retain_transient_browser_metadata(previous);
+        }
+
+        let Some(event) = context_change_event(previous.as_ref(), &current) else {
+            previous = Some(current);
+            continue;
+        };
+
+        let asleep = is_display_asleep_async().await;
+        let avail_mb = get_available_memory_mb_async().await;
+        let mem_blocked = avail_mb
+            .map(|mb| mb < LOW_MEMORY_THRESHOLD_MB)
+            .unwrap_or(false);
+        let ax_tripped = super::ax::is_circuit_breaker_tripped();
+        if asleep || mem_blocked || ax_tripped {
+            warn!(
+                asleep,
+                avail_mb = ?avail_mb,
+                ax_tripped,
+                "变化采集门禁命中，本轮不推进上下文，5 秒后重试"
+            );
+            continue;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(1), tx.send(event)).await {
+            Ok(Ok(())) => previous = Some(current),
+            Ok(Err(_)) => {
+                info!("采集引擎已关闭，停止前台上下文变化监听器");
+                break;
+            }
+            Err(_) => warn!("发送前台上下文变化事件超时，下一轮重试"),
+        }
+    }
+}
 
 /// 启动事件监听器（自适应采集策略）
 ///
@@ -61,6 +218,7 @@ pub async fn start_listener(config: ListenerConfig, tx: mpsc::Sender<CaptureEven
     let base_interval = config.interval_secs.max(1);
     let mut current_interval = base_interval;
     let mut ticker = interval(Duration::from_secs(current_interval));
+    ticker.tick().await; // 消费 interval 创建后的立即 tick，避免启动瞬间触发采集。
 
     loop {
         ticker.tick().await;
@@ -126,7 +284,7 @@ pub async fn start_listener(config: ListenerConfig, tx: mpsc::Sender<CaptureEven
         }
 
         // 系统空闲时间检测
-        if let Ok(idle_secs) = get_system_idle_time_async().await {
+        if let Ok(idle_secs) = get_system_idle_time_secs().await {
             if idle_secs > config.idle_threshold_secs {
                 debug!("系统空闲 {} 秒，跳过本次采集", idle_secs);
                 continue;
@@ -159,7 +317,7 @@ async fn get_memory_pressure_async() -> MemoryPressure {
 }
 
 /// 获取系统空闲时间（异步版本）
-async fn get_system_idle_time_async() -> Result<u64, ()> {
+pub(crate) async fn get_system_idle_time_secs() -> Result<u64, ()> {
     tokio::task::spawn_blocking(get_system_idle_time)
         .await
         .map_err(|_| ())?
@@ -414,4 +572,82 @@ fn is_display_asleep() -> bool {
 #[cfg(not(target_os = "macos"))]
 fn is_display_asleep() -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_intervals_keep_five_second_watch_and_ninety_second_fallback() {
+        assert_eq!(CONTEXT_WATCH_INTERVAL_SECS, 5);
+        assert_eq!(ListenerConfig::default().interval_secs, 90);
+    }
+
+    fn context(app: &str, bundle_id: &str, url: Option<&str>) -> ObservedContext {
+        ObservedContext {
+            app_name: app.to_string(),
+            bundle_id: Some(bundle_id.to_string()),
+            win_title: Some("页面标题".to_string()),
+            url: url.map(ToString::to_string),
+            webpage_title: Some("页面标题".to_string()),
+        }
+    }
+
+    #[test]
+    fn initial_browser_context_emits_navigation() {
+        let current = context(
+            "Google Chrome",
+            "com.google.Chrome",
+            Some("https://example.com/a"),
+        );
+        let event = context_change_event(None, &current).unwrap();
+        assert!(matches!(event, CaptureEvent::BrowserNavigation { .. }));
+    }
+
+    #[test]
+    fn browser_url_change_emits_navigation_once() {
+        let previous = context(
+            "Google Chrome",
+            "com.google.Chrome",
+            Some("https://example.com/a"),
+        );
+        let current = context(
+            "Google Chrome",
+            "com.google.Chrome",
+            Some("https://example.com/b"),
+        );
+        assert!(matches!(
+            context_change_event(Some(&previous), &current),
+            Some(CaptureEvent::BrowserNavigation { .. })
+        ));
+        assert!(context_change_event(Some(&current), &current).is_none());
+    }
+
+    #[test]
+    fn app_change_without_url_emits_app_switch() {
+        let previous = context(
+            "Google Chrome",
+            "com.google.Chrome",
+            Some("https://example.com/a"),
+        );
+        let current = context("访达", "com.apple.finder", None);
+        assert!(matches!(
+            context_change_event(Some(&previous), &current),
+            Some(CaptureEvent::AppSwitch { .. })
+        ));
+    }
+
+    #[test]
+    fn transient_browser_metadata_failure_keeps_previous_url() {
+        let previous = context(
+            "Google Chrome",
+            "com.google.Chrome",
+            Some("https://example.com/a"),
+        );
+        let mut current = context("Google Chrome", "com.google.Chrome", None);
+        current.retain_transient_browser_metadata(&previous);
+        assert_eq!(current.url, previous.url);
+        assert!(context_change_event(Some(&previous), &current).is_none());
+    }
 }

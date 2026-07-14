@@ -52,6 +52,22 @@ def test_priority_order_p0_beats_p2(small_queue):
     assert order[4] == "P1-x"
 
 
+def test_is_idle_tracks_queued_and_running_tasks(small_queue):
+    assert small_queue.is_idle() is True
+
+    fut = small_queue.submit(Priority.P2, _delayed_factory([], "work", 0.1))
+    assert small_queue.is_idle() is False
+
+    fut.result(timeout=5)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if small_queue.is_idle():
+            break
+        time.sleep(0.01)
+
+    assert small_queue.is_idle() is True
+
+
 def test_per_priority_eviction_drops_oldest(small_queue):
     """同优先级超过 per_priority_limit 时，丢最老。"""
     order: list[str] = []

@@ -12,7 +12,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { convertFileSrc } from '@tauri-apps/api/core'
+import { invoke } from '@tauri-apps/api/core'
 import { ChevronDown, ExternalLink, Loader2 } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { useFetchRagHistory, useModelStatus, useRagQuery } from '../hooks/useApi'
@@ -20,6 +20,7 @@ import { fetchBillingBalance } from '../utils/authApi'
 import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
 import { BUILTIN_TEMPLATES, CATEGORY_COLORS, groupTemplatesByCategory } from '../data/taskTemplates'
 import ModelSelect from './ModelSelect'
+import { HistoryPagination, HistorySearch } from './HistoryBrowserControls'
 import { BreadAppIcon, BreadToolIcon } from './icons/BreadIcons'
 import type { RagContext, RagHistoryItem } from '../types'
 
@@ -29,6 +30,7 @@ interface RagPanelProps {
 }
 
 const GROUPED_TEMPLATES = groupTemplatesByCategory(BUILTIN_TEMPLATES)
+const HISTORY_PAGE_SIZE = 20
 
 type MarkdownBlock =
   | { type: 'markdown'; content: string }
@@ -158,6 +160,71 @@ const compactButtonStyle: React.CSSProperties = {
   fontWeight: 600,
 }
 
+const HistoryScreenshotThumbnail = ({
+  screenshotPath,
+  onPreview,
+}: {
+  screenshotPath: string
+  onPreview: (src: string) => void
+}) => {
+  const [src, setSrc] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    setSrc(null)
+    setFailed(false)
+
+    invoke<string>('read_floating_assist_image_data_url', { path: screenshotPath })
+      .then((dataUrl) => {
+        if (cancelled) return
+        if (dataUrl) {
+          setSrc(dataUrl)
+        } else {
+          setFailed(true)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [screenshotPath])
+
+  const openPreview = (event: React.MouseEvent | React.KeyboardEvent) => {
+    event.stopPropagation()
+    if (!src) return
+    onPreview(src)
+  }
+
+  return (
+    <span
+      role="button"
+      tabIndex={0}
+      className={`rag-panel__history-shot${failed ? ' rag-panel__history-shot--unavailable' : ''}`}
+      onClick={openPreview}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          openPreview(event)
+        }
+      }}
+      aria-label={src ? '查看悬浮球截屏' : failed ? '悬浮球截屏暂不可用' : '正在加载悬浮球截屏'}
+      aria-disabled={!src}
+    >
+      {src ? (
+        <img src={src} alt="悬浮球截屏缩略图" />
+      ) : (
+        <span className="rag-panel__history-shot-placeholder" aria-hidden="true">
+          {failed ? '截屏暂不可用' : '加载中'}
+        </span>
+      )}
+    </span>
+  )
+}
+
 const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   const {
     ragQuery,
@@ -179,6 +246,12 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   const [topTab, setTopTab] = useState<'consult' | 'history'>('consult')
   const [activeBottomTab, setActiveBottomTab] = useState<'references' | 'templates' | null>(null)
   const [ragHistory, setRagHistory] = useState<RagHistoryItem[]>([])
+  const [historyTotal, setHistoryTotal] = useState(0)
+  const [historyPage, setHistoryPage] = useState(1)
+  const [historySearch, setHistorySearch] = useState('')
+  const [debouncedHistorySearch, setDebouncedHistorySearch] = useState('')
+  const [historyLoading, setHistoryLoading] = useState(true)
+  const [historyError, setHistoryError] = useState<string | null>(null)
   const [copySuccess, setCopySuccess] = useState(false)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [screenshotPreview, setScreenshotPreview] = useState<string | null>(null)
@@ -253,13 +326,27 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
     }
   }, [])
 
-  const refreshHistory = useCallback(async () => {
+  const refreshHistory = useCallback(async (signal?: AbortSignal) => {
+    setHistoryLoading(true)
+    setHistoryError(null)
     try {
-      setRagHistory(await fetchRagHistory(20))
-    } catch {
+      const result = await fetchRagHistory({
+        limit: HISTORY_PAGE_SIZE,
+        offset: (historyPage - 1) * HISTORY_PAGE_SIZE,
+        query: debouncedHistorySearch,
+      }, signal)
+      if (signal?.aborted) return
+      setRagHistory(result.items)
+      setHistoryTotal(result.total)
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
       setRagHistory([])
+      setHistoryTotal(0)
+      setHistoryError('咨询记录加载失败，请稍后重试。')
+    } finally {
+      if (!signal?.aborted) setHistoryLoading(false)
     }
-  }, [fetchRagHistory])
+  }, [debouncedHistorySearch, fetchRagHistory, historyPage])
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -270,12 +357,16 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
       try {
         await doQuery(q)
         setActiveBottomTab('references')
-        void refreshHistory()
+        if (historyPage === 1) {
+          void refreshHistory()
+        } else {
+          setHistoryPage(1)
+        }
       } catch {
         // error is set in store by useRagQuery
       }
     },
-    [inputValue, setRagQuery, doQuery, refreshHistory]
+    [inputValue, setRagQuery, doQuery, historyPage, refreshHistory]
   )
 
   const handleTemplateClick = useCallback(
@@ -287,7 +378,17 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   )
 
   useEffect(() => {
-    void refreshHistory()
+    const timer = window.setTimeout(() => {
+      setHistoryPage(1)
+      setDebouncedHistorySearch(historySearch.trim())
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [historySearch])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void refreshHistory(controller.signal)
+    return () => controller.abort()
   }, [refreshHistory])
 
   useEffect(() => {
@@ -374,49 +475,50 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
     ),
   }
 
-  const renderHistoryList = (emptyClassName = 'rag-panel__bottom-empty') => (
-    ragHistory.length ? (
+  const renderHistoryList = () => {
+    if (historyLoading && ragHistory.length === 0) {
+      return <div className="history-browser__state">正在加载咨询记录…</div>
+    }
+    if (historyError) {
+      return (
+        <div className="history-browser__state history-browser__state--error" role="alert">
+          <span>{historyError}</span>
+          <button type="button" onClick={() => void refreshHistory()}>重新加载</button>
+        </div>
+      )
+    }
+    if (ragHistory.length === 0) {
+      return (
+        <div className="history-browser__state">
+          {debouncedHistorySearch ? '没有找到匹配的咨询记录。' : '暂无咨询记录。'}
+        </div>
+      )
+    }
+    return (
       <div className="rag-panel__history-list">
         {ragHistory.map((item) => {
           const shot = historyScreenshot(item)
-          const shotSrc = shot?.screenshot_path ? convertFileSrc(shot.screenshot_path) : ''
+          const shotPath = shot?.screenshot_path || ''
           return (
             <button key={item.id} className="rag-panel__history-item" onClick={() => handleRestoreHistory(item)}>
-              {shotSrc && (
-                <span
-                  role="button"
-                  tabIndex={0}
-                  className="rag-panel__history-shot"
-                  onClick={(event) => {
-                    event.stopPropagation()
-                    setScreenshotPreview(shotSrc)
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      event.preventDefault()
-                      event.stopPropagation()
-                      setScreenshotPreview(shotSrc)
-                    }
-                  }}
-                  aria-label="查看悬浮球截屏"
-                >
-                  <img src={shotSrc} alt="悬浮球截屏缩略图" />
-                </span>
+              {shotPath && (
+                <HistoryScreenshotThumbnail
+                  screenshotPath={shotPath}
+                  onPreview={setScreenshotPreview}
+                />
               )}
               <span className="rag-panel__history-main">
                 <span className="rag-panel__history-query">{item.query}</span>
                 <span className="rag-panel__history-meta">
-                  {formatTs(item.ts)} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latency_ms)} · {shotSrc ? '悬浮截屏 · ' : ''}{item.context_count} 条参考
+                  {formatTs(item.ts)} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latency_ms)} · {shotPath ? '悬浮截屏 · ' : ''}{item.context_count} 条参考
                 </span>
               </span>
             </button>
           )
         })}
       </div>
-    ) : (
-      <div className={emptyClassName}>暂无咨询记录。</div>
     )
-  )
+  }
 
   return (
     <div
@@ -428,7 +530,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
       <div className="rag-panel__top-tabs" data-testid="rag-panel-header">
         {([
           { key: 'consult', label: '咨询' },
-          { key: 'history', label: `咨询记录${ragHistory.length ? ` (${ragHistory.length})` : ''}` },
+          { key: 'history', label: `咨询记录${historyTotal ? ` (${historyTotal})` : ''}` },
         ] as const).map(({ key, label }) => (
           <button
             key={key}
@@ -443,7 +545,24 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
 
       {topTab === 'history' ? (
         <div className="rag-panel__history-page">
-          {renderHistoryList('rag-panel__history-empty')}
+          <HistorySearch
+            value={historySearch}
+            onChange={setHistorySearch}
+            placeholder="搜索问题或回答"
+            ariaLabel="搜索咨询记录"
+            total={historyTotal}
+            loading={historyLoading}
+          />
+          <div className="history-browser__list-scroll">
+            {renderHistoryList()}
+          </div>
+          <HistoryPagination
+            page={historyPage}
+            pageSize={HISTORY_PAGE_SIZE}
+            total={historyTotal}
+            loading={historyLoading}
+            onPageChange={setHistoryPage}
+          />
         </div>
       ) : (
         <>

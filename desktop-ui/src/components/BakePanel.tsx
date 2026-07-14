@@ -102,8 +102,20 @@ const mapBakeOverview = (data: BakeOverviewResponse): BakeOverview => {
 }
 
 const DAY_MS = 86_400_000
-const MAX_TREND_BUCKETS = 30
+const RECENT_DAILY_TREND_DAYS = 90
+const MAX_OLDER_TREND_BUCKETS = 30
 const OVERVIEW_TREND_LIMIT = 5000
+
+const startOfLocalDay = (timestamp: number) => {
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return 0
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
+}
+
+const addLocalDays = (dayStart: number, days: number) => {
+  const date = new Date(dayStart)
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days).getTime()
+}
 
 const formatTrendDate = (timestamp: number) => {
   const date = new Date(timestamp)
@@ -129,12 +141,9 @@ const buildLocalInventoryTrend = (sources: {
 
   if (timestamps.length === 0) return []
 
-  const minDay = Math.floor(Math.min(...timestamps) / DAY_MS) * DAY_MS
-  const maxDay = Math.floor(Math.max(...timestamps) / DAY_MS) * DAY_MS
-  const totalDays = Math.max(1, Math.floor((maxDay - minDay) / DAY_MS) + 1)
-  const bucketCount = Math.max(1, Math.min(MAX_TREND_BUCKETS, totalDays))
-  const daysPerBucket = Math.max(1, Math.ceil(totalDays / bucketCount))
-  const bucketMs = daysPerBucket * DAY_MS
+  const minDay = startOfLocalDay(Math.min(...timestamps))
+  const maxDay = startOfLocalDay(Math.max(...timestamps))
+  if (minDay <= 0 || maxDay <= 0) return []
 
   const countInBucket = (items: Array<{ createdAtMs?: number }>, startTs: number, endTs: number) => (
     items.filter(item => {
@@ -143,24 +152,46 @@ const buildLocalInventoryTrend = (sources: {
     }).length
   )
 
-  return Array.from({ length: bucketCount }, (_, index) => {
-    const startTs = minDay + index * bucketMs
-    const rawEndTs = index === bucketCount - 1 ? Number.POSITIVE_INFINITY : startTs + bucketMs
-    const endTs = Number.isFinite(rawEndTs) ? rawEndTs - 1 : startTs + bucketMs - 1
-    const label = daysPerBucket === 1
+  const buildBucket = (startTs: number, nextStartTs: number): BakeInventoryTrendBucket => {
+    const endTs = nextStartTs - 1
+    const label = nextStartTs <= addLocalDays(startTs, 1)
       ? formatTrendDate(startTs)
-      : `${formatTrendDate(startTs)}-${formatTrendDate(endTs)}`
+      : `${formatTrendDate(startTs)}-${formatTrendDate(addLocalDays(nextStartTs, -1))}`
 
     return {
       label,
       startTs,
       endTs,
-      memoryCount: countInBucket(sources.memories, startTs, rawEndTs),
-      knowledgeCount: countInBucket(sources.knowledge, startTs, rawEndTs),
-      templateCount: countInBucket(sources.templates, startTs, rawEndTs),
-      sopCount: countInBucket(sources.sops, startTs, rawEndTs),
+      memoryCount: countInBucket(sources.memories, startTs, nextStartTs),
+      knowledgeCount: countInBucket(sources.knowledge, startTs, nextStartTs),
+      templateCount: countInBucket(sources.templates, startTs, nextStartTs),
+      sopCount: countInBucket(sources.sops, startTs, nextStartTs),
     }
-  })
+  }
+
+  const buckets: BakeInventoryTrendBucket[] = []
+  const recentStartCandidate = addLocalDays(maxDay, 1 - RECENT_DAILY_TREND_DAYS)
+  const recentStartDay = Math.max(minDay, recentStartCandidate)
+
+  if (minDay < recentStartDay) {
+    const olderDays = Math.max(1, Math.round((recentStartDay - minDay) / DAY_MS))
+    const olderBucketCount = Math.max(1, Math.min(MAX_OLDER_TREND_BUCKETS, olderDays))
+    const olderDaysPerBucket = Math.max(1, Math.ceil(olderDays / olderBucketCount))
+
+    for (let startTs = minDay; startTs < recentStartDay;) {
+      const nextStartTs = Math.min(addLocalDays(startTs, olderDaysPerBucket), recentStartDay)
+      buckets.push(buildBucket(startTs, nextStartTs))
+      startTs = nextStartTs
+    }
+  }
+
+  for (let startTs = recentStartDay; startTs <= maxDay;) {
+    const nextStartTs = addLocalDays(startTs, 1)
+    buckets.push(buildBucket(startTs, nextStartTs))
+    startTs = nextStartTs
+  }
+
+  return buckets
 }
 
 const BakePanel: React.FC = () => {

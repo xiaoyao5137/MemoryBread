@@ -97,6 +97,17 @@ fn fallback_extractor_for_context(
     }
 }
 
+fn browser_identity_is_consistent(bundle_id: Option<&str>, app_name: Option<&str>) -> bool {
+    let normalized_name = app_name.unwrap_or_default().trim().to_ascii_lowercase();
+    match bundle_id {
+        Some("com.google.Chrome") | Some("com.google.Chrome.canary") => {
+            normalized_name.contains("chrome")
+        }
+        Some("com.apple.Safari") => normalized_name == "safari",
+        _ => true,
+    }
+}
+
 fn parse_keyed_quoted_value(raw: &str, key: &str) -> Option<String> {
     raw.lines().find_map(|line| {
         let line = line.trim();
@@ -245,6 +256,26 @@ pub fn is_circuit_breaker_tripped() -> bool {
     }
 }
 
+/// 读取轻量前台上下文：应用身份，以及浏览器处于前台时的 URL/标题。
+///
+/// 不遍历 AX 树、不读取页面正文，供高频变化监听使用。
+pub async fn get_frontmost_context_snapshot_async() -> Option<AXInfo> {
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        use std::time::Duration;
+
+        let task = tokio::task::spawn_blocking(macos_impl::get_frontmost_context_snapshot_macos);
+        match tokio::time::timeout(Duration::from_millis(1500), task).await {
+            Ok(Ok(info)) => info,
+            _ => None,
+        }
+    }
+    #[cfg(any(not(target_os = "macos"), test))]
+    {
+        None
+    }
+}
+
 /// 异步获取当前前台应用的 AX 信息（带超时保护）。
 ///
 /// 使用 spawn_blocking 避免阻塞 tokio 运行时，基础上下文与文本提取分阶段超时。
@@ -361,7 +392,7 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
 #[cfg(all(target_os = "macos", not(test)))]
 mod macos_impl {
     use super::{
-        fallback_extractor_for_context, parse_keyed_quoted_value,
+        browser_identity_is_consistent, fallback_extractor_for_context, parse_keyed_quoted_value,
         sanitize_extracted_text_with_reason, AXInfo, ExtractedText, TextExtractor,
         AX_CACHE_TTL_SECS, AX_SUPPORT_CACHE, EXTRACTED_TEXT_MAX_CHARS, GENERIC_ALL_UI_ITEM_LIMIT,
         GENERIC_FOCUS_MIN_CHARS, GENERIC_STATIC_ITEM_LIMIT, GENERIC_WINDOW_MIN_CHARS,
@@ -455,6 +486,79 @@ mod macos_impl {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    fn read_frontmost_app_identity() -> Option<(String, String, Option<String>)> {
+        let front = match run_lsappinfo(&["front"], "front_context") {
+            Ok(raw) => raw,
+            Err(err) => {
+                warn!("AX front app 查询失败: {}", err);
+                return None;
+            }
+        };
+
+        let asn = front.trim().to_string();
+        if asn.is_empty() {
+            warn!("AX front app 查询未返回 ASN");
+            return None;
+        }
+
+        let info_raw = match run_lsappinfo(
+            &["info", "-only", "bundleID", "-only", "name", &asn],
+            "front_context_info",
+        ) {
+            Ok(raw) => raw,
+            Err(err) => {
+                warn!(asn = %asn, "AX front app 信息查询失败: {}", err);
+                return None;
+            }
+        };
+
+        let app_name = parse_keyed_quoted_value(&info_raw, "LSDisplayName")?;
+        let app_bundle_id = parse_keyed_quoted_value(&info_raw, "CFBundleIdentifier");
+        if !browser_identity_is_consistent(app_bundle_id.as_deref(), Some(&app_name)) {
+            warn!(
+                app = %app_name,
+                bundle_id = ?app_bundle_id,
+                "前台浏览器身份不一致，丢弃本轮上下文快照"
+            );
+            return None;
+        }
+
+        Some((asn, app_name, app_bundle_id))
+    }
+
+    fn frontmost_context_is_stable(expected_asn: &str) -> bool {
+        match run_lsappinfo(&["front"], "front_context_verify") {
+            Ok(current) => current.trim() == expected_asn,
+            Err(_) => false,
+        }
+    }
+
+    pub fn get_frontmost_context_snapshot_macos() -> Option<AXInfo> {
+        let (asn, app_name, app_bundle_id) = read_frontmost_app_identity()?;
+        let is_browser = matches!(
+            fallback_extractor_for_context(app_bundle_id.as_deref(), Some(&app_name)),
+            Some(TextExtractor::Chrome | TextExtractor::Safari)
+        );
+        let (url, webpage_title) =
+            get_browser_page_metadata(app_bundle_id.as_deref(), Some(&app_name))
+                .map(|(url, title)| (Some(url), Some(title)))
+                .unwrap_or((None, None));
+
+        if is_browser && !frontmost_context_is_stable(&asn) {
+            debug!("轻量上下文读取期间前台应用发生变化，丢弃本轮快照");
+            return None;
+        }
+
+        Some(AXInfo {
+            app_name: Some(app_name),
+            app_bundle_id,
+            win_title: webpage_title.clone(),
+            url,
+            webpage_title,
+            ..Default::default()
+        })
+    }
+
     pub fn get_frontmost_info_macos() -> Option<AXInfo> {
         let mut info = get_frontmost_basic_info_macos()?;
         let app_name = info.app_name.clone();
@@ -532,38 +636,7 @@ end tell"#,
     }
 
     pub fn get_frontmost_basic_info_macos() -> Option<AXInfo> {
-        let front = match run_lsappinfo(&["front"], "front_context") {
-            Ok(raw) => raw,
-            Err(err) => {
-                warn!("AX front app 查询失败: {}", err);
-                return None;
-            }
-        };
-
-        let asn = front.trim();
-        if asn.is_empty() {
-            warn!(raw = %front, "AX front app 查询未返回 ASN");
-            return None;
-        }
-
-        let info_raw = match run_lsappinfo(
-            &["info", "-only", "bundleID", "-only", "name", asn],
-            "front_context_info",
-        ) {
-            Ok(raw) => raw,
-            Err(err) => {
-                warn!(asn = %asn, "AX front app 信息查询失败: {}", err);
-                return None;
-            }
-        };
-
-        let app_name = parse_keyed_quoted_value(&info_raw, "LSDisplayName");
-        let app_bundle_id = parse_keyed_quoted_value(&info_raw, "CFBundleIdentifier");
-
-        if app_name.is_none() {
-            warn!(raw = %info_raw, "AX front app 信息未返回有效 app_name");
-            return None;
-        }
+        let (asn, app_name, app_bundle_id) = read_frontmost_app_identity()?;
 
         let basic_script = r#"
             tell application "System Events"
@@ -596,12 +669,17 @@ end tell"#,
         };
 
         let (url, webpage_title) =
-            get_browser_page_metadata(app_bundle_id.as_deref(), app_name.as_deref())
+            get_browser_page_metadata(app_bundle_id.as_deref(), Some(&app_name))
                 .map(|(url, title)| (Some(url), Some(title)))
                 .unwrap_or((None, None));
 
+        if !frontmost_context_is_stable(&asn) {
+            debug!("完整上下文读取期间前台应用发生变化，丢弃本轮快照");
+            return None;
+        }
+
         Some(AXInfo {
-            app_name,
+            app_name: Some(app_name),
             app_bundle_id,
             win_title,
             url,
@@ -1156,6 +1234,26 @@ mod tests {
             fallback_extractor_for_context(Some("com.tencent.xinWeChat"), Some("Whatever")),
             Some(TextExtractor::WeChat)
         );
+    }
+
+    #[test]
+    fn test_browser_identity_consistency_rejects_cross_app_context() {
+        assert!(browser_identity_is_consistent(
+            Some("com.google.Chrome"),
+            Some("Google Chrome")
+        ));
+        assert!(!browser_identity_is_consistent(
+            Some("com.google.Chrome"),
+            Some("memory-bread-desktop")
+        ));
+        assert!(browser_identity_is_consistent(
+            Some("com.apple.Safari"),
+            Some("Safari")
+        ));
+        assert!(browser_identity_is_consistent(
+            Some("com.apple.finder"),
+            Some("访达")
+        ));
     }
 
     #[test]

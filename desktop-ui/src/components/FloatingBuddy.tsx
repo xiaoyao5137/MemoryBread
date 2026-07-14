@@ -73,9 +73,9 @@ const MENU_GROUPS: MenuGroup[] = [
         icon: 'capture'
       },
       {
-        mode: 'profile',
-        label: '画像',
-        testId: 'profile-btn',
+        mode: 'diary',
+        label: '日记',
+        testId: 'diary-btn',
         icon: 'profile'
       },
     ]

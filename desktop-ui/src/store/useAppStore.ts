@@ -273,6 +273,17 @@ const getBuildAdminApiBaseUrl = (): string | null => {
   }
 }
 
+const isTruthyEnvValue = (value?: string | null): boolean =>
+  ['1', 'true', 'yes', 'on', 'debug'].includes(String(value ?? '').trim().toLowerCase())
+
+const getStartupDebugModeEnabled = (): boolean => {
+  try {
+    return isTruthyEnvValue((import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_MEMORYBREAD_DEBUG_MODE)
+  } catch {
+    return false
+  }
+}
+
 const loadAuthSession = (): AuthSession | null => {
   try {
     const raw = safeLocalStorage?.getItem(AUTH_SESSION_KEY)
@@ -341,6 +352,8 @@ const initialCreationDraft: CreationDraft = {
 }
 
 const initialSession = loadAuthSession()
+const startupDebugModeEnabled = getStartupDebugModeEnabled()
+const initialLocalDebugModeEnabled = startupDebugModeEnabled && safeLocalStorage?.getItem(LOCAL_DEBUG_MODE_KEY) === 'true'
 
 const initialState = {
   windowMode:          'rag' as WindowMode,
@@ -393,17 +406,17 @@ const initialState = {
   pendingAction:       null,
   actionConfirmed:     false,
   apiBaseUrl:          'http://127.0.0.1:7070',
-  adminApiBaseUrl:     safeLocalStorage?.getItem(LOCAL_DEBUG_MODE_KEY) === 'true'
+  adminApiBaseUrl:     initialLocalDebugModeEnabled
     ? LOCAL_ADMIN_API_BASE_URL
     : safeLocalStorage?.getItem(ADMIN_API_BASE_URL_KEY) || getBuildAdminApiBaseUrl() || LOCAL_ADMIN_API_BASE_URL,
-  gatewayApiBaseUrl:   safeLocalStorage?.getItem(LOCAL_DEBUG_MODE_KEY) === 'true'
+  gatewayApiBaseUrl:   initialLocalDebugModeEnabled
     ? LOCAL_GATEWAY_API_BASE_URL
     : safeLocalStorage?.getItem(GATEWAY_API_BASE_URL_KEY) || LOCAL_GATEWAY_API_BASE_URL,
   sidecarVersion:      '0.1.0',
   accountType:         normalizeAccountType(initialSession?.user.roles.includes('platform_admin') ? 'platform_admin' : safeLocalStorage?.getItem(ACCOUNT_TYPE_KEY) || getBuildAccountType()),
   serviceEnvironment:  normalizeServiceEnvironment(safeLocalStorage?.getItem(SERVICE_ENVIRONMENT_KEY)),
-  debugModeEnabled:    safeLocalStorage?.getItem(DEBUG_MODE_KEY) === 'true',
-  localDebugModeEnabled: safeLocalStorage?.getItem(LOCAL_DEBUG_MODE_KEY) === 'true',
+  debugModeEnabled:    startupDebugModeEnabled,
+  localDebugModeEnabled: initialLocalDebugModeEnabled,
   authToken:           initialSession?.access_token ?? null,
   authExpiresAt:       initialSession?.expires_at ?? null,
   currentUser:         initialSession?.user ?? null,
@@ -609,11 +622,21 @@ export const useAppStore = create<AppState>((set) => ({
   },
 
   setDebugModeEnabled: (enabled) => {
-    safeLocalStorage?.setItem(DEBUG_MODE_KEY, String(enabled))
-    set({ debugModeEnabled: enabled })
+    const next = startupDebugModeEnabled && enabled
+    safeLocalStorage?.setItem(DEBUG_MODE_KEY, String(next))
+    if (!next) safeLocalStorage?.setItem(LOCAL_DEBUG_MODE_KEY, 'false')
+    set((state) => ({
+      debugModeEnabled: next,
+      localDebugModeEnabled: next ? state.localDebugModeEnabled : false,
+    }))
   },
 
   setLocalDebugModeEnabled: (enabled) => {
+    if (!startupDebugModeEnabled) {
+      safeLocalStorage?.setItem(LOCAL_DEBUG_MODE_KEY, 'false')
+      set({ localDebugModeEnabled: false })
+      return
+    }
     safeLocalStorage?.setItem(LOCAL_DEBUG_MODE_KEY, String(enabled))
     if (enabled) {
       set({

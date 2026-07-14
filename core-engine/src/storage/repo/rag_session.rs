@@ -93,17 +93,57 @@ impl StorageManager {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<RagSessionRecord>, StorageError> {
+        self.list_rag_sessions_page(None, limit, offset)
+            .map(|(records, _)| records)
+    }
+
+    /// 分页检索 RAG 会话；关键词同时匹配用户问题和模型回答。
+    pub fn list_rag_sessions_page(
+        &self,
+        query: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<RagSessionRecord>, usize), StorageError> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, ts, scene_type, user_query, retrieved_ids,
-                        prompt_used, llm_response, user_feedback, latency_ms, model
-                 FROM rag_sessions ORDER BY ts DESC LIMIT ?1 OFFSET ?2",
-            )?;
-            let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
-                Ok(row_to_rag_session(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(StorageError::Sqlite)
+            let query = query.map(str::trim).filter(|value| !value.is_empty());
+            if let Some(query) = query {
+                let predicate = "(instr(lower(COALESCE(user_query, '')), lower(?1)) > 0
+                                  OR instr(lower(COALESCE(llm_response, '')), lower(?1)) > 0)";
+                let total = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM rag_sessions WHERE {predicate}"),
+                    params![query],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT id, ts, scene_type, user_query, retrieved_ids,
+                            prompt_used, llm_response, user_feedback, latency_ms, model
+                     FROM rag_sessions WHERE {predicate}
+                     ORDER BY ts DESC, id DESC LIMIT ?2 OFFSET ?3"
+                ))?;
+                let rows = stmt.query_map(params![query, limit as i64, offset as i64], |row| {
+                    Ok(row_to_rag_session(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
+                })?;
+                let records = rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(StorageError::Sqlite)?;
+                Ok((records, total.max(0) as usize))
+            } else {
+                let total = conn.query_row("SELECT COUNT(*) FROM rag_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let mut stmt = conn.prepare(
+                    "SELECT id, ts, scene_type, user_query, retrieved_ids,
+                            prompt_used, llm_response, user_feedback, latency_ms, model
+                     FROM rag_sessions ORDER BY ts DESC, id DESC LIMIT ?1 OFFSET ?2",
+                )?;
+                let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
+                    Ok(row_to_rag_session(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
+                })?;
+                let records = rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(StorageError::Sqlite)?;
+                Ok((records, total.max(0) as usize))
+            }
         })
     }
 
@@ -248,5 +288,36 @@ mod tests {
 
         let feedback_list = mgr.list_rag_sessions_with_feedback(10).unwrap();
         assert_eq!(feedback_list.len(), 1);
+    }
+
+    #[test]
+    fn test_search_and_paginate_sessions() {
+        let mgr = make_mgr();
+        for (index, query) in ["年度规划", "项目复盘", "路线规划"].into_iter().enumerate()
+        {
+            let session = NewRagSession {
+                ts: 1_700_000_000_000 + index as i64,
+                user_query: query.into(),
+                llm_response: Some(
+                    if index == 1 {
+                        "包含年度目标"
+                    } else {
+                        "普通回答"
+                    }
+                    .into(),
+                ),
+                ..sample_session()
+            };
+            mgr.insert_rag_session(&session).unwrap();
+        }
+
+        let (first_page, total) = mgr.list_rag_sessions_page(Some("年度"), 1, 0).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(first_page.len(), 1);
+
+        let (second_page, total) = mgr.list_rag_sessions_page(Some("年度"), 1, 1).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(second_page.len(), 1);
+        assert_ne!(first_page[0].id, second_page[0].id);
     }
 }

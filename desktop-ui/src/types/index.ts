@@ -116,6 +116,13 @@ export interface RagHistoryItem {
   model?: string | null
 }
 
+export interface RagHistoryPage {
+  items: RagHistoryItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
 export interface DebugLogFile {
   key: string
   label: string
@@ -153,7 +160,7 @@ export interface ActionResult {
   action_id:   string
 }
 
-export type WindowMode = 'buddy' | 'rag' | 'creation' | 'knowledge' | 'models' | 'privacy' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake' | 'profile' | 'account'
+export type WindowMode = 'buddy' | 'rag' | 'creation' | 'knowledge' | 'models' | 'privacy' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake' | 'diary' | 'account'
 
 export type ServiceEnvironment = 'production' | 'staging'
 
@@ -220,9 +227,14 @@ export interface UpsertCloudDeviceRequest {
 export interface CloudSnapshot {
   id: string
   device_id: string
+  format_version?: number
+  schema_version?: number
+  encryption_version?: number
   encrypted_size: number
   status: string
   committed_at?: string | null
+  oss_object_key?: string | null
+  checksum_sha256?: string | null
 }
 
 export interface CompleteCloudSnapshotRequest {
@@ -233,6 +245,65 @@ export interface CompleteCloudSnapshotRequest {
   format_version: number
   schema_version: number
   encryption_version: number
+}
+
+export interface MemoryPackageTableSummary {
+  name: string
+  row_count: number
+  identity_columns: string[]
+}
+
+export interface MemoryPackageManifest {
+  app: string
+  format_version: number
+  schema_version: number
+  exported_at_ms: number
+  source_db_path: string
+  excluded_tables: string[]
+  excluded_capture_columns: string[]
+  table_summaries: MemoryPackageTableSummary[]
+  payload_sha256: string
+}
+
+export interface MemoryPackageExportResult {
+  path: string
+  file_sha256: string
+  file_size_bytes: number
+  manifest: MemoryPackageManifest
+}
+
+export interface MemoryPackageTableImportReport {
+  name: string
+  incoming: number
+  inserted: number
+  updated: number
+  skipped: number
+}
+
+export interface MemoryPackageImportReport {
+  file_sha256: string
+  payload_sha256: string
+  dry_run: boolean
+  capture_refs: MemoryPackageTableImportReport
+  tables: MemoryPackageTableImportReport[]
+}
+
+export interface CloudMemoryPackageBackupResult {
+  local_encrypted_path: string
+  generated_recovery_key_base64?: string | null
+  oss_object_key: string
+  checksum_sha256: string
+  encrypted_size: number
+  snapshot: CloudSnapshot
+}
+
+export interface CloudMemoryPackageRestoreResult {
+  local_encrypted_path: string
+  local_decrypted_path: string
+  checksum_sha256: string
+  encrypted_size: number
+  oss_object_key: string
+  import_report?: MemoryPackageImportReport | null
 }
 
 export type BakeTab = 'overview' | 'templates' | 'knowledge' | 'sop'
@@ -441,6 +512,32 @@ export interface MonitorOverview {
     by_caller:     { caller: string; total: number; calls: number }[]
     trend:         { ts: number; date: string; tokens: number; calls: number }[]
     trend_by_model:{ model: string; total: number; calls: number; trend: { ts: number; date: string; tokens: number; calls: number }[] }[]
+  }
+  ocr_backfill: {
+    submitted_total: number
+    completed_total: number
+    succeeded_total: number
+    failed_total: number
+    timed_out_total: number
+    empty_total: number
+    skipped_offline_total: number
+    skipped_backpressure_total: number
+    queued_count: number
+    in_progress_count: number
+    backlog_count: number
+    period_completed: number
+    period_succeeded: number
+    period_failed: number
+    period_timed_out: number
+    period_empty: number
+    period_skipped_offline: number
+    period_skipped_backpressure: number
+    period_success_rate: number
+    period_throughput_per_min: number
+    avg_latency_ms: number
+    last_submitted_at_ms: number | null
+    last_completed_at_ms: number | null
+    recent: { ts: number; status: string; latency_ms: number }[]
   }
   capture_flow: {
     today_count:              number

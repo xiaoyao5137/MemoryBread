@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
     AppSwitch,
+    BrowserNavigation,
     MouseClick,
     Scroll,
     KeyPause,
@@ -26,6 +27,7 @@ impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
             EventType::AppSwitch => "app_switch",
+            EventType::BrowserNavigation => "browser_navigation",
             EventType::MouseClick => "mouse_click",
             EventType::Scroll => "scroll",
             EventType::KeyPause => "key_pause",
@@ -40,6 +42,7 @@ impl TryFrom<&str> for EventType {
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
             "app_switch" => Ok(EventType::AppSwitch),
+            "browser_navigation" => Ok(EventType::BrowserNavigation),
             "mouse_click" => Ok(EventType::MouseClick),
             "scroll" => Ok(EventType::Scroll),
             "key_pause" => Ok(EventType::KeyPause),
@@ -363,5 +366,38 @@ pub struct NewUserProfile {
     pub snapshot_type: String,
     pub snapshot_date: String,
     pub content: String,
+    pub is_system_generated: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// diaries 表
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiaryRecord {
+    pub id: i64,
+    pub period_type: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub diary_date: String,
+    pub content: String,
+    pub source_timeline_ids: String,
+    pub source_diary_ids: String,
+    pub generation_status: String,
+    pub is_system_generated: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDiaryEntry {
+    pub period_type: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub diary_date: String,
+    pub content: String,
+    pub source_timeline_ids: String,
+    pub source_diary_ids: String,
+    pub generation_status: String,
     pub is_system_generated: bool,
 }

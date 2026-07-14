@@ -7,13 +7,16 @@
 //! - 引擎本身不包含事件监听逻辑（由 `listener` 模块或外部注入）
 //! - 这使得引擎在测试中可以完全脱离系统 API 运行
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::ipc::IpcClient;
@@ -23,11 +26,11 @@ use crate::storage::{
 };
 
 use super::{
-    ax::{get_frontmost_info_async, AXInfo},
+    ax::{get_frontmost_context_snapshot_async, get_frontmost_info_async, AXInfo},
     blacklist::BlacklistChecker,
     content_filter::ContentFilter,
     filter::PrivacyFilter,
-    screenshot::{capture_and_save, hamming_distance},
+    screenshot::{capture_and_save_async, hamming_distance},
     CaptureError,
 };
 
@@ -73,6 +76,14 @@ pub enum CaptureEvent {
         bundle_id: Option<String>,
         win_title: String,
     },
+    /// 浏览器前台标签页 URL 发生变化（触发完整 AX 采集，必要时截图并 OCR）
+    BrowserNavigation {
+        app_name: String,
+        bundle_id: Option<String>,
+        win_title: Option<String>,
+        url: String,
+        webpage_title: Option<String>,
+    },
     /// 鼠标点击（在新位置落点）
     MouseClick { x: f64, y: f64 },
     /// 键盘停顿（2 秒无按键）
@@ -82,7 +93,7 @@ pub enum CaptureEvent {
     },
     /// 页面/内容滚动
     Scroll,
-    /// 定时兜底采集（每 N 分钟触发）
+    /// 定时兜底采集（按配置触发，默认 90 秒）
     Periodic,
     /// 用户手动唤醒
     Manual,
@@ -93,6 +104,7 @@ impl CaptureEvent {
     pub fn to_event_type(&self) -> EventType {
         match self {
             CaptureEvent::AppSwitch { .. } => EventType::AppSwitch,
+            CaptureEvent::BrowserNavigation { .. } => EventType::BrowserNavigation,
             CaptureEvent::MouseClick { .. } => EventType::MouseClick,
             CaptureEvent::KeyPause { .. } => EventType::KeyPause,
             CaptureEvent::Scroll => EventType::Scroll,
@@ -112,8 +124,69 @@ impl CaptureEvent {
     /// 提取事件携带的应用名（AppSwitch 专用）。
     pub fn app_name(&self) -> Option<&str> {
         match self {
-            CaptureEvent::AppSwitch { app_name, .. } => Some(app_name),
+            CaptureEvent::AppSwitch { app_name, .. }
+            | CaptureEvent::BrowserNavigation { app_name, .. } => Some(app_name),
             _ => None,
+        }
+    }
+
+    /// 变化监听器随事件携带的可信前台上下文。
+    fn context_info(&self) -> Option<AXInfo> {
+        match self {
+            CaptureEvent::AppSwitch {
+                app_name,
+                bundle_id,
+                win_title,
+            } => Some(AXInfo {
+                app_name: Some(app_name.clone()),
+                app_bundle_id: bundle_id.clone(),
+                win_title: (!win_title.trim().is_empty()).then(|| win_title.clone()),
+                ..Default::default()
+            }),
+            CaptureEvent::BrowserNavigation {
+                app_name,
+                bundle_id,
+                win_title,
+                url,
+                webpage_title,
+            } => Some(AXInfo {
+                app_name: Some(app_name.clone()),
+                app_bundle_id: bundle_id.clone(),
+                win_title: win_title.clone(),
+                url: Some(url.clone()),
+                webpage_title: webpage_title.clone(),
+                ..Default::default()
+            }),
+            _ => None,
+        }
+    }
+
+    fn is_context_change_event(&self) -> bool {
+        matches!(
+            self,
+            CaptureEvent::AppSwitch { .. } | CaptureEvent::BrowserNavigation { .. }
+        )
+    }
+
+    fn matches_context(&self, actual: &AXInfo) -> bool {
+        let Some(expected) = self.context_info() else {
+            return true;
+        };
+
+        if !same_app_identity(&expected, actual) {
+            return false;
+        }
+
+        match self {
+            // 完整 AX 阶段偶尔拿不到 URL；此时先允许继续，并由采集后的轻量快照复核。
+            // 如果本阶段明确拿到了不同 URL，则立即丢弃过期事件。
+            CaptureEvent::BrowserNavigation { url, .. } => actual
+                .url
+                .as_deref()
+                .map(str::trim)
+                .map(|actual_url| actual_url == url.trim())
+                .unwrap_or(true),
+            _ => true,
         }
     }
 }
@@ -123,13 +196,16 @@ impl CaptureEvent {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// 核心采集引擎，协调所有采集步骤。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct CachedContext {
     app_name: Option<String>,
     app_bundle_id: Option<String>,
     win_title: Option<String>,
+    url: Option<String>,
+    webpage_title: Option<String>,
     focused_role: Option<String>,
     focused_id: Option<String>,
+    observed_at: Instant,
 }
 
 impl CachedContext {
@@ -142,19 +218,49 @@ impl CachedContext {
             app_name: info.app_name.clone(),
             app_bundle_id: info.app_bundle_id.clone(),
             win_title: info.win_title.clone(),
+            url: info.url.clone(),
+            webpage_title: info.webpage_title.clone(),
             focused_role: info.focused_role.clone(),
             focused_id: info.focused_id.clone(),
+            observed_at: Instant::now(),
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.observed_at.elapsed() <= Duration::from_secs(10)
+    }
+
+    fn matches_identity(&self, info: &AXInfo) -> bool {
+        match (self.app_bundle_id.as_deref(), info.app_bundle_id.as_deref()) {
+            (Some(cached), Some(current)) => cached == current,
+            _ => match (self.app_name.as_deref(), info.app_name.as_deref()) {
+                (Some(cached), Some(current)) => cached == current,
+                _ => false,
+            },
+        }
+    }
+
+    fn into_ax_info(self) -> AXInfo {
+        AXInfo {
+            app_name: self.app_name,
+            app_bundle_id: self.app_bundle_id,
+            win_title: self.win_title,
+            url: self.url,
+            webpage_title: self.webpage_title,
+            focused_role: self.focused_role,
+            focused_id: self.focused_id,
+            ..Default::default()
         }
     }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct PeriodicSceneKey {
+struct CaptureSceneKey {
     app_identity: String,
-    win_title: String,
+    page_identity: String,
 }
 
-impl PeriodicSceneKey {
+impl CaptureSceneKey {
     fn from_ax_info(info: &AXInfo) -> Option<Self> {
         let app_identity = info
             .app_bundle_id
@@ -165,23 +271,370 @@ impl PeriodicSceneKey {
             return None;
         }
 
-        let win_title = info.win_title.as_deref().unwrap_or("").trim();
+        let page_identity = info
+            .url
+            .as_deref()
+            .or(info.webpage_title.as_deref())
+            .or(info.win_title.as_deref())
+            .unwrap_or("")
+            .trim();
         Some(Self {
             app_identity: app_identity.to_string(),
-            win_title: win_title.to_string(),
+            page_identity: page_identity.to_string(),
         })
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RecentFrameFingerprint {
+#[derive(Debug, Clone)]
+struct RecentCaptureFingerprint {
     ts_ms: i64,
-    dhash: u64,
+    capture_id: i64,
+    ax_text_hash: Option<u64>,
+    dhash: Option<u64>,
+    screenshot_path: Option<String>,
 }
 
-const PERIODIC_DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
-const PERIODIC_DHASH_SKIP_DISTANCE: u32 = 1;
-const PERIODIC_MAX_RECENT_PER_SCENE: usize = 8;
+const CAPTURE_DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
+const CAPTURE_DHASH_SKIP_DISTANCE: u32 = 1;
+const CAPTURE_MAX_RECENT_PER_SCENE: usize = 8;
+const OCR_BACKFILL_TIMEOUT_SECS: u64 = 15;
+const OCR_BACKFILL_MAX_ATTEMPTS: usize = 3;
+const OCR_BACKFILL_MAX_PENDING: usize = 4;
+const OCR_BACKFILL_EVENT_HISTORY_LIMIT: usize = 50_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcrBackfillOutcome {
+    Success,
+    Empty,
+    Failed,
+    Timeout,
+    SkippedOffline,
+    SkippedBackpressure,
+}
+
+impl OcrBackfillOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Empty => "empty",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+            Self::SkippedOffline => "skipped_offline",
+            Self::SkippedBackpressure => "skipped_backpressure",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OcrBackfillEvent {
+    ts_ms: i64,
+    outcome: OcrBackfillOutcome,
+    latency_ms: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OcrBackfillMetricsSnapshot {
+    pub submitted_total: u64,
+    pub completed_total: u64,
+    pub succeeded_total: u64,
+    pub failed_total: u64,
+    pub timed_out_total: u64,
+    pub empty_total: u64,
+    pub skipped_offline_total: u64,
+    pub skipped_backpressure_total: u64,
+    pub queued_count: usize,
+    pub in_progress_count: usize,
+    pub backlog_count: usize,
+    pub period_completed: u64,
+    pub period_succeeded: u64,
+    pub period_failed: u64,
+    pub period_timed_out: u64,
+    pub period_empty: u64,
+    pub period_skipped_offline: u64,
+    pub period_skipped_backpressure: u64,
+    pub period_success_rate: f64,
+    pub period_throughput_per_min: f64,
+    pub avg_latency_ms: i64,
+    pub last_submitted_at_ms: Option<i64>,
+    pub last_completed_at_ms: Option<i64>,
+    pub recent: Vec<OcrBackfillRecentItem>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OcrBackfillRecentItem {
+    pub ts: i64,
+    pub status: String,
+    pub latency_ms: i64,
+}
+
+struct OcrBackfillMetrics {
+    submitted_total: AtomicU64,
+    completed_total: AtomicU64,
+    succeeded_total: AtomicU64,
+    failed_total: AtomicU64,
+    timed_out_total: AtomicU64,
+    empty_total: AtomicU64,
+    skipped_offline_total: AtomicU64,
+    skipped_backpressure_total: AtomicU64,
+    queued_count: AtomicUsize,
+    in_progress_count: AtomicUsize,
+    last_submitted_at_ms: AtomicI64,
+    last_completed_at_ms: AtomicI64,
+    events: Mutex<VecDeque<OcrBackfillEvent>>,
+}
+
+impl OcrBackfillMetrics {
+    fn new() -> Self {
+        Self {
+            submitted_total: AtomicU64::new(0),
+            completed_total: AtomicU64::new(0),
+            succeeded_total: AtomicU64::new(0),
+            failed_total: AtomicU64::new(0),
+            timed_out_total: AtomicU64::new(0),
+            empty_total: AtomicU64::new(0),
+            skipped_offline_total: AtomicU64::new(0),
+            skipped_backpressure_total: AtomicU64::new(0),
+            queued_count: AtomicUsize::new(0),
+            in_progress_count: AtomicUsize::new(0),
+            last_submitted_at_ms: AtomicI64::new(0),
+            last_completed_at_ms: AtomicI64::new(0),
+            events: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn record_submitted(&self, ts_ms: i64) {
+        self.submitted_total.fetch_add(1, Ordering::Relaxed);
+        self.queued_count.fetch_add(1, Ordering::Relaxed);
+        self.last_submitted_at_ms.store(ts_ms, Ordering::Relaxed);
+    }
+
+    fn record_started(&self) {
+        self.queued_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .ok();
+        self.in_progress_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_completed(&self, outcome: OcrBackfillOutcome, ts_ms: i64, latency_ms: i64) {
+        self.in_progress_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .ok();
+        self.completed_total.fetch_add(1, Ordering::Relaxed);
+        self.last_completed_at_ms.store(ts_ms, Ordering::Relaxed);
+
+        match outcome {
+            OcrBackfillOutcome::Success => {
+                self.succeeded_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::Empty => {
+                self.empty_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::Failed => {
+                self.failed_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::Timeout => {
+                self.timed_out_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::SkippedOffline => {
+                self.skipped_offline_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::SkippedBackpressure => {
+                self.skipped_backpressure_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if let Ok(mut events) = self.events.lock() {
+            events.push_back(OcrBackfillEvent {
+                ts_ms,
+                outcome,
+                latency_ms,
+            });
+            while events.len() > OCR_BACKFILL_EVENT_HISTORY_LIMIT {
+                events.pop_front();
+            }
+        }
+    }
+
+    fn record_skipped_without_queue(&self, outcome: OcrBackfillOutcome, ts_ms: i64) {
+        self.submitted_total.fetch_add(1, Ordering::Relaxed);
+        self.completed_total.fetch_add(1, Ordering::Relaxed);
+        self.last_submitted_at_ms.store(ts_ms, Ordering::Relaxed);
+        self.last_completed_at_ms.store(ts_ms, Ordering::Relaxed);
+        self.record_outcome_count(outcome);
+        self.push_event(OcrBackfillEvent {
+            ts_ms,
+            outcome,
+            latency_ms: 0,
+        });
+    }
+
+    fn record_aborted_before_start(&self, outcome: OcrBackfillOutcome, ts_ms: i64) {
+        self.queued_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .ok();
+        self.completed_total.fetch_add(1, Ordering::Relaxed);
+        self.last_completed_at_ms.store(ts_ms, Ordering::Relaxed);
+        self.record_outcome_count(outcome);
+        self.push_event(OcrBackfillEvent {
+            ts_ms,
+            outcome,
+            latency_ms: 0,
+        });
+    }
+
+    fn record_outcome_count(&self, outcome: OcrBackfillOutcome) {
+        match outcome {
+            OcrBackfillOutcome::Success => {
+                self.succeeded_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::Empty => {
+                self.empty_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::Failed => {
+                self.failed_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::Timeout => {
+                self.timed_out_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::SkippedOffline => {
+                self.skipped_offline_total.fetch_add(1, Ordering::Relaxed);
+            }
+            OcrBackfillOutcome::SkippedBackpressure => {
+                self.skipped_backpressure_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn push_event(&self, event: OcrBackfillEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push_back(event);
+            while events.len() > OCR_BACKFILL_EVENT_HISTORY_LIMIT {
+                events.pop_front();
+            }
+        }
+    }
+
+    fn snapshot(&self, range_ms: i64, now_ms: i64) -> OcrBackfillMetricsSnapshot {
+        let from_ms = now_ms.saturating_sub(range_ms.max(1));
+        let queued_count = self.queued_count.load(Ordering::Relaxed);
+        let in_progress_count = self.in_progress_count.load(Ordering::Relaxed);
+        let last_submitted = optional_ms(self.last_submitted_at_ms.load(Ordering::Relaxed));
+        let last_completed = optional_ms(self.last_completed_at_ms.load(Ordering::Relaxed));
+
+        let mut period_completed = 0u64;
+        let mut period_succeeded = 0u64;
+        let mut period_failed = 0u64;
+        let mut period_timed_out = 0u64;
+        let mut period_empty = 0u64;
+        let mut period_skipped_offline = 0u64;
+        let mut period_skipped_backpressure = 0u64;
+        let mut latency_total = 0i64;
+        let mut latency_count = 0i64;
+        let mut recent = Vec::new();
+
+        if let Ok(events) = self.events.lock() {
+            for event in events.iter().filter(|event| event.ts_ms >= from_ms) {
+                period_completed += 1;
+                match event.outcome {
+                    OcrBackfillOutcome::Success => period_succeeded += 1,
+                    OcrBackfillOutcome::Empty => period_empty += 1,
+                    OcrBackfillOutcome::Failed => period_failed += 1,
+                    OcrBackfillOutcome::Timeout => period_timed_out += 1,
+                    OcrBackfillOutcome::SkippedOffline => period_skipped_offline += 1,
+                    OcrBackfillOutcome::SkippedBackpressure => period_skipped_backpressure += 1,
+                }
+                if event.latency_ms > 0 {
+                    latency_total += event.latency_ms;
+                    latency_count += 1;
+                }
+            }
+            recent = events
+                .iter()
+                .rev()
+                .take(8)
+                .map(|event| OcrBackfillRecentItem {
+                    ts: event.ts_ms,
+                    status: event.outcome.as_str().to_string(),
+                    latency_ms: event.latency_ms,
+                })
+                .collect();
+        }
+
+        let denominator = period_succeeded
+            + period_failed
+            + period_timed_out
+            + period_empty
+            + period_skipped_offline
+            + period_skipped_backpressure;
+        let period_success_rate = if denominator > 0 {
+            period_succeeded as f64 * 100.0 / denominator as f64
+        } else {
+            0.0
+        };
+        let period_throughput_per_min = if range_ms > 0 {
+            period_completed as f64 / (range_ms as f64 / 60_000.0)
+        } else {
+            0.0
+        };
+        let avg_latency_ms = if latency_count > 0 {
+            latency_total / latency_count
+        } else {
+            0
+        };
+
+        OcrBackfillMetricsSnapshot {
+            submitted_total: self.submitted_total.load(Ordering::Relaxed),
+            completed_total: self.completed_total.load(Ordering::Relaxed),
+            succeeded_total: self.succeeded_total.load(Ordering::Relaxed),
+            failed_total: self.failed_total.load(Ordering::Relaxed),
+            timed_out_total: self.timed_out_total.load(Ordering::Relaxed),
+            empty_total: self.empty_total.load(Ordering::Relaxed),
+            skipped_offline_total: self.skipped_offline_total.load(Ordering::Relaxed),
+            skipped_backpressure_total: self.skipped_backpressure_total.load(Ordering::Relaxed),
+            queued_count,
+            in_progress_count,
+            backlog_count: queued_count + in_progress_count,
+            period_completed,
+            period_succeeded,
+            period_failed,
+            period_timed_out,
+            period_empty,
+            period_skipped_offline,
+            period_skipped_backpressure,
+            period_success_rate,
+            period_throughput_per_min,
+            avg_latency_ms,
+            last_submitted_at_ms: last_submitted,
+            last_completed_at_ms: last_completed,
+            recent,
+        }
+    }
+}
+
+fn ocr_metrics() -> &'static OcrBackfillMetrics {
+    static METRICS: OnceLock<OcrBackfillMetrics> = OnceLock::new();
+    METRICS.get_or_init(OcrBackfillMetrics::new)
+}
+
+fn optional_ms(value: i64) -> Option<i64> {
+    if value > 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+pub fn ocr_backfill_metrics_snapshot(range_ms: i64, now_ms: i64) -> OcrBackfillMetricsSnapshot {
+    ocr_metrics().snapshot(range_ms, now_ms)
+}
 
 pub struct CaptureEngine {
     storage: StorageManager,
@@ -190,7 +643,9 @@ pub struct CaptureEngine {
     blacklist: BlacklistChecker,
     ipc_client: Option<IpcClient>,
     last_context: Mutex<Option<CachedContext>>,
-    recent_periodic_frames: Mutex<HashMap<PeriodicSceneKey, VecDeque<RecentFrameFingerprint>>>,
+    recent_captures: Mutex<HashMap<CaptureSceneKey, VecDeque<RecentCaptureFingerprint>>>,
+    ocr_backfill_permits: Arc<Semaphore>,
+    ocr_backfill_queue_slots: Arc<Semaphore>,
 }
 
 impl CaptureEngine {
@@ -212,7 +667,9 @@ impl CaptureEngine {
             blacklist,
             ipc_client: Some(ipc_client),
             last_context: Mutex::new(None),
-            recent_periodic_frames: Mutex::new(HashMap::new()),
+            recent_captures: Mutex::new(HashMap::new()),
+            ocr_backfill_permits: Arc::new(Semaphore::new(1)),
+            ocr_backfill_queue_slots: Arc::new(Semaphore::new(OCR_BACKFILL_MAX_PENDING)),
         }
     }
 
@@ -238,29 +695,78 @@ impl CaptureEngine {
             blacklist,
             ipc_client: Some(ipc_client),
             last_context: Mutex::new(None),
-            recent_periodic_frames: Mutex::new(HashMap::new()),
+            recent_captures: Mutex::new(HashMap::new()),
+            ocr_backfill_permits: Arc::new(Semaphore::new(1)),
+            ocr_backfill_queue_slots: Arc::new(Semaphore::new(OCR_BACKFILL_MAX_PENDING)),
         }
     }
 
     // ── 主处理流程 ─────────────────────────────────────────────────────────
 
-    /// 处理一个采集事件：截图 + AX 抓取 + 隐私过滤 + DB 写入。
+    /// 处理一个采集事件：AX 抓取 + 必要时截图/OCR + 隐私过滤 + DB 写入。
     ///
-    /// 返回 `Ok(Some(id))`：已写入数据库的 capture id（含被过滤的记录）。
+    /// 返回 `Ok(Some(id))`：已写入数据库的 capture id；隐私拦截或重复内容返回 `Ok(None)`。
     pub async fn process_event(&self, event: CaptureEvent) -> Result<Option<i64>, CaptureError> {
-        let ts = current_ts_ms();
+        // 变化事件已携带可信应用身份，先做一次隐私门禁，避免对密码管理器等应用发起 AX 正文读取。
+        if let Some(context) = event.context_info() {
+            let blacklisted = self.blacklist.is_blacklisted_by_bundle_or_name(
+                context.app_bundle_id.as_deref(),
+                context.app_name.as_deref(),
+            );
+            let sensitive = self.filter.is_sensitive(
+                context.app_name.as_deref(),
+                context.app_bundle_id.as_deref(),
+                context.focused_role.as_deref(),
+                context.win_title.as_deref(),
+            );
+            if blacklisted || sensitive {
+                if blacklisted {
+                    self.record_blacklist_block(&context);
+                }
+                info!(
+                    event = ?event.to_event_type(),
+                    app = ?context.app_name,
+                    bundle_id = ?context.app_bundle_id,
+                    "变化事件命中隐私门禁，跳过 AX 正文读取"
+                );
+                return Ok(None);
+            }
+        }
 
-        // 1. 抓取 Accessibility 信息（异步 + 超时保护）
         let ax_info = if self.config.enable_ax {
             get_frontmost_info_async().await
         } else {
             None
         };
+        self.process_event_with_ax_info(event, ax_info, true).await
+    }
 
+    async fn process_event_with_ax_info(
+        &self,
+        event: CaptureEvent,
+        ax_info: Option<AXInfo>,
+        revalidate_context: bool,
+    ) -> Result<Option<i64>, CaptureError> {
+        let ts = current_ts_ms();
+        let is_context_change_event = event.is_context_change_event();
+        if is_context_change_event
+            && ax_info
+                .as_ref()
+                .is_some_and(|actual| !event.matches_context(actual))
+        {
+            debug!(
+                event = ?event.to_event_type(),
+                expected = ?event.context_info(),
+                actual = ?ax_info,
+                "变化事件处理时前台上下文已改变，丢弃过期事件"
+            );
+            return Ok(None);
+        }
         let ax_missing = ax_info.is_none();
+        let has_fresh_context = ax_info.is_some();
 
-        // 2. 合并事件携带的信息、AX 抓取结果和最近一次成功上下文
-        let merged = self.merge_ax_and_event(&event, ax_info);
+        // 变化事件的应用/URL 元数据优先，但保留本轮完整 AX 抓取到的正文与焦点信息。
+        let mut merged = self.merge_ax_and_event(&event, ax_info);
         let cache_hit = ax_missing
             && (merged.app_name.is_some()
                 || merged.win_title.is_some()
@@ -279,6 +785,12 @@ impl CaptureEngine {
             "AX 与上下文合并完成"
         );
 
+        // 即使随后命中隐私/应用黑名单，也要刷新内存中的当前应用身份。
+        // 否则下一次 AX 失败时可能回退到上一应用，造成跨应用上下文错配。
+        if has_fresh_context {
+            self.update_cached_context(&merged);
+        }
+
         // 3. 应用黑名单检测（优先级最高，快速跳过）
         if self.blacklist.is_blacklisted_by_bundle_or_name(
             merged.app_bundle_id.as_deref(),
@@ -289,23 +801,7 @@ impl CaptureEngine {
                 bundle_id = ?merged.app_bundle_id,
                 "应用在黑名单中，跳过采集"
             );
-            // 记录拦截统计。优先按 Bundle ID 归档，缺失时按应用名兜底。
-            let storage = self.storage.clone();
-            let stat_target = merged
-                .app_bundle_id
-                .clone()
-                .or_else(|| merged.app_name.clone());
-            if let Some(target_id) = stat_target {
-                tokio::spawn(async move {
-                    let _ = storage.with_conn(|conn| {
-                        crate::storage::repo::privacy::increment_block_stat(
-                            conn,
-                            "blacklist",
-                            &target_id,
-                        )
-                    });
-                });
-            }
+            self.record_blacklist_block(&merged);
             return Ok(None);
         }
 
@@ -332,124 +828,155 @@ impl CaptureEngine {
             return Ok(None);
         }
 
-        // 4. 截图 / periodic 去重策略
+        if revalidate_context
+            && is_context_change_event
+            && !self.context_still_matches(&event).await
+        {
+            debug!(
+                event = ?event.to_event_type(),
+                app = ?merged.app_name,
+                url = ?merged.url,
+                "正文抓取后前台上下文已改变，丢弃过期变化采集"
+            );
+            return Ok(None);
+        }
+
+        let ax_text_hash = meaningful_ax_text_hash(&merged);
+        if is_periodic_event
+            && ax_text_hash.is_some()
+            && self
+                .find_recent_duplicate(&merged, ts, ax_text_hash, None)
+                .is_some()
+        {
+            debug!(
+                event = ?event.to_event_type(),
+                app = ?merged.app_name,
+                url = ?merged.url,
+                "跳过入库：periodic_ax_text_duplicate"
+            );
+            return Ok(None);
+        }
+
+        // AX 正文优先：只有 AX 正文为空时才截图，并把截图交给后台 OCR。
         let mut screenshot_path = None;
         let mut screenshot_source: Option<String> = None;
-        let mut periodic_screenshot_dhash = None;
-        if is_periodic_event {
-            if has_ax_text {
-                debug!(event = ?event.to_event_type(), "跳过截图：periodic_ax_present_lightweight_mode");
-            } else if !self.config.enable_screenshot {
-                debug!(event = ?event.to_event_type(), "跳过入库：periodic_ax_missing_without_screenshot");
-                return Ok(None);
-            } else if let Some(result) =
-                capture_and_save(&self.config.captures_dir, self.config.screenshot_quality)?
+        let mut screenshot_dhash = None;
+        let mut duplicate_capture_id = None;
+        if !has_ax_text && self.config.enable_screenshot {
+            match capture_and_save_async(
+                self.config.captures_dir.clone(),
+                self.config.screenshot_quality,
+            )
+            .await
             {
-                let duplicate = self.should_skip_periodic_capture(&merged, ts, result.dhash);
-                if duplicate {
-                    delete_screenshot_file(&result.full_path);
-                    debug!(
-                        event = ?event.to_event_type(),
-                        path = %result.relative_path,
-                        "跳过入库：periodic_visual_duplicate"
-                    );
-                    return Ok(None);
-                }
+                Ok(Some(result)) => {
+                    if merged.app_name.as_deref().unwrap_or("").trim().is_empty() {
+                        merged.app_name = result.app_name.clone();
+                    }
+                    if merged.win_title.as_deref().unwrap_or("").trim().is_empty() {
+                        merged.win_title = result.window_title.clone();
+                    }
+                    if self.filter.is_sensitive(
+                        merged.app_name.as_deref(),
+                        merged.app_bundle_id.as_deref(),
+                        merged.focused_role.as_deref(),
+                        merged.win_title.as_deref(),
+                    ) {
+                        delete_screenshot_file(&result.full_path);
+                        error!(
+                            event = ?event.to_event_type(),
+                            app = ?merged.app_name,
+                            bundle_id = ?merged.app_bundle_id,
+                            focused_role = ?merged.focused_role,
+                            win_title = ?merged.win_title,
+                            reason = "sensitive_capture_after_screenshot_context",
+                            "capture dropped: sensitive metadata recovered from screenshot context"
+                        );
+                        return Ok(None);
+                    }
 
-                debug!(path = %result.relative_path, dhash = result.dhash, source = %result.source.as_str(), "periodic 截图已保存，等待 OCR 兜底");
-                periodic_screenshot_dhash = Some(result.dhash);
-                screenshot_path = Some(result.relative_path);
-                screenshot_source = Some(result.source.as_str().to_string());
-            } else {
-                debug!(event = ?event.to_event_type(), "跳过入库：periodic_ax_missing_without_screenshot_result");
-                return Ok(None);
-            }
-        } else if self.config.enable_screenshot {
-            match capture_and_save(&self.config.captures_dir, self.config.screenshot_quality)? {
-                Some(result) => {
-                    debug!(path = %result.relative_path, source = %result.source.as_str(), "截图已保存");
+                    if revalidate_context
+                        && is_context_change_event
+                        && !self.context_still_matches(&event).await
+                    {
+                        delete_screenshot_file(&result.full_path);
+                        debug!(
+                            event = ?event.to_event_type(),
+                            path = %result.relative_path,
+                            "截图后前台上下文已改变，删除错配截图"
+                        );
+                        return Ok(None);
+                    }
+
+                    let duplicate =
+                        self.find_recent_duplicate(&merged, ts, None, Some(result.dhash));
+                    if is_periodic_event && duplicate.is_some() {
+                        delete_screenshot_file(&result.full_path);
+                        debug!(
+                            event = ?event.to_event_type(),
+                            path = %result.relative_path,
+                            "跳过入库：periodic_visual_duplicate"
+                        );
+                        return Ok(None);
+                    }
+
+                    if let Some(previous) = duplicate.as_ref() {
+                        if let Some(previous_path) = previous.screenshot_path.as_deref() {
+                            let previous_full_path = self.config.captures_dir.join(previous_path);
+                            if replace_with_hard_link(&previous_full_path, &result.full_path) {
+                                duplicate_capture_id = Some(previous.capture_id);
+                                debug!(
+                                    capture_id = previous.capture_id,
+                                    path = %result.relative_path,
+                                    "变化采集视觉重复，复用已有截图数据块"
+                                );
+                            }
+                        }
+                    }
+
+                    debug!(
+                        path = %result.relative_path,
+                        dhash = result.dhash,
+                        source = %result.source.as_str(),
+                        "截图关键帧已保存"
+                    );
+                    screenshot_dhash = Some(result.dhash);
                     screenshot_path = Some(result.relative_path);
                     screenshot_source = Some(result.source.as_str().to_string());
                 }
-                None => {}
-            }
-        }
-
-        let mut ocr_text_for_insert: Option<String> = None;
-        if !has_ax_text {
-            if let Some(screenshot_rel_path) = screenshot_path.as_ref() {
-                if let Some(ref ipc_client) = self.ipc_client {
-                    if ipc_client.ping().await {
-                        let full_path = self.config.captures_dir.join(screenshot_rel_path);
-                        debug!(path = %screenshot_rel_path, "触发 OCR：ax_missing_pre_insert");
-                        match tokio::time::timeout(
-                            Duration::from_secs(15),
-                            tokio::task::spawn_blocking({
-                                let client = ipc_client.clone();
-                                let path = full_path.to_string_lossy().to_string();
-                                move || {
-                                    let mut last_err = None;
-                                    for attempt in 0..3 {
-                                        match client.call_ocr(0, &path) {
-                                            Ok(result) => return Ok(result),
-                                            Err(err) => {
-                                                last_err = Some(err);
-                                                if attempt < 2 {
-                                                    thread::sleep(Duration::from_millis(200));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(last_err.expect("OCR 重试失败但无错误信息"))
-                                }
-                            }),
-                        )
-                        .await
-                        {
-                            Ok(Ok(Ok(ocr_result))) => {
-                                let trimmed = ocr_result.text.trim().to_string();
-                                if trimmed.is_empty() {
-                                    warn!(
-                                        app = ?merged.app_name,
-                                        win_title = ?merged.win_title,
-                                        "OCR 返回空文本，等待本轮双空校验"
-                                    );
-                                } else {
-                                    ocr_text_for_insert = Some(trimmed);
-                                    debug!(
-                                        app = ?merged.app_name,
-                                        win_title = ?merged.win_title,
-                                        ocr_text_len = ocr_text_for_insert.as_ref().map(|t| t.len()),
-                                        "OCR 识别成功（入库前）"
-                                    );
-                                }
-                            }
-                            Ok(Ok(Err(e))) => {
-                                warn!(app = ?merged.app_name, "OCR 调用失败（入库前）: {}", e);
-                            }
-                            Ok(Err(e)) => {
-                                warn!(app = ?merged.app_name, "OCR 任务崩溃（入库前）: {:?}", e);
-                            }
-                            Err(_) => {
-                                warn!(app = ?merged.app_name, "OCR 超时（入库前，15 秒）");
-                            }
-                        }
-                    } else {
-                        debug!(app = ?merged.app_name, "跳过 OCR：sidecar_offline_pre_insert");
-                    }
-                } else {
-                    debug!(app = ?merged.app_name, "跳过 OCR：sidecar_unavailable_pre_insert");
+                Ok(None) => {
+                    debug!(event = ?event.to_event_type(), "跳过截图：screenshot_unavailable");
                 }
-            } else {
-                debug!(app = ?merged.app_name, "跳过 OCR：no_screenshot_pre_insert");
+                Err(error) => {
+                    if !has_ax_text && !has_input_text {
+                        return Err(error);
+                    }
+                    warn!(
+                        event = ?event.to_event_type(),
+                        app = ?merged.app_name,
+                        win_title = ?merged.win_title,
+                        %error,
+                        "截图失败，继续保存已有文本采集"
+                    );
+                }
             }
+        } else {
+            debug!(
+                event = ?event.to_event_type(),
+                has_ax_text,
+                screenshot_enabled = self.config.enable_screenshot,
+                "跳过截图：AX 正文已满足或截图已关闭"
+            );
         }
 
+        let ocr_text_for_insert = duplicate_capture_id
+            .and_then(|capture_id| self.storage.get_capture(capture_id).ok().flatten())
+            .and_then(|capture| capture.ocr_text)
+            .filter(|text| !text.trim().is_empty());
         if !has_ax_text
-            && ocr_text_for_insert
-                .as_deref()
-                .map(|text| text.trim().is_empty())
-                .unwrap_or(true)
+            && !has_input_text
+            && ocr_text_for_insert.is_none()
+            && screenshot_path.is_none()
         {
             error!(
                 event = ?event.to_event_type(),
@@ -457,7 +984,7 @@ impl CaptureEngine {
                 win_title = ?merged.win_title,
                 has_input_text,
                 has_ax_text,
-                screenshot_present = screenshot_path.is_some(),
+                screenshot_present = false,
                 reason = "empty_text_payload",
                 "capture dropped: empty_text_payload"
             );
@@ -475,13 +1002,30 @@ impl CaptureEngine {
             false,
         )?;
         self.update_cached_context(&merged);
-        if is_periodic_event {
-            if let (Some(scene_key), Some(dhash)) = (
-                PeriodicSceneKey::from_ax_info(&merged),
-                periodic_screenshot_dhash,
-            ) {
-                self.record_periodic_frame(scene_key, ts, dhash);
+        let mut ocr_backfill_enqueued = false;
+        if !has_ax_text {
+            if ocr_text_for_insert.is_none() {
+                if let Some(screenshot_rel_path) = screenshot_path.clone() {
+                    ocr_backfill_enqueued = self.enqueue_ocr_backfill(
+                        id,
+                        screenshot_rel_path,
+                        merged.app_name.clone(),
+                        merged.win_title.clone(),
+                    );
+                }
             }
+        }
+        if ax_text_hash.is_some() || screenshot_dhash.is_some() {
+            self.record_recent_capture(
+                &merged,
+                RecentCaptureFingerprint {
+                    ts_ms: ts,
+                    capture_id: id,
+                    ax_text_hash,
+                    dhash: screenshot_dhash,
+                    screenshot_path: screenshot_path.clone(),
+                },
+            );
         }
         debug!(
             id,
@@ -491,6 +1035,7 @@ impl CaptureEngine {
             ax_text_len = merged.extracted_text.as_ref().map(|t| t.len()),
             ocr_text_len = ocr_text_for_insert.as_ref().map(|t| t.len()),
             screenshot = screenshot_path.is_some(),
+            ocr_backfill_enqueued,
             "采集完成"
         );
 
@@ -517,19 +1062,33 @@ impl CaptureEngine {
 
     // ── 辅助方法 ──────────────────────────────────────────────────────────
 
-    /// 合并事件内置信息、AX 抓取结果与最近一次成功上下文。
+    /// 合并事件内置信息、完整 AX 抓取结果与最近一次成功上下文。
     ///
-    /// 优先级：事件显式字段 > 当前 AX 成功值 > 最近缓存值。
+    /// 事件显式的应用/页面身份优先；完整 AX 抓取到的正文和焦点信息必须保留。
+    /// 缓存只在应用身份一致时补空字段，避免跨应用上下文错配。
     fn merge_ax_and_event(&self, event: &CaptureEvent, ax: Option<AXInfo>) -> AXInfo {
         let cached = self
             .last_context
             .lock()
             .ok()
-            .and_then(|guard| guard.clone());
+            .and_then(|guard| guard.clone())
+            .filter(CachedContext::is_fresh);
 
-        let mut info = ax.unwrap_or_default();
+        let current_ax = ax;
+        let event_context = event.context_info();
+        let Some(mut info) = current_ax.or_else(|| event_context.clone()) else {
+            return cached.map(CachedContext::into_ax_info).unwrap_or_default();
+        };
 
-        if let Some(cached) = cached {
+        if let Some(event_context) = event_context {
+            info.app_name = event_context.app_name.or(info.app_name);
+            info.app_bundle_id = event_context.app_bundle_id.or(info.app_bundle_id);
+            info.win_title = event_context.win_title.or(info.win_title);
+            info.url = event_context.url.or(info.url);
+            info.webpage_title = event_context.webpage_title.or(info.webpage_title);
+        }
+
+        if let Some(cached) = cached.filter(|cached| cached.matches_identity(&info)) {
             if info.app_name.is_none() {
                 info.app_name = cached.app_name;
             }
@@ -539,6 +1098,12 @@ impl CaptureEngine {
             if info.win_title.is_none() {
                 info.win_title = cached.win_title;
             }
+            if info.url.is_none() {
+                info.url = cached.url;
+            }
+            if info.webpage_title.is_none() {
+                info.webpage_title = cached.webpage_title;
+            }
             if info.focused_role.is_none() {
                 info.focused_role = cached.focused_role;
             }
@@ -547,20 +1112,24 @@ impl CaptureEngine {
             }
         }
 
-        if let CaptureEvent::AppSwitch {
-            app_name,
-            bundle_id,
-            win_title,
-        } = event
-        {
-            info.app_name = Some(app_name.clone());
-            info.win_title = Some(win_title.clone());
-            if let Some(bid) = bundle_id {
-                info.app_bundle_id = Some(bid.clone());
-            }
+        info
+    }
+
+    async fn context_still_matches(&self, event: &CaptureEvent) -> bool {
+        if !event.is_context_change_event() {
+            return true;
         }
 
-        info
+        match get_frontmost_context_snapshot_async().await {
+            Some(actual) => event.matches_context(&actual),
+            None => {
+                debug!(
+                    event = ?event.to_event_type(),
+                    "前台上下文复核暂不可用，沿用完整 AX 阶段的一致性结果"
+                );
+                true
+            }
+        }
     }
 
     fn update_cached_context(&self, info: &AXInfo) {
@@ -574,31 +1143,66 @@ impl CaptureEngine {
         }
     }
 
-    fn should_skip_periodic_capture(&self, info: &AXInfo, ts: i64, dhash: u64) -> bool {
-        let Some(scene_key) = PeriodicSceneKey::from_ax_info(info) else {
-            return false;
-        };
+    fn record_blacklist_block(&self, info: &AXInfo) {
+        let storage = self.storage.clone();
+        let stat_target = info.app_bundle_id.clone().or_else(|| info.app_name.clone());
+        if let Some(target_id) = stat_target {
+            tokio::spawn(async move {
+                let _ = storage.with_conn(|conn| {
+                    crate::storage::repo::privacy::increment_block_stat(
+                        conn,
+                        "blacklist",
+                        &target_id,
+                    )
+                });
+            });
+        }
+    }
 
-        let Ok(mut guard) = self.recent_periodic_frames.lock() else {
-            return false;
+    fn find_recent_duplicate(
+        &self,
+        info: &AXInfo,
+        ts: i64,
+        ax_text_hash: Option<u64>,
+        dhash: Option<u64>,
+    ) -> Option<RecentCaptureFingerprint> {
+        let scene_key = CaptureSceneKey::from_ax_info(info)?;
+        let Ok(mut guard) = self.recent_captures.lock() else {
+            return None;
         };
 
         let entry = guard.entry(scene_key).or_default();
-        prune_recent_frames(entry, ts);
+        prune_recent_captures(entry, ts);
         entry
             .iter()
-            .any(|frame| hamming_distance(frame.dhash, dhash) <= PERIODIC_DHASH_SKIP_DISTANCE)
+            .rev()
+            .find(|capture| {
+                let same_ax = ax_text_hash.is_some()
+                    && capture.ax_text_hash.is_some()
+                    && ax_text_hash == capture.ax_text_hash;
+                let same_visual = match (dhash, capture.dhash) {
+                    (Some(current), Some(previous)) => {
+                        hamming_distance(current, previous) <= CAPTURE_DHASH_SKIP_DISTANCE
+                    }
+                    _ => false,
+                };
+                same_ax || same_visual
+            })
+            .cloned()
     }
 
-    fn record_periodic_frame(&self, scene_key: PeriodicSceneKey, ts: i64, dhash: u64) {
-        let Ok(mut guard) = self.recent_periodic_frames.lock() else {
+    fn record_recent_capture(&self, info: &AXInfo, capture: RecentCaptureFingerprint) {
+        let Some(scene_key) = CaptureSceneKey::from_ax_info(info) else {
+            return;
+        };
+        let Ok(mut guard) = self.recent_captures.lock() else {
             return;
         };
 
         let entry = guard.entry(scene_key).or_default();
-        prune_recent_frames(entry, ts);
-        entry.push_back(RecentFrameFingerprint { ts_ms: ts, dhash });
-        while entry.len() > PERIODIC_MAX_RECENT_PER_SCENE {
+        prune_recent_captures(entry, capture.ts_ms);
+        entry.push_back(capture);
+        while entry.len() > CAPTURE_MAX_RECENT_PER_SCENE {
             entry.pop_front();
         }
     }
@@ -664,6 +1268,123 @@ impl CaptureEngine {
         Ok(self.storage.insert_capture(&new_capture)?)
     }
 
+    fn enqueue_ocr_backfill(
+        &self,
+        capture_id: i64,
+        screenshot_rel_path: String,
+        app_name: Option<String>,
+        win_title: Option<String>,
+    ) -> bool {
+        let submitted_at_ms = current_ts_ms();
+        let Some(ipc_client) = self.ipc_client.clone() else {
+            debug!(capture_id, "跳过 OCR 后台补写：sidecar_unavailable");
+            ocr_metrics()
+                .record_skipped_without_queue(OcrBackfillOutcome::SkippedOffline, submitted_at_ms);
+            return false;
+        };
+
+        let Ok(queue_slot) = self.ocr_backfill_queue_slots.clone().try_acquire_owned() else {
+            warn!(
+                capture_id,
+                max_pending = OCR_BACKFILL_MAX_PENDING,
+                "跳过 OCR 后台补写：队列已满，保留截图等待后续兜底"
+            );
+            ocr_metrics().record_skipped_without_queue(
+                OcrBackfillOutcome::SkippedBackpressure,
+                submitted_at_ms,
+            );
+            return false;
+        };
+
+        ocr_metrics().record_submitted(submitted_at_ms);
+        let storage = self.storage.clone();
+        let captures_dir = self.config.captures_dir.clone();
+        let permits = self.ocr_backfill_permits.clone();
+
+        tokio::spawn(async move {
+            let _queue_slot = queue_slot;
+            let Ok(_permit) = permits.acquire_owned().await else {
+                warn!(capture_id, "OCR 后台补写获取限流许可失败");
+                ocr_metrics()
+                    .record_aborted_before_start(OcrBackfillOutcome::Failed, current_ts_ms());
+                return;
+            };
+            ocr_metrics().record_started();
+
+            if !ipc_client.ping().await {
+                debug!(capture_id, app = ?app_name, "跳过 OCR 后台补写：sidecar_offline");
+                ocr_metrics().record_completed(
+                    OcrBackfillOutcome::SkippedOffline,
+                    current_ts_ms(),
+                    0,
+                );
+                return;
+            }
+
+            let screenshot_path = captures_dir.join(&screenshot_rel_path);
+            let path_for_ocr = screenshot_path.to_string_lossy().to_string();
+            let started_at_ms = current_ts_ms();
+            debug!(
+                capture_id,
+                path = %screenshot_rel_path,
+                app = ?app_name,
+                win_title = ?win_title,
+                "OCR 后台补写开始"
+            );
+
+            match run_ocr_backfill(ipc_client, path_for_ocr).await {
+                Ok(Some((text, confidence))) => {
+                    let completed_at_ms = current_ts_ms();
+                    let (filtered_text, pii_scrubbed) = filter_ocr_text_for_update(&storage, text);
+                    if let Err(error) =
+                        storage.update_ocr_text(capture_id, &filtered_text, confidence)
+                    {
+                        warn!(capture_id, %error, "OCR 后台补写失败：数据库更新失败");
+                        ocr_metrics().record_completed(
+                            OcrBackfillOutcome::Failed,
+                            completed_at_ms,
+                            completed_at_ms.saturating_sub(started_at_ms),
+                        );
+                        return;
+                    }
+                    if pii_scrubbed {
+                        let _ = storage.mark_pii_scrubbed(capture_id);
+                    }
+                    ocr_metrics().record_completed(
+                        OcrBackfillOutcome::Success,
+                        completed_at_ms,
+                        completed_at_ms.saturating_sub(started_at_ms),
+                    );
+                    debug!(
+                        capture_id,
+                        text_len = filtered_text.chars().count(),
+                        pii_scrubbed,
+                        "OCR 后台补写完成"
+                    );
+                }
+                Ok(None) => {
+                    debug!(capture_id, "OCR 后台补写返回空文本");
+                    let completed_at_ms = current_ts_ms();
+                    ocr_metrics().record_completed(
+                        OcrBackfillOutcome::Empty,
+                        completed_at_ms,
+                        completed_at_ms.saturating_sub(started_at_ms),
+                    );
+                }
+                Err(error) => {
+                    warn!(capture_id, %error, "OCR 后台补写失败");
+                    let completed_at_ms = current_ts_ms();
+                    ocr_metrics().record_completed(
+                        classify_ocr_backfill_error(&error),
+                        completed_at_ms,
+                        completed_at_ms.saturating_sub(started_at_ms),
+                    );
+                }
+            }
+        });
+        true
+    }
+
     fn filter_optional_text(
         &self,
         content_filter: &Option<ContentFilter>,
@@ -716,19 +1437,131 @@ fn has_meaningful_input_text(event: &CaptureEvent) -> bool {
         .unwrap_or(false)
 }
 
-fn prune_recent_frames(frames: &mut VecDeque<RecentFrameFingerprint>, now_ts: i64) {
-    while let Some(front) = frames.front() {
-        if now_ts - front.ts_ms > PERIODIC_DEDUP_WINDOW_MS {
-            frames.pop_front();
+fn meaningful_ax_text_hash(info: &AXInfo) -> Option<u64> {
+    let text = info.extracted_text.as_deref()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn same_app_identity(expected: &AXInfo, actual: &AXInfo) -> bool {
+    match (
+        expected.app_bundle_id.as_deref(),
+        actual.app_bundle_id.as_deref(),
+    ) {
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => match (expected.app_name.as_deref(), actual.app_name.as_deref()) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => false,
+        },
+    }
+}
+
+fn prune_recent_captures(captures: &mut VecDeque<RecentCaptureFingerprint>, now_ts: i64) {
+    while let Some(front) = captures.front() {
+        if now_ts - front.ts_ms > CAPTURE_DEDUP_WINDOW_MS {
+            captures.pop_front();
         } else {
             break;
         }
     }
 }
 
+fn replace_with_hard_link(existing: &std::path::Path, target: &std::path::Path) -> bool {
+    if !existing.is_file() || !target.is_file() {
+        return false;
+    }
+    let temp_link = target.with_extension("dedup-link");
+    if std::fs::hard_link(existing, &temp_link).is_err() {
+        return false;
+    }
+    if std::fs::remove_file(target).is_err() {
+        let _ = std::fs::remove_file(&temp_link);
+        return false;
+    }
+    if std::fs::rename(&temp_link, target).is_ok() {
+        true
+    } else {
+        let restored = std::fs::hard_link(existing, target).is_ok();
+        let _ = std::fs::remove_file(&temp_link);
+        restored
+    }
+}
+
 fn delete_screenshot_file(path: &std::path::Path) {
     if let Err(err) = std::fs::remove_file(path) {
         warn!(path = ?path, "删除去重截图失败: {}", err);
+    }
+}
+
+async fn run_ocr_backfill(
+    ipc_client: IpcClient,
+    path_for_ocr: String,
+) -> Result<Option<(String, f32)>, String> {
+    match tokio::time::timeout(
+        Duration::from_secs(OCR_BACKFILL_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            let mut last_err = None;
+            for attempt in 0..OCR_BACKFILL_MAX_ATTEMPTS {
+                match ipc_client.call_ocr(0, &path_for_ocr) {
+                    Ok(result) => return Ok(result),
+                    Err(err) => {
+                        last_err = Some(err);
+                        if attempt + 1 < OCR_BACKFILL_MAX_ATTEMPTS {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                }
+            }
+            Err(last_err
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "OCR 重试失败但无错误信息".to_string()))
+        }),
+    )
+    .await
+    {
+        Ok(Ok(Ok(result))) => {
+            let trimmed = result.text.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some((trimmed, result.confidence as f32)))
+            }
+        }
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(error)) => Err(format!("OCR 后台任务崩溃: {error}")),
+        Err(_) => Err(format!(
+            "OCR 后台任务超时（{} 秒）",
+            OCR_BACKFILL_TIMEOUT_SECS
+        )),
+    }
+}
+
+fn filter_ocr_text_for_update(storage: &StorageManager, text: String) -> (String, bool) {
+    let content_filter = ContentFilter::from_storage(storage);
+    let result = content_filter.filter_text(&text);
+    if result.redacted_count == 0 {
+        return (text, false);
+    }
+
+    for filter_type in &result.hit_types {
+        let _ = storage.with_conn(|conn| {
+            crate::storage::repo::privacy::increment_block_stat(conn, "filter", filter_type)
+        });
+    }
+
+    (result.text, true)
+}
+
+fn classify_ocr_backfill_error(error: &str) -> OcrBackfillOutcome {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") || error.contains("超时") {
+        OcrBackfillOutcome::Timeout
+    } else {
+        OcrBackfillOutcome::Failed
     }
 }
 
@@ -842,7 +1675,9 @@ mod tests {
             enable_ax: false,
             ..Default::default()
         };
-        CaptureEngine::new(storage, config)
+        let mut engine = CaptureEngine::new(storage, config);
+        engine.ipc_client = None;
+        engine
     }
 
     fn make_engine_with_screenshot() -> CaptureEngine {
@@ -853,7 +1688,9 @@ mod tests {
             enable_ax: false,
             ..Default::default()
         };
-        CaptureEngine::new(storage, config)
+        let mut engine = CaptureEngine::new(storage, config);
+        engine.ipc_client = None;
+        engine
     }
 
     fn make_minimal_privacy_engine() -> CaptureEngine {
@@ -923,7 +1760,9 @@ mod tests {
             enable_ax: false,
             ..Default::default()
         };
-        CaptureEngine::new(storage, config)
+        let mut engine = CaptureEngine::new(storage, config);
+        engine.ipc_client = None;
+        engine
     }
 
     fn gradient_image(offset: u8) -> DynamicImage {
@@ -1028,56 +1867,141 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_app_switch_without_payload_skips_insert() {
-        let engine = make_engine();
+    async fn test_app_switch_full_capture_stores_ax_text_without_screenshot() {
+        let engine = make_engine_with_screenshot();
+        let event = CaptureEvent::AppSwitch {
+            app_name: "Feishu".into(),
+            bundle_id: Some("com.feishu.feishu".into()),
+            win_title: "工作群".into(),
+        };
+        let id = engine
+            .process_event_with_ax_info(
+                event,
+                Some(AXInfo {
+                    app_name: Some("Feishu".into()),
+                    app_bundle_id: Some("com.feishu.feishu".into()),
+                    win_title: Some("工作群".into()),
+                    extracted_text: Some("项目同步中".into()),
+                    ..Default::default()
+                }),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let record = engine.storage.get_capture(id).unwrap().unwrap();
+        assert_eq!(record.event_type, "app_switch");
+        assert_eq!(record.app_name.as_deref(), Some("Feishu"));
+        assert_eq!(record.win_title.as_deref(), Some("工作群"));
+        assert!(record.screenshot_path.is_none());
+        assert_eq!(record.ax_text.as_deref(), Some("项目同步中"));
+        assert!(record.ocr_text.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_browser_navigation_full_capture_stores_ax_text_without_screenshot() {
+        let engine = make_engine_with_screenshot();
+        let event = CaptureEvent::BrowserNavigation {
+            app_name: "Google Chrome".into(),
+            bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("Example".into()),
+            url: "https://example.com/page".into(),
+            webpage_title: Some("Example".into()),
+        };
+        let id = engine
+            .process_event_with_ax_info(
+                event,
+                Some(AXInfo {
+                    app_name: Some("Google Chrome".into()),
+                    app_bundle_id: Some("com.google.Chrome".into()),
+                    win_title: Some("Example".into()),
+                    url: Some("https://example.com/page".into()),
+                    webpage_title: Some("Example".into()),
+                    extracted_text: Some("Example 正文".into()),
+                    ..Default::default()
+                }),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let record = engine.storage.get_capture(id).unwrap().unwrap();
+        assert_eq!(record.event_type, "browser_navigation");
+        assert_eq!(record.url.as_deref(), Some("https://example.com/page"));
+        assert_eq!(record.webpage_title.as_deref(), Some("Example"));
+        assert_eq!(record.ax_text.as_deref(), Some("Example 正文"));
+        assert!(record.screenshot_path.is_none());
+        assert!(record.ocr_text.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_browser_navigation_without_ax_text_uses_screenshot_for_ocr() {
+        clear_test_screenshots();
+        let engine = make_engine_with_screenshot();
+        push_test_screenshot_from_image(&gradient_image(0));
+        let id = engine
+            .process_event_with_ax_info(
+                CaptureEvent::BrowserNavigation {
+                    app_name: "Google Chrome".into(),
+                    bundle_id: Some("com.google.Chrome".into()),
+                    win_title: Some("Canvas App".into()),
+                    url: "https://example.com/canvas".into(),
+                    webpage_title: Some("Canvas App".into()),
+                },
+                Some(AXInfo {
+                    app_name: Some("Google Chrome".into()),
+                    app_bundle_id: Some("com.google.Chrome".into()),
+                    win_title: Some("Canvas App".into()),
+                    url: Some("https://example.com/canvas".into()),
+                    webpage_title: Some("Canvas App".into()),
+                    ..Default::default()
+                }),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let rec = engine.storage.get_capture(id).unwrap().unwrap();
+        assert_eq!(rec.event_type, "browser_navigation");
+        assert!(rec.ax_text.is_none());
+        assert!(rec.screenshot_path.is_some());
+        assert!(rec.ocr_text.is_none(), "OCR 应后台补写，不阻塞变化采集");
+    }
+
+    #[tokio::test]
+    async fn test_stale_browser_navigation_is_dropped_before_insert() {
+        let engine = make_engine_with_screenshot();
         let result = engine
-            .process_event(CaptureEvent::AppSwitch {
-                app_name: "Feishu".into(),
-                bundle_id: Some("com.feishu.feishu".into()),
-                win_title: "工作群".into(),
-            })
+            .process_event_with_ax_info(
+                CaptureEvent::BrowserNavigation {
+                    app_name: "Google Chrome".into(),
+                    bundle_id: Some("com.google.Chrome".into()),
+                    win_title: Some("Old Page".into()),
+                    url: "https://example.com/old".into(),
+                    webpage_title: Some("Old Page".into()),
+                },
+                Some(AXInfo {
+                    app_name: Some("Google Chrome".into()),
+                    app_bundle_id: Some("com.google.Chrome".into()),
+                    win_title: Some("New Page".into()),
+                    url: Some("https://example.com/new".into()),
+                    extracted_text: Some("新页面正文".into()),
+                    ..Default::default()
+                }),
+                false,
+            )
             .await
             .unwrap();
 
         assert!(result.is_none());
-        let list = engine.storage.list_captures(&CaptureFilter::new()).unwrap();
-        assert!(list.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_app_switch_with_ax_text_stores_app_info() {
-        let engine = make_engine();
-        let ts = current_ts_ms();
-        let ax = AXInfo {
-            app_name: Some("Feishu".into()),
-            app_bundle_id: Some("com.feishu.feishu".into()),
-            win_title: Some("工作群".into()),
-            extracted_text: Some("项目同步中".into()),
-            ..Default::default()
-        };
-
-        let id = engine
-            .save_capture(
-                ts,
-                &ax,
-                &CaptureEvent::AppSwitch {
-                    app_name: "Feishu".into(),
-                    bundle_id: Some("com.feishu.feishu".into()),
-                    win_title: "工作群".into(),
-                },
-                None,
-                None,
-                None,
-                false,
-            )
-            .unwrap();
-
-        let rec = engine.storage.get_capture(id).unwrap().unwrap();
-        assert_eq!(rec.event_type, "app_switch");
-        assert_eq!(rec.app_name.as_deref(), Some("Feishu"));
-        assert_eq!(rec.app_bundle_id.as_deref(), Some("com.feishu.feishu"));
-        assert_eq!(rec.win_title.as_deref(), Some("工作群"));
-        assert_eq!(rec.ax_text.as_deref(), Some("项目同步中"));
+        assert!(engine
+            .storage
+            .list_captures(&CaptureFilter::new())
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1101,9 +2025,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_periodic_with_ax_text_stays_lightweight() {
+    async fn test_periodic_with_ax_text_skips_screenshot() {
         let engine = make_engine_with_screenshot();
-        let ts = current_ts_ms();
         let ax = AXInfo {
             app_name: Some("Chrome".into()),
             app_bundle_id: Some("com.google.Chrome".into()),
@@ -1113,7 +2036,9 @@ mod tests {
         };
 
         let id = engine
-            .save_capture(ts, &ax, &CaptureEvent::Periodic, None, None, None, false)
+            .process_event_with_ax_info(CaptureEvent::Periodic, Some(ax), false)
+            .await
+            .unwrap()
             .unwrap();
         let rec = engine.storage.get_capture(id).unwrap().unwrap();
         assert_eq!(rec.event_type, "auto");
@@ -1160,6 +2085,7 @@ mod tests {
         assert_eq!(rec.event_type, "auto");
         assert!(rec.screenshot_path.is_some());
         assert!(rec.ax_text.is_none());
+        assert!(rec.ocr_text.is_none(), "OCR 应后台补写，不阻塞本轮采集");
     }
 
     #[tokio::test]
@@ -1213,15 +2139,24 @@ mod tests {
             win_title: Some("Doc".into()),
             ..Default::default()
         };
-        let scene_key = PeriodicSceneKey::from_ax_info(&info).unwrap();
         let now = current_ts_ms();
 
-        engine.record_periodic_frame(scene_key.clone(), now, 0);
-        assert!(engine.should_skip_periodic_capture(&info, now, 1));
-        assert!(!engine.should_skip_periodic_capture(&info, now, 3));
-
-        engine.record_periodic_frame(scene_key, now - PERIODIC_DEDUP_WINDOW_MS - 1, 0);
-        assert!(!engine.should_skip_periodic_capture(&info, now, 3));
+        engine.record_recent_capture(
+            &info,
+            RecentCaptureFingerprint {
+                ts_ms: now,
+                capture_id: 1,
+                ax_text_hash: None,
+                dhash: Some(0),
+                screenshot_path: Some("screenshots/a.webp".into()),
+            },
+        );
+        assert!(engine
+            .find_recent_duplicate(&info, now, None, Some(1))
+            .is_some());
+        assert!(engine
+            .find_recent_duplicate(&info, now, None, Some(3))
+            .is_none());
     }
 
     #[test]
@@ -1233,11 +2168,21 @@ mod tests {
             win_title: Some("Doc".into()),
             ..Default::default()
         };
-        let scene_key = PeriodicSceneKey::from_ax_info(&info).unwrap();
         let now = current_ts_ms();
 
-        engine.record_periodic_frame(scene_key, now - PERIODIC_DEDUP_WINDOW_MS - 10, 0);
-        assert!(!engine.should_skip_periodic_capture(&info, now, 0));
+        engine.record_recent_capture(
+            &info,
+            RecentCaptureFingerprint {
+                ts_ms: now - CAPTURE_DEDUP_WINDOW_MS - 10,
+                capture_id: 1,
+                ax_text_hash: None,
+                dhash: Some(0),
+                screenshot_path: Some("screenshots/a.webp".into()),
+            },
+        );
+        assert!(engine
+            .find_recent_duplicate(&info, now, None, Some(0))
+            .is_none());
     }
 
     #[test]
@@ -1257,14 +2202,39 @@ mod tests {
         };
         let now = current_ts_ms();
 
-        engine.record_periodic_frame(PeriodicSceneKey::from_ax_info(&chrome).unwrap(), now, 0);
-        assert!(!engine.should_skip_periodic_capture(&safari, now, 0));
+        engine.record_recent_capture(
+            &chrome,
+            RecentCaptureFingerprint {
+                ts_ms: now,
+                capture_id: 1,
+                ax_text_hash: None,
+                dhash: Some(0),
+                screenshot_path: Some("screenshots/a.webp".into()),
+            },
+        );
+        assert!(engine
+            .find_recent_duplicate(&safari, now, None, Some(0))
+            .is_none());
+    }
+
+    #[test]
+    fn test_ocr_backpressure_is_visible_in_metrics() {
+        let metrics = OcrBackfillMetrics::new();
+        let now = current_ts_ms();
+        metrics.record_skipped_without_queue(OcrBackfillOutcome::SkippedBackpressure, now);
+
+        let snapshot = metrics.snapshot(60_000, now);
+        assert_eq!(snapshot.submitted_total, 1);
+        assert_eq!(snapshot.completed_total, 1);
+        assert_eq!(snapshot.skipped_backpressure_total, 1);
+        assert_eq!(snapshot.period_skipped_backpressure, 1);
+        assert_eq!(snapshot.recent[0].status, "skipped_backpressure");
     }
 
     // ── 隐私过滤 ──────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_blocked_app_records_sensitive_row() {
+    async fn test_blocked_app_is_dropped_before_capture() {
         let storage = StorageManager::open_in_memory().unwrap();
         let config = CaptureConfig {
             enable_screenshot: false,
@@ -1274,27 +2244,25 @@ mod tests {
         let filter = PrivacyFilter::new().with_extra_blocked_apps(&["SecretApp".into()]);
         let engine = CaptureEngine::with_filter(storage, config, filter);
 
-        let id = engine
+        let result = engine
             .process_event(CaptureEvent::AppSwitch {
                 app_name: "SecretApp".into(),
                 bundle_id: None,
                 win_title: "Secret Window".into(),
             })
             .await
-            .unwrap()
             .unwrap();
 
-        let rec = engine.storage.get_capture(id).unwrap().unwrap();
-        assert!(rec.is_sensitive, "应标记为敏感");
-        assert!(rec.ax_text.is_none(), "敏感记录不含文本");
-        assert!(rec.win_title.is_none(), "敏感记录不含标题");
-        assert!(rec.input_text.is_none(), "敏感记录不含输入");
-        // app_name 保留（用于统计）
-        assert_eq!(rec.app_name.as_deref(), Some("SecretApp"));
+        assert!(result.is_none());
+        assert!(engine
+            .storage
+            .list_captures(&CaptureFilter::new())
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
-    async fn test_wechat_blocked_app_records_sensitive_row() {
+    async fn test_wechat_blocked_app_is_dropped_before_capture() {
         let storage = StorageManager::open_in_memory().unwrap();
         let config = CaptureConfig {
             enable_screenshot: false,
@@ -1304,20 +2272,21 @@ mod tests {
         let filter = PrivacyFilter::new().with_extra_blocked_apps(&["WeChat".into()]);
         let engine = CaptureEngine::with_filter(storage, config, filter);
 
-        let id = engine
+        let result = engine
             .process_event(CaptureEvent::AppSwitch {
                 app_name: "WeChat".into(),
                 bundle_id: Some("com.tencent.xinWeChat".into()),
                 win_title: "微信聊天".into(),
             })
             .await
-            .unwrap()
             .unwrap();
 
-        let rec = engine.storage.get_capture(id).unwrap().unwrap();
-        assert!(rec.is_sensitive, "WeChat 黑名单命中后应标记为敏感");
-        assert!(rec.screenshot_path.is_none(), "敏感记录不应截图");
-        assert!(rec.ax_text.is_none(), "敏感记录不应保留 AX 文本");
+        assert!(result.is_none());
+        assert!(engine
+            .storage
+            .list_captures(&CaptureFilter::new())
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1330,18 +2299,21 @@ mod tests {
         };
         let engine = CaptureEngine::new(storage, config);
 
-        let id = engine
+        let result = engine
             .process_event(CaptureEvent::AppSwitch {
                 app_name: "1Password".into(),
                 bundle_id: None,
                 win_title: "Unlock 1Password".into(),
             })
             .await
-            .unwrap()
             .unwrap();
 
-        let rec = engine.storage.get_capture(id).unwrap().unwrap();
-        assert!(rec.is_sensitive);
+        assert!(result.is_none());
+        assert!(engine
+            .storage
+            .list_captures(&CaptureFilter::new())
+            .unwrap()
+            .is_empty());
     }
 
     // ── channel 事件循环 ──────────────────────────────────────────────────
@@ -1390,6 +2362,17 @@ mod tests {
         assert_eq!(CaptureEvent::Periodic.to_event_type(), EventType::Auto);
         assert_eq!(CaptureEvent::Manual.to_event_type(), EventType::Manual);
         assert_eq!(CaptureEvent::Scroll.to_event_type(), EventType::Scroll);
+        assert_eq!(
+            CaptureEvent::BrowserNavigation {
+                app_name: "Chrome".into(),
+                bundle_id: Some("com.google.Chrome".into()),
+                win_title: Some("Example".into()),
+                url: "https://example.com".into(),
+                webpage_title: Some("Example".into()),
+            }
+            .to_event_type(),
+            EventType::BrowserNavigation
+        );
         assert_eq!(
             CaptureEvent::MouseClick { x: 0.0, y: 0.0 }.to_event_type(),
             EventType::MouseClick
@@ -1496,5 +2479,28 @@ mod tests {
         );
         assert_eq!(merged.app_name.as_deref(), Some("NewApp"));
         assert_eq!(merged.win_title.as_deref(), Some("New Window"));
+    }
+
+    #[test]
+    fn test_merge_does_not_mix_cache_across_apps() {
+        let engine = make_engine();
+        engine.update_cached_context(&AXInfo {
+            app_name: Some("Google Chrome".into()),
+            app_bundle_id: Some("com.google.Chrome".into()),
+            win_title: Some("Old Browser Page".into()),
+            ..Default::default()
+        });
+
+        let merged = engine.merge_ax_and_event(
+            &CaptureEvent::Periodic,
+            Some(AXInfo {
+                app_name: Some("memory-bread-desktop".into()),
+                win_title: Some("MemoryBread".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(merged.app_name.as_deref(), Some("memory-bread-desktop"));
+        assert!(merged.app_bundle_id.is_none());
+        assert_eq!(merged.win_title.as_deref(), Some("MemoryBread"));
     }
 }

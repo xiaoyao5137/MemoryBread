@@ -366,6 +366,33 @@ def test_process_knowledge_vectorization_passes_semantic_metadata(tmp_path, monk
     assert metadata["evidence_strength"] == "medium"
 
 
+def test_extraction_status_heartbeat_refreshes_updated_at(tmp_path, monkeypatch) -> None:
+    db_path = str(tmp_path / "captures.db")
+    _init_db(db_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class _FakeClock:
+        ticks = iter([1000.0, 1005.0])
+
+        @staticmethod
+        def time():
+            return next(_FakeClock.ticks)
+
+    monkeypatch.setattr("background_processor.time", _FakeClock)
+
+    processor = BackgroundProcessor(db_path=db_path)
+    status_file = tmp_path / ".memory-bread" / "state" / "extraction_status.json"
+    initial = json.loads(status_file.read_text())
+
+    processor._touch_status_file()
+    refreshed = json.loads(status_file.read_text())
+
+    assert initial["running"] is True
+    assert initial["updated_at_ms"] == 1000000
+    assert refreshed["running"] is True
+    assert refreshed["updated_at_ms"] == 1005000
+
+
 def test_trigger_unified_bake_pipeline_skips_when_no_new_knowledge(tmp_path) -> None:
     db_path = str(tmp_path / "captures.db")
     _init_db(db_path)

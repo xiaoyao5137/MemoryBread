@@ -40,7 +40,6 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
     debugModeEnabled,
     localDebugModeEnabled,
     setApiBaseUrl,
-    setDebugModeEnabled,
     setLocalDebugModeEnabled,
     setWindowMode,
   } = useAppStore()
@@ -286,6 +285,12 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
       </div>
 
       <div className="settings-v2__content">
+        {saveMsg && (
+          <div className="settings-v2__success-msg" data-testid="save-msg">
+            ✓ {saveMsg}
+          </div>
+        )}
+
         {/* 我是谁 */}
         <section className="settings-v2__card settings-v2__card--identity" data-testid="settings-identity-section">
           <div className="settings-v2__card-header">
@@ -429,62 +434,59 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
         </section>
 
         {/* API 服务配置 */}
-        <section className="settings-v2__card" data-testid="settings-api-section">
-          <div className="settings-v2__card-header">
-            <div className="settings-v2__card-icon settings-v2__card-icon--blue">
-              {/* server 图标 */}
-              <svg
-                width="20"
-                height="20"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
-                <rect width="20" height="8" x="2" y="14" rx="2" ry="2" />
-                <line x1="6" x2="6.01" y1="6" y2="6" />
-                <line x1="6" x2="6.01" y1="18" y2="18" />
-              </svg>
-            </div>
-            <div>
-              <h2 className="settings-v2__card-title">本机服务</h2>
-              <p className="settings-v2__card-desc">配置记忆面包本机服务连接地址</p>
-            </div>
-          </div>
-
-          <div className="settings-v2__form-group">
-            <label htmlFor="api-url-input" className="settings-v2__label">
-              服务地址
-            </label>
-            <div className="settings-v2__input-group">
-              <input
-                id="api-url-input"
-                data-testid="api-url-input"
-                type="text"
-                className="settings-v2__input"
-                value={apiUrlInput}
-                onChange={(e) => setApiUrlInput(e.target.value)}
-                placeholder="http://localhost:7070"
-              />
-              <button
-                data-testid="api-url-save"
-                onClick={handleSaveApiUrl}
-                type="button"
-                className="settings-v2__btn settings-v2__btn--primary"
-              >
-                保存
-              </button>
-            </div>
-            {saveMsg && (
-              <div className="settings-v2__success-msg" data-testid="save-msg">
-                ✓ {saveMsg}
+        {debugModeEnabled && (
+          <section className="settings-v2__card" data-testid="settings-api-section">
+            <div className="settings-v2__card-header">
+              <div className="settings-v2__card-icon settings-v2__card-icon--blue">
+                {/* server 图标 */}
+                <svg
+                  width="20"
+                  height="20"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
+                  <rect width="20" height="8" x="2" y="14" rx="2" ry="2" />
+                  <line x1="6" x2="6.01" y1="6" y2="6" />
+                  <line x1="6" x2="6.01" y1="18" y2="18" />
+                </svg>
               </div>
-            )}
-          </div>
-        </section>
+              <div>
+                <h2 className="settings-v2__card-title">本机服务</h2>
+                <p className="settings-v2__card-desc">配置记忆面包本机服务连接地址</p>
+              </div>
+            </div>
+
+            <div className="settings-v2__form-group">
+              <label htmlFor="api-url-input" className="settings-v2__label">
+                服务地址
+              </label>
+              <div className="settings-v2__input-group">
+                <input
+                  id="api-url-input"
+                  data-testid="api-url-input"
+                  type="text"
+                  className="settings-v2__input"
+                  value={apiUrlInput}
+                  onChange={(e) => setApiUrlInput(e.target.value)}
+                  placeholder="http://localhost:7070"
+                />
+                <button
+                  data-testid="api-url-save"
+                  onClick={handleSaveApiUrl}
+                  type="button"
+                  className="settings-v2__btn settings-v2__btn--primary"
+                >
+                  保存
+                </button>
+              </div>
+            </div>
+          </section>
+        )}
 
         {/* 个性化偏好 */}
         <section className="settings-v2__card" data-testid="settings-prefs-section">
@@ -609,13 +611,41 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
         </section>
 
         {/* 开发者工具 */}
-        <section className="settings-v2__card" data-testid="settings-debug-section">
-          <div className="settings-v2__card-header">
-            <div className="settings-v2__card-icon settings-v2__card-icon--orange">
-              {/* wrench 图标 */}
+        {debugModeEnabled && (
+          <section className="settings-v2__card" data-testid="settings-debug-section">
+            <div className="settings-v2__card-header">
+              <div className="settings-v2__card-icon settings-v2__card-icon--orange">
+                {/* wrench 图标 */}
+                <svg
+                  width="20"
+                  height="20"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+                </svg>
+              </div>
+              <div>
+                <h2 className="settings-v2__card-title">开发者工具</h2>
+                <p className="settings-v2__card-desc">
+                  查看实时采集记录、处理状态和系统性能指标
+                </p>
+              </div>
+            </div>
+
+            <button
+              data-testid="open-debug-btn"
+              onClick={() => setWindowMode('debug')}
+              type="button"
+              className="settings-v2__btn settings-v2__btn--secondary"
+            >
               <svg
-                width="20"
-                height="20"
+                width="16"
+                height="16"
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
@@ -625,69 +655,30 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
               >
                 <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
               </svg>
-            </div>
-            <div>
-              <h2 className="settings-v2__card-title">开发者工具</h2>
-              <p className="settings-v2__card-desc">
-                查看实时采集记录、处理状态和系统性能指标
-              </p>
-            </div>
-          </div>
+              打开调试面板
+            </button>
 
-          <button
-            data-testid="open-debug-btn"
-            onClick={() => setWindowMode('debug')}
-            type="button"
-            className="settings-v2__btn settings-v2__btn--secondary"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
-            </svg>
-            打开调试面板
-          </button>
-
-          <label className="settings-v2__toggle-row" htmlFor="debug-mode-toggle">
-            <span>
-              <strong>调试模式</strong>
-              <small>开启后显示更多连接与诊断选项。</small>
-            </span>
-            <input
-              id="debug-mode-toggle"
-              type="checkbox"
-              checked={debugModeEnabled}
-              onChange={(event) => setDebugModeEnabled(event.target.checked)}
-            />
-          </label>
-
-          <label className="settings-v2__toggle-row" htmlFor="local-debug-mode-toggle">
-            <span>
-              <strong>本地调试模式</strong>
-              <small>开启后使用本机开发服务验证账户登录和云端创作流程。</small>
-            </span>
-            <input
-              id="local-debug-mode-toggle"
-              type="checkbox"
-              checked={localDebugModeEnabled}
-              onChange={(event) => setLocalDebugModeEnabled(event.target.checked)}
-            />
-          </label>
-          {localDebugModeEnabled && (
-            <div className="settings-v2__debug-routes" aria-label="本地调试服务地址">
-              <span>Core <strong>{apiBaseUrl}</strong></span>
-              <span>Account <strong>{adminApiBaseUrl}</strong></span>
-              <span>Cloud Creation <strong>{gatewayApiBaseUrl}</strong></span>
-            </div>
-          )}
-        </section>
+            <label className="settings-v2__toggle-row" htmlFor="local-debug-mode-toggle">
+              <span>
+                <strong>本地调试模式</strong>
+                <small>开启后使用本机开发服务验证账户登录和云端创作流程。</small>
+              </span>
+              <input
+                id="local-debug-mode-toggle"
+                type="checkbox"
+                checked={localDebugModeEnabled}
+                onChange={(event) => setLocalDebugModeEnabled(event.target.checked)}
+              />
+            </label>
+            {localDebugModeEnabled && (
+              <div className="settings-v2__debug-routes" aria-label="本地调试服务地址">
+                <span>Core <strong>{apiBaseUrl}</strong></span>
+                <span>Account <strong>{adminApiBaseUrl}</strong></span>
+                <span>Cloud Creation <strong>{gatewayApiBaseUrl}</strong></span>
+              </div>
+            )}
+          </section>
+        )}
 
         {/* 版本信息 */}
         <section className="settings-v2__card" data-testid="settings-version-section">

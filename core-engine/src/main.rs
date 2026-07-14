@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use memory_bread_core::{
     api::{server::start_server, state::AppState},
-    capture::{start_listener, CaptureConfig, CaptureEngine, ListenerConfig},
+    capture::{
+        start_context_watcher, start_listener, CaptureConfig, CaptureEngine, ListenerConfig,
+    },
     monitor::ResourceMonitor,
     scheduler::Scheduler,
     storage::{db::current_ts_ms, StorageManager},
@@ -19,7 +21,7 @@ fn parse_capture_interval_secs(storage: &StorageManager) -> u64 {
         .flatten()
         .and_then(|p| p.value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(30)
+        .unwrap_or(90)
 }
 
 fn parse_screenshot_keep_days(storage: &StorageManager) -> i64 {
@@ -142,9 +144,15 @@ async fn main() -> anyhow::Result<()> {
     listener_config.interval_secs = interval_secs;
     listener_config.enabled = state.capture_enabled.clone();
     let enabled = listener_config.enabled.clone();
+    let context_enabled = listener_config.enabled.clone();
+    let periodic_tx = tx.clone();
 
     tokio::spawn(async move {
-        start_listener(listener_config, tx).await;
+        start_listener(listener_config, periodic_tx).await;
+    });
+
+    tokio::spawn(async move {
+        start_context_watcher(context_enabled, tx).await;
     });
 
     // 启动资源监控器

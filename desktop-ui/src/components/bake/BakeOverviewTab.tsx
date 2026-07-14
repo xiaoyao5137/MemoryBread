@@ -20,6 +20,34 @@ const trendRangeOptions = [
 
 type TrendRangeKey = typeof trendRangeOptions[number]['key']
 
+const parseLocalDate = (year: string, month: string, day: string) => (
+  new Date(Number(year), Number(month) - 1, Number(day)).getTime()
+)
+
+const parseTrendLabelRange = (label: string) => {
+  const match = label.match(/^(\d{4})-(\d{2})-(\d{2})(?:-(\d{4})-(\d{2})-(\d{2}))?$/)
+  if (!match) return null
+
+  const startTs = parseLocalDate(match[1], match[2], match[3])
+  const endTs = match[4]
+    ? parseLocalDate(match[4], match[5], match[6])
+    : startTs
+
+  if (!Number.isFinite(startTs) || !Number.isFinite(endTs)) return null
+  return { startTs, endTs }
+}
+
+const startOfLocalDay = (timestamp: number) => {
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return 0
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
+}
+
+const addLocalDays = (dayStart: number, days: number) => {
+  const date = new Date(dayStart)
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days).getTime()
+}
+
 const formatShortDate = (timestamp: number) => {
   const date = new Date(timestamp)
   if (Number.isNaN(date.getTime())) return '未知'
@@ -41,18 +69,65 @@ const getBucketEndTs = (bucket: BakeInventoryTrendBucket) => (
   Number.isFinite(bucket.endTs) && bucket.endTs > 0 ? bucket.endTs : bucket.startTs
 )
 
+const getBucketStartDay = (bucket: BakeInventoryTrendBucket) => (
+  parseTrendLabelRange(bucket.label)?.startTs ?? startOfLocalDay(bucket.startTs)
+)
+
+const getBucketEndDay = (bucket: BakeInventoryTrendBucket) => {
+  const labelRange = parseTrendLabelRange(bucket.label)
+  if (labelRange) return labelRange.endTs
+
+  const startDay = getBucketStartDay(bucket)
+  if (startDay <= 0) return 0
+  const spanDays = Math.max(1, Math.round((getBucketEndTs(bucket) - bucket.startTs + 1) / DAY_MS))
+  return addLocalDays(startDay, spanDays - 1)
+}
+
 const getBucketTotal = (bucket: BakeInventoryTrendBucket) => (
   trendSeries.reduce((sum, series) => sum + bucket[series.key], 0)
 )
 
+const createDailyBucket = (dayStart: number): BakeInventoryTrendBucket => ({
+  label: formatFullDate(dayStart),
+  startTs: dayStart,
+  endTs: addLocalDays(dayStart, 1) - 1,
+  memoryCount: 0,
+  knowledgeCount: 0,
+  templateCount: 0,
+  sopCount: 0,
+})
+
+const addBucketCounts = (target: BakeInventoryTrendBucket, source: BakeInventoryTrendBucket) => {
+  target.memoryCount += source.memoryCount
+  target.knowledgeCount += source.knowledgeCount
+  target.templateCount += source.templateCount
+  target.sopCount += source.sopCount
+}
+
+const getRecentDailyBuckets = (buckets: BakeInventoryTrendBucket[], days: number) => {
+  const endDay = startOfLocalDay(Date.now())
+  if (endDay <= 0) return []
+
+  const startDay = addLocalDays(endDay, 1 - days)
+  const bucketsByDay = new Map<number, BakeInventoryTrendBucket>()
+  for (let index = 0; index < days; index += 1) {
+    const dayStart = addLocalDays(startDay, index)
+    bucketsByDay.set(dayStart, createDailyBucket(dayStart))
+  }
+
+  buckets.forEach(bucket => {
+    const bucketDay = getBucketStartDay(bucket)
+    const target = bucketsByDay.get(bucketDay)
+    if (target) addBucketCounts(target, bucket)
+  })
+
+  return Array.from(bucketsByDay.values())
+}
+
 const getDisplayBuckets = (buckets: BakeInventoryTrendBucket[], range: TrendRangeKey) => {
   const option = trendRangeOptions.find(item => item.key === range) ?? trendRangeOptions[0]
   if (!option.days || buckets.length === 0) return buckets
-
-  const latestTs = Math.max(...buckets.map(getBucketEndTs))
-  const rangeStartTs = latestTs - option.days * DAY_MS + 1
-  const filtered = buckets.filter(bucket => getBucketEndTs(bucket) >= rangeStartTs && bucket.startTs <= latestTs)
-  return filtered.length > 0 ? filtered : buckets
+  return getRecentDailyBuckets(buckets, option.days)
 }
 
 const getAxisTickIndexes = (bucketCount: number) => {
@@ -71,15 +146,17 @@ const getAxisTickIndexes = (bucketCount: number) => {
 }
 
 const getAxisLabelLines = (bucket: BakeInventoryTrendBucket) => {
-  const endTs = getBucketEndTs(bucket)
-  if (endTs - bucket.startTs <= DAY_MS) return [formatShortDate(bucket.startTs)]
-  return [formatShortDate(bucket.startTs), formatShortDate(endTs)]
+  const startDay = getBucketStartDay(bucket)
+  const endDay = getBucketEndDay(bucket)
+  if (startDay <= 0 || endDay <= startDay) return [formatShortDate(bucket.startTs)]
+  return [formatShortDate(startDay), formatShortDate(endDay)]
 }
 
 const getTooltipTitle = (bucket: BakeInventoryTrendBucket) => {
-  const endTs = getBucketEndTs(bucket)
-  if (endTs - bucket.startTs <= DAY_MS) return formatFullDate(bucket.startTs)
-  return `${formatFullDate(bucket.startTs)} 至 ${formatFullDate(endTs)}`
+  const startDay = getBucketStartDay(bucket)
+  const endDay = getBucketEndDay(bucket)
+  if (startDay <= 0 || endDay <= startDay) return formatFullDate(bucket.startTs)
+  return `${formatFullDate(startDay)} 至 ${formatFullDate(endDay)}`
 }
 
 const InventoryTrendChart: React.FC<{ overview: BakeOverview }> = ({ overview }) => {

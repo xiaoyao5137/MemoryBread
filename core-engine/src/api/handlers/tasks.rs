@@ -9,10 +9,11 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::api::{error::ApiError, state::AppState};
 use crate::scheduler::{
+    cron_expression::next_run_at_ms,
     models::{NewScheduledTask, UpdateScheduledTask},
     repo::TaskRepo,
 };
@@ -20,15 +21,15 @@ use crate::scheduler::{
 /// POST /api/tasks - 创建任务
 pub async fn create_task(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<NewScheduledTask>,
+    Json(mut body): Json<NewScheduledTask>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // 验证 cron 表达式
-    use std::str::FromStr;
-    cron::Schedule::from_str(&body.cron_expression)
-        .map_err(|e| ApiError::BadRequest(format!("cron 表达式无效: {e}")))?;
+    let (normalized_cron, next_run) = next_run_at_ms(&body.cron_expression)
+        .map_err(|error| ApiError::BadRequest(format!("cron 表达式无效: {error}")))?;
+    body.cron_expression = normalized_cron;
 
     let now_ms = Utc::now().timestamp_millis();
     let id = TaskRepo::create(&state.storage, &body, now_ms)?;
+    TaskRepo::set_next_run(&state.storage, id, next_run)?;
     let task = TaskRepo::get(&state.storage, id)?.ok_or(ApiError::NotFound("task".into()))?;
     Ok((StatusCode::CREATED, Json(task)))
 }
@@ -54,14 +55,16 @@ pub async fn get_task(
 pub async fn update_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-    Json(body): Json<UpdateScheduledTask>,
+    Json(mut body): Json<UpdateScheduledTask>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // 如果更新了 cron 表达式，验证合法性
-    if let Some(ref expr) = body.cron_expression {
-        use std::str::FromStr;
-        cron::Schedule::from_str(expr)
-            .map_err(|e| ApiError::BadRequest(format!("cron 表达式无效: {e}")))?;
-    }
+    let next_run = if let Some(expression) = body.cron_expression.as_deref() {
+        let (normalized, next_run) = next_run_at_ms(expression)
+            .map_err(|error| ApiError::BadRequest(format!("cron 表达式无效: {error}")))?;
+        body.cron_expression = Some(normalized);
+        Some(next_run)
+    } else {
+        None
+    };
 
     let now_ms = Utc::now().timestamp_millis();
     let updated = TaskRepo::update(&state.storage, id, &body, now_ms)?;
@@ -69,9 +72,8 @@ pub async fn update_task(
         return Err(ApiError::NotFound("task".into()));
     }
 
-    // 如果更新了 cron，重置 next_run_at
-    if body.cron_expression.is_some() {
-        TaskRepo::set_next_run(&state.storage, id, 0)?;
+    if let Some(next_run) = next_run {
+        TaskRepo::set_next_run(&state.storage, id, next_run)?;
     }
 
     let task = TaskRepo::get(&state.storage, id)?.ok_or(ApiError::NotFound("task".into()))?;

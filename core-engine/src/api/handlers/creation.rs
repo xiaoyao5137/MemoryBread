@@ -1,7 +1,7 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
-    response::{sse::Event, Sse},
+    response::{sse::Event, IntoResponse, Response, Sse},
     Json,
 };
 use futures::stream::Stream;
@@ -413,19 +413,60 @@ pub async fn save_history(
     Ok(Json(SaveHistoryResponse { id }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ListHistoryParams {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub paged: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistoryPageResponse {
+    pub items: Vec<crate::storage::repo::creation_history::CreationHistory>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+}
+
 pub async fn list_history(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<crate::storage::repo::creation_history::CreationHistory>>, (StatusCode, String)>
-{
-    let histories = state
+    Query(params): Query<ListHistoryParams>,
+) -> Result<Response, (StatusCode, String)> {
+    let limit = params
+        .limit
+        .unwrap_or(if params.paged { 20 } else { 50 })
+        .clamp(1, 100);
+    let offset = params.offset.min(1_000_000);
+    let query = params
+        .q
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let (histories, total) = state
         .storage
         .with_conn(|conn| {
-            crate::storage::repo::creation_history::list_recent(conn, 50).map_err(Into::into)
+            crate::storage::repo::creation_history::list_page(conn, query.as_deref(), limit, offset)
+                .map_err(Into::into)
         })
         .map_err(|e| {
             error!("查询创作记录失败: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
-    Ok(Json(histories))
+    if params.paged {
+        Ok(Json(HistoryPageResponse {
+            items: histories,
+            total,
+            limit,
+            offset,
+        })
+        .into_response())
+    } else {
+        // 保留旧客户端依赖的数组响应；新页面显式传 paged=true 获取分页元数据。
+        Ok(Json(histories).into_response())
+    }
 }

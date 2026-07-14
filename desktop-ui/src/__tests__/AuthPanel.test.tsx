@@ -21,6 +21,24 @@ const fillPasswordLogin = () => {
 }
 
 describe('AuthPanel', () => {
+  it('普通启动时隐藏账户连接地址输入框', () => {
+    render(<AuthPanel />)
+
+    expect(screen.queryByLabelText('账户连接地址')).not.toBeInTheDocument()
+  })
+
+  it('调试模式下允许编辑账户连接地址', () => {
+    useAppStore.setState({ debugModeEnabled: true })
+
+    render(<AuthPanel />)
+
+    const input = screen.getByLabelText('账户连接地址')
+    expect(input).toHaveValue('http://127.0.0.1:8080')
+
+    fireEvent.change(input, { target: { value: 'http://127.0.0.1:18080' } })
+    expect(useAppStore.getState().adminApiBaseUrl).toBe('http://127.0.0.1:18080')
+  })
+
   it('默认以未登录界面启动，并在登录后保存管理员会话', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

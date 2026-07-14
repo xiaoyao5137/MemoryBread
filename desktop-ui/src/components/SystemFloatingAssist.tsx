@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import ReactMarkdown from 'react-markdown'
-import { EyeOff, Home, Loader2, MessageSquare, Sparkles, X } from 'lucide-react'
+import { ChevronDown, ChevronUp, EyeOff, Home, Loader2, MessageSquare, Sparkles, X } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
 import { RAG_REFERENCE_LIMIT, runGatewayRagQuery, runRagQueryJob } from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
@@ -20,18 +20,23 @@ import {
 import { REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId } from '../utils/modelSelection'
 import { BreadToolIcon } from './icons/BreadIcons'
 import breadRollAsset from '../assets/floating-assist/bread-roll.png'
-import capybaraEmptyAsset from '../assets/floating-assist/capybara-empty.png'
 import './SystemFloatingAssist.css'
 
 type AssistPhase = 'idle' | 'receiving' | 'capturing' | 'answering' | 'done' | 'error'
 
 const FLOATING_ASSIST_BALL_SIZE = 82
 const FLOATING_ASSIST_CONTEXT_MENU_WIDTH = 214
-const FLOATING_ASSIST_CONTEXT_MENU_HEIGHT = 210
+const FLOATING_ASSIST_CONTEXT_MENU_TOP = 86
+const FLOATING_ASSIST_CONTEXT_MENU_HEIGHT = 160
+const FLOATING_ASSIST_CONTEXT_MENU_WINDOW_HEIGHT = FLOATING_ASSIST_CONTEXT_MENU_TOP + FLOATING_ASSIST_CONTEXT_MENU_HEIGHT
 const FLOATING_ASSIST_DONE_IDLE_DELAY_MS = 5 * 60 * 1000
-const AUTO_TASK_SCAN_INITIAL_DELAY_MS = 2_000
-const AUTO_TASK_SCAN_INTERVAL_MS = 30_000
+const DEFAULT_VISIBLE_REFERENCE_COUNT = 5
+const AUTO_TASK_SCAN_INITIAL_DELAY_MS = 10_000
+const AUTO_TASK_SCAN_INTERVAL_MS = 120_000
+const AUTO_TASK_USER_IDLE_GUARD_MS = 3_000
 const AUTO_TASK_DEDUP_CACHE_LIMIT = 64
+const FLOATING_ASSIST_DRAG_TICK_MS = 33
+const FLOATING_ASSIST_NATIVE_HOVER_POLL_MS = 240
 
 const isAssistPhase = (value: string | null): value is AssistPhase =>
   value === 'idle' || value === 'receiving' || value === 'capturing' || value === 'answering' || value === 'done' || value === 'error'
@@ -51,6 +56,10 @@ interface FloatingAssistOcrResult {
 interface FloatingAssistDragOrigin {
   offset_x: number
   offset_y: number
+}
+
+interface FloatingAssistPointerState {
+  hovering_ball: boolean
 }
 
 interface RunAssistOptions {
@@ -233,10 +242,12 @@ const SystemFloatingAssist: React.FC = () => {
   const [screenshot, setScreenshot] = useState<FloatingAssistOcrResult | null>(null)
   const [screenshotSrc, setScreenshotSrc] = useState('')
   const [references, setReferences] = useState<RagContext[]>([])
+  const [referencesExpanded, setReferencesExpanded] = useState(false)
   const [outputTruncated, setOutputTruncated] = useState(false)
   const [previewOpen, setPreviewOpen] = useState(false)
   const [canvasOpen, setCanvasOpen] = useState(false)
   const [contextMenuOpen, setContextMenuOpen] = useState(false)
+  const [nativeHovering, setNativeHovering] = useState(false)
   const [manualInstruction, setManualInstruction] = useState('')
   const [attachments, setAttachments] = useState<UserAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
@@ -248,6 +259,8 @@ const SystemFloatingAssist: React.FC = () => {
   const progressTimerRef = useRef<number | null>(null)
   const doneIdleTimerRef = useRef<number | null>(null)
   const autoTaskScanInFlightRef = useRef(false)
+  const dragUpdateInFlightRef = useRef(false)
+  const lastUserInteractionAtRef = useRef(Date.now())
   const seenAutoTasksRef = useRef<Map<string, number>>(new Map())
   const activeAssistTaskRef = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
@@ -324,6 +337,7 @@ const SystemFloatingAssist: React.FC = () => {
     drag.dragging = false
     drag.pointerId = -1
     drag.tickId = null
+    dragUpdateInFlightRef.current = false
     if (releaseClick && wasDragging) {
       window.setTimeout(() => {
         suppressClickRef.current = false
@@ -370,6 +384,9 @@ const SystemFloatingAssist: React.FC = () => {
     document.documentElement.classList.add('floating-assist-html')
     document.body.classList.add('floating-assist-body')
     const tauriCleanups: Array<() => void> = []
+    const markUserInteraction = () => {
+      lastUserInteractionAtRef.current = Date.now()
+    }
     const stopGlobalDrag = () => stopDrag()
     const handleWindowBlur = () => {
       stopDrag()
@@ -380,8 +397,12 @@ const SystemFloatingAssist: React.FC = () => {
     window.addEventListener('blur', handleWindowBlur)
     const closeContextMenu = () => setContextMenuOpen(false)
     const handleKeyDown = (event: KeyboardEvent) => {
+      markUserInteraction()
       if (event.key === 'Escape') collapseExpandedSurface()
     }
+    window.addEventListener('pointerdown', markUserInteraction, { passive: true })
+    window.addEventListener('pointermove', markUserInteraction, { passive: true })
+    window.addEventListener('wheel', markUserInteraction, { passive: true })
     window.addEventListener('click', closeContextMenu)
     window.addEventListener('keydown', handleKeyDown)
     void listen('floating-assist-reset', () => {
@@ -445,12 +466,83 @@ const SystemFloatingAssist: React.FC = () => {
       clearDoneIdleTimer()
       stopProgress()
       stopDrag(false)
+      window.removeEventListener('pointerdown', markUserInteraction)
+      window.removeEventListener('pointermove', markUserInteraction)
+      window.removeEventListener('wheel', markUserInteraction)
       window.removeEventListener('pointerup', stopGlobalDrag)
       window.removeEventListener('mouseup', stopGlobalDrag)
       window.removeEventListener('blur', handleWindowBlur)
       window.removeEventListener('click', closeContextMenu)
       window.removeEventListener('keydown', handleKeyDown)
       tauriCleanups.forEach(cleanup => cleanup())
+    }
+  }, [])
+
+  useEffect(() => {
+    if (import.meta.env.MODE === 'test') return
+
+    let cancelled = false
+    let polling = false
+    let timer: number | null = null
+
+    const clearTimer = () => {
+      if (timer != null) {
+        window.clearTimeout(timer)
+        timer = null
+      }
+    }
+
+    const pollNativeHover = async () => {
+      if (cancelled || !polling) return
+      try {
+        const pointerState = await invoke<FloatingAssistPointerState>('get_floating_assist_pointer_state')
+        if (!cancelled && polling) {
+          setNativeHovering(Boolean(pointerState?.hovering_ball))
+        }
+      } catch {
+        if (!cancelled && polling) {
+          setNativeHovering(false)
+        }
+      } finally {
+        if (!cancelled && polling) {
+          timer = window.setTimeout(() => {
+            timer = null
+            void pollNativeHover()
+          }, FLOATING_ASSIST_NATIVE_HOVER_POLL_MS)
+        }
+      }
+    }
+
+    const startPolling = () => {
+      if (polling) return
+      polling = true
+      void pollNativeHover()
+    }
+
+    const stopPolling = () => {
+      polling = false
+      clearTimer()
+      setNativeHovering(false)
+    }
+
+    const syncPolling = () => {
+      if (document.hasFocus()) {
+        stopPolling()
+      } else {
+        startPolling()
+      }
+    }
+
+    window.addEventListener('focus', syncPolling)
+    window.addEventListener('blur', syncPolling)
+    syncPolling()
+
+    return () => {
+      cancelled = true
+      polling = false
+      clearTimer()
+      window.removeEventListener('focus', syncPolling)
+      window.removeEventListener('blur', syncPolling)
     }
   }, [])
 
@@ -470,6 +562,10 @@ const SystemFloatingAssist: React.FC = () => {
   }, [clearDoneIdleTimer, doneIdleDelayMs, phase])
 
   useEffect(() => {
+    setReferencesExpanded(false)
+  }, [references])
+
+  useEffect(() => {
     const width = previewOpen
       ? 720
       : hasCanvas
@@ -482,7 +578,7 @@ const SystemFloatingAssist: React.FC = () => {
       : hasCanvas
         ? Math.max(FLOATING_ASSIST_BALL_SIZE + 8 + canvasHeight, contextMenuOpen ? FLOATING_ASSIST_CONTEXT_MENU_HEIGHT : FLOATING_ASSIST_BALL_SIZE)
         : contextMenuOpen
-          ? FLOATING_ASSIST_CONTEXT_MENU_HEIGHT
+          ? FLOATING_ASSIST_CONTEXT_MENU_WINDOW_HEIGHT
           : FLOATING_ASSIST_BALL_SIZE
     invoke('set_floating_assist_size', { width, height }).catch(() => {})
   }, [canvasHeight, contextMenuOpen, hasCanvas, previewOpen])
@@ -703,6 +799,9 @@ const SystemFloatingAssist: React.FC = () => {
       if (
         activeAssistTaskRef.current
         || busy
+        || dragRef.current.active
+        || dragRef.current.dragging
+        || Date.now() - lastUserInteractionAtRef.current < AUTO_TASK_USER_IDLE_GUARD_MS
         || canvasOpen
         || contextMenuOpen
         || previewOpen
@@ -988,16 +1087,22 @@ const SystemFloatingAssist: React.FC = () => {
       drag.offsetX = origin.offset_x
       drag.offsetY = origin.offset_y
       const tick = () => {
+        if (dragUpdateInFlightRef.current) return
+        dragUpdateInFlightRef.current = true
         invoke('update_floating_assist_drag', {
           offsetX: drag.offsetX,
           offsetY: drag.offsetY,
-        }).catch((reason) => {
-          console.warn('floating assist drag update failed', reason)
-          stopDrag()
         })
+          .catch((reason) => {
+            console.warn('floating assist drag update failed', reason)
+            stopDrag()
+          })
+          .finally(() => {
+            dragUpdateInFlightRef.current = false
+          })
       }
       tick()
-      drag.tickId = window.setInterval(tick, 16)
+      drag.tickId = window.setInterval(tick, FLOATING_ASSIST_DRAG_TICK_MS)
     } catch (reason) {
       console.warn('floating assist drag start failed', reason)
       stopDrag()
@@ -1047,6 +1152,10 @@ const SystemFloatingAssist: React.FC = () => {
   }
 
   const visibleReferences = references.filter(item => (item.source_type || item.source) !== 'floating_assist')
+  const displayedReferences = referencesExpanded
+    ? visibleReferences
+    : visibleReferences.slice(0, DEFAULT_VISIBLE_REFERENCE_COUNT)
+  const hiddenReferenceCount = visibleReferences.length - DEFAULT_VISIBLE_REFERENCE_COUNT
   const floatingAnswer = useMemo(() => splitFloatingAssistAnswer(answer), [answer])
   const displayedAnswer = floatingAnswer.responseContent || (floatingAnswer.userQuestionUnderstanding ? '' : answer)
   const showAnswer = Boolean(displayedAnswer) && (phase === 'done' || phase === 'idle')
@@ -1058,11 +1167,13 @@ const SystemFloatingAssist: React.FC = () => {
     >
       <div className="system-floating-assist__dock">
         <button
-          className={`system-floating-assist__ball system-floating-assist__ball--${phase}`}
+          className={`system-floating-assist__ball system-floating-assist__ball--${phase}${nativeHovering ? ' system-floating-assist__ball--native-hover' : ''}`}
           type="button"
           onClick={handleBallClick}
           onContextMenu={handleBallContextMenu}
           onDoubleClick={handleBallDoubleClick}
+          onPointerEnter={() => setNativeHovering(true)}
+          onPointerLeave={() => setNativeHovering(false)}
           onPointerDown={startDrag}
           onPointerMove={moveDrag}
           onPointerUp={endDrag}
@@ -1073,17 +1184,29 @@ const SystemFloatingAssist: React.FC = () => {
           {autoTaskConfig.enabled && (
             <span className="system-floating-assist__auto-mark" aria-hidden="true">auto</span>
           )}
-          <span className="system-floating-assist__mascot" aria-hidden="true">
-            <img className="system-floating-assist__mascot-img" src={capybaraEmptyAsset} alt="" draggable={false} />
-            <span className="system-floating-assist__idle-ear system-floating-assist__idle-ear--left" />
-            <span className="system-floating-assist__idle-ear system-floating-assist__idle-ear--right" />
-            <span className="system-floating-assist__idle-blush system-floating-assist__idle-blush--left" />
-            <span className="system-floating-assist__idle-blush system-floating-assist__idle-blush--right" />
-            <span className="system-floating-assist__idle-muzzle" />
-            <img className="system-floating-assist__falling-bread" src={breadRollAsset} alt="" draggable={false} />
-            <img className="system-floating-assist__held-bread" src={breadRollAsset} alt="" draggable={false} />
+          <span className="system-floating-assist__mascot system-floating-assist__bread-person" aria-hidden="true">
+            <span className="system-floating-assist__bread-shadow" />
+            <span className="system-floating-assist__bread-arm system-floating-assist__bread-arm--left" />
+            <span className="system-floating-assist__bread-arm system-floating-assist__bread-arm--right" />
+            <span className="system-floating-assist__bread-leg system-floating-assist__bread-leg--left" />
+            <span className="system-floating-assist__bread-leg system-floating-assist__bread-leg--right" />
+            <img className="system-floating-assist__bread-body" src={breadRollAsset} alt="" draggable={false} />
+            <span className="system-floating-assist__bread-face">
+              <span className="system-floating-assist__bread-eye system-floating-assist__bread-eye--left" />
+              <span className="system-floating-assist__bread-eye system-floating-assist__bread-eye--right" />
+              <span className="system-floating-assist__bread-mouth" />
+            </span>
+            <span className="system-floating-assist__bread-cheek system-floating-assist__bread-cheek--left" />
+            <span className="system-floating-assist__bread-cheek system-floating-assist__bread-cheek--right" />
+            <span className="system-floating-assist__task-card">
+              <span />
+            </span>
+            <span className="system-floating-assist__scan-ring system-floating-assist__scan-ring--outer" />
+            <span className="system-floating-assist__scan-ring system-floating-assist__scan-ring--inner" />
+            <span className="system-floating-assist__thinking-dots" />
             <span className="system-floating-assist__crumbs" />
             <span className="system-floating-assist__sparkles" />
+            <span className="system-floating-assist__bread-sweat" />
           </span>
           <span className="system-floating-assist__ball-badge" aria-hidden="true">
             <span className="system-floating-assist__ball-check" />
@@ -1331,7 +1454,7 @@ const SystemFloatingAssist: React.FC = () => {
           {showAnswer && visibleReferences.length > 0 && (
             <div className="system-floating-assist__refs">
               <div className="system-floating-assist__refs-title">参考资料</div>
-              {visibleReferences.slice(0, 4).map((item, index) => (
+              {displayedReferences.map((item, index) => (
                 <button
                   className="system-floating-assist__ref"
                   type="button"
@@ -1342,6 +1465,17 @@ const SystemFloatingAssist: React.FC = () => {
                   <strong>{referenceTitle(item)}</strong>
                 </button>
               ))}
+              {hiddenReferenceCount > 0 && (
+                <button
+                  className="system-floating-assist__refs-toggle"
+                  type="button"
+                  aria-expanded={referencesExpanded}
+                  onClick={() => setReferencesExpanded(expanded => !expanded)}
+                >
+                  {referencesExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                  {referencesExpanded ? '收起' : `展开更多（${hiddenReferenceCount}）`}
+                </button>
+              )}
             </div>
           )}
 

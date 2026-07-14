@@ -29,6 +29,7 @@ use super::{
         debug::{
             clear_extraction_queue, debug_log_content, debug_log_files, system_stats, vector_status,
         },
+        diary::{get_diary, get_latest_diary, list_diaries, update_diary},
         health::health_handler,
         knowledge::{
             delete_knowledge, extract_knowledge, get_knowledge, list_knowledge, verify_knowledge,
@@ -142,7 +143,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/monitor/extraction_live", get(monitor_extraction_live))
         .route("/api/monitor/pipeline_dag", get(monitor_pipeline_dag))
         .route("/api/monitor/system", get(monitor_system))
-        // 用户画像
+        // 日记
+        .route("/api/diaries", get(list_diaries))
+        .route("/api/diaries/latest", get(get_latest_diary))
+        .route("/api/diaries/:id", get(get_diary).put(update_diary))
+        // 旧用户画像 API：兼容旧客户端，返回同一批日记快照
         .route("/api/profiles", get(list_profiles))
         .route("/api/profiles/latest", get(get_latest_profile))
         .route("/api/profiles/:id", get(get_profile).put(update_profile))

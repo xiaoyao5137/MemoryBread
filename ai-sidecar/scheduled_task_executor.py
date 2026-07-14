@@ -10,10 +10,12 @@
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
-from datetime import datetime
+from collections import Counter
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -24,24 +26,25 @@ BUILTIN_TEMPLATES = [
     # ── 工作总结类 ──────────────────────────────────────────────────────────
     {
         "id": "daily_journal",
-        "name": "每日工作日记",
-        "cron": "0 20 * * *",
+        "name": "生成昨日工作日记",
+        "cron": "0 9 * * *",
         "category": "工作总结",
         "user_instruction": (
-            "请根据今天的工作记录，生成一份工作日记。要求：\n"
-            "1. 【今日产出】列出今天完成的具体成果（功能、修复、决策、文档等），每条以「完成了…」「修复了…」「确定了…」等结果动词开头，有数据的写数据。\n"
-            "2. 【问题与解决】仅记录今天真正解决的问题及解决方案，未解决的问题不写入此项。\n"
-            "3. 【明日计划】列出明天的具体可交付目标，不写「继续研究」「了解」等模糊计划。\n"
-            "过滤掉：查看文档、配置环境、参加会议（无结论时）等无产出的活动。"
+            "请根据昨天的工作记录，生成高度浓缩的工作日记。要求：\n"
+            "默认使用简体中文；即使原始记录主要为英文，也使用中文叙述，产品名和代码标识符可保留原文。\n"
+            "1. 【今日产出】最多 4 条，只写真正完成的成果、修复、决策或交付，每条不超过 45 个中文字符。\n"
+            "2. 【问题与解决】最多 2 条，仅记录已解决问题或明确结论；没有则写「无」。\n"
+            "3. 【明日计划】最多 3 条，只写可交付、可验证目标。\n"
+            "过滤掉：浏览、阅读、搜索、应用切换、会议过程、配置环境、失败尝试等流水账。"
         ),
     },
     {
         "id": "weekly_report",
-        "name": "每周工作周报",
-        "cron": "0 18 * * 5",
+        "name": "生成上周工作周记",
+        "cron": "0 9 * * 1",
         "category": "工作总结",
         "user_instruction": (
-            "请根据本周的工作记录，生成一份工作周报。要求：\n"
+            "请根据上周每日工作日记，生成一份工作周记。要求：\n"
             "1. 【本周核心产出】按重要性排列，每条说明：做了什么（结果）、为什么重要（价值/影响），有量化数据的必须写出。\n"
             "2. 【项目进展】当前各项目的阶段状态，用「已完成 / 进行中 / 待启动」标注。\n"
             "3. 【下周计划】每条是具体可交付目标，不写「继续推进」「调研」等模糊描述。\n"
@@ -51,12 +54,12 @@ BUILTIN_TEMPLATES = [
     },
     {
         "id": "monthly_summary",
-        "name": "月度工作总结",
-        "cron": "0 18 28 * *",
+        "name": "生成上月工作月记",
+        "cron": "0 9 1 * *",
         "category": "工作总结",
         "user_instruction": (
-            "请根据本月的工作记录，生成月度工作总结。要求：\n"
-            "1. 【主要成果】列出本月最重要的 3-5 项交付物，每项说明其业务价值或影响，有数据的写数据。\n"
+            "请根据上月每日工作日记，生成工作月记。要求：\n"
+            "1. 【主要成果】列出上月最重要的 3-5 项交付物，每项说明其业务价值或影响，有数据的写数据。\n"
             "2. 【时间分配】按项目/类别分析时间投入占比，指出是否与优先级匹配。\n"
             "3. 【效率亮点与问题】各一条，基于事实而非感受。\n"
             "4. 【下月目标】具体、可验收的目标，不写方向性描述。\n"
@@ -183,6 +186,19 @@ AVG_TOKENS_PER_KNOWLEDGE = 300
 FULL_CONTEXT_TOKEN_LIMIT = 24000
 # 只用 overview 的 token 上限
 OVERVIEW_ONLY_TOKEN_LIMIT = 60000
+# 每次 daily_journal 执行时补偿/刷新最近几个已完成自然日，覆盖关机、休眠、提炼延迟等断档场景
+DAILY_DIARY_CATCHUP_DAYS = int(os.getenv("DAILY_DIARY_CATCHUP_DAYS", "7"))
+# 推理队列空闲时，自动从最近历史日期中补齐缺失的 daily 日记。一次只处理一天，避免后台长时间占用 LLM。
+IDLE_DIARY_BACKFILL_LOOKBACK_DAYS = int(os.getenv("DIARY_BACKFILL_LOOKBACK_DAYS", "30"))
+DAILY_DIARY_CONTEXT_MAX_ITEMS = int(os.getenv("DAILY_DIARY_CONTEXT_MAX_ITEMS", "24"))
+DAILY_DIARY_TIMELINE_MAX_ITEMS = int(os.getenv("DAILY_DIARY_TIMELINE_MAX_ITEMS", "12"))
+DIARY_ITEM_SUMMARY_MAX_CHARS = 120
+DIARY_DEFAULT_LANGUAGE = "zh-CN"
+DIARY_LANGUAGE_LABELS = {
+    "zh-CN": "简体中文",
+    "zh-TW": "繁体中文",
+    "en": "英文",
+}
 
 
 class TaskExecutor:
@@ -195,7 +211,9 @@ class TaskExecutor:
     def _get_llm_client(self):
         if self._llm_client is None:
             from ollama import Client
-            self._llm_client = Client()
+            # Ollama 是固定的本机服务。macOS 系统代理可能被 httpx 自动继承，
+            # 导致 127.0.0.1 请求错误地走代理并出现 Connection refused。
+            self._llm_client = Client(host="http://127.0.0.1:11434", trust_env=False)
         return self._llm_client
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -220,26 +238,33 @@ class TaskExecutor:
         exec_id = self._create_execution(conn, task_id, started_at)
 
         try:
-            # 3. 查询 knowledge 上下文
-            knowledge_list = self._query_knowledge(conn, task['user_instruction'])
-            knowledge_count = len(knowledge_list)
-            is_weekly_report = self._is_weekly_report_instruction(task['user_instruction'])
-            kpi_mode = is_weekly_report and self._is_kpi_mode_instruction(task['user_instruction'])
+            diary_period = self._detect_diary_period(task)
+            if diary_period:
+                diary_result = self._execute_diary_task(conn, task, diary_period)
+                knowledge_count = diary_result["source_count"]
+                token_estimate = diary_result["token_estimate"]
+                result_text = diary_result["result_text"]
+            else:
+                # 3. 查询 knowledge 上下文
+                knowledge_list = self._query_knowledge(conn, task['user_instruction'])
+                knowledge_count = len(knowledge_list)
+                is_weekly_report = self._is_weekly_report_instruction(task['user_instruction'])
+                kpi_mode = is_weekly_report and self._is_kpi_mode_instruction(task['user_instruction'])
 
-            # 4. 构建上下文（根据 token 预算决定压缩策略）
-            context_text, token_estimate = self._build_context(
-                knowledge_list,
-                user_instruction=task['user_instruction'],
-            )
+                # 4. 构建上下文（根据 token 预算决定压缩策略）
+                context_text, token_estimate = self._build_context(
+                    knowledge_list,
+                    user_instruction=task['user_instruction'],
+                )
 
-            # 5. 调用 LLM 生成报告
-            result_text = self._llm_generate(
-                user_instruction=task['user_instruction'],
-                context=context_text,
-                task_id=task_id,
-                is_weekly_report=is_weekly_report,
-                kpi_mode=kpi_mode,
-            )
+                # 5. 调用 LLM 生成报告
+                result_text = self._llm_generate(
+                    user_instruction=task['user_instruction'],
+                    context=context_text,
+                    task_id=task_id,
+                    is_weekly_report=is_weekly_report,
+                    kpi_mode=kpi_mode,
+                )
 
             # 6. 更新执行记录为成功
             completed_at = int(time.time() * 1000)
@@ -275,6 +300,950 @@ class TaskExecutor:
     # ─────────────────────────────────────────────────────────────────────────
     # Knowledge 查询与上下文构建
     # ─────────────────────────────────────────────────────────────────────────
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 日记生成
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _detect_diary_period(self, task: dict) -> Optional[str]:
+        template_id = (task.get("template_id") or "").strip()
+        text = " ".join(
+            str(task.get(k) or "") for k in ("name", "user_instruction", "template_id")
+        ).lower()
+
+        if template_id == "daily_journal" or "工作日记" in text or "daily journal" in text:
+            return "daily"
+        if template_id == "weekly_report" or "周记" in text or "工作周报" in text:
+            return "weekly"
+        if template_id == "monthly_summary" or "月记" in text or "月度工作总结" in text:
+            return "monthly"
+        return None
+
+    def _execute_diary_task(self, conn: sqlite3.Connection, task: dict, period_type: str) -> dict:
+        self._ensure_diaries_table(conn)
+        if period_type == "daily":
+            return self._execute_daily_diary_catchup(conn, task)
+
+        output_language = self._resolve_diary_output_language(task.get("user_instruction") or "")
+        period_start, period_end, diary_date = self._resolve_diary_period(period_type)
+        source_diaries = self._query_daily_diaries(conn, period_start, period_end)
+        context_text = self._build_diary_rollup_context(source_diaries)
+        token_estimate = max(1, len(context_text) // 4)
+        source_items = source_diaries
+        source_timeline_ids = []
+        source_diary_ids = [int(item["id"]) for item in source_diaries if item.get("id") is not None]
+
+        result_text = self._llm_generate(
+            user_instruction=self._diary_instruction(
+                period_type,
+                task["user_instruction"],
+                output_language=output_language,
+            ),
+            context=context_text or "无可用工作记录。",
+            task_id=task["id"],
+            is_weekly_report=(period_type == "weekly"),
+            kpi_mode=False,
+            output_language=output_language,
+            concise=True,
+        )
+
+        content = self._build_diary_content(
+            period_type=period_type,
+            period_start=period_start,
+            period_end=period_end,
+            diary_date=diary_date,
+            markdown=result_text,
+            source_items=source_items,
+            output_language=output_language,
+        )
+        self._upsert_diary(
+            conn=conn,
+            period_type=period_type,
+            period_start=period_start,
+            period_end=period_end,
+            diary_date=diary_date,
+            content=content,
+            source_timeline_ids=source_timeline_ids,
+            source_diary_ids=source_diary_ids,
+        )
+
+        return {
+            "result_text": result_text,
+            "source_count": len(source_items),
+            "token_estimate": token_estimate,
+        }
+
+    def _execute_daily_diary_catchup(self, conn: sqlite3.Connection, task: dict) -> dict:
+        target_dates = self._resolve_recent_daily_dates(days=DAILY_DIARY_CATCHUP_DAYS)
+        newest_target = target_dates[-1] if target_dates else None
+        result_blocks: list[str] = []
+        skipped_dates: list[str] = []
+        total_source_count = 0
+        total_token_estimate = 0
+
+        for diary_date in target_dates:
+            existing = self._get_diary_meta(conn, "daily", diary_date)
+            if existing and not existing["is_system_generated"]:
+                skipped_dates.append(f"{diary_date}: 用户已编辑")
+                continue
+
+            source_items = self._query_timelines_for_date(conn, diary_date)
+            if not source_items and existing is None and diary_date != newest_target:
+                skipped_dates.append(f"{diary_date}: 无可用工作记录")
+                continue
+
+            result = self._execute_single_daily_diary(conn, task, diary_date, source_items)
+            total_source_count += result["source_count"]
+            total_token_estimate += result["token_estimate"]
+            result_blocks.append(f"### {diary_date}\n{result['result_text']}")
+
+        if result_blocks:
+            result_text = "\n\n".join(result_blocks)
+            if skipped_dates:
+                result_text += "\n\n已跳过：\n" + "\n".join(f"- {item}" for item in skipped_dates)
+        else:
+            result_text = "最近工作日记无需更新。"
+            if skipped_dates:
+                result_text += "\n" + "\n".join(f"- {item}" for item in skipped_dates)
+
+        return {
+            "result_text": result_text,
+            "source_count": total_source_count,
+            "token_estimate": total_token_estimate,
+        }
+
+    def _execute_single_daily_diary(
+        self,
+        conn: sqlite3.Connection,
+        task: dict,
+        diary_date: str,
+        source_items: Optional[list[dict]] = None,
+    ) -> dict:
+        source_items = source_items if source_items is not None else self._query_timelines_for_date(conn, diary_date)
+        output_language = self._resolve_diary_output_language(task.get("user_instruction") or "")
+        context_text, token_estimate = self._build_daily_diary_context(
+            source_items,
+            output_language=output_language,
+        )
+        source_timeline_ids = [int(item["id"]) for item in source_items if item.get("id") is not None]
+        result_text = self._llm_generate(
+            user_instruction=self._daily_diary_instruction(
+                diary_date,
+                output_language=output_language,
+            ),
+            context=context_text or "无可用工作记录。",
+            task_id=task["id"],
+            is_weekly_report=False,
+            kpi_mode=False,
+            output_language=output_language,
+            concise=True,
+        )
+        result_text = self._normalize_daily_diary_markdown(
+            result_text,
+            output_language=output_language,
+        )
+
+        content = self._build_diary_content(
+            period_type="daily",
+            period_start=diary_date,
+            period_end=diary_date,
+            diary_date=diary_date,
+            markdown=result_text,
+            source_items=source_items,
+            output_language=output_language,
+        )
+        self._upsert_diary(
+            conn=conn,
+            period_type="daily",
+            period_start=diary_date,
+            period_end=diary_date,
+            diary_date=diary_date,
+            content=content,
+            source_timeline_ids=source_timeline_ids,
+            source_diary_ids=[],
+        )
+
+        return {
+            "result_text": result_text,
+            "source_count": len(source_items),
+            "token_estimate": token_estimate,
+        }
+
+    @staticmethod
+    def _resolve_recent_daily_dates(
+        today: Optional[date] = None,
+        days: int = DAILY_DIARY_CATCHUP_DAYS,
+    ) -> list[str]:
+        today = today or date.today()
+        day_count = max(1, int(days))
+        return [
+            (today - timedelta(days=offset)).isoformat()
+            for offset in range(day_count, 0, -1)
+        ]
+
+    def execute_idle_diary_backfill_once(
+        self,
+        lookback_days: int = IDLE_DIARY_BACKFILL_LOOKBACK_DAYS,
+        today: Optional[date] = None,
+    ) -> dict:
+        """推理队列空闲时调用：补齐一个缺失的历史 daily 日记。"""
+        started_at = int(time.time() * 1000)
+        conn = sqlite3.connect(self.db_path)
+        self._ensure_diaries_table(conn)
+
+        task = self._get_daily_diary_task(conn)
+        if not task:
+            conn.close()
+            return {"status": "idle", "reason": "daily_diary_task_not_configured"}
+
+        candidate = self._find_idle_diary_backfill_candidate(
+            conn,
+            lookback_days=lookback_days,
+            today=today,
+        )
+        if not candidate:
+            conn.close()
+            return {"status": "idle", "reason": "no_missing_historical_daily_diary"}
+
+        diary_date = candidate["diary_date"]
+        source_items = candidate["source_items"]
+        exec_id = self._create_execution(conn, task["id"], started_at) if task.get("id") else None
+
+        try:
+            result = self._execute_single_daily_diary(conn, task, diary_date, source_items)
+            result_text = f"### {diary_date}\n{result['result_text']}"
+            completed_at = int(time.time() * 1000)
+            if exec_id is not None:
+                self._update_execution(conn, exec_id, {
+                    "status": "success",
+                    "completed_at": completed_at,
+                    "result_text": result_text,
+                    "knowledge_count": result["source_count"],
+                    "token_used": result["token_estimate"],
+                    "latency_ms": completed_at - started_at,
+                })
+                self._update_task_stats(conn, task["id"], "success", completed_at)
+            conn.close()
+            logger.info(
+                "✅ 闲时补齐历史日记成功: date=%s source_count=%s",
+                diary_date,
+                result["source_count"],
+            )
+            return {
+                "status": "success",
+                "diary_date": diary_date,
+                "source_count": result["source_count"],
+                "token_estimate": result["token_estimate"],
+                "exec_id": exec_id,
+            }
+        except Exception as e:
+            completed_at = int(time.time() * 1000)
+            if exec_id is not None:
+                self._update_execution(conn, exec_id, {
+                    "status": "failed",
+                    "completed_at": completed_at,
+                    "error_message": str(e),
+                    "latency_ms": completed_at - started_at,
+                })
+                self._update_task_stats(conn, task["id"], "failed", completed_at)
+            conn.close()
+            logger.error("❌ 闲时补齐历史日记失败: date=%s error=%s", diary_date, e)
+            return {"status": "failed", "diary_date": diary_date, "error": str(e)}
+
+    def _get_daily_diary_task(self, conn: sqlite3.Connection) -> Optional[dict]:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT id, name, user_instruction, cron_expression, template_id
+                FROM scheduled_tasks
+                WHERE enabled = 1
+                  AND (
+                    template_id = 'daily_journal'
+                    OR name LIKE '%工作日记%'
+                    OR user_instruction LIKE '%工作日记%'
+                    OR lower(user_instruction) LIKE '%daily journal%'
+                  )
+                ORDER BY
+                  CASE WHEN template_id = 'daily_journal' THEN 0 ELSE 1 END,
+                  id ASC
+                LIMIT 1
+                """
+            )
+        except sqlite3.OperationalError as e:
+            logger.warning("读取 daily_journal 任务失败: %s", e)
+            return None
+        row = cursor.fetchone()
+        if row:
+            return {
+                "id": row[0],
+                "name": row[1],
+                "user_instruction": row[2],
+                "cron_expression": row[3],
+                "template_id": row[4],
+            }
+        return self._create_default_daily_diary_task(conn)
+
+    def _create_default_daily_diary_task(self, conn: sqlite3.Connection) -> Optional[dict]:
+        template = self._builtin_template("daily_journal")
+        if not template:
+            return None
+
+        now_ms = int(time.time() * 1000)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO scheduled_tasks (
+                    name, user_instruction, cron_expression, template_id,
+                    enabled, run_count, next_run_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 1, 0, 0, ?, ?)
+                """,
+                (
+                    template["name"],
+                    template["user_instruction"],
+                    template["cron"],
+                    template["id"],
+                    now_ms,
+                    now_ms,
+                ),
+            )
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            logger.warning("创建默认 daily_journal 任务失败: %s", e)
+            return None
+
+        task_id = cursor.lastrowid
+        logger.info("已创建默认 daily_journal 任务用于日记补齐: id=%s", task_id)
+        return {
+            "id": task_id,
+            "name": template["name"],
+            "user_instruction": template["user_instruction"],
+            "cron_expression": template["cron"],
+            "template_id": template["id"],
+        }
+
+    @staticmethod
+    def _builtin_template(template_id: str) -> Optional[dict]:
+        for template in BUILTIN_TEMPLATES:
+            if template.get("id") == template_id:
+                return template
+        return None
+
+    def _find_idle_diary_backfill_candidate(
+        self,
+        conn: sqlite3.Connection,
+        lookback_days: int = IDLE_DIARY_BACKFILL_LOOKBACK_DAYS,
+        today: Optional[date] = None,
+    ) -> Optional[dict]:
+        """返回最近一个有时间线但缺 daily 日记的历史日期。"""
+        today = today or date.today()
+        day_count = max(1, int(lookback_days))
+        start_day = today - timedelta(days=day_count)
+        start_ms, _ = self._date_range_ms(start_day.isoformat())
+        end_ms, _ = self._date_range_ms(today.isoformat())
+
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                WITH timeline_days AS (
+                    SELECT
+                        date(
+                            COALESCE(start_time, event_time_start, observed_at, created_at_ms, 0) / 1000,
+                            'unixepoch',
+                            'localtime'
+                        ) AS diary_date,
+                        COUNT(*) AS source_count
+                    FROM timelines
+                    WHERE COALESCE(start_time, event_time_start, observed_at, created_at_ms, 0) >= ?
+                      AND COALESCE(start_time, event_time_start, observed_at, created_at_ms, 0) < ?
+                      AND COALESCE(is_self_generated, 0) = 0
+                      AND (
+                          COALESCE(overview, '') != ''
+                          OR COALESCE(details, '') != ''
+                      )
+                    GROUP BY diary_date
+                )
+                SELECT td.diary_date, td.source_count
+                FROM timeline_days td
+                LEFT JOIN diaries d
+                  ON d.period_type = 'daily'
+                 AND d.diary_date = td.diary_date
+                WHERE d.id IS NULL
+                ORDER BY td.diary_date DESC
+                LIMIT 1
+                """,
+                (start_ms, end_ms),
+            )
+        except sqlite3.OperationalError as e:
+            logger.warning("查找历史日记缺口失败: %s", e)
+            return None
+
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        diary_date = row[0]
+        source_items = self._query_timelines_for_date(conn, diary_date)
+        if not source_items:
+            return None
+
+        return {
+            "diary_date": diary_date,
+            "source_count": row[1],
+            "source_items": source_items,
+        }
+
+    @staticmethod
+    def _resolve_diary_period(period_type: str, today: Optional[date] = None) -> tuple[str, str, str]:
+        today = today or date.today()
+        if period_type == "daily":
+            target = today - timedelta(days=1)
+            iso = target.isoformat()
+            return iso, iso, iso
+
+        if period_type == "weekly":
+            end = today - timedelta(days=today.weekday() + 1)
+            start = end - timedelta(days=6)
+            return start.isoformat(), end.isoformat(), end.isoformat()
+
+        if period_type == "monthly":
+            first_this_month = today.replace(day=1)
+            end = first_this_month - timedelta(days=1)
+            start = end.replace(day=1)
+            return start.isoformat(), end.isoformat(), end.isoformat()
+
+        raise ValueError(f"不支持的日记周期: {period_type}")
+
+    @staticmethod
+    def _date_range_ms(day: str) -> tuple[int, int]:
+        d = date.fromisoformat(day)
+        start_dt = datetime.combine(d, datetime_time.min)
+        end_dt = start_dt + timedelta(days=1)
+        return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+
+    def _query_timelines_for_date(self, conn: sqlite3.Connection, diary_date: str) -> list[dict]:
+        start_ms, end_ms = self._date_range_ms(diary_date)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, capture_id, overview, details, category, importance,
+                   start_time, end_time, duration_minutes,
+                   frag_app_name, entities,
+                   user_verified, observed_at, event_time_start, event_time_end,
+                   history_view, content_origin, activity_type, is_self_generated,
+                   evidence_strength, created_at_ms
+            FROM timelines
+            WHERE COALESCE(start_time, event_time_start, observed_at, created_at_ms, 0) >= ?
+              AND COALESCE(start_time, event_time_start, observed_at, created_at_ms, 0) < ?
+              AND COALESCE(is_self_generated, 0) = 0
+            ORDER BY COALESCE(start_time, event_time_start, observed_at, created_at_ms, 0) ASC, id ASC
+            LIMIT 500
+            """,
+            (start_ms, end_ms),
+        )
+
+        rows = cursor.fetchall()
+        return [
+            {
+                "id": r[0],
+                "capture_id": r[1],
+                "overview": r[2] or "",
+                "details": r[3] or "",
+                "category": r[4] or "其他",
+                "importance": r[5] or 3,
+                "start_time": r[6],
+                "end_time": r[7],
+                "duration_minutes": r[8],
+                "app_name": r[9],
+                "entities": json.loads(r[10]) if r[10] else [],
+                "user_verified": bool(r[11]) if r[11] is not None else False,
+                "observed_at": r[12],
+                "event_time_start": r[13],
+                "event_time_end": r[14],
+                "history_view": bool(r[15]) if r[15] is not None else False,
+                "content_origin": r[16],
+                "activity_type": r[17],
+                "is_self_generated": bool(r[18]) if r[18] is not None else False,
+                "evidence_strength": r[19],
+                "created_at": r[20],
+            }
+            for r in rows
+        ]
+
+    def _query_daily_diaries(
+        self, conn: sqlite3.Connection, period_start: str, period_end: str
+    ) -> list[dict]:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, diary_date, content
+            FROM diaries
+            WHERE period_type = 'daily'
+              AND diary_date >= ?
+              AND diary_date <= ?
+            ORDER BY diary_date ASC, id ASC
+            """,
+            (period_start, period_end),
+        )
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            content = self._parse_json_object(row[2])
+            result.append({"id": row[0], "diary_date": row[1], "content": content})
+        return result
+
+    def _build_diary_rollup_context(self, diaries: list[dict]) -> str:
+        blocks = []
+        for diary in diaries:
+            content = diary.get("content") or {}
+            lines = [f"[{diary['diary_date']}] {content.get('title') or '工作日记'}"]
+            for label, key in (
+                ("产出", "work_outputs"),
+                ("问题与解决", "problems_solved"),
+                ("计划", "next_plan"),
+            ):
+                values = content.get(key) or []
+                if values:
+                    lines.append(f"{label}:")
+                    lines.extend(f"- {item}" for item in values if item)
+            markdown = content.get("markdown")
+            if markdown and len(lines) == 1:
+                lines.append(str(markdown)[:2000])
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
+
+    def _diary_instruction(
+        self,
+        period_type: str,
+        user_instruction: str,
+        output_language: str = DIARY_DEFAULT_LANGUAGE,
+    ) -> str:
+        language_label = self._diary_language_label(output_language)
+        if period_type == "daily":
+            return self._daily_diary_instruction(None, output_language=output_language)
+        if period_type == "weekly":
+            return (
+                "请仅基于 daily 工作日记汇总周记，不要引入日记之外的事实。\n"
+                f"必须使用{language_label}输出，即使来源中包含大量英文。\n"
+                "输出 Markdown，包含：## 本周核心产出、## 项目进展、## 下周计划、## 风险/阻塞。\n"
+                "每个章节最多 5 条，每条只写一个结论，不复述每日过程。"
+            )
+        if period_type == "monthly":
+            return (
+                "请仅基于 daily 工作日记汇总月记，不要引入日记之外的事实。\n"
+                f"必须使用{language_label}输出，即使来源中包含大量英文。\n"
+                "输出 Markdown，包含：## 主要成果、## 时间分配、## 效率亮点与问题、## 下月目标。\n"
+                "每个章节最多 5 条，合并重复事项，不逐日复述。"
+            )
+        return user_instruction
+
+    @classmethod
+    def _daily_diary_instruction(
+        cls,
+        diary_date: Optional[str],
+        output_language: str = DIARY_DEFAULT_LANGUAGE,
+    ) -> str:
+        date_label = f"{diary_date} " if diary_date else ""
+        language_label = cls._diary_language_label(output_language)
+        section_titles = [rule[0] for rule in cls._daily_diary_section_rules(output_language)]
+        return (
+            f"请基于{date_label}的时间线内容生成高度浓缩的工作日记，只保留当天最重要的产出、决策、修复和明确结论。\n"
+            f"必须使用{language_label}输出；即使时间线、应用名或技术术语主要为英文，也要用{language_label}叙述，产品名和代码标识符可保留原文。\n"
+            f"输出 Markdown，只包含：{'、'.join(f'## {title}' for title in section_titles)}。\n"
+            "写作约束：\n"
+            f"- 【{section_titles[0]}】最多 4 条，每条不超过 45 个字符，必须是结果，不写过程。\n"
+            f"- 【{section_titles[1]}】最多 2 条，只写已解决问题或明确结论；没有则写「- 无」。\n"
+            f"- 【{section_titles[2]}】最多 3 条，必须是可交付、可验证事项。\n"
+            "- 删除浏览、阅读、搜索、应用切换、会议过程、配置环境、失败尝试等流水账。"
+        )
+
+    def _build_diary_content(
+        self,
+        period_type: str,
+        period_start: str,
+        period_end: str,
+        diary_date: str,
+        markdown: str,
+        source_items: list[dict],
+        output_language: str = DIARY_DEFAULT_LANGUAGE,
+    ) -> dict:
+        title_suffix = {"daily": "工作日记", "weekly": "工作周记", "monthly": "工作月记"}.get(
+            period_type, "工作日记"
+        )
+        title = f"{diary_date} {title_suffix}" if period_start == period_end else f"{period_start} 至 {period_end} {title_suffix}"
+
+        content = {
+            "schema_version": "diary.v1",
+            "period_type": period_type,
+            "title": title,
+            "period_start": period_start,
+            "period_end": period_end,
+            "language": output_language,
+            "summary": self._first_meaningful_line(markdown),
+            "markdown": markdown,
+            "work_outputs": self._extract_markdown_section_items(markdown, ("今日产出", "工作产出", "核心产出", "主要成果", "Today's Outcomes", "Work Outputs")),
+            "problems_solved": self._extract_markdown_section_items(markdown, ("问题与解决", "风险/阻塞", "效率亮点与问题", "Problems & Resolutions", "Problems and Resolutions")),
+            "next_plan": self._extract_markdown_section_items(markdown, ("明日计划", "下周计划", "下月目标", "Next-day Plan", "Next Day Plan")),
+            "timeline": [],
+            "source_count": len(source_items),
+        }
+
+        if period_type == "daily":
+            content["work_environment"] = self._infer_work_environment(source_items)
+            content["timeline"] = [
+                {
+                    "timeline_id": item.get("id"),
+                    "time": self._format_time(item.get("start_time")),
+                    "duration_minutes": item.get("duration_minutes"),
+                    "summary": self._compact_diary_item_text(item),
+                    "category": item.get("category") or "其他",
+                }
+                for item in self._select_daily_diary_items(
+                    source_items,
+                    limit=DAILY_DIARY_TIMELINE_MAX_ITEMS,
+                )
+            ]
+        else:
+            content["source_dates"] = [item.get("diary_date") for item in source_items if item.get("diary_date")]
+
+        return content
+
+    def _build_daily_diary_context(
+        self,
+        source_items: list[dict],
+        output_language: str = DIARY_DEFAULT_LANGUAGE,
+    ) -> tuple[str, int]:
+        if not source_items:
+            return "", 0
+
+        picked = self._select_daily_diary_items(source_items, limit=DAILY_DIARY_CONTEXT_MAX_ITEMS)
+        blocks: list[str] = [self._build_work_environment_context(source_items, output_language)]
+        for item in picked:
+            ts = self._format_time(item.get("start_time"))
+            duration = f"（{item['duration_minutes']}分钟）" if item.get("duration_minutes") else ""
+            category = item.get("category") or "其他"
+            importance = item.get("importance") or 0
+            text = self._compact_diary_item_text(item)
+            if text:
+                blocks.append(f"[{ts}{duration}][{category}][重要性{importance}] {text}")
+
+        if len(source_items) > len(picked):
+            blocks.append(f"已从 {len(source_items)} 条时间线中筛选 {len(picked)} 条高价值线索，其余低价值流水不展开。")
+
+        context = "\n".join(blocks)
+        return context, max(1, len(context) // 4)
+
+    @classmethod
+    def _resolve_diary_output_language(cls, user_instruction: str = "") -> str:
+        instruction = (user_instruction or "").lower()
+        explicit_languages = (
+            (r"(?<!默认)(?:使用|用|以|输出为?|写成)\s*(?:简体)?中文|simplified chinese|in chinese", "zh-CN"),
+            (r"(?<!默认)(?:使用|用|以|输出为?|写成)\s*繁体中文|traditional chinese", "zh-TW"),
+            (r"(?<!默认)(?:使用|用|以|输出为?|写成)\s*英文|in english|english output", "en"),
+        )
+        matches: list[tuple[int, str]] = []
+        for pattern, language in explicit_languages:
+            matches.extend(
+                (match.start(), language)
+                for match in re.finditer(pattern, instruction, flags=re.IGNORECASE)
+            )
+        if matches:
+            return max(matches, key=lambda item: item[0])[1]
+
+        configured = cls._normalize_diary_language(os.getenv("MEMORY_BREAD_DIARY_LANGUAGE", ""))
+        return configured or DIARY_DEFAULT_LANGUAGE
+
+    @staticmethod
+    def _normalize_diary_language(value: str) -> Optional[str]:
+        normalized = (value or "").strip().lower().replace("_", "-")
+        if not normalized:
+            return None
+        if normalized.startswith("zh-hant") or normalized.startswith(("zh-tw", "zh-hk")):
+            return "zh-TW"
+        if normalized.startswith("zh") or normalized in {"chinese", "中文", "简体中文"}:
+            return "zh-CN"
+        aliases = {
+            "english": "en",
+            "英文": "en",
+        }
+        primary = normalized.split("-", 1)[0]
+        return aliases.get(normalized) or (primary if primary == "en" else None)
+
+    @staticmethod
+    def _diary_language_label(language: str) -> str:
+        return DIARY_LANGUAGE_LABELS.get(language, language or "简体中文")
+
+    @staticmethod
+    def _infer_work_environment(source_items: list[dict]) -> dict:
+        apps: Counter[str] = Counter()
+        categories: Counter[str] = Counter()
+        entities: Counter[str] = Counter()
+
+        for item in source_items:
+            app = re.sub(r"\s+", " ", str(item.get("app_name") or "")).strip()
+            category = re.sub(r"\s+", " ", str(item.get("category") or "")).strip()
+            if app and app.lower() not in {"unknown", "未知", "其他"}:
+                apps[app[:48]] += 1
+            if category and category.lower() not in {"unknown", "未知", "其他"}:
+                categories[category[:32]] += 1
+            entity_values = item.get("entities") or []
+            if isinstance(entity_values, str):
+                try:
+                    parsed_entities = json.loads(entity_values)
+                    entity_values = parsed_entities if isinstance(parsed_entities, list) else [entity_values]
+                except Exception:
+                    entity_values = [entity_values]
+            for entity in entity_values:
+                text = re.sub(r"\s+", " ", str(entity or "")).strip()
+                if text:
+                    entities[text[:48]] += 1
+
+        return {
+            "apps": [name for name, _ in apps.most_common(5)],
+            "categories": [name for name, _ in categories.most_common(4)],
+            "entities": [name for name, _ in entities.most_common(6)],
+        }
+
+    @classmethod
+    def _build_work_environment_context(
+        cls,
+        source_items: list[dict],
+        output_language: str,
+    ) -> str:
+        environment = cls._infer_work_environment(source_items)
+        lines = [
+            "【工作环境摘要】",
+            f"- 输出语言：{cls._diary_language_label(output_language)}",
+        ]
+        if environment["apps"]:
+            lines.append(f"- 主要应用/工具：{'、'.join(environment['apps'])}")
+        if environment["categories"]:
+            lines.append(f"- 主要工作类型：{'、'.join(environment['categories'])}")
+        if environment["entities"]:
+            lines.append(f"- 项目/主题线索：{'、'.join(environment['entities'])}")
+        lines.append("以上信息只用于识别用户的真实工作场景；不要把应用切换或工具使用本身写成产出。")
+        return "\n".join(lines)
+
+    @classmethod
+    def _daily_diary_section_rules(cls, output_language: str) -> tuple:
+        if output_language == "en":
+            return (
+                ("Today's Outcomes", ("Today's Outcomes", "Work Outputs", "今日产出", "工作产出"), 4, 45),
+                ("Problems & Resolutions", ("Problems & Resolutions", "Problems and Resolutions", "问题与解决"), 2, 45),
+                ("Next-day Plan", ("Next-day Plan", "Next Day Plan", "明日计划"), 3, 45),
+            )
+        return (
+            ("今日产出", ("今日产出", "工作产出", "核心产出", "主要成果"), 4, 45),
+            ("问题与解决", ("问题与解决", "风险/阻塞", "效率亮点与问题"), 2, 45),
+            ("明日计划", ("明日计划", "下周计划", "下月目标"), 3, 45),
+        )
+
+    @classmethod
+    def _normalize_daily_diary_markdown(
+        cls,
+        markdown: str,
+        output_language: str = DIARY_DEFAULT_LANGUAGE,
+    ) -> str:
+        section_rules = cls._daily_diary_section_rules(output_language)
+        blocks: list[str] = []
+        for title, headings, item_limit, char_limit in section_rules:
+            items = cls._extract_markdown_section_items(markdown, headings)
+            compacted: list[str] = []
+            seen: set[str] = set()
+            for item in items:
+                text = re.sub(r"\s+", " ", item).strip()
+                if not text or text in seen:
+                    continue
+                if len(text) > char_limit:
+                    text = text[: char_limit - 1].rstrip("，,。；; ") + "…"
+                seen.add(text)
+                compacted.append(text)
+                if len(compacted) >= item_limit:
+                    break
+            blocks.append(f"## {title}\n" + "\n".join(f"- {item}" for item in (compacted or ["无"])))
+        return "\n\n".join(blocks)
+
+    def _select_daily_diary_items(self, source_items: list[dict], limit: int) -> list[dict]:
+        valuable = [
+            item for item in source_items
+            if self._compact_diary_item_text(item) and not self._is_low_value_diary_item(item)
+        ]
+        candidates = valuable or [
+            item for item in source_items if self._compact_diary_item_text(item)
+        ]
+
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                int(item.get("importance") or 0),
+                int(item.get("duration_minutes") or 0),
+                int(item.get("start_time") or item.get("created_at") or 0),
+            ),
+            reverse=True,
+        )
+        picked = ranked[: max(1, int(limit))]
+        picked.sort(key=lambda item: int(item.get("start_time") or item.get("created_at") or 0))
+        return picked
+
+    @staticmethod
+    def _compact_diary_item_text(item: dict) -> str:
+        text = " ".join(str(part or "").strip() for part in (item.get("overview"), item.get("details")) if part)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > DIARY_ITEM_SUMMARY_MAX_CHARS:
+            return text[:DIARY_ITEM_SUMMARY_MAX_CHARS].rstrip() + "..."
+        return text
+
+    @staticmethod
+    def _is_low_value_diary_item(item: dict) -> bool:
+        text = TaskExecutor._compact_diary_item_text(item)
+        lowered = text.lower()
+        category = str(item.get("category") or "").lower()
+        activity = str(item.get("activity_type") or "").lower()
+
+        result_tokens = (
+            "完成", "修复", "确定", "交付", "上线", "发布", "实现", "新增", "优化", "解决",
+            "通过", "验证", "沉淀", "设计", "决策", "整理出", "形成了", "关闭", "delivered",
+            "fixed", "implemented", "released",
+        )
+        if any(token in text or token in lowered for token in result_tokens):
+            return False
+        if int(item.get("importance") or 0) >= 4:
+            return False
+
+        low_value_tokens = (
+            "浏览", "查看", "阅读", "搜索", "打开", "切换", "停留", "尝试", "调试环境",
+            "安装", "配置", "无明显", "idle", "browsing", "reading",
+        )
+        if any(token in text or token in lowered for token in low_value_tokens):
+            return True
+        return category in {"浏览", "阅读", "其他", "idle", "browsing"} or activity in {"idle", "browsing"}
+
+    @staticmethod
+    def _first_meaningful_line(markdown: str) -> str:
+        for raw_line in (markdown or "").splitlines():
+            line = raw_line.strip().strip("#-* ")
+            if line:
+                return line[:160]
+        return ""
+
+    @staticmethod
+    def _extract_markdown_section_items(markdown: str, headings: tuple[str, ...]) -> list[str]:
+        items: list[str] = []
+        in_section = False
+        for raw_line in (markdown or "").splitlines():
+            line = raw_line.strip()
+            heading_text = line.strip("# ").strip("【】")
+            if any(token in heading_text for token in headings):
+                in_section = True
+                continue
+            if in_section and (line.startswith("#") or re.fullmatch(r"【.+】", line)):
+                break
+            if in_section and re.match(r"^(?:[-*]|\d+[.)、])\s*", line):
+                item = re.sub(r"^(?:[-*]|\d+[.)、])\s*", "", line).strip()
+                if item:
+                    items.append(item[:240])
+        return items[:12]
+
+    @staticmethod
+    def _parse_json_object(raw: str) -> dict:
+        try:
+            parsed = json.loads(raw or "{}")
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {"markdown": raw or ""}
+
+    def _get_diary_meta(
+        self,
+        conn: sqlite3.Connection,
+        period_type: str,
+        diary_date: str,
+    ) -> Optional[dict]:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, is_system_generated, generation_status, updated_at
+            FROM diaries
+            WHERE period_type = ?
+              AND diary_date = ?
+            """,
+            (period_type, diary_date),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "is_system_generated": bool(row[1]),
+            "generation_status": row[2],
+            "updated_at": row[3],
+        }
+
+    def _ensure_diaries_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS diaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period_type TEXT NOT NULL CHECK(period_type IN ('daily', 'weekly', 'monthly', 'yearly')),
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                diary_date TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_timeline_ids TEXT NOT NULL DEFAULT '[]',
+                source_diary_ids TEXT NOT NULL DEFAULT '[]',
+                generation_status TEXT NOT NULL DEFAULT 'ready',
+                is_system_generated INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(period_type, diary_date)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_diaries_type_date ON diaries(period_type, diary_date DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_diaries_period ON diaries(period_start, period_end)")
+        conn.commit()
+
+    def _upsert_diary(
+        self,
+        conn: sqlite3.Connection,
+        period_type: str,
+        period_start: str,
+        period_end: str,
+        diary_date: str,
+        content: dict,
+        source_timeline_ids: list[int],
+        source_diary_ids: list[int],
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO diaries (
+                period_type, period_start, period_end, diary_date, content,
+                source_timeline_ids, source_diary_ids, generation_status, is_system_generated
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', 1)
+            ON CONFLICT(period_type, diary_date) DO UPDATE SET
+                period_start = excluded.period_start,
+                period_end = excluded.period_end,
+                content = excluded.content,
+                source_timeline_ids = excluded.source_timeline_ids,
+                source_diary_ids = excluded.source_diary_ids,
+                generation_status = 'ready',
+                is_system_generated = 1,
+                updated_at = datetime('now')
+            """,
+            (
+                period_type,
+                period_start,
+                period_end,
+                diary_date,
+                json.dumps(content, ensure_ascii=False),
+                json.dumps(source_timeline_ids, ensure_ascii=False),
+                json.dumps(source_diary_ids, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
 
     def _query_knowledge(self, conn: sqlite3.Connection, user_instruction: str) -> list[dict]:
         """
@@ -582,6 +1551,8 @@ class TaskExecutor:
         task_id: int = None,
         is_weekly_report: bool = False,
         kpi_mode: bool = False,
+        output_language: Optional[str] = None,
+        concise: bool = False,
     ) -> str:
         """调用 LLM 生成报告"""
         from monitor.llm_tracker import LLMCallTracker, estimate_tokens
@@ -599,6 +1570,18 @@ class TaskExecutor:
                     "\n6. 无证据支撑时不得编造数字。"
                 )
 
+        language_rules = ""
+        if output_language:
+            language_label = self._diary_language_label(output_language)
+            language_rules = (
+                f"\n8. 【输出语言】必须使用{language_label}。即使工作记录大部分为英文，也必须用{language_label}叙述；"
+                "产品名、应用名和代码标识符可以保留原文。"
+            )
+        if concise:
+            language_rules += (
+                "\n9. 【精简要求】合并同类事项，只保留成果、结论和可验证计划；禁止逐时段复述，禁止补写背景铺垫或总结性套话。"
+            )
+
         system_prompt = (
             "你是用户的个人工作助手。以下是用户近期的工作记录摘要（按时间顺序）。"
             "每条记录的格式为：[时间][工作项] 概述（进度）\n\n"
@@ -613,41 +1596,120 @@ class TaskExecutor:
             "5. 凡有可量化数据（测试通过率、性能指标、完成模块数等），必须写出具体数字。\n"
             "6. 每条工作项须能回答「这件事带来了什么价值？」，否则删除该条。\n"
             "7. 【格式规范】所有章节标题必须使用 ## 二级标题格式（如 ## 开发、## 阅读、## 今日小结），章节内的列表项必须统一使用无序列表格式（以 - 或 * 开头，无额外缩进）。"
-            f"{weekly_rules}"
+            f"{weekly_rules}{language_rules}"
         )
         user_prompt = f"## 工作记录\n\n{context}\n\n---\n\n## 用户指令\n\n{user_instruction}"
         # 使用全局统一的 Ollama 模型名，避免与 RAG 查询使用不同模型导致 Ollama swap
         from model_registry_global import get_active_ollama_model
         model = get_active_ollama_model()
 
-        client = self._get_llm_client()
+        def _chat() -> dict:
+            client = self._get_llm_client()
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            response = client.chat(
+                model=model,
+                messages=messages,
+                # Qwen 等模型会把内部推理放在 thinking 字段。日记只需要最终正文，
+                # 显式关闭思考输出，避免英文推理过程被误当成日记保存。
+                think=False,
+                options={"temperature": 0.2 if concise else 0.5, "num_predict": 768 if concise else 2048},
+            )
+            content = self._llm_message_content(response)
+            if self._requires_chinese_output(output_language) and not self._is_chinese_diary_output(content):
+                logger.warning("日记首次生成未遵守中文输出要求，正在执行一次纠偏重写")
+                response = client.chat(
+                    model=model,
+                    messages=messages + [
+                        {"role": "assistant", "content": content},
+                        {
+                            "role": "user",
+                            "content": (
+                                "请将上面的内容严格改写为简体中文，不得新增事实。"
+                                "保留规定章节，删除过程性流水账和套话，每条只保留一个结果或结论。"
+                            ),
+                        },
+                    ],
+                    think=False,
+                    options={"temperature": 0.1, "num_predict": 768 if concise else 2048},
+                )
+                content = self._llm_message_content(response)
+                if not self._is_chinese_diary_output(content):
+                    raise RuntimeError("模型连续两次未按要求输出中文日记，已拒绝写入")
+            return response
+
         with LLMCallTracker(
             caller="task",
             model_name=model,
             caller_id=str(task_id) if task_id else None,
             db_path=self.db_path,
         ) as tracker:
-            response = client.chat(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                options={"temperature": 0.5, "num_predict": 2048},
-            )
+            try:
+                from inference_queue import LANE_P2_DIARY, Priority, get_global_queue
+
+                response = get_global_queue().submit_sync(
+                    Priority.P2,
+                    _chat,
+                    timeout=900.0,
+                    lane=LANE_P2_DIARY,
+                )
+            except ImportError:
+                response = _chat()
             tracker.set_response(response)
             # 如果 Ollama 没返回 token 信息，用估算补充
-            msg = response['message']
-            content = msg.get('content', '')
-            # Qwen3.5 等推理模型可能将内容放在 thinking 字段
-            if not content:
-                content = msg.get('thinking', '')
+            content = self._llm_message_content(response)
             if tracker._prompt_tokens == 0:
                 tracker.set_tokens(
                     prompt=estimate_tokens(system_prompt + user_prompt),
                     completion=estimate_tokens(content),
                 )
         return content
+
+    @staticmethod
+    def _llm_message_content(response: dict) -> str:
+        msg = response.get("message") or {}
+        return msg.get("content", "") or msg.get("thinking", "")
+
+    @staticmethod
+    def _requires_chinese_output(output_language: Optional[str]) -> bool:
+        return bool(output_language and output_language.startswith("zh"))
+
+    @staticmethod
+    def _is_chinese_diary_output(content: str) -> bool:
+        lowered = (content or "").lower()
+        reasoning_markers = (
+            "thinking process",
+            "constraints (from",
+            "user's latest prompt",
+            "simplified chinese only",
+            "no new facts",
+        )
+        if any(marker in lowered for marker in reasoning_markers):
+            return False
+
+        body = re.sub(
+            r"(?m)^#+\s*(?:今日产出|问题与解决|明日计划|本周核心产出|项目进展|下周计划|风险/阻塞|主要成果|时间分配|效率亮点与问题|下月目标)\s*$",
+            "",
+            content or "",
+        )
+        chinese_chars = len(re.findall(r"[\u3400-\u9fff]", body))
+        latin_words = len(re.findall(r"\b[A-Za-z]{2,}\b", body))
+        if chinese_chars < 2 or chinese_chars < latin_words:
+            return False
+
+        bullet_items = [
+            re.sub(r"^(?:[-*]|\d+[.)、])\s*", "", line.strip())
+            for line in (content or "").splitlines()
+            if re.match(r"^(?:[-*]|\d+[.)、])\s*", line.strip())
+        ]
+        for item in bullet_items:
+            item_chinese_chars = len(re.findall(r"[\u3400-\u9fff]", item))
+            item_latin_words = len(re.findall(r"\b[A-Za-z]{2,}\b", item))
+            if item_chinese_chars == 0 or item_latin_words > max(4, item_chinese_chars):
+                return False
+        return True
 
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -657,13 +1719,19 @@ class TaskExecutor:
     def _get_task(self, conn: sqlite3.Connection, task_id: int) -> Optional[dict]:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, name, user_instruction, cron_expression FROM scheduled_tasks WHERE id = ?",
+            "SELECT id, name, user_instruction, cron_expression, template_id FROM scheduled_tasks WHERE id = ?",
             (task_id,)
         )
         row = cursor.fetchone()
         if not row:
             return None
-        return {"id": row[0], "name": row[1], "user_instruction": row[2], "cron_expression": row[3]}
+        return {
+            "id": row[0],
+            "name": row[1],
+            "user_instruction": row[2],
+            "cron_expression": row[3],
+            "template_id": row[4],
+        }
 
     def _create_execution(self, conn: sqlite3.Connection, task_id: int, started_at: int) -> int:
         cursor = conn.cursor()

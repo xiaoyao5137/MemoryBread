@@ -1,4 +1,4 @@
-//! Asset snapshot export/import.
+//! Memory package export/import.
 //!
 //! These snapshots intentionally exclude raw capture payloads (OCR text,
 //! keyboard input, screenshot paths, audio text). Timelines still require a
@@ -39,6 +39,31 @@ const EXCLUDED_TABLES: &[&str] = &[
     "captures_fts_data",
     "captures_fts_docsize",
     "captures_fts_idx",
+    "user_preferences",
+    "app_filters",
+    "app_blacklist",
+    "privacy_filters",
+    "style_samples",
+    "action_logs",
+    "rag_sessions",
+    "scheduled_tasks",
+    "task_executions",
+    "bake_runs",
+    "bake_watermarks",
+    "bake_retry_state",
+    "bake_articles",
+    "bake_articles_fts",
+    "bake_designs",
+    "bake_designs_fts",
+    "bake_documents_fts",
+    "bake_document_sections_fts",
+    "bake_knowledge_fts",
+    "bake_sops_fts",
+    "bake_templates",
+    "creation_history",
+    "designs_fts",
+    "episodic_memories_fts",
+    "knowledge_fts",
     "vector_index",
     "system_metrics",
     "llm_usage_logs",
@@ -54,67 +79,11 @@ struct AssetTableSpec {
 
 const ASSET_TABLES: &[AssetTableSpec] = &[
     AssetTableSpec {
-        name: "user_preferences",
-        identity_columns: &["key"],
-    },
-    AssetTableSpec {
-        name: "app_filters",
-        identity_columns: &["app_name"],
-    },
-    AssetTableSpec {
-        name: "app_blacklist",
-        identity_columns: &["bundle_id"],
-    },
-    AssetTableSpec {
-        name: "privacy_filters",
-        identity_columns: &["filter_type"],
-    },
-    AssetTableSpec {
-        name: "style_samples",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
-        name: "action_logs",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
-        name: "rag_sessions",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
-        name: "scheduled_tasks",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
-        name: "task_executions",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
         name: "timelines",
         identity_columns: &["id"],
     },
     AssetTableSpec {
-        name: "bake_runs",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
-        name: "bake_watermarks",
-        identity_columns: &["pipeline_name"],
-    },
-    AssetTableSpec {
-        name: "bake_retry_state",
-        identity_columns: &["timeline_id"],
-    },
-    AssetTableSpec {
-        name: "bake_articles",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
-        name: "bake_designs",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
-        name: "bake_templates",
+        name: "bake_knowledge",
         identity_columns: &["id"],
     },
     AssetTableSpec {
@@ -126,15 +95,7 @@ const ASSET_TABLES: &[AssetTableSpec] = &[
         identity_columns: &["id"],
     },
     AssetTableSpec {
-        name: "bake_knowledge",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
         name: "bake_sops",
-        identity_columns: &["id"],
-    },
-    AssetTableSpec {
-        name: "creation_history",
         identity_columns: &["id"],
     },
 ];
@@ -230,6 +191,14 @@ impl StorageManager {
         dry_run: bool,
     ) -> Result<AssetSnapshotImportReport, StorageError> {
         let bytes = std::fs::read(path)?;
+        self.import_asset_snapshot_from_bytes(&bytes, dry_run)
+    }
+
+    pub fn import_asset_snapshot_from_bytes(
+        &self,
+        bytes: &[u8],
+        dry_run: bool,
+    ) -> Result<AssetSnapshotImportReport, StorageError> {
         let snapshot: AssetSnapshot = serde_json::from_slice(&bytes)?;
         let actual_payload_sha256 = snapshot_payload_sha256(&snapshot)?;
         if snapshot.manifest.payload_sha256 != actual_payload_sha256 {
@@ -897,6 +866,14 @@ mod tests {
         let snapshot: AssetSnapshot =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(snapshot.tables.iter().all(|table| table.name != "captures"));
+        assert!(snapshot.tables.iter().all(|table| matches!(
+            table.name.as_str(),
+            "timelines"
+                | "bake_knowledge"
+                | "bake_documents"
+                | "bake_document_sections"
+                | "bake_sops"
+        )));
         assert_eq!(snapshot.capture_refs.len(), 1);
         assert!(snapshot.capture_refs[0].get("ax_text").is_none());
         assert!(snapshot.capture_refs[0].get("screenshot_path").is_none());

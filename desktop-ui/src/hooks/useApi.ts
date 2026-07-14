@@ -7,16 +7,21 @@ import type {
   BakeBucket,
   BakeCaptureItem,
   BakeKnowledgeItem,
+  CloudMemoryPackageBackupResult,
+  CloudMemoryPackageRestoreResult,
   CaptureRecord,
   ConfigCheckActionResult,
   ConfigCheckItem,
   DebugLogContent,
   DebugLogFile,
+  MemoryPackageExportResult,
+  MemoryPackageImportReport,
   TimelineItem,
   PaginatedBakeResponse,
   PreferenceRecord,
   RagContext,
   RagHistoryItem,
+  RagHistoryPage,
   RagQueryResponse,
   ActionResult,
   SopCandidate,
@@ -400,12 +405,28 @@ export function useRagQuery() {
 export function useFetchRagHistory() {
   const apiBaseUrl = useAppStore((s) => normalizeLocalApiBaseUrl(s.apiBaseUrl))
 
-  return useCallback(async (limit = 20): Promise<RagHistoryItem[]> => {
-    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/rag/history?limit=${encodeURIComponent(String(limit))}`)
-    if (resp.status === 404) return []
+  return useCallback(async (
+    params: { limit?: number; offset?: number; query?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<RagHistoryPage> => {
+    const limit = params.limit ?? 20
+    const offset = params.offset ?? 0
+    const searchParams = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+    })
+    if (params.query?.trim()) searchParams.set('q', params.query.trim())
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/rag/history?${searchParams}`, { signal })
+    if (resp.status === 404) return { items: [], total: 0, limit, offset }
     if (!resp.ok) throw new Error(`rag history fetch failed: ${resp.status}`)
     const data = await resp.json()
-    return data.items ?? []
+    const items: RagHistoryItem[] = Array.isArray(data) ? data : data.items ?? []
+    return {
+      items,
+      total: Number.isFinite(Number(data?.total)) ? Number(data.total) : items.length,
+      limit: Number.isFinite(Number(data?.limit)) ? Number(data.limit) : limit,
+      offset: Number.isFinite(Number(data?.offset)) ? Number(data.offset) : offset,
+    }
   }, [apiBaseUrl])
 }
 
@@ -531,6 +552,82 @@ export function useExecuteAction() {
       body:    JSON.stringify(action),
     })
     if (!resp.ok) throw new Error(`execute action failed: ${resp.status}`)
+    return resp.json()
+  }, [apiBaseUrl])
+}
+
+export function useExportMemoryPackage() {
+  const apiBaseUrl = useAppStore((s) => normalizeLocalApiBaseUrl(s.apiBaseUrl))
+
+  return useCallback(async (): Promise<MemoryPackageExportResult> => {
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/snapshots/assets/export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    if (!resp.ok) {
+      throw new Error(await parseApiErrorMessage(resp, `memory package export failed: ${resp.status}`))
+    }
+    return resp.json()
+  }, [apiBaseUrl])
+}
+
+export function useImportMemoryPackage() {
+  const apiBaseUrl = useAppStore((s) => normalizeLocalApiBaseUrl(s.apiBaseUrl))
+
+  return useCallback(async (content: string, dryRun = false): Promise<MemoryPackageImportReport> => {
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/snapshots/assets/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, dry_run: dryRun }),
+    })
+    if (!resp.ok) {
+      throw new Error(await parseApiErrorMessage(resp, `memory package import failed: ${resp.status}`))
+    }
+    return resp.json()
+  }, [apiBaseUrl])
+}
+
+export function useBackupMemoryPackageToCloud() {
+  const apiBaseUrl = useAppStore((s) => normalizeLocalApiBaseUrl(s.apiBaseUrl))
+
+  return useCallback(async (payload: {
+    admin_base_url: string
+    access_token: string
+    device_id: string
+    recovery_key_base64?: string
+  }): Promise<CloudMemoryPackageBackupResult> => {
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/snapshots/cloud/backup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      throw new Error(await parseApiErrorMessage(resp, `cloud memory package backup failed: ${resp.status}`))
+    }
+    return resp.json()
+  }, [apiBaseUrl])
+}
+
+export function useRestoreMemoryPackageFromCloud() {
+  const apiBaseUrl = useAppStore((s) => normalizeLocalApiBaseUrl(s.apiBaseUrl))
+
+  return useCallback(async (payload: {
+    admin_base_url: string
+    access_token: string
+    snapshot_id: string
+    recovery_key_base64: string
+    import_to_local: boolean
+    dry_run?: boolean
+  }): Promise<CloudMemoryPackageRestoreResult> => {
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/snapshots/cloud/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      throw new Error(await parseApiErrorMessage(resp, `cloud memory package restore failed: ${resp.status}`))
+    }
     return resp.json()
   }, [apiBaseUrl])
 }

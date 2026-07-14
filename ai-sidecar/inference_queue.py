@@ -60,6 +60,7 @@ LANE_P0_QUERY = "p0_query"
 LANE_P1_CAPTURE = "p1_capture"
 LANE_P1_PREEXTRACT = "p1_preextract"
 LANE_P2_BAKE = "p2_bake"
+LANE_P2_DIARY = "p2_diary"
 
 _DEFAULT_PER_PRIORITY_LIMIT = 32
 _DEFAULT_TOTAL_LIMIT = 64
@@ -89,6 +90,7 @@ class InferenceQueue:
             LANE_P1_CAPTURE: 1,
             LANE_P1_PREEXTRACT: 1,
             LANE_P2_BAKE: self._background_concurrency_limit(),
+            LANE_P2_DIARY: 1,
         }
         if lane_limits:
             self._lane_limits.update({k: max(1, int(v)) for k, v in lane_limits.items()})
@@ -166,6 +168,11 @@ class InferenceQueue:
     def stats(self) -> dict[str, Any]:
         with self._cv:
             return self._stats_locked()
+
+    def is_idle(self) -> bool:
+        """True when no inference task is queued or running in this process."""
+        with self._cv:
+            return self._active_total == 0 and all(not q for q in self._queues.values())
 
     def configure(self, max_concurrency: Optional[int] = None) -> dict[str, Any]:
         with self._cv:

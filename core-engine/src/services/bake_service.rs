@@ -3478,6 +3478,7 @@ fn friendly_raw_type_label(event_type: &str, record: &CaptureRecord) -> String {
 fn friendly_event_type_label(event_type: &str) -> &'static str {
     match event_type {
         "app_switch" => "应用切换",
+        "browser_navigation" => "网页切换",
         "mouse_click" => "鼠标点击",
         "scroll" => "滚动",
         "key_pause" => "键入停顿",

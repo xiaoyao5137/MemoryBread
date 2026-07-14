@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { Copy, ExternalLink, FileText, Image, Loader2, Paperclip, Search, Sparkles, Square, X } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
@@ -8,6 +8,7 @@ import { fetchBillingBalance } from '../utils/authApi'
 import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
 import ModelSelect from './ModelSelect'
+import { HistoryPagination, HistorySearch } from './HistoryBrowserControls'
 
 interface CreationPanelProps {
   className?: string
@@ -16,6 +17,7 @@ interface CreationPanelProps {
 type ReferenceItem = CreationReferenceItem
 type ReferencePreview = CreationReferencePreview
 interface CreationHistoryItem {
+  id: number
   prompt: string
   timestamp: string
   preview: string
@@ -31,6 +33,7 @@ type MarkdownBlock =
   | { type: 'table'; headers: string[]; alignments: Array<'left' | 'center' | 'right'>; rows: string[][] }
 
 const defaultPrompt = '请生成一份“数据治理平台建设方案”，参考历史项目方案、知识库和操作手册，风格正式，包含总体架构、功能设计、实施计划和后续核验清单。'
+const HISTORY_PAGE_SIZE = 20
 
 const sanitizeGeneratedContent = (content: string) =>
   content.replace(/<a\s+(?:id|name)=["'][^"']+["']\s*>\s*<\/a>/gi, '')
@@ -79,6 +82,7 @@ const mapCreationHistory = (histories: any[]): CreationHistoryItem[] => historie
     references = []
   }
   return {
+    id: Number(h.id),
     prompt: h.prompt,
     timestamp: new Date(h.created_at).toLocaleString('zh-CN'),
     preview: fullContent.slice(0, 100) + (fullContent.length > 100 ? '...' : ''),
@@ -236,6 +240,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const toggleBottomTab = (tab: 'reference' | 'config') =>
     setActiveBottomTab(prev => prev === tab ? null : tab)
   const [creationHistory, setCreationHistory] = useState<CreationHistoryItem[]>([])
+  const [historyTotal, setHistoryTotal] = useState(0)
+  const [historyPage, setHistoryPage] = useState(1)
+  const [historySearch, setHistorySearch] = useState('')
+  const [debouncedHistorySearch, setDebouncedHistorySearch] = useState('')
+  const [historyLoading, setHistoryLoading] = useState(true)
+  const [historyError, setHistoryError] = useState<string | null>(null)
   const [lastInferenceMeta, setLastInferenceMeta] = useState<{ model: string; latencyMs: number | null } | null>(null)
   const [attachments, setAttachments] = useState<UserAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
@@ -260,6 +270,49 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   }
 
   useEffect(() => () => stopTimer(), [])
+
+  const loadCreationHistory = useCallback(async (signal?: AbortSignal) => {
+    setHistoryLoading(true)
+    setHistoryError(null)
+    const params = new URLSearchParams({
+      paged: 'true',
+      limit: String(HISTORY_PAGE_SIZE),
+      offset: String((historyPage - 1) * HISTORY_PAGE_SIZE),
+    })
+    if (debouncedHistorySearch) params.set('q', debouncedHistorySearch)
+
+    try {
+      const response = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history?${params}`, { signal })
+      if (!response.ok) throw new Error(`creation history fetch failed: ${response.status}`)
+      const data = await response.json()
+      if (signal?.aborted) return
+      const records = Array.isArray(data) ? data : data.items ?? []
+      setCreationHistory(mapCreationHistory(records))
+      setHistoryTotal(Number.isFinite(Number(data?.total)) ? Number(data.total) : records.length)
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      console.error('加载创作记录失败:', err)
+      setCreationHistory([])
+      setHistoryTotal(0)
+      setHistoryError('创作记录加载失败，请稍后重试。')
+    } finally {
+      if (!signal?.aborted) setHistoryLoading(false)
+    }
+  }, [apiBaseUrl, debouncedHistorySearch, historyPage])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setHistoryPage(1)
+      setDebouncedHistorySearch(historySearch.trim())
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [historySearch])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void loadCreationHistory(controller.signal)
+    return () => controller.abort()
+  }, [loadCreationHistory])
 
   const handleOpenReferenceSource = (item: Pick<ReferenceItem, 'id'>) => {
     const templateId = String(item.id)
@@ -594,10 +647,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
               latency_ms: inferenceLatencyMs,
             }),
           })
-          const historyResponse = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`)
-          if (historyResponse.ok) {
-            const histories = await historyResponse.json()
-            setCreationHistory(mapCreationHistory(histories))
+          if (historyPage === 1) {
+            void loadCreationHistory()
+          } else {
+            setHistoryPage(1)
           }
         } catch (saveErr) {
           console.error('保存创作记录失败:', saveErr)
@@ -622,41 +675,6 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     stopTimer()
     setError('已中止本次创作')
   }
-
-  useEffect(() => {
-    if (!isGenerating && generatedContent && prompt) {
-      const preview = generatedContent.slice(0, 100) + (generatedContent.length > 100 ? '...' : '')
-      setCreationHistory(prev => {
-        if (prev[0]?.prompt === prompt.trim()) return prev
-        return [{
-          prompt: prompt.trim(),
-          timestamp: new Date().toLocaleString('zh-CN'),
-          preview,
-          fullContent: generatedContent,
-          docType: docType || '',
-          audience: audience || '',
-          references: referencePreview?.references || [],
-          model: lastInferenceMeta?.model ?? activeCreationModelId,
-          latencyMs: lastInferenceMeta?.latencyMs ?? null,
-        }, ...prev].slice(0, 10)
-      })
-    }
-  }, [isGenerating, generatedContent, prompt, activeCreationModelId, docType, audience, referencePreview, lastInferenceMeta])
-
-  useEffect(() => {
-    const loadHistory = async () => {
-      try {
-        const response = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`)
-        if (response.ok) {
-          const histories = await response.json()
-          setCreationHistory(mapCreationHistory(histories))
-        }
-      } catch (err) {
-        console.error('加载创作记录失败:', err)
-      }
-    }
-    loadHistory()
-  }, [apiBaseUrl])
 
   const handleCopy = async () => {
     await navigator.clipboard.writeText(generatedContent)
@@ -752,34 +770,59 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
               marginBottom: -1,
             }}
           >
-            {tab === 'creation' ? '方案创作' : `创作记录${creationHistory.length ? ` (${creationHistory.length})` : ''}`}
+            {tab === 'creation' ? '方案创作' : `创作记录${historyTotal ? ` (${historyTotal})` : ''}`}
           </button>
         ))}
       </div>
 
       {topTab === 'history' ? (
-        <div style={{ flex: 1, overflow: 'auto', padding: 22 }}>
-          {creationHistory.length > 0 ? (
-            <div style={{ display: 'grid', gap: 10 }}>
-              {creationHistory.map((item, idx) => (
-                <div
-                  key={idx}
-                  onClick={() => { handleRestoreHistory(item); setTopTab('creation') }}
-                  style={{ padding: 12, border: '1px solid #e1e5ea', borderRadius: 8, background: '#fff', cursor: 'pointer', transition: 'border-color 0.15s' }}
-                  onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#0f766e' }}
-                  onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e1e5ea' }}
-                >
-                  <div style={{ fontSize: 13, fontWeight: 600, color: '#1f2937', marginBottom: 6 }}>{item.prompt}</div>
-                  <div style={{ fontSize: 11, color: '#667085', marginBottom: 6 }}>
-                    {item.timestamp} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latencyMs)}
-                  </div>
-                  <div style={{ fontSize: 12, color: '#475467', lineHeight: 1.5 }}>{item.preview}</div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div style={{ color: '#667085', fontSize: 13 }}>暂无创作记录</div>
-          )}
+        <div className="creation-history-page">
+          <HistorySearch
+            value={historySearch}
+            onChange={setHistorySearch}
+            placeholder="搜索主题、正文、文档类型或受众"
+            ariaLabel="搜索创作记录"
+            total={historyTotal}
+            loading={historyLoading}
+          />
+          <div className="history-browser__list-scroll">
+            {historyLoading && creationHistory.length === 0 ? (
+              <div className="history-browser__state">正在加载创作记录…</div>
+            ) : historyError ? (
+              <div className="history-browser__state history-browser__state--error" role="alert">
+                <span>{historyError}</span>
+                <button type="button" onClick={() => void loadCreationHistory()}>重新加载</button>
+              </div>
+            ) : creationHistory.length > 0 ? (
+              <div className="creation-history__list">
+                {creationHistory.map((item) => (
+                  <button
+                    type="button"
+                    key={item.id}
+                    className="creation-history__item"
+                    onClick={() => { handleRestoreHistory(item); setTopTab('creation') }}
+                  >
+                    <span className="creation-history__title">{item.prompt}</span>
+                    <span className="creation-history__meta">
+                      {item.timestamp} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latencyMs)}
+                    </span>
+                    <span className="creation-history__preview">{item.preview}</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="history-browser__state">
+                {debouncedHistorySearch ? '没有找到匹配的创作记录。' : '暂无创作记录。'}
+              </div>
+            )}
+          </div>
+          <HistoryPagination
+            page={historyPage}
+            pageSize={HISTORY_PAGE_SIZE}
+            total={historyTotal}
+            loading={historyLoading}
+            onPageChange={setHistoryPage}
+          />
         </div>
       ) : (
         <main style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>

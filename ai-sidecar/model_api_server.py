@@ -12,6 +12,7 @@ import psutil
 import logging
 import dataclasses
 import json
+import os
 import sqlite3
 import time
 import fcntl
@@ -28,6 +29,7 @@ if str(IPC_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(IPC_PYTHON_DIR))
 
 from background_processor import BackgroundProcessor
+from idle_diary_backfill import IdleDiaryBackfillWorker
 from inference_queue import (
     LANE_P0_QUERY,
     LANE_P1_PREEXTRACT,
@@ -39,6 +41,7 @@ from inference_queue import (
 )
 from monitor.llm_tracker import estimate_tokens, log_llm_usage
 from idle_compute.model_manager import _log_model_event
+from scheduled_task_executor import TaskExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +160,10 @@ _bake_extractor = None
 _bake_extractor_lock = __import__('threading').Lock()
 DB_PATH = str(Path.home() / ".memory-bread" / "memory-bread.db")
 RAG_REFERENCE_LIMIT = 10
+_TASK_CPU_THRESHOLD = float(os.getenv("BAKE_CPU_THRESHOLD", "85"))
+_TASK_MEM_THRESHOLD = float(os.getenv("BAKE_MEM_THRESHOLD", "90"))
+_task_executor = TaskExecutor(db_path=DB_PATH)
+_idle_diary_backfill_worker = IdleDiaryBackfillWorker(db_path=DB_PATH, executor=_task_executor)
 
 
 def _coerce_rag_top_k(value, default: int = RAG_REFERENCE_LIMIT) -> int:
@@ -706,6 +713,37 @@ def health():
     except Exception as e:
         logger.error(f"健康检查失败: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+def _check_task_resources() -> tuple[bool, str]:
+    cpu = psutil.cpu_percent(interval=0.5)
+    mem = psutil.virtual_memory().percent
+    if cpu >= _TASK_CPU_THRESHOLD:
+        return False, f"CPU 使用率 {cpu:.1f}% >= {_TASK_CPU_THRESHOLD}%"
+    if mem >= _TASK_MEM_THRESHOLD:
+        return False, f"内存使用率 {mem:.1f}% >= {_TASK_MEM_THRESHOLD}%"
+    return True, ""
+
+
+@app.route('/tasks/execute', methods=['POST'])
+def execute_scheduled_task():
+    """Core Engine scheduler endpoint for scheduled reports and diaries."""
+    data = request.get_json(silent=True) or {}
+    try:
+        task_id = int(data.get("task_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "task_id 缺失或无效"}), 400
+
+    ok, reason = _check_task_resources()
+    if not ok:
+        logger.warning("系统资源不足，跳过任务 %s: %s", task_id, reason)
+        return jsonify({"error": f"系统资源不足，稍后重试: {reason}"}), 503
+
+    logger.info("收到任务执行请求: task_id=%s", task_id)
+    result = _task_executor.execute_task(task_id)
+    if result.get("status") == "failed":
+        return jsonify({"error": result.get("error", "执行失败")}), 500
+    return jsonify(result)
 
 
 @app.route('/api/models', methods=['GET'])
@@ -1690,5 +1728,7 @@ if __name__ == '__main__':
     import threading
     threading.Thread(target=_warmup_rag_pipeline_async, daemon=True, name='rag-warmup').start()
     logger.info('RAG pipeline 异步预热已启动')
+
+    _idle_diary_backfill_worker.start()
 
     app.run(host='0.0.0.0', port=7071, debug=False, threaded=True)
