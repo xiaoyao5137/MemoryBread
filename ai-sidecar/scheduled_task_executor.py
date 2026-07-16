@@ -34,7 +34,7 @@ BUILTIN_TEMPLATES = [
             "默认使用简体中文；即使原始记录主要为英文，也使用中文叙述，产品名和代码标识符可保留原文。\n"
             "1. 【今日产出】最多 4 条，只写真正完成的成果、修复、决策或交付，每条不超过 45 个中文字符。\n"
             "2. 【问题与解决】最多 2 条，仅记录已解决问题或明确结论；没有则写「无」。\n"
-            "3. 【明日计划】最多 3 条，只写可交付、可验证目标。\n"
+            "3. 不要生成明日计划、后续计划、待办或建议，只记录当天已经发生并有依据的事实。\n"
             "过滤掉：浏览、阅读、搜索、应用切换、会议过程、配置环境、失败尝试等流水账。"
         ),
     },
@@ -803,7 +803,6 @@ class TaskExecutor:
             for label, key in (
                 ("产出", "work_outputs"),
                 ("问题与解决", "problems_solved"),
-                ("计划", "next_plan"),
             ):
                 values = content.get(key) or []
                 if values:
@@ -856,7 +855,7 @@ class TaskExecutor:
             "写作约束：\n"
             f"- 【{section_titles[0]}】最多 4 条，每条不超过 45 个字符，必须是结果，不写过程。\n"
             f"- 【{section_titles[1]}】最多 2 条，只写已解决问题或明确结论；没有则写「- 无」。\n"
-            f"- 【{section_titles[2]}】最多 3 条，必须是可交付、可验证事项。\n"
+            "- 不要生成明日计划、后续计划、待办或建议，不要推测未来事项。\n"
             "- 删除浏览、阅读、搜索、应用切换、会议过程、配置环境、失败尝试等流水账。"
         )
 
@@ -886,10 +885,15 @@ class TaskExecutor:
             "markdown": markdown,
             "work_outputs": self._extract_markdown_section_items(markdown, ("今日产出", "工作产出", "核心产出", "主要成果", "Today's Outcomes", "Work Outputs")),
             "problems_solved": self._extract_markdown_section_items(markdown, ("问题与解决", "风险/阻塞", "效率亮点与问题", "Problems & Resolutions", "Problems and Resolutions")),
-            "next_plan": self._extract_markdown_section_items(markdown, ("明日计划", "下周计划", "下月目标", "Next-day Plan", "Next Day Plan")),
             "timeline": [],
             "source_count": len(source_items),
         }
+
+        if period_type != "daily":
+            content["next_plan"] = self._extract_markdown_section_items(
+                markdown,
+                ("明日计划", "下周计划", "下月目标", "Next-day Plan", "Next Day Plan"),
+            )
 
         if period_type == "daily":
             content["work_environment"] = self._infer_work_environment(source_items)
@@ -1033,12 +1037,10 @@ class TaskExecutor:
             return (
                 ("Today's Outcomes", ("Today's Outcomes", "Work Outputs", "今日产出", "工作产出"), 4, 45),
                 ("Problems & Resolutions", ("Problems & Resolutions", "Problems and Resolutions", "问题与解决"), 2, 45),
-                ("Next-day Plan", ("Next-day Plan", "Next Day Plan", "明日计划"), 3, 45),
             )
         return (
             ("今日产出", ("今日产出", "工作产出", "核心产出", "主要成果"), 4, 45),
             ("问题与解决", ("问题与解决", "风险/阻塞", "效率亮点与问题"), 2, 45),
-            ("明日计划", ("明日计划", "下周计划", "下月目标"), 3, 45),
         )
 
     @classmethod

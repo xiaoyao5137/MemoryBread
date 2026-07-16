@@ -29,6 +29,7 @@ if str(IPC_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(IPC_PYTHON_DIR))
 
 from memory_bread_ipc import IpcServer
+from runtime_lock import SidecarAlreadyRunningError, SidecarInstanceLock
 
 # 模块级 runtime 状态：Flask daemon 线程通过它访问 BackgroundProcessor
 _RUNTIME_STATE: dict = {
@@ -37,6 +38,7 @@ _RUNTIME_STATE: dict = {
 }
 _STATE_DIR = Path.home() / ".memory-bread" / "state"
 _RUNTIME_STATUS_FILE = _STATE_DIR / "sidecar_runtime_status.json"
+_INSTANCE_LOCK_FILE = _STATE_DIR / "sidecar.instance.lock"
 _RUNTIME_STATUS_CACHE: dict | None = None
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,9 +243,7 @@ def _start_vector_search_server() -> None:
 # 主入口
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _main() -> None:
-    args = _parse_args()
-    logging.getLogger().setLevel(args.log_level)
+async def _run_main(args: argparse.Namespace) -> None:
     limited_mode = os.environ.get("SIDECAR_LIMITED_MODE") == "1"
     _write_runtime_status(
         mode="starting",
@@ -318,7 +318,7 @@ async def _main() -> None:
                 logger.warning("向量模型不可用，以降级模式启动（RAG 向量检索不可用，提炼功能正常）")
 
             from dispatcher_v2 import Dispatcher
-            dispatcher = Dispatcher()
+            dispatcher = Dispatcher(ocr_worker=ocr_worker)
             await dispatcher.initialize()
             runtime_state["dispatch"] = dispatcher.dispatch
             logger.info("生产模式：已切换到完整任务分发器")
@@ -378,8 +378,38 @@ async def _main() -> None:
         loop.add_signal_handler(sig, shutdown)
 
     logger.info("记忆面包 AI Sidecar 启动完成，等待 Rust Core Engine 连接...")
-    await server.serve()
+    try:
+        await server.serve()
+    finally:
+        bg_processor = runtime_state.get("bg_processor")
+        if bg_processor:
+            bg_processor.stop()
+        ocr_worker.close()
+        _write_runtime_status(
+            mode="stopped",
+            full_dispatch_ready=False,
+            background_processor_running=False,
+            critical_checks_passed=False,
+            embedding_ok=False,
+            issues=["Sidecar 已停止"],
+        )
     logger.info("Sidecar 已正常退出")
+
+
+async def _main() -> None:
+    args = _parse_args()
+    logging.getLogger().setLevel(args.log_level)
+    instance_lock = SidecarInstanceLock(_INSTANCE_LOCK_FILE)
+    try:
+        instance_lock.acquire()
+    except SidecarAlreadyRunningError as exc:
+        logger.error("拒绝启动重复 Sidecar: %s", exc)
+        return
+
+    try:
+        await _run_main(args)
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":

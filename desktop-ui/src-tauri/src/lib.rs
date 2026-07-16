@@ -13,14 +13,31 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, WebviewUrl,
+    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, RunEvent, WebviewUrl,
     WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
+#[cfg(target_os = "macos")]
+use objc2::{
+    define_class,
+    ffi::{objc_getAssociatedObject, objc_setAssociatedObject, OBJC_ASSOCIATION_RETAIN_NONATOMIC},
+    msg_send,
+    rc::Retained,
+    runtime::AnyObject,
+    AllocAnyThread, DeclaredClass, MainThreadMarker,
+};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{
+    NSEvent, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior,
+};
+use tauri_plugin_shell::ShellExt;
+
 static QUITTING: AtomicBool = AtomicBool::new(false);
+static FULL_SHUTDOWN_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static LAST_FLOATING_ASSIST_TEMP_CLEANUP_MS: AtomicI64 = AtomicI64::new(0);
 const FLOATING_ASSIST_LABEL: &str = "floating-assist";
+const SUPERVISOR_SHUTDOWN_MARKER: &str = "supervisor-shutdown-in-progress";
 const FLOATING_ASSIST_DEFAULT_MARGIN: i32 = 24;
 const FLOATING_ASSIST_DEFAULT_TOP: i32 = 140;
 const FLOATING_ASSIST_DEFAULT_SIZE: i32 = 82;
@@ -29,25 +46,129 @@ const FLOATING_ASSIST_TEMP_CLEANUP_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 const TRAY_TEMPLATE_ICON_SIZE: u32 = 64;
 
 #[cfg(target_os = "macos")]
-fn configure_floating_assist_macos_window(window: &tauri::WebviewWindow) {
-    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+static FLOATING_ASSIST_HOVER_OWNER_KEY: u8 = 0;
+#[cfg(target_os = "macos")]
+static FLOATING_ASSIST_HOVER_TRACKING_AREA_KEY: u8 = 0;
 
-    let Ok(ns_window_ptr) = window.ns_window() else {
-        return;
-    };
-    if ns_window_ptr.is_null() {
-        return;
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct FloatingAssistHoverOwnerIvars {
+    window: tauri::WebviewWindow,
+}
+
+#[cfg(target_os = "macos")]
+define_class!(
+    #[unsafe(super(NSView))]
+    #[name = "MemoryBreadFloatingAssistHoverOwner"]
+    #[ivars = FloatingAssistHoverOwnerIvars]
+    struct FloatingAssistHoverOwner;
+
+    impl FloatingAssistHoverOwner {
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            let _ = self
+                .ivars()
+                .window
+                .emit("floating-assist-native-hover-changed", true);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            let _ = self
+                .ivars()
+                .window
+                .emit("floating-assist-native-hover-changed", false);
+        }
     }
+);
 
-    let ns_window: &NSWindow = unsafe { &*ns_window_ptr.cast() };
-    ns_window.setIgnoresMouseEvents(false);
-    ns_window.setAcceptsMouseMovedEvents(true);
-    ns_window.setCollectionBehavior(
-        ns_window.collectionBehavior()
-            | NSWindowCollectionBehavior::CanJoinAllSpaces
-            | NSWindowCollectionBehavior::Stationary
-            | NSWindowCollectionBehavior::FullScreenAuxiliary,
-    );
+#[cfg(target_os = "macos")]
+fn configure_floating_assist_macos_window(window: &tauri::WebviewWindow) {
+    let tracked_window = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window_ptr) = tracked_window.ns_window() else {
+            return;
+        };
+        if ns_window_ptr.is_null() {
+            return;
+        }
+
+        let ns_window: &NSWindow = unsafe { &*ns_window_ptr.cast() };
+        ns_window.setIgnoresMouseEvents(false);
+        ns_window.setAcceptsMouseMovedEvents(true);
+        ns_window.setCollectionBehavior(
+            ns_window.collectionBehavior()
+                | NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+
+        let Some(content_view) = ns_window.contentView() else {
+            return;
+        };
+        let view_ptr = Retained::as_ptr(&content_view).cast_mut().cast();
+        let owner_key = std::ptr::addr_of!(FLOATING_ASSIST_HOVER_OWNER_KEY).cast();
+        let mut owner_ptr = unsafe { objc_getAssociatedObject(view_ptr, owner_key) };
+        if owner_ptr.is_null() {
+            let Some(main_thread_marker) = MainThreadMarker::new() else {
+                return;
+            };
+            let allocated_owner =
+                main_thread_marker
+                    .alloc()
+                    .set_ivars(FloatingAssistHoverOwnerIvars {
+                        window: tracked_window.clone(),
+                    });
+            let owner: Retained<FloatingAssistHoverOwner> =
+                unsafe { msg_send![super(allocated_owner), initWithFrame: content_view.bounds()] };
+            owner_ptr = Retained::as_ptr(&owner).cast::<AnyObject>();
+            unsafe {
+                objc_setAssociatedObject(
+                    view_ptr,
+                    owner_key,
+                    owner_ptr.cast_mut(),
+                    OBJC_ASSOCIATION_RETAIN_NONATOMIC,
+                );
+            }
+        }
+
+        let tracking_area_key = std::ptr::addr_of!(FLOATING_ASSIST_HOVER_TRACKING_AREA_KEY).cast();
+        let previous_tracking_area_ptr =
+            unsafe { objc_getAssociatedObject(view_ptr, tracking_area_key) };
+        if !previous_tracking_area_ptr.is_null() {
+            let previous_tracking_area: &NSTrackingArea =
+                unsafe { &*previous_tracking_area_ptr.cast() };
+            content_view.removeTrackingArea(previous_tracking_area);
+        }
+
+        let bounds = content_view.bounds();
+        let mut ball_rect = bounds;
+        ball_rect.origin.x = 8.0;
+        ball_rect.origin.y = (bounds.size.height - 80.0).max(0.0);
+        ball_rect.size.width = 72.0;
+        ball_rect.size.height = 72.0;
+        let options =
+            NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::ActiveAlways;
+        let tracking_area = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                ball_rect,
+                options,
+                Some(&*owner_ptr),
+                None,
+            )
+        };
+        content_view.addTrackingArea(&tracking_area);
+
+        unsafe {
+            objc_setAssociatedObject(
+                view_ptr,
+                tracking_area_key,
+                Retained::as_ptr(&tracking_area).cast_mut().cast(),
+                OBJC_ASSOCIATION_RETAIN_NONATOMIC,
+            );
+        }
+    });
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -77,11 +198,6 @@ struct FloatingAssistOcrResult {
 struct FloatingAssistDragOrigin {
     offset_x: f64,
     offset_y: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct FloatingAssistPointerState {
-    hovering_ball: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,9 +414,9 @@ fn set_floating_assist_position_clamped(
 }
 
 fn set_floating_assist_visible_inner(app: &AppHandle, enabled: bool) -> Result<(), String> {
-    let window = ensure_floating_assist_window(app)?;
     let menu_state = app.state::<TrayMenuState>();
     if enabled {
+        let window = ensure_floating_assist_window(app)?;
         let _ = window.set_size(LogicalSize::new(
             FLOATING_ASSIST_DEFAULT_SIZE as f64,
             FLOATING_ASSIST_DEFAULT_SIZE as f64,
@@ -323,7 +439,11 @@ fn set_floating_assist_visible_inner(app: &AppHandle, enabled: bool) -> Result<(
             .set_enabled(true)
             .map_err(|error| error.to_string())?;
     } else {
-        window.hide().map_err(|error| error.to_string())?;
+        // A hidden transparent WebView can keep a CoreAnimation/WindowServer layer alive.
+        // Destroy it when the assist is disabled; it is recreated lazily on next enable.
+        if let Some(window) = app.get_webview_window(FLOATING_ASSIST_LABEL) {
+            window.destroy().map_err(|error| error.to_string())?;
+        }
         menu_state
             .floating_assist_auto_task
             .set_checked(false)
@@ -714,8 +834,36 @@ fn start_script_path() -> PathBuf {
         .join("start.sh")
 }
 
+fn supervisor_shutdown_in_progress() -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let marker = PathBuf::from(home)
+        .join(".memory-bread")
+        .join("state")
+        .join(SUPERVISOR_SHUTDOWN_MARKER);
+    let Ok(metadata) = marker.metadata() else {
+        return false;
+    };
+
+    // 标记只在 start.sh stop/restart 的几秒内有效；异常遗留的旧文件不能永久
+    // 禁用用户退出时的后端清理。
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|age| age < Duration::from_secs(60))
+        .unwrap_or(false)
+}
+
 /// 退出 App 后再由独立脚本停止启动器和所有后台服务，避免脚本先杀掉当前进程。
 fn schedule_full_shutdown() {
+    if supervisor_shutdown_in_progress() {
+        return;
+    }
+    if FULL_SHUTDOWN_SCHEDULED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let script = start_script_path();
     if !script.is_file() {
         eprintln!("未找到全组件停止脚本: {}", script.display());
@@ -850,43 +998,6 @@ fn update_floating_assist_drag(app: AppHandle, offset_x: f64, offset_y: f64) -> 
 }
 
 #[tauri::command]
-fn get_floating_assist_pointer_state(app: AppHandle) -> Result<FloatingAssistPointerState, String> {
-    let Some(window) = app.get_webview_window(FLOATING_ASSIST_LABEL) else {
-        return Ok(FloatingAssistPointerState {
-            hovering_ball: false,
-        });
-    };
-
-    configure_floating_assist_macos_window(&window);
-
-    if !window.is_visible().unwrap_or(false) {
-        return Ok(FloatingAssistPointerState {
-            hovering_ball: false,
-        });
-    }
-
-    let window_position = window.outer_position().map_err(|error| error.to_string())?;
-    let cursor_position = app.cursor_position().map_err(|error| error.to_string())?;
-    let scale_factor = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .map(|monitor| monitor.scale_factor())
-        .unwrap_or(1.0);
-    let ball_margin = 8.0 * scale_factor;
-    let ball_size = 72.0 * scale_factor;
-    let relative_x = cursor_position.x - f64::from(window_position.x);
-    let relative_y = cursor_position.y - f64::from(window_position.y);
-
-    Ok(FloatingAssistPointerState {
-        hovering_ball: relative_x >= ball_margin
-            && relative_x <= ball_margin + ball_size
-            && relative_y >= ball_margin
-            && relative_y <= ball_margin + ball_size,
-    })
-}
-
-#[tauri::command]
 fn set_floating_assist_size(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
     let window = ensure_floating_assist_window(&app)?;
     window
@@ -896,6 +1007,7 @@ fn set_floating_assist_size(app: AppHandle, width: f64, height: f64) -> Result<(
     if let Ok(position) = window.outer_position() {
         set_floating_assist_position_clamped(&app, &window, position, Some((width, height)))?;
     }
+    configure_floating_assist_macos_window(&window);
 
     Ok(())
 }
@@ -912,6 +1024,25 @@ fn open_floating_assist_reference(app: AppHandle, detail: serde_json::Value) -> 
     show_main_window(&app);
     app.emit("floating-assist-open-reference", detail)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(deprecated)]
+fn open_export_folder(app: AppHandle, path: String) -> Result<(), String> {
+    let exported_path =
+        fs::canonicalize(&path).map_err(|error| format!("找不到已导出的记忆包：{error}"))?;
+    let folder = if exported_path.is_dir() {
+        exported_path
+    } else {
+        exported_path
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| "无法确定备份所在文件夹".to_string())?
+    };
+
+    app.shell()
+        .open(folder.to_string_lossy().into_owned(), None)
+        .map_err(|error| format!("无法打开备份所在文件夹：{error}"))
 }
 
 #[tauri::command]
@@ -990,10 +1121,10 @@ pub fn run() {
             set_floating_assist_position,
             begin_floating_assist_drag,
             update_floating_assist_drag,
-            get_floating_assist_pointer_state,
             set_floating_assist_size,
             read_floating_assist_image_data_url,
             open_floating_assist_reference,
+            open_export_folder,
             capture_screen_ocr_for_floating_assist,
         ])
         .setup(|app| {
@@ -1052,7 +1183,6 @@ pub fn run() {
                 autostart: autostart.clone(),
             });
 
-            let _ = ensure_floating_assist_window(app.handle());
             schedule_floating_assist_temp_cleanup(true);
 
             let mut tray = TrayIconBuilder::with_id("memory-bread")
@@ -1157,6 +1287,12 @@ pub fn run() {
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+                QUITTING.store(true, Ordering::SeqCst);
+                schedule_full_shutdown();
+            }
+        });
 }

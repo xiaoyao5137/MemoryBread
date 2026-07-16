@@ -8,37 +8,51 @@ const firstNonEmpty = (...values: Array<string | null | undefined>): string | nu
   return null
 }
 
-const PLAN_LABELS: Record<string, string> = {
-  silver: 'Std',
-  silver_monthly: 'Std',
-  silver_annual: 'Std Annual',
-  gold: 'Plus',
-  gold_monthly: 'Plus',
-  gold_annual: 'Plus Annual',
-  platinum: 'Pro',
-  platinum_monthly: 'Pro',
-  platinum_annual: 'Pro Annual',
-  enterprise_monthly: 'Enterprise',
-  enterprise_annual: 'Enterprise Annual',
-  普通套餐: 'Std',
-  基础套餐: 'Std',
-  白银: 'Std',
-  白银套餐: 'Std',
-  白银年费套餐: 'Std Annual',
-  黄金: 'Plus',
-  黄金套餐: 'Plus',
-  黄金年费套餐: 'Plus Annual',
-  白金: 'Pro',
-  白金套餐: 'Pro',
-  白金年费套餐: 'Pro Annual',
-  企业月费套餐: 'Enterprise',
-  企业年费套餐: 'Enterprise Annual',
+const RUN_MODE_LABELS: Record<string, string> = {
+  std: '标准模式',
+  std_monthly: '标准模式',
+  std_annual: '标准模式',
+  'std annual': '标准模式',
+  silver: '标准模式',
+  silver_monthly: '标准模式',
+  silver_annual: '标准模式',
+  plus: '增强模式',
+  plus_monthly: '增强模式',
+  plus_annual: '增强模式',
+  'plus annual': '增强模式',
+  gold: '增强模式',
+  gold_monthly: '增强模式',
+  gold_annual: '增强模式',
+  pro: '专家模式',
+  pro_monthly: '专家模式',
+  pro_annual: '专家模式',
+  'pro annual': '专家模式',
+  platinum: '专家模式',
+  platinum_monthly: '专家模式',
+  platinum_annual: '专家模式',
+  enterprise: '企业模式',
+  enterprise_monthly: '企业模式',
+  enterprise_annual: '企业模式',
+  'enterprise annual': '企业模式',
+  普通套餐: '标准模式',
+  基础套餐: '标准模式',
+  白银: '标准模式',
+  白银套餐: '标准模式',
+  白银年费套餐: '标准模式',
+  黄金: '增强模式',
+  黄金套餐: '增强模式',
+  黄金年费套餐: '增强模式',
+  白金: '专家模式',
+  白金套餐: '专家模式',
+  白金年费套餐: '专家模式',
+  企业月费套餐: '企业模式',
+  企业年费套餐: '企业模式',
 }
 
-const normalizePlanLabel = (value?: string | null): string | null => {
+const normalizeRunModeLabel = (value?: string | null): string | null => {
   const normalized = firstNonEmpty(value)
   if (!normalized) return null
-  return PLAN_LABELS[normalized] ?? PLAN_LABELS[normalized.toLowerCase()] ?? normalized
+  return RUN_MODE_LABELS[normalized] ?? RUN_MODE_LABELS[normalized.toLowerCase()] ?? normalized
 }
 
 export const getUserDisplayName = (user?: CloudUser | null): string => {
@@ -56,17 +70,17 @@ export const getUserDisplayName = (user?: CloudUser | null): string => {
   )
 }
 
-export const getMembershipPlanLabel = (
+export const getRunModeLabel = (
   user?: CloudUser | null,
   subscription?: CloudSubscription | null,
 ): string => {
   if (!user) return '本地模式'
   return (
-    normalizePlanLabel(subscription?.plan_key) ||
-    normalizePlanLabel(subscription?.name) ||
-    normalizePlanLabel(user.membership_plan) ||
-    normalizePlanLabel(user.plan_name) ||
-    normalizePlanLabel(user.subscription_plan) ||
-    'Std'
+    normalizeRunModeLabel(subscription?.plan_key) ||
+    normalizeRunModeLabel(subscription?.name) ||
+    normalizeRunModeLabel(user.membership_plan) ||
+    normalizeRunModeLabel(user.plan_name) ||
+    normalizeRunModeLabel(user.subscription_plan) ||
+    '标准模式'
   )
 }

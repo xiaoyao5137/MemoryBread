@@ -368,7 +368,8 @@ const BakeOverviewTab: React.FC<{
   overview: BakeOverview
   onOpenTab: (tab: 'knowledge' | 'templates' | 'sop') => void
   onOpenRepository: (tab: 'memory' | 'capture') => void
-}> = ({ overview, onOpenTab, onOpenRepository }) => {
+  footer?: React.ReactNode
+}> = ({ overview, onOpenTab, onOpenRepository, footer }) => {
 
   return (
     <div style={{ display: 'grid', gap: 16 }}>
@@ -466,6 +467,8 @@ const BakeOverviewTab: React.FC<{
           </BakeCard>
         </div>
       </div>
+
+      {footer}
     </div>
   )
 }

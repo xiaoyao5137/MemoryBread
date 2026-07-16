@@ -297,8 +297,6 @@ struct RecentCaptureFingerprint {
 const CAPTURE_DEDUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 const CAPTURE_DHASH_SKIP_DISTANCE: u32 = 1;
 const CAPTURE_MAX_RECENT_PER_SCENE: usize = 8;
-const OCR_BACKFILL_TIMEOUT_SECS: u64 = 15;
-const OCR_BACKFILL_MAX_ATTEMPTS: usize = 3;
 const OCR_BACKFILL_MAX_PENDING: usize = 4;
 const OCR_BACKFILL_EVENT_HISTORY_LIMIT: usize = 50_000;
 
@@ -1501,29 +1499,12 @@ async fn run_ocr_backfill(
     ipc_client: IpcClient,
     path_for_ocr: String,
 ) -> Result<Option<(String, f32)>, String> {
-    match tokio::time::timeout(
-        Duration::from_secs(OCR_BACKFILL_TIMEOUT_SECS),
-        tokio::task::spawn_blocking(move || {
-            let mut last_err = None;
-            for attempt in 0..OCR_BACKFILL_MAX_ATTEMPTS {
-                match ipc_client.call_ocr(0, &path_for_ocr) {
-                    Ok(result) => return Ok(result),
-                    Err(err) => {
-                        last_err = Some(err);
-                        if attempt + 1 < OCR_BACKFILL_MAX_ATTEMPTS {
-                            std::thread::sleep(Duration::from_millis(200));
-                        }
-                    }
-                }
-            }
-            Err(last_err
-                .map(|err| err.to_string())
-                .unwrap_or_else(|| "OCR 重试失败但无错误信息".to_string()))
-        }),
-    )
-    .await
-    {
-        Ok(Ok(Ok(result))) => {
+    // spawn_blocking 中的同步 UnixStream/Vision 请求无法被 Tokio timeout 真正取消。
+    // 旧实现 15 秒后释放队列许可，但阻塞线程仍继续最多重试 3 次，导致相同截图
+    // 在 Sidecar 内并发执行。这里只发一次请求，并一直持有单并发许可，直到该阻塞
+    // 调用真实结束；传输层自身仍有有限的读写截止时间用于处理 Sidecar 故障。
+    match tokio::task::spawn_blocking(move || ipc_client.call_ocr(0, &path_for_ocr)).await {
+        Ok(Ok(result)) => {
             let trimmed = result.text.trim().to_string();
             if trimmed.is_empty() {
                 Ok(None)
@@ -1531,12 +1512,8 @@ async fn run_ocr_backfill(
                 Ok(Some((trimmed, result.confidence as f32)))
             }
         }
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(error)) => Err(format!("OCR 后台任务崩溃: {error}")),
-        Err(_) => Err(format!(
-            "OCR 后台任务超时（{} 秒）",
-            OCR_BACKFILL_TIMEOUT_SECS
-        )),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(format!("OCR 后台任务崩溃: {error}")),
     }
 }
 
@@ -2229,6 +2206,43 @@ mod tests {
         assert_eq!(snapshot.skipped_backpressure_total, 1);
         assert_eq!(snapshot.period_skipped_backpressure, 1);
         assert_eq!(snapshot.recent[0].status, "skipped_backpressure");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ocr_timeout_sends_exactly_one_ipc_request() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::AtomicUsize;
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "memory-bread-ocr-timeout-{}-{}.sock",
+            std::process::id(),
+            current_ts_ms()
+        ));
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_for_server = accepted.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            accepted_for_server.fetch_add(1, Ordering::SeqCst);
+            let mut length = [0u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut payload = vec![0u8; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut payload).unwrap();
+            std::thread::sleep(Duration::from_millis(120));
+        });
+
+        let client = IpcClient::with_socket_path_and_timeout(
+            socket_path.to_string_lossy(),
+            Duration::from_millis(40),
+        );
+        let result = run_ocr_backfill(client, "/tmp/one-shot.jpg".to_string()).await;
+
+        assert!(result.is_err());
+        server.join().unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(socket_path);
     }
 
     // ── 隐私过滤 ──────────────────────────────────────────────────────────

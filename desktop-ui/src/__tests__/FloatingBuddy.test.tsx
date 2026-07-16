@@ -51,7 +51,7 @@ describe('FloatingBuddy', () => {
     expect(screen.getByRole('button', { name: '测试' })).toHaveAttribute('aria-pressed', 'true')
   })
 
-  it('账号入口显示用户名和会员套餐', () => {
+  it('账号入口显示用户名和中文运行模式', () => {
     useAppStore.getState().setAuthSession({
       access_token: 'mbs_test_token',
       expires_at: new Date(Date.now() + 86400_000).toISOString(),
@@ -78,7 +78,7 @@ describe('FloatingBuddy', () => {
 
     expect(screen.getByText('烘焙师土豆')).toBeInTheDocument()
     expect(screen.queryByText('土豆账户')).not.toBeInTheDocument()
-    expect(screen.getByText('Plus')).toBeInTheDocument()
+    expect(screen.getByText('增强模式')).toBeInTheDocument()
     expect(screen.queryByText('云账户已连接')).not.toBeInTheDocument()
   })
 })

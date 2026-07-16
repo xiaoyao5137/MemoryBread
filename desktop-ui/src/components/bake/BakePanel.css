@@ -791,6 +791,33 @@ button.bake-list-item.bake-list-item--active {
   overflow: hidden;
 }
 
+.bake-memory-backup-section {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.bake-memory-backup-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.bake-memory-backup-status > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.bake-memory-backup-status .bake-btn {
+  gap: 6px;
+}
+
+.bake-memory-backup-status .bake-btn:focus-visible {
+  outline: 3px solid rgba(0, 102, 204, 0.28);
+  outline-offset: 2px;
+}
+
 .bake-memory-package-card .bake-section-header {
   margin-bottom: 0;
 }
@@ -1725,6 +1752,15 @@ button.bake-list-item.bake-list-item--active {
 
   .bake-memory-package-actions .bake-btn {
     flex: 1 1 140px;
+  }
+
+  .bake-memory-backup-status {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .bake-memory-backup-status .bake-btn {
+    width: 100%;
   }
 
   .bake-title {

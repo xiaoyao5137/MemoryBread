@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import SystemFloatingAssist from '../components/SystemFloatingAssist'
 import { useAppStore } from '../store/useAppStore'
 import { runRagQueryJob } from '../hooks/useApi'
@@ -28,6 +29,7 @@ vi.mock('../utils/authApi', () => ({
 }))
 
 const mockedInvoke = vi.mocked(invoke)
+const mockedListen = vi.mocked(listen)
 const mockedRunRagQueryJob = vi.mocked(runRagQueryJob)
 const assistButton = () => screen.getByRole('button', { name: '识别当前屏幕并咨询记忆面包' })
 const AUTO_TASK_SCAN_INITIAL_DELAY_MS = 10_000
@@ -153,6 +155,8 @@ beforeEach(() => {
     if (command === 'read_floating_assist_image_data_url') return ''
     return undefined
   })
+  mockedListen.mockReset()
+  mockedListen.mockResolvedValue(() => {})
   mockedRunRagQueryJob.mockReset()
   mockedRunRagQueryJob.mockResolvedValue({
     answer: '自动识别任务的咨询输出',
@@ -181,6 +185,49 @@ describe('SystemFloatingAssist', () => {
     expect(container.querySelector('.system-floating-assist__idle-eye')).not.toBeInTheDocument()
     expect(container.querySelector('.system-floating-assist__idle-shadow')).not.toBeInTheDocument()
     expect(container.querySelectorAll('.system-floating-assist__bread-cheek')).toHaveLength(2)
+  })
+
+  it('鼠标进入和离开时切换悬停动画状态', () => {
+    render(<SystemFloatingAssist />)
+    const button = assistButton()
+
+    fireEvent.pointerEnter(button)
+    expect(button).toHaveClass('system-floating-assist__ball--native-hover')
+
+    fireEvent.pointerLeave(button)
+    expect(button).not.toHaveClass('system-floating-assist__ball--native-hover')
+  })
+
+  it('原生追踪区域进入和离开时切换悬停动画状态', async () => {
+    render(<SystemFloatingAssist />)
+    await act(async () => flushMicrotasks())
+    const registration = mockedListen.mock.calls.find(
+      ([eventName]) => eventName === 'floating-assist-native-hover-changed',
+    )
+    expect(registration).toBeDefined()
+
+    const button = assistButton()
+    act(() => registration?.[1]({ payload: true } as any))
+    expect(button).toHaveClass('system-floating-assist__ball--native-hover')
+
+    act(() => registration?.[1]({ payload: false } as any))
+    expect(button).not.toHaveClass('system-floating-assist__ball--native-hover')
+  })
+
+  it('闲置动画按周期播放并在间隔期停止合成', () => {
+    render(<SystemFloatingAssist />)
+    const button = assistButton()
+
+    expect(button).toHaveClass('system-floating-assist__ball--ambient-active')
+    act(() => {
+      vi.advanceTimersByTime(2_200)
+    })
+    expect(button).not.toHaveClass('system-floating-assist__ball--ambient-active')
+
+    act(() => {
+      vi.advanceTimersByTime(5_800)
+    })
+    expect(button).toHaveClass('system-floating-assist__ball--ambient-active')
   })
 
   it('完成态 5 分钟后自动切回闲置态', () => {

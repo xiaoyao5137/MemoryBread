@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from memory_bread_ipc import IpcRequest, IpcResponse, OcrResult
 
@@ -23,6 +24,7 @@ from .engine import OcrEngine
 from .privacy_filter import PrivacyFilter
 
 logger = logging.getLogger(__name__)
+_OCR_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="memory-bread-ocr")
 
 
 class OcrWorker:
@@ -37,6 +39,10 @@ class OcrWorker:
     def __init__(self, engine: OcrEngine | None = None, enable_privacy_filter: bool = False) -> None:
         self._engine = engine or OcrEngine.create_default()
         self._privacy_filter = PrivacyFilter() if enable_privacy_filter else None
+        # Vision/Paddle 都是同步且资源密集的实现。独立的单线程执行器提供硬并发上限，
+        # Semaphore 则避免多个协程提前向执行器内部继续排队。
+        self._ocr_semaphore = asyncio.Semaphore(1)
+        self._executor = _OCR_EXECUTOR
 
     async def handle(self, req: IpcRequest) -> IpcResponse:
         """
@@ -49,11 +55,12 @@ class OcrWorker:
         task = req.task  # OcrRequest
 
         try:
-            # 在线程池中执行同步 OCR（避免阻塞事件循环）
-            loop   = asyncio.get_running_loop()
-            output = await loop.run_in_executor(
-                None, self._engine.process, task.screenshot_path
-            )
+            # OCR 全局串行执行，避免 Vision 在同一张图的超时重试下并发放大。
+            async with self._ocr_semaphore:
+                loop = asyncio.get_running_loop()
+                output = await loop.run_in_executor(
+                    self._executor, self._engine.process, task.screenshot_path
+                )
 
             # 隐私过滤
             text = output.text
@@ -99,3 +106,7 @@ class OcrWorker:
             return IpcResponse.make_error(
                 req.id, "INTERNAL_ERROR", str(exc), latency_ms
             )
+
+    def close(self) -> None:
+        """停止接收新的 OCR 线程任务；进程退出时不等待已运行的系统调用。"""
+        self._executor.shutdown(wait=False, cancel_futures=True)

@@ -36,7 +36,8 @@ const AUTO_TASK_SCAN_INTERVAL_MS = 120_000
 const AUTO_TASK_USER_IDLE_GUARD_MS = 3_000
 const AUTO_TASK_DEDUP_CACHE_LIMIT = 64
 const FLOATING_ASSIST_DRAG_TICK_MS = 33
-const FLOATING_ASSIST_NATIVE_HOVER_POLL_MS = 240
+const FLOATING_ASSIST_AMBIENT_ACTIVE_MS = 2_200
+const FLOATING_ASSIST_AMBIENT_PERIOD_MS = 8_000
 
 const isAssistPhase = (value: string | null): value is AssistPhase =>
   value === 'idle' || value === 'receiving' || value === 'capturing' || value === 'answering' || value === 'done' || value === 'error'
@@ -56,10 +57,6 @@ interface FloatingAssistOcrResult {
 interface FloatingAssistDragOrigin {
   offset_x: number
   offset_y: number
-}
-
-interface FloatingAssistPointerState {
-  hovering_ball: boolean
 }
 
 interface RunAssistOptions {
@@ -248,6 +245,7 @@ const SystemFloatingAssist: React.FC = () => {
   const [canvasOpen, setCanvasOpen] = useState(false)
   const [contextMenuOpen, setContextMenuOpen] = useState(false)
   const [nativeHovering, setNativeHovering] = useState(false)
+  const [ambientAnimating, setAmbientAnimating] = useState(false)
   const [manualInstruction, setManualInstruction] = useState('')
   const [attachments, setAttachments] = useState<UserAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
@@ -401,7 +399,6 @@ const SystemFloatingAssist: React.FC = () => {
       if (event.key === 'Escape') collapseExpandedSurface()
     }
     window.addEventListener('pointerdown', markUserInteraction, { passive: true })
-    window.addEventListener('pointermove', markUserInteraction, { passive: true })
     window.addEventListener('wheel', markUserInteraction, { passive: true })
     window.addEventListener('click', closeContextMenu)
     window.addEventListener('keydown', handleKeyDown)
@@ -454,6 +451,11 @@ const SystemFloatingAssist: React.FC = () => {
     }).then(dispose => {
       tauriCleanups.push(dispose)
     }).catch(() => {})
+    void listen<boolean>('floating-assist-native-hover-changed', event => {
+      setNativeHovering(Boolean(event.payload))
+    }).then(dispose => {
+      tauriCleanups.push(dispose)
+    }).catch(() => {})
     return () => {
       document.documentElement.classList.remove('floating-assist-html')
       document.body.classList.remove('floating-assist-body')
@@ -467,7 +469,6 @@ const SystemFloatingAssist: React.FC = () => {
       stopProgress()
       stopDrag(false)
       window.removeEventListener('pointerdown', markUserInteraction)
-      window.removeEventListener('pointermove', markUserInteraction)
       window.removeEventListener('wheel', markUserInteraction)
       window.removeEventListener('pointerup', stopGlobalDrag)
       window.removeEventListener('mouseup', stopGlobalDrag)
@@ -479,72 +480,38 @@ const SystemFloatingAssist: React.FC = () => {
   }, [])
 
   useEffect(() => {
-    if (import.meta.env.MODE === 'test') return
+    if (phase !== 'idle' && phase !== 'done' && phase !== 'error') {
+      setAmbientAnimating(false)
+      return
+    }
 
     let cancelled = false
-    let polling = false
-    let timer: number | null = null
+    let frameId: number | null = null
+    let activeTimer: number | null = null
 
-    const clearTimer = () => {
-      if (timer != null) {
-        window.clearTimeout(timer)
-        timer = null
-      }
+    const playAmbientCycle = () => {
+      setAmbientAnimating(false)
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null
+        if (cancelled) return
+        setAmbientAnimating(true)
+        activeTimer = window.setTimeout(() => {
+          activeTimer = null
+          if (!cancelled) setAmbientAnimating(false)
+        }, FLOATING_ASSIST_AMBIENT_ACTIVE_MS)
+      })
     }
 
-    const pollNativeHover = async () => {
-      if (cancelled || !polling) return
-      try {
-        const pointerState = await invoke<FloatingAssistPointerState>('get_floating_assist_pointer_state')
-        if (!cancelled && polling) {
-          setNativeHovering(Boolean(pointerState?.hovering_ball))
-        }
-      } catch {
-        if (!cancelled && polling) {
-          setNativeHovering(false)
-        }
-      } finally {
-        if (!cancelled && polling) {
-          timer = window.setTimeout(() => {
-            timer = null
-            void pollNativeHover()
-          }, FLOATING_ASSIST_NATIVE_HOVER_POLL_MS)
-        }
-      }
-    }
-
-    const startPolling = () => {
-      if (polling) return
-      polling = true
-      void pollNativeHover()
-    }
-
-    const stopPolling = () => {
-      polling = false
-      clearTimer()
-      setNativeHovering(false)
-    }
-
-    const syncPolling = () => {
-      if (document.hasFocus()) {
-        stopPolling()
-      } else {
-        startPolling()
-      }
-    }
-
-    window.addEventListener('focus', syncPolling)
-    window.addEventListener('blur', syncPolling)
-    syncPolling()
-
+    playAmbientCycle()
+    const cycleTimer = window.setInterval(playAmbientCycle, FLOATING_ASSIST_AMBIENT_PERIOD_MS)
     return () => {
       cancelled = true
-      polling = false
-      clearTimer()
-      window.removeEventListener('focus', syncPolling)
-      window.removeEventListener('blur', syncPolling)
+      window.clearInterval(cycleTimer)
+      if (frameId != null) window.cancelAnimationFrame(frameId)
+      if (activeTimer != null) window.clearTimeout(activeTimer)
+      setAmbientAnimating(false)
     }
-  }, [])
+  }, [phase])
 
   useEffect(() => {
     if (phase !== 'done') {
@@ -1167,7 +1134,7 @@ const SystemFloatingAssist: React.FC = () => {
     >
       <div className="system-floating-assist__dock">
         <button
-          className={`system-floating-assist__ball system-floating-assist__ball--${phase}${nativeHovering ? ' system-floating-assist__ball--native-hover' : ''}`}
+          className={`system-floating-assist__ball system-floating-assist__ball--${phase}${nativeHovering ? ' system-floating-assist__ball--native-hover' : ''}${ambientAnimating ? ' system-floating-assist__ball--ambient-active' : ''}`}
           type="button"
           onClick={handleBallClick}
           onContextMenu={handleBallContextMenu}

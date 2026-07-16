@@ -1,10 +1,8 @@
 import React, { FormEvent, useEffect, useState } from 'react'
-import { ArrowRight, CheckCircle2, CreditCard, KeyRound, LogOut, LockKeyhole, Mail, RefreshCw, Server, Smartphone, UserRound, WalletCards } from 'lucide-react'
+import { ArrowRight, CheckCircle2, KeyRound, LogOut, LockKeyhole, Mail, Server, Smartphone, UserRound, WalletCards } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { authenticateWithPassword, authenticateWithPhoneCode, fetchConsoleSummary, logoutSession, sendPhoneVerificationCode } from '../utils/authApi'
-import { getMembershipPlanLabel, getUserDisplayName } from '../utils/accountDisplay'
-import { buildAdminConsoleUrl } from '../utils/adminConsole'
-import { openExternalUrl } from '../utils/openExternalUrl'
+import { getRunModeLabel, getUserDisplayName } from '../utils/accountDisplay'
 import './AuthPanel.css'
 
 type AuthMode = 'login' | 'register'
@@ -40,12 +38,10 @@ const AuthPanel: React.FC = () => {
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
-  const [balanceLoading, setBalanceLoading] = useState(false)
   const [balanceError, setBalanceError] = useState<string | null>(null)
 
   const refreshBalance = async () => {
     if (!authToken || !currentUser) return
-    setBalanceLoading(true)
     setBalanceError(null)
     try {
       const summary = await fetchConsoleSummary(adminApiBaseUrl, authToken)
@@ -55,8 +51,6 @@ const AuthPanel: React.FC = () => {
       setCloudBalance(null)
       setCloudSubscription(null)
       setBalanceError(err instanceof Error ? err.message : '钱包信息读取失败')
-    } finally {
-      setBalanceLoading(false)
     }
   }
 
@@ -108,10 +102,7 @@ const AuthPanel: React.FC = () => {
 
   if (currentUser) {
     const accountLabel = getUserDisplayName(currentUser)
-    const planLabel = getMembershipPlanLabel(currentUser, cloudSubscription)
-    const openBillingConsole = () => {
-      void openExternalUrl(buildAdminConsoleUrl(adminApiBaseUrl))
-    }
+    const runModeLabel = getRunModeLabel(currentUser, cloudSubscription)
     return (
       <main className="auth-panel auth-panel--signed-in" data-testid="auth-panel">
         <section className="auth-panel__form" aria-label="用户信息">
@@ -128,12 +119,12 @@ const AuthPanel: React.FC = () => {
             </span>
             <div>
               <strong>{accountLabel}</strong>
-              <span>{planLabel} · ID {currentUser.id}</span>
+              <span>{runModeLabel} · ID {currentUser.id}</span>
             </div>
           </div>
           <div className="auth-panel__profile">
-            <span>会员套餐</span>
-            <strong>{planLabel}</strong>
+            <span>运行模式</span>
+            <strong>{runModeLabel}</strong>
           </div>
           <div className="auth-panel__profile-grid">
             <div><span>状态</span><strong>{accountStatusLabel[currentUser.status] ?? '正常'}</strong></div>
@@ -145,22 +136,9 @@ const AuthPanel: React.FC = () => {
           <div className="auth-panel__wallet">
             <div className="auth-panel__wallet-head">
               <span><WalletCards size={16} aria-hidden /> 钱包信息</span>
-              <div className="auth-panel__wallet-actions">
-                <button type="button" onClick={openBillingConsole}>
-                  <CreditCard size={14} aria-hidden />
-                  充值
-                </button>
-                <button type="button" onClick={refreshBalance} disabled={balanceLoading}>
-                  <RefreshCw size={14} aria-hidden className={balanceLoading ? 'spin' : undefined} />
-                  刷新
-                </button>
-              </div>
             </div>
             <div className="auth-panel__wallet-grid">
               <div><span>可用 Credit</span><strong>{cloudBalance?.available ?? '-'}</strong></div>
-              <div><span>冻结 Credit</span><strong>{cloudBalance?.reserved ?? '-'}</strong></div>
-              <div><span>币种</span><strong>{cloudBalance?.currency ?? 'CREDIT'}</strong></div>
-              <div><span>更新时间</span><strong>{cloudBalance?.as_of ? new Date(cloudBalance.as_of).toLocaleString('zh-CN') : '-'}</strong></div>
             </div>
             {balanceError && <div className="auth-panel__wallet-error">{balanceError}</div>}
           </div>

@@ -54,6 +54,8 @@ describe('DiaryPanel', () => {
     expect(fetch).toHaveBeenCalledWith('http://localhost:7070/api/diaries?period_type=daily&limit=20')
     expect(screen.getByText('工作日记')).toBeInTheDocument()
     expect(screen.getByText('问题与解决')).toBeInTheDocument()
+    expect(screen.queryByText('后续计划')).not.toBeInTheDocument()
+    expect(screen.queryByText('验证周记汇总')).not.toBeInTheDocument()
   })
 
   it('后端尚未升级日记接口时显示空状态而不是错误', async () => {

@@ -8,7 +8,7 @@ use memory_bread_core::{
     capture::{
         start_context_watcher, start_listener, CaptureConfig, CaptureEngine, ListenerConfig,
     },
-    monitor::ResourceMonitor,
+    monitor::{ResourceMonitor, SystemPressureState},
     scheduler::Scheduler,
     storage::{db::current_ts_ms, StorageManager},
 };
@@ -140,11 +140,13 @@ async fn main() -> anyhow::Result<()> {
     // 启动事件监听器
     tracing::info!("启动事件监听器...");
     let interval_secs = parse_capture_interval_secs(&storage);
+    let system_pressure = SystemPressureState::default();
     let mut listener_config = ListenerConfig::default();
     listener_config.interval_secs = interval_secs;
     listener_config.enabled = state.capture_enabled.clone();
-    let enabled = listener_config.enabled.clone();
+    listener_config.system_pressure = system_pressure.clone();
     let context_enabled = listener_config.enabled.clone();
+    let context_system_pressure = system_pressure.clone();
     let periodic_tx = tx.clone();
 
     tokio::spawn(async move {
@@ -152,13 +154,13 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tokio::spawn(async move {
-        start_context_watcher(context_enabled, tx).await;
+        start_context_watcher(context_enabled, context_system_pressure, tx).await;
     });
 
     // 启动资源监控器
     tracing::info!("启动资源监控器...");
     tokio::spawn(async move {
-        ResourceMonitor::new(enabled).start().await;
+        ResourceMonitor::new(system_pressure).start().await;
     });
 
     // 启动定时任务调度器

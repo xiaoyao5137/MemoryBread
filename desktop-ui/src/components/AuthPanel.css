@@ -457,51 +457,21 @@
 .auth-panel__wallet-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
 }
 
-.auth-panel__wallet-head span,
-.auth-panel__wallet-head button {
+.auth-panel__wallet-head span {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-}
-
-.auth-panel__wallet-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
-.auth-panel__wallet-head span {
   color: #2f2017;
   font-size: 13px;
   font-weight: 850;
 }
 
-.auth-panel__wallet-head button {
-  min-height: 30px;
-  padding: 0 10px;
-  border: 1px solid rgba(154, 106, 49, 0.18);
-  border-radius: 10px;
-  background: #fffefa;
-  color: #813f22;
-  font-size: 12px;
-  font-weight: 800;
-  cursor: pointer;
-}
-
-.auth-panel__wallet-head button:disabled {
-  cursor: not-allowed;
-  opacity: 0.6;
-}
-
 .auth-panel__wallet-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 

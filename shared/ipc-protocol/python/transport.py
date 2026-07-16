@@ -111,17 +111,60 @@ class IpcServer:
 
     async def _serve_unix(self) -> None:
         import os
-        # 清理上次遗留的 socket 文件
+        # 只有无法连接时才把路径视为崩溃遗留。旧实现无条件 unlink，允许第二个
+        # Sidecar 在同一路径重新 bind，旧进程则继续持有一个不可达 socket。
         if os.path.exists(UNIX_SOCKET_PATH):
-            os.remove(UNIX_SOCKET_PATH)
+            try:
+                _reader, writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(UNIX_SOCKET_PATH),
+                    timeout=0.25,
+                )
+            except ConnectionRefusedError:
+                try:
+                    os.remove(UNIX_SOCKET_PATH)
+                except FileNotFoundError:
+                    pass
+            except FileNotFoundError:
+                pass
+            except (OSError, asyncio.TimeoutError) as exc:
+                # 无法确认所有者已死亡时宁可拒绝启动，也不能删除可能仍在使用的
+                # Socket；否则会再次制造一个不可达的旧 Sidecar。
+                raise RuntimeError(
+                    f"无法确认 IPC Socket 是否空闲: {UNIX_SOCKET_PATH}"
+                ) from exc
+            else:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"IPC Socket 已由另一个 Sidecar 使用: {UNIX_SOCKET_PATH}"
+                )
 
         self._server = await asyncio.start_unix_server(
             self._handle_connection,
             path=UNIX_SOCKET_PATH,
         )
+        socket_stat = os.stat(UNIX_SOCKET_PATH)
+        socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
         logger.info("IPC 服务端已启动（Unix Socket: %s）", UNIX_SOCKET_PATH)
-        async with self._server:
-            await self._server.serve_forever()
+        try:
+            async with self._server:
+                try:
+                    await self._server.serve_forever()
+                except asyncio.CancelledError:
+                    if self._server.is_serving():
+                        raise
+        finally:
+            self._server.close()
+            await self._server.wait_closed()
+            try:
+                current_stat = os.stat(UNIX_SOCKET_PATH)
+                if (current_stat.st_dev, current_stat.st_ino) == socket_identity:
+                    os.remove(UNIX_SOCKET_PATH)
+            except FileNotFoundError:
+                pass
 
     async def _serve_tcp(self) -> None:
         self._server = await asyncio.start_server(

@@ -106,7 +106,7 @@ describe('AuthPanel', () => {
     expect(screen.getByRole('alert')).not.toHaveTextContent('mb-admin/.env')
   })
 
-  it('用户详情显示套餐并可打开控制台充值', async () => {
+  it('用户详情显示中文运行模式和可用 Credit，并隐藏未开放的钱包操作与字段', async () => {
     useAppStore.getState().setAuthSession({
       access_token: 'mbs_test_token',
       expires_at: new Date(Date.now() + 86400_000).toISOString(),
@@ -141,16 +141,18 @@ describe('AuthPanel', () => {
         },
       }),
     }))
-    const openMock = vi.spyOn(window, 'open').mockImplementation(() => null)
-
     render(<AuthPanel />)
 
     expect(screen.getByText('烘焙师土豆')).toBeInTheDocument()
     expect(screen.queryByText('土豆账户')).not.toBeInTheDocument()
-    expect(await screen.findAllByText('Plus')).not.toHaveLength(0)
+    expect(screen.getByText('运行模式')).toBeInTheDocument()
+    expect(await screen.findAllByText('增强模式')).not.toHaveLength(0)
+    expect(screen.queryByText('会员套餐')).not.toBeInTheDocument()
     expect(await screen.findByText('120.0000')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: '充值' }))
-    expect(openMock).toHaveBeenCalledWith('http://127.0.0.1:3000/console', '_blank', 'noopener,noreferrer')
+    expect(screen.queryByText('冻结 Credit')).not.toBeInTheDocument()
+    expect(screen.queryByText('币种')).not.toBeInTheDocument()
+    expect(screen.queryByText('更新时间')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '充值' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '刷新' })).not.toBeInTheDocument()
   })
 })

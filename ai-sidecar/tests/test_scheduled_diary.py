@@ -132,6 +132,8 @@ def test_daily_diary_task_writes_yesterday_diary(tmp_path):
     assert row[0] == "daily"
     assert row[1] == diary_date
     assert content["work_outputs"] == ["完成了日记生成链路"]
+    assert "next_plan" not in content
+    assert "明日计划" not in content["markdown"]
     assert content["language"] == "zh-CN"
     assert content["work_environment"] == {
         "apps": ["IDE"],
@@ -399,12 +401,39 @@ def test_daily_diary_markdown_is_compacted_to_fixed_sections_and_limits():
     outputs = TaskExecutor._extract_markdown_section_items(compacted, ("今日产出",))
     problems = TaskExecutor._extract_markdown_section_items(compacted, ("问题与解决",))
 
-    assert compacted.count("## ") == 3
+    assert compacted.count("## ") == 2
     assert "背景铺垫" not in compacted
     assert "额外总结" not in compacted
+    assert "明日计划" not in compacted
+    assert "验证中文输出" not in compacted
     assert len(outputs) == 4
     assert len(outputs[0]) <= 45
     assert len(problems) == 2
+
+
+def test_daily_diary_instruction_excludes_future_plans():
+    instruction = TaskExecutor._daily_diary_instruction("2026-07-15")
+
+    assert "## 今日产出" in instruction
+    assert "## 问题与解决" in instruction
+    assert "## 明日计划" not in instruction
+    assert "不要生成明日计划" in instruction
+
+
+def test_diary_rollup_context_ignores_legacy_daily_plans():
+    context = TaskExecutor(db_path=":memory:")._build_diary_rollup_context([
+        {
+            "diary_date": "2026-07-15",
+            "content": {
+                "title": "2026-07-15 工作日记",
+                "work_outputs": ["完成日记生成约束"],
+                "next_plan": ["明天继续开发"],
+            },
+        },
+    ])
+
+    assert "完成日记生成约束" in context
+    assert "明天继续开发" not in context
 
 
 def test_daily_diary_chinese_output_check_rejects_english_body():

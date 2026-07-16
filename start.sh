@@ -57,6 +57,9 @@ check_path_leaks() {
 # 日志目录
 LOG_DIR="$HOME/.memory-bread/logs"
 mkdir -p "$LOG_DIR"
+STATE_DIR="$HOME/.memory-bread/state"
+mkdir -p "$STATE_DIR"
+SUPERVISOR_SHUTDOWN_MARKER="$STATE_DIR/supervisor-shutdown-in-progress"
 
 # PID 文件
 SIDECAR_PID_FILE="$LOG_DIR/sidecar.pid"
@@ -184,6 +187,56 @@ is_running() {
         fi
     fi
     return 1
+}
+
+find_sidecar_pids() {
+    local pid command
+    while read -r pid command; do
+        [ -n "$pid" ] || continue
+        case "$command" in
+            *"Python main.py"*|*".venv/bin/python main.py"*|*"ai-sidecar/main.py"*)
+                if pid_belongs_to_project "$pid"; then
+                    printf '%s\n' "$pid"
+                fi
+                ;;
+        esac
+    done < <(ps -axo pid=,command=)
+}
+
+stop_sidecar_pids() {
+    local pids="$1"
+    [ -n "$pids" ] || return 0
+
+    echo "$pids" | xargs kill 2>/dev/null || true
+    sleep 1
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        if ps -p "$pid" > /dev/null 2>&1 && pid_belongs_to_project "$pid"; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done <<< "$pids"
+}
+
+cleanup_duplicate_sidecars() {
+    local keep_pid=""
+    local duplicates=""
+    local pid
+
+    if is_running "$SIDECAR_PID_FILE"; then
+        keep_pid=$(tr -d '[:space:]' < "$SIDECAR_PID_FILE")
+    fi
+
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        if [ -z "$keep_pid" ] || [ "$pid" != "$keep_pid" ]; then
+            duplicates+="${duplicates:+$'\n'}$pid"
+        fi
+    done < <(find_sidecar_pids)
+
+    if [ -n "$duplicates" ]; then
+        log_warn "清理未被 PID 文件管理的重复 AI Sidecar: $(echo "$duplicates" | tr '\n' ' ')"
+        stop_sidecar_pids "$duplicates"
+    fi
 }
 
 is_ollama_ready() {
@@ -444,6 +497,9 @@ show_status() {
 # 停止所有服务
 stop_all() {
     log_info "停止所有服务..."
+    # Desktop 收到退出事件时会自行派生 stop-after-app。由启动器主动 stop/restart
+    # 时先放置短生命周期标记，避免旧 Desktop 的延迟清理误杀刚启动的新实例。
+    : > "$SUPERVISOR_SHUTDOWN_MARKER"
 
     # 停止 Desktop UI（包括子进程）
     if is_running "$UI_PID_FILE"; then
@@ -514,6 +570,14 @@ stop_all() {
         rm -f "$SIDECAR_PID_FILE"
     fi
 
+    # PID 文件只能记录一个进程；继续清理手工启动或历史启动器遗留的 Sidecar。
+    local remaining_sidecars=$(find_sidecar_pids)
+    if [ -n "$remaining_sidecars" ]; then
+        log_info "停止未登记的 AI Sidecar: $(echo "$remaining_sidecars" | tr '\n' ' ')"
+        stop_sidecar_pids "$remaining_sidecars"
+    fi
+    rm -f /tmp/memory-bread-sidecar.sock
+
     # 停止 Model API Server
     if is_running "$MODEL_API_PID_FILE"; then
         local pid=$(cat "$MODEL_API_PID_FILE")
@@ -540,6 +604,7 @@ stop_all() {
         rm -f "$OLLAMA_PID_FILE"
     fi
 
+    rm -f "$SUPERVISOR_SHUTDOWN_MARKER"
     log_success "所有服务已停止"
 }
 
@@ -551,12 +616,22 @@ stop_after_app() {
         exit 1
     fi
 
+    if [ -f "$SUPERVISOR_SHUTDOWN_MARKER" ]; then
+        log_info "启动器正在停止组件，忽略 Desktop 派生的重复清理"
+        exit 0
+    fi
+
     for _ in {1..50}; do
         if ! ps -p "$app_pid" > /dev/null 2>&1; then
             break
         fi
         sleep 0.2
     done
+
+    if [ -f "$SUPERVISOR_SHUTDOWN_MARKER" ]; then
+        log_info "启动器已接管组件停止，忽略 Desktop 派生的重复清理"
+        exit 0
+    fi
 
     stop_all
 }
@@ -633,6 +708,8 @@ clean_stale_tauri_cache() {
 
 # 启动 AI Sidecar
 start_sidecar() {
+    cleanup_duplicate_sidecars
+
     if is_running "$SIDECAR_PID_FILE" && is_running "$MODEL_API_PID_FILE"; then
         log_info "AI Sidecar 与 Model API 已在运行，复用现有进程"
         wait_for_http "http://localhost:${MODEL_API_PORT}/health" "Model API / RAG API" 10 1 || log_warn "现有 Model API 进程健康检查失败，建议执行 ./start.sh restart"
@@ -680,6 +757,14 @@ start_sidecar() {
     # 启动 Sidecar（后台运行）
     nohup .venv/bin/python main.py > "$SIDECAR_LOG" 2>&1 &
     echo $! > "$SIDECAR_PID_FILE"
+
+    # 单实例锁或启动检查失败时进程会快速退出，不能把失效 PID 当成启动成功。
+    sleep 0.2
+    if ! is_running "$SIDECAR_PID_FILE"; then
+        log_error "AI Sidecar 启动失败或已有未受管实例，请查看日志: $SIDECAR_LOG"
+        rm -f "$SIDECAR_PID_FILE"
+        exit 1
+    fi
 
     # 启动 Model API / RAG API Server（后台运行）
     nohup .venv/bin/python model_api_server.py > "$MODEL_API_LOG" 2>&1 &

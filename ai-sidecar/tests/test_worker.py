@@ -169,6 +169,41 @@ class TestOcrWorkerConcurrency:
         # 每次调用 make_ocr_request 生成新 UUID，所以 n_tasks 个响应有 n_tasks 个不同 ID
         assert len({r.id for r in responses}) == n_tasks
 
+    async def test_ocr_engine_process_is_strictly_serial(
+        self, jpeg_image_path, make_ocr_request
+    ):
+        class ConcurrencyTrackingBackend:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+
+            def is_available(self) -> bool:
+                return True
+
+            def run(self, _image_path: str) -> OcrOutput:
+                with self._lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                time.sleep(0.03)
+                with self._lock:
+                    self.active -= 1
+                return OcrOutput(boxes=[OcrBox(text="串行识别", confidence=0.93)])
+
+        backend = ConcurrencyTrackingBackend()
+        worker = OcrWorker(
+            engine=OcrEngine(primary=backend, fallback=MockOcrBackend(available=False))
+        )
+        responses = await asyncio.gather(
+            *[
+                worker.handle(make_ocr_request(screenshot_path=jpeg_image_path))
+                for _ in range(5)
+            ]
+        )
+
+        assert all(response.status == ResponseStatus.OK for response in responses)
+        assert backend.max_active == 1
+
     async def test_concurrent_requests_share_single_lazy_init(self, jpeg_image_path, make_ocr_request):
         class ThreadSafeLazyBackend:
             def __init__(self) -> None:

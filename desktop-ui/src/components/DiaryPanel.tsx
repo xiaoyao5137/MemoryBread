@@ -386,7 +386,9 @@ const DiaryPanel: React.FC = () => {
 const DiaryContentView: React.FC<{ diary: DiaryEntry }> = ({ diary }) => {
   const content = diary.content || {}
   const hasStructured = Boolean(
-    content.work_outputs?.length || content.problems_solved?.length || content.next_plan?.length || content.timeline?.length
+    content.work_outputs?.length || content.problems_solved?.length
+      || (diary.period_type !== 'daily' && content.next_plan?.length)
+      || content.timeline?.length
   )
 
   if (!hasStructured && content.markdown) {
@@ -397,7 +399,9 @@ const DiaryContentView: React.FC<{ diary: DiaryEntry }> = ({ diary }) => {
     <div style={{ display: 'grid', gap: '20px' }}>
       <SectionList title="工作产出" items={content.work_outputs || []} />
       <SectionList title="问题与解决" items={content.problems_solved || []} />
-      <SectionList title="后续计划" items={content.next_plan || []} />
+      {diary.period_type !== 'daily' && (
+        <SectionList title="后续计划" items={content.next_plan || []} />
+      )}
       {content.timeline && content.timeline.length > 0 && (
         <div>
           <h3 style={sectionTitleStyle}>来源线索</h3>

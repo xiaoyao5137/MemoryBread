@@ -1,6 +1,8 @@
 import React from 'react'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { invoke } from '@tauri-apps/api/core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import MemoryBackupSection from '../components/MemoryBackupSection'
 import RepositoryPanel from '../components/RepositoryPanel'
 import { useAppStore } from '../store/useAppStore'
 
@@ -21,6 +23,10 @@ const mocks = vi.hoisted(() => ({
   restoreMemoryPackageFromCloud: vi.fn(),
   fetchCloudSnapshots: vi.fn(),
   upsertCloudDevice: vi.fn(),
+}))
+
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('../hooks/useApi', () => ({
@@ -47,6 +53,7 @@ vi.mock('../utils/authApi', () => ({
 
 beforeEach(() => {
   Object.values(mocks).forEach(mock => mock.mockReset())
+  vi.mocked(invoke).mockReset().mockResolvedValue(undefined)
   mocks.fetchMemories.mockResolvedValue({ items: [], total: 0 })
   mocks.fetchCaptures.mockResolvedValue({ items: [], total: 0 })
   mocks.fetchTemplates.mockResolvedValue({ items: [], total: 0 })
@@ -63,10 +70,40 @@ beforeEach(() => {
 
   useAppStore.getState().reset()
   useAppStore.getState().clearAuthSession()
-  useAppStore.getState().setRepositoryTab('memory')
 })
 
-describe('RepositoryPanel memory backup', () => {
+describe('MemoryBackupSection', () => {
+  it('导出成功后可打开备份所在文件夹', async () => {
+    mocks.exportMemoryPackage.mockResolvedValue({
+      path: '/Users/test/.memory-bread/backups/memory-package-1.mbmemory.json',
+      file_sha256: 'file-sha256',
+      file_size_bytes: 2048,
+      manifest: {
+        app: 'memory-bread',
+        format_version: 1,
+        schema_version: 1,
+        exported_at_ms: 1,
+        source_db_path: '/Users/test/.memory-bread/memory.db',
+        excluded_tables: [],
+        excluded_capture_columns: [],
+        payload_sha256: 'payload-sha256',
+        table_summaries: [{ name: 'timelines', row_count: 3, identity_columns: ['id'] }],
+      },
+    })
+
+    render(<MemoryBackupSection />)
+    fireEvent.click(screen.getByRole('button', { name: '导出备份' }))
+
+    expect(await screen.findByText(/记忆包已保存：/)).toHaveTextContent('memory-package-1.mbmemory.json')
+    fireEvent.click(screen.getByRole('button', { name: '打开文件夹' }))
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('open_export_folder', {
+        path: '/Users/test/.memory-bread/backups/memory-package-1.mbmemory.json',
+      })
+    })
+  })
+
   it('登录且具备权限后自动读取并显示云端备份', async () => {
     useAppStore.getState().setAuthSession({
       access_token: 'mbs-test-token',
@@ -88,7 +125,7 @@ describe('RepositoryPanel memory backup', () => {
       name: '云端备份',
     })
 
-    render(<RepositoryPanel />)
+    render(<MemoryBackupSection />)
 
     await waitFor(() => {
       expect(mocks.fetchCloudSnapshots).toHaveBeenCalledWith(
@@ -99,5 +136,13 @@ describe('RepositoryPanel memory backup', () => {
     expect(await screen.findByRole('combobox', { name: '云端备份' })).toHaveValue('snapshot-after-login')
     expect(screen.getByRole('button', { name: '备份到云端' })).toBeEnabled()
     expect(screen.getByRole('button', { name: '恢复到本机' })).toBeEnabled()
+  })
+
+  it('不再出现在采集页面', async () => {
+    render(<RepositoryPanel />)
+
+    await waitFor(() => expect(mocks.fetchMemories).toHaveBeenCalled())
+    expect(screen.queryByText('记忆备份')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '导出备份' })).not.toBeInTheDocument()
   })
 })

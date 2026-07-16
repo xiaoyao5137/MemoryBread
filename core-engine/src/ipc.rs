@@ -7,7 +7,10 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
+
+const DEFAULT_IPC_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_OCR_IPC_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// IPC 客户端错误
 #[derive(Debug, Error)]
@@ -77,6 +80,7 @@ pub struct EmbedResult {
 pub struct IpcClient {
     socket_path: String,
     timeout: Duration,
+    ocr_timeout: Duration,
 }
 
 impl IpcClient {
@@ -84,7 +88,22 @@ impl IpcClient {
     pub fn new() -> Self {
         Self {
             socket_path: "/tmp/memory-bread-sidecar.sock".to_string(),
-            timeout: Duration::from_secs(10), // 改为 10 秒超时
+            // OCR 是同步系统调用，客户端超时不能取消服务端正在运行的 Vision 任务。
+            // 使用覆盖最慢正常请求的单次截止时间，禁止超时后在后台继续重试。
+            timeout: DEFAULT_IPC_TIMEOUT,
+            ocr_timeout: DEFAULT_OCR_IPC_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_socket_path_and_timeout(
+        socket_path: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            timeout,
+            ocr_timeout: timeout,
         }
     }
 
@@ -116,7 +135,7 @@ impl IpcClient {
             },
         };
 
-        let response = self.send_request(&request)?;
+        let response = self.send_request_with_timeout(&request, self.ocr_timeout)?;
 
         if response.status != "ok" {
             let error_msg = response.error.unwrap_or_else(|| "未知错误".to_string());
@@ -161,6 +180,14 @@ impl IpcClient {
 
     /// 发送请求并接收响应
     fn send_request(&self, request: &IpcRequest) -> Result<IpcResponse, IpcError> {
+        self.send_request_with_timeout(request, self.timeout)
+    }
+
+    fn send_request_with_timeout(
+        &self,
+        request: &IpcRequest,
+        timeout: Duration,
+    ) -> Result<IpcResponse, IpcError> {
         // 连接到 Unix Socket
         let mut stream = UnixStream::connect(&self.socket_path).map_err(|e| {
             IpcError::ConnectionFailed(format!(
@@ -169,8 +196,8 @@ impl IpcClient {
             ))
         })?;
 
-        stream.set_read_timeout(Some(self.timeout))?;
-        stream.set_write_timeout(Some(self.timeout))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
 
         // 序列化请求
         let request_json = serde_json::to_string(request)?;
@@ -178,15 +205,19 @@ impl IpcClient {
 
         // 发送请求（长度前缀 + JSON）
         let length = (request_bytes.len() as u32).to_be_bytes();
-        stream.write_all(&length)?;
-        stream.write_all(request_bytes)?;
-        stream.flush()?;
+        stream.write_all(&length).map_err(Self::map_io_error)?;
+        stream
+            .write_all(request_bytes)
+            .map_err(Self::map_io_error)?;
+        stream.flush().map_err(Self::map_io_error)?;
 
         debug!("发送 IPC 请求: {} 字节", request_bytes.len());
 
         // 读取响应长度
         let mut length_buf = [0u8; 4];
-        stream.read_exact(&mut length_buf)?;
+        stream
+            .read_exact(&mut length_buf)
+            .map_err(Self::map_io_error)?;
         let response_length = u32::from_be_bytes(length_buf) as usize;
 
         if response_length > 10 * 1024 * 1024 {
@@ -199,13 +230,26 @@ impl IpcClient {
 
         // 读取响应内容
         let mut response_buf = vec![0u8; response_length];
-        stream.read_exact(&mut response_buf)?;
+        stream
+            .read_exact(&mut response_buf)
+            .map_err(Self::map_io_error)?;
 
         debug!("接收 IPC 响应: {} 字节", response_length);
 
         // 反序列化响应
         let response: IpcResponse = serde_json::from_slice(&response_buf)?;
         Ok(response)
+    }
+
+    fn map_io_error(error: std::io::Error) -> IpcError {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            IpcError::Timeout
+        } else {
+            IpcError::IoError(error)
+        }
     }
 
     /// 检查 Sidecar 是否可用
@@ -228,5 +272,7 @@ mod tests {
     fn test_ipc_client_creation() {
         let client = IpcClient::new();
         assert_eq!(client.socket_path, "/tmp/memory-bread-sidecar.sock");
+        assert_eq!(client.timeout, DEFAULT_IPC_TIMEOUT);
+        assert_eq!(client.ocr_timeout, DEFAULT_OCR_IPC_TIMEOUT);
     }
 }

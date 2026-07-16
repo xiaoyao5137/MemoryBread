@@ -11,6 +11,7 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use super::{ax::get_frontmost_context_snapshot_async, ax::AXInfo, CaptureEvent};
+use crate::monitor::SystemPressureState;
 
 /// 内存压力等级
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub struct ListenerConfig {
     pub enabled: Arc<AtomicBool>,
     /// 空闲阈值（秒），超过此时间无操作则暂停采集
     pub idle_threshold_secs: u64,
+    /// ResourceMonitor 更新的系统/WindowServer 压力状态
+    pub system_pressure: SystemPressureState,
 }
 
 impl Default for ListenerConfig {
@@ -37,6 +40,7 @@ impl Default for ListenerConfig {
             interval_secs: 90, // 默认 90 秒兜底采集
             enabled: Arc::new(AtomicBool::new(true)),
             idle_threshold_secs: 300, // 5 分钟无操作暂停
+            system_pressure: SystemPressureState::default(),
         }
     }
 }
@@ -143,7 +147,11 @@ fn context_change_event(
 ///
 /// 每 5 秒读取应用身份和浏览器 URL；应用或 URL 变化时触发完整 AX 采集，
 /// AX 正文为空时再由采集引擎截图并异步 OCR。
-pub async fn start_context_watcher(enabled: Arc<AtomicBool>, tx: mpsc::Sender<CaptureEvent>) {
+pub async fn start_context_watcher(
+    enabled: Arc<AtomicBool>,
+    system_pressure: SystemPressureState,
+    tx: mpsc::Sender<CaptureEvent>,
+) {
     info!(
         interval_secs = CONTEXT_WATCH_INTERVAL_SECS,
         "启动前台上下文变化监听器"
@@ -180,11 +188,14 @@ pub async fn start_context_watcher(enabled: Arc<AtomicBool>, tx: mpsc::Sender<Ca
             .map(|mb| mb < LOW_MEMORY_THRESHOLD_MB)
             .unwrap_or(false);
         let ax_tripped = super::ax::is_circuit_breaker_tripped();
-        if asleep || mem_blocked || ax_tripped {
+        let load_pressure = system_pressure.snapshot();
+        if asleep || mem_blocked || ax_tripped || load_pressure.under_pressure {
             warn!(
                 asleep,
                 avail_mb = ?avail_mb,
                 ax_tripped,
+                system_cpu = load_pressure.system_cpu_percent,
+                window_server_cpu = load_pressure.window_server_cpu_percent,
                 "变化采集门禁命中，本轮不推进上下文，5 秒后重试"
             );
             continue;
@@ -236,8 +247,9 @@ pub async fn start_listener(config: ListenerConfig, tx: mpsc::Sender<CaptureEven
             .map(|mb| mb < LOW_MEMORY_THRESHOLD_MB)
             .unwrap_or(false);
         let ax_tripped = super::ax::is_circuit_breaker_tripped();
+        let load_pressure = config.system_pressure.snapshot();
 
-        if asleep || mem_blocked || ax_tripped {
+        if asleep || mem_blocked || ax_tripped || load_pressure.under_pressure {
             let new_interval = current_interval
                 .saturating_mul(2)
                 .min(MAX_BACKOFF_SECS)
@@ -246,6 +258,8 @@ pub async fn start_listener(config: ListenerConfig, tx: mpsc::Sender<CaptureEven
                 asleep,
                 avail_mb = ?avail_mb,
                 ax_tripped,
+                system_cpu = load_pressure.system_cpu_percent,
+                window_server_cpu = load_pressure.window_server_cpu_percent,
                 from = current_interval,
                 to = new_interval,
                 "门禁命中，跳过本次采集并延长 tick"

@@ -36,6 +36,7 @@ import BakeKnowledgeTab from './bake/BakeKnowledgeTab'
 import BakeTabs from './bake/BakeTabs'
 import { BakeButton } from './bake/BakeShared'
 import { parseDateInputToMs } from './bake/BakeCaptureTab'
+import MemoryBackupSection from './MemoryBackupSection'
 import './bake/BakePanel.css'
 
 const PAGE_SIZE = 20
@@ -903,6 +904,7 @@ const BakePanel: React.FC = () => {
             overview={overview}
             onOpenTab={handleBakeTabChange}
             onOpenRepository={handleOpenRepositoryFromOverview}
+            footer={<MemoryBackupSection />}
           />
         )}
         {bakeTab === 'knowledge' && (

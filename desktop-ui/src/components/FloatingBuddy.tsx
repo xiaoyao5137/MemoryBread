@@ -12,7 +12,7 @@ import React from 'react'
 import { ChevronRight, CircleUserRound, LogIn } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { type WindowMode } from '../types'
-import { getMembershipPlanLabel, getUserDisplayName } from '../utils/accountDisplay'
+import { getRunModeLabel, getUserDisplayName } from '../utils/accountDisplay'
 import EnvironmentSwitch from './admin/EnvironmentSwitch'
 import { BreadAppIcon, type BreadAppIconName } from './icons/BreadIcons'
 import './FloatingBuddy.v2.css'
@@ -114,7 +114,7 @@ const MENU_GROUPS: MenuGroup[] = [
 const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
   const { windowMode, setWindowMode, clearBakeNavigationStack, currentUser, cloudSubscription } = useAppStore()
   const accountLabel = getUserDisplayName(currentUser)
-  const planLabel = getMembershipPlanLabel(currentUser, cloudSubscription)
+  const runModeLabel = getRunModeLabel(currentUser, cloudSubscription)
   const handleNavigate = (mode: WindowMode) => {
     clearBakeNavigationStack()
     setWindowMode(mode)
@@ -175,7 +175,7 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
         </span>
         <span className="buddy-account-pill__text">
           <strong>{accountLabel}</strong>
-          <span>{planLabel}</span>
+          <span>{runModeLabel}</span>
         </span>
         <ChevronRight className="buddy-account-pill__chevron" size={15} aria-hidden="true" />
       </button>

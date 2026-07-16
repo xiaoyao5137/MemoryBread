@@ -188,6 +188,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "044_correct_weekday_semantics",
         include_str!("migrations/044_correct_weekday_semantics.sql"),
     ),
+    (
+        "045_remove_daily_diary_future_plans",
+        include_str!("migrations/045_remove_daily_diary_future_plans.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -680,6 +684,13 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(weekly_cron, "0 0 9 * * 2");
+                let daily_instruction: String = conn.query_row(
+                    "SELECT user_instruction FROM scheduled_tasks WHERE template_id = 'daily_journal'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(!daily_instruction.contains("【明日计划】"));
+                assert!(daily_instruction.contains("不要生成明日计划"));
                 Ok(())
             })
             .unwrap();

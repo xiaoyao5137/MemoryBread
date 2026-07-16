@@ -122,4 +122,17 @@ describe('BakeOverviewTab 趋势图', () => {
     expect(screen.getByText('2026-06-01')).toBeInTheDocument()
     expect(screen.getByText('合计 4')).toBeInTheDocument()
   })
+
+  it('将记忆备份区域放在总览内容底部', () => {
+    const { container } = render(
+      <BakeOverviewTab
+        overview={overview}
+        onOpenTab={noop}
+        onOpenRepository={noop}
+        footer={<section aria-label="记忆备份">备份功能</section>}
+      />,
+    )
+
+    expect(container.firstElementChild?.lastElementChild).toHaveAttribute('aria-label', '记忆备份')
+  })
 })
