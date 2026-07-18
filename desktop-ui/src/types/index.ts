@@ -197,6 +197,35 @@ export interface CloudBalance {
   as_of: string
 }
 
+export type AchievementSurface = 'profile_avatar' | 'floating_avatar'
+
+export interface AchievementBadge {
+  id: string
+  badge_key: string
+  name: string
+  tagline: string
+  description: string
+  icon_key: string
+  palette_key: string
+  rarity: 'common' | 'rare' | 'epic' | 'legendary'
+}
+
+export interface UserAchievementBadge {
+  badge: AchievementBadge
+  quantity: number
+  total_credit_earned: string
+  first_earned_at: string
+  last_earned_at: string
+}
+
+export interface AchievementProfile {
+  badges: UserAchievementBadge[]
+  equipped: {
+    profile_avatar?: AchievementBadge | null
+    floating_avatar?: AchievementBadge | null
+  }
+}
+
 export interface CloudSubscription {
   id: string
   status: string

@@ -1,4 +1,6 @@
 import type {
+  AchievementProfile,
+  AchievementSurface,
   AuthSession,
   CloudBalance,
   CloudDevice,
@@ -8,6 +10,8 @@ import type {
   CompleteCloudSnapshotRequest,
   UpsertCloudDeviceRequest,
 } from '../types'
+
+export const ACHIEVEMENTS_CHANGED_KEY = 'memorybread.achievements.changed'
 
 function normalizeAuthFetchError(error: unknown, adminApiBaseUrl: string): Error {
   if (error instanceof TypeError) {
@@ -221,4 +225,56 @@ export async function fetchCloudSnapshots(
     throw new Error(authErrorMessage(payload, `snapshots fetch failed: ${response.status}`))
   }
   return payload.data as CloudSnapshot[]
+}
+
+export async function fetchAchievementProfile(
+  adminApiBaseUrl: string,
+  token: string,
+): Promise<AchievementProfile> {
+  const response = await fetch(`${adminApiBaseUrl}/v1/achievements`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }).catch((error) => {
+    throw normalizeAuthFetchError(error, adminApiBaseUrl)
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(authErrorMessage(payload, `achievements fetch failed: ${response.status}`))
+  }
+  const data = (payload?.data || {}) as Partial<AchievementProfile>
+  return {
+    badges: Array.isArray(data.badges) ? data.badges : [],
+    equipped: data.equipped || {},
+  }
+}
+
+export async function equipAchievementBadge(
+  adminApiBaseUrl: string,
+  token: string,
+  surface: AchievementSurface,
+  badgeId: string | null,
+): Promise<AchievementProfile> {
+  const response = await fetch(`${adminApiBaseUrl}/v1/achievements/equipped`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ surface, badge_id: badgeId }),
+  }).catch((error) => {
+    throw normalizeAuthFetchError(error, adminApiBaseUrl)
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(authErrorMessage(payload, `badge equip failed: ${response.status}`))
+  }
+  try {
+    localStorage.setItem(ACHIEVEMENTS_CHANGED_KEY, String(Date.now()))
+  } catch {
+    // 同窗口状态由返回值更新；跨窗口广播属于尽力通知。
+  }
+  const data = (payload?.data || {}) as Partial<AchievementProfile>
+  return {
+    badges: Array.isArray(data.badges) ? data.badges : [],
+    equipped: data.equipped || {},
+  }
 }

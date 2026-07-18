@@ -1,8 +1,10 @@
 import React, { FormEvent, useEffect, useState } from 'react'
-import { ArrowRight, CheckCircle2, KeyRound, LogOut, LockKeyhole, Mail, Server, Smartphone, UserRound, WalletCards } from 'lucide-react'
+import { ArrowRight, Award, CheckCircle2, KeyRound, LogOut, LockKeyhole, Mail, Server, Smartphone, UserRound, WalletCards } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
-import { authenticateWithPassword, authenticateWithPhoneCode, fetchConsoleSummary, logoutSession, sendPhoneVerificationCode } from '../utils/authApi'
+import type { AchievementProfile } from '../types'
+import { authenticateWithPassword, authenticateWithPhoneCode, fetchAchievementProfile, fetchConsoleSummary, logoutSession, sendPhoneVerificationCode } from '../utils/authApi'
 import { getRunModeLabel, getUserDisplayName } from '../utils/accountDisplay'
+import AchievementGallery from './AchievementGallery'
 import './AuthPanel.css'
 
 type AuthMode = 'login' | 'register'
@@ -39,6 +41,11 @@ const AuthPanel: React.FC = () => {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [balanceError, setBalanceError] = useState<string | null>(null)
+  const [activeProfileTab, setActiveProfileTab] = useState<'personal' | 'achievements'>('personal')
+  const [achievementProfile, setAchievementProfile] = useState<AchievementProfile | null>(null)
+  const [achievementError, setAchievementError] = useState<string | null>(null)
+  const [achievementLoading, setAchievementLoading] = useState(false)
+  const [achievementRetryKey, setAchievementRetryKey] = useState(0)
 
   const refreshBalance = async () => {
     if (!authToken || !currentUser) return
@@ -57,6 +64,31 @@ const AuthPanel: React.FC = () => {
   useEffect(() => {
     void refreshBalance()
   }, [authToken, currentUser?.id, adminApiBaseUrl, setCloudBalance, setCloudSubscription])
+
+  useEffect(() => {
+    if (!authToken || !currentUser) {
+      setAchievementProfile(null)
+      setAchievementError(null)
+      setAchievementLoading(false)
+      return undefined
+    }
+    let cancelled = false
+    setAchievementLoading(true)
+    setAchievementError(null)
+    fetchAchievementProfile(adminApiBaseUrl, authToken)
+      .then((profile) => {
+        if (!cancelled) setAchievementProfile(profile)
+      })
+      .catch((achievementFetchError) => {
+        if (!cancelled) {
+          setAchievementError(achievementFetchError instanceof Error ? achievementFetchError.message : '标签卡片读取失败')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setAchievementLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [adminApiBaseUrl, authToken, currentUser?.id, achievementRetryKey])
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
@@ -105,46 +137,94 @@ const AuthPanel: React.FC = () => {
     const runModeLabel = getRunModeLabel(currentUser, cloudSubscription)
     return (
       <main className="auth-panel auth-panel--signed-in" data-testid="auth-panel">
-        <section className="auth-panel__form" aria-label="用户信息">
+        <section className="auth-panel__form" aria-label="个人中心">
           <div className="auth-panel__form-head">
             <span className="auth-panel__form-icon" aria-hidden="true"><CheckCircle2 size={18} /></span>
             <div>
-              <strong>用户详情</strong>
-              <span>账号、用户资料与钱包信息</span>
+              <strong>个人中心</strong>
+              <span>管理账户资料与标签卡片</span>
             </div>
           </div>
           <div className="auth-panel__avatar-row">
             <span className="auth-panel__avatar" aria-hidden="true">
               {accountLabel.slice(0, 1).toUpperCase()}
+              {achievementProfile?.equipped.profile_avatar && (
+                <span
+                  className={`auth-panel__avatar-badge auth-panel__avatar-badge--${achievementProfile.equipped.profile_avatar.palette_key}`}
+                  title={`已佩戴 ${achievementProfile.equipped.profile_avatar.name}`}
+                >
+                  {Array.from(achievementProfile.equipped.profile_avatar.name)[0]}
+                </span>
+              )}
             </span>
             <div>
               <strong>{accountLabel}</strong>
               <span>{runModeLabel} · ID {currentUser.id}</span>
             </div>
           </div>
-          <div className="auth-panel__profile">
-            <span>运行模式</span>
-            <strong>{runModeLabel}</strong>
-          </div>
-          <div className="auth-panel__profile-grid">
-            <div><span>状态</span><strong>{accountStatusLabel[currentUser.status] ?? '正常'}</strong></div>
-            <div><span>区域</span><strong>{currentUser.locale}</strong></div>
-            <div><span>时区</span><strong>{currentUser.timezone}</strong></div>
-            <div><span>创建时间</span><strong>{new Date(currentUser.created_at).toLocaleString('zh-CN')}</strong></div>
-            <div><span>登录方式</span><strong>{currentUser.email ? '邮箱账号' : '手机号账号'}</strong></div>
-          </div>
-          <div className="auth-panel__wallet">
-            <div className="auth-panel__wallet-head">
-              <span><WalletCards size={16} aria-hidden /> 钱包信息</span>
+
+          <nav className="auth-panel__profile-tabs" role="tablist" aria-label="个人中心页面导航">
+            <button
+              aria-selected={activeProfileTab === 'personal'}
+              className={activeProfileTab === 'personal' ? 'auth-panel__profile-tab auth-panel__profile-tab--active' : 'auth-panel__profile-tab'}
+              onClick={() => setActiveProfileTab('personal')}
+              role="tab"
+              type="button"
+            >
+              <UserRound size={16} aria-hidden />个人信息
+            </button>
+            <button
+              aria-selected={activeProfileTab === 'achievements'}
+              className={activeProfileTab === 'achievements' ? 'auth-panel__profile-tab auth-panel__profile-tab--active' : 'auth-panel__profile-tab'}
+              onClick={() => setActiveProfileTab('achievements')}
+              role="tab"
+              type="button"
+            >
+              <Award size={16} aria-hidden />标签卡片
+            </button>
+          </nav>
+
+          {activeProfileTab === 'personal' && (
+            <div className="auth-panel__profile-content" role="tabpanel">
+              <div className="auth-panel__profile">
+                <span>运行模式</span>
+                <strong>{runModeLabel}</strong>
+              </div>
+              <div className="auth-panel__profile-grid">
+                <div><span>状态</span><strong>{accountStatusLabel[currentUser.status] ?? '正常'}</strong></div>
+                <div><span>区域</span><strong>{currentUser.locale}</strong></div>
+                <div><span>时区</span><strong>{currentUser.timezone}</strong></div>
+                <div><span>创建时间</span><strong>{new Date(currentUser.created_at).toLocaleString('zh-CN')}</strong></div>
+                <div><span>登录方式</span><strong>{currentUser.email ? '邮箱账号' : '手机号账号'}</strong></div>
+              </div>
+              <div className="auth-panel__wallet">
+                <div className="auth-panel__wallet-head">
+                  <span><WalletCards size={16} aria-hidden /> 钱包信息</span>
+                </div>
+                <div className="auth-panel__wallet-grid">
+                  <div><span>可用 Credit</span><strong>{cloudBalance?.available ?? '-'}</strong></div>
+                </div>
+                {balanceError && <div className="auth-panel__wallet-error">{balanceError}</div>}
+              </div>
+              <button className="auth-panel__submit auth-panel__submit--secondary" type="button" onClick={handleLogout}>
+                退出登录 <LogOut size={16} aria-hidden />
+              </button>
             </div>
-            <div className="auth-panel__wallet-grid">
-              <div><span>可用 Credit</span><strong>{cloudBalance?.available ?? '-'}</strong></div>
+          )}
+
+          {activeProfileTab === 'achievements' && (
+            <div className="auth-panel__profile-content" role="tabpanel">
+              <AchievementGallery
+                adminApiBaseUrl={adminApiBaseUrl}
+                authToken={authToken ?? ''}
+                error={achievementError}
+                loading={achievementLoading}
+                onChange={setAchievementProfile}
+                onRetry={() => setAchievementRetryKey((value) => value + 1)}
+                profile={achievementProfile}
+              />
             </div>
-            {balanceError && <div className="auth-panel__wallet-error">{balanceError}</div>}
-          </div>
-          <button className="auth-panel__submit auth-panel__submit--secondary" type="button" onClick={handleLogout}>
-            退出登录 <LogOut size={16} aria-hidden />
-          </button>
+          )}
         </section>
       </main>
     )

@@ -116,6 +116,38 @@
   box-shadow: 0 4px 9px rgba(66, 36, 14, 0.2);
 }
 
+.system-floating-assist__equipped-badge {
+  --equipped-badge-accent: #a34d29;
+  position: absolute;
+  top: -3px;
+  right: -2px;
+  z-index: 8;
+  width: 25px;
+  height: 25px;
+  padding: 2px;
+  border: 2px solid rgba(255, 250, 243, 0.96);
+  border-radius: 9px;
+  background: var(--equipped-badge-accent);
+  color: #fffaf3;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1;
+  box-shadow: 0 5px 12px rgba(66, 36, 14, 0.25);
+  transform: rotate(5deg);
+}
+
+.system-floating-assist__equipped-badge > span {
+  position: static;
+}
+
+.system-floating-assist__equipped-badge--cobalt { --equipped-badge-accent: #315f98; }
+.system-floating-assist__equipped-badge--midnight { --equipped-badge-accent: #42466f; }
+.system-floating-assist__equipped-badge--forest { --equipped-badge-accent: #3e7357; }
+.system-floating-assist__equipped-badge--honey { --equipped-badge-accent: #a56b25; }
+.system-floating-assist__equipped-badge--rose { --equipped-badge-accent: #a34d55; }
+
 .system-floating-assist__mascot {
   position: absolute;
   inset: 0;

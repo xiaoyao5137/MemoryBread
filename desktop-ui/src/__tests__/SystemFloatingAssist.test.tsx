@@ -25,6 +25,8 @@ vi.mock('../hooks/useApi', () => ({
 }))
 
 vi.mock('../utils/authApi', () => ({
+  ACHIEVEMENTS_CHANGED_KEY: 'memorybread.achievements.changed',
+  fetchAchievementProfile: vi.fn().mockResolvedValue({ badges: [], equipped: {} }),
   fetchBillingBalance: vi.fn().mockResolvedValue(null),
 }))
 

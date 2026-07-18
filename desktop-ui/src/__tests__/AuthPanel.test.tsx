@@ -155,4 +155,66 @@ describe('AuthPanel', () => {
     expect(screen.queryByRole('button', { name: '充值' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '刷新' })).not.toBeInTheDocument()
   })
+
+  it('在标签卡片页展示数量与 Credit，并支持佩戴到个人头像', async () => {
+    useAppStore.getState().setAuthSession({
+      access_token: 'mbs_test_token',
+      expires_at: new Date(Date.now() + 86400_000).toISOString(),
+      user: {
+        id: '018f0000-0000-7000-8000-000000000004',
+        username: '代码师傅',
+        email: 'coder@memorybread.local',
+        status: 'active',
+        roles: ['user'],
+        locale: 'zh-CN',
+        timezone: 'Asia/Shanghai',
+        created_at: new Date().toISOString(),
+      },
+    })
+    const badge = {
+      id: 'badge-code-elite',
+      badge_key: 'code_elite',
+      name: '代码精英',
+      tagline: '键盘上的耐力赛冠军',
+      description: '一周内累计完成超过 50 小时的代码编写工作。',
+      icon_key: 'code',
+      palette_key: 'cobalt',
+      rarity: 'epic',
+    }
+    const profile = {
+      badges: [{
+        badge,
+        quantity: 3,
+        total_credit_earned: '180.0000',
+        first_earned_at: '2026-06-01T00:00:00Z',
+        last_earned_at: '2026-07-18T00:00:00Z',
+      }],
+      equipped: {},
+    }
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/v1/console/summary')) {
+        return { ok: true, json: async () => ({ data: {} }) }
+      }
+      if (url.endsWith('/v1/achievements/equipped') && init?.method === 'PUT') {
+        return { ok: true, json: async () => ({ data: { ...profile, equipped: { profile_avatar: badge } } }) }
+      }
+      return { ok: true, json: async () => ({ data: profile }) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<AuthPanel />)
+    fireEvent.click(screen.getByRole('tab', { name: '标签卡片' }))
+
+    expect(await screen.findByText('代码精英')).toBeInTheDocument()
+    expect(screen.getByText('×3')).toBeInTheDocument()
+    expect(screen.getByText(/累计奖励/)).toHaveTextContent('180 Credit')
+
+    fireEvent.click(screen.getByRole('button', { name: '佩戴到头像' }))
+    expect(await screen.findByText('已将「代码精英」佩戴到个人头像。')).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:8080/v1/achievements/equipped',
+      expect.objectContaining({ method: 'PUT' }),
+    )
+  })
 })

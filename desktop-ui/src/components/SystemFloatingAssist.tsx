@@ -5,9 +5,9 @@ import { ChevronDown, ChevronUp, EyeOff, Home, Loader2, MessageSquare, Sparkles,
 import { listen } from '@tauri-apps/api/event'
 import { RAG_REFERENCE_LIMIT, runGatewayRagQuery, runRagQueryJob } from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
-import type { RagContext } from '../types'
+import type { AchievementBadge, RagContext } from '../types'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
-import { fetchBillingBalance } from '../utils/authApi'
+import { ACHIEVEMENTS_CHANGED_KEY, fetchAchievementProfile, fetchBillingBalance } from '../utils/authApi'
 import {
   FLOATING_ASSIST_AUTO_TASK_KEY,
   FLOATING_ASSIST_ENABLED_KEY,
@@ -249,6 +249,7 @@ const SystemFloatingAssist: React.FC = () => {
   const [manualInstruction, setManualInstruction] = useState('')
   const [attachments, setAttachments] = useState<UserAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
+  const [floatingBadge, setFloatingBadge] = useState<AchievementBadge | null>(null)
   const [progress, setProgress] = useState(0)
   const [autoTaskConfig, setAutoTaskConfig] = useState(readFloatingAssistAutoTaskConfig)
   const [pendingAutoTask, setPendingAutoTask] = useState<PendingFloatingAssistTask | null>(null)
@@ -377,6 +378,32 @@ const SystemFloatingAssist: React.FC = () => {
       })
     return () => { cancelled = true }
   }, [adminApiBaseUrl, authToken, currentUser, setCloudBalance])
+
+  useEffect(() => {
+    if (!authToken || !currentUser) {
+      setFloatingBadge(null)
+      return undefined
+    }
+    let cancelled = false
+    const refreshBadge = () => {
+      fetchAchievementProfile(adminApiBaseUrl, authToken)
+        .then((profile) => {
+          if (!cancelled) setFloatingBadge(profile.equipped.floating_avatar ?? null)
+        })
+        .catch(() => {
+          if (!cancelled) setFloatingBadge(null)
+        })
+    }
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === ACHIEVEMENTS_CHANGED_KEY) refreshBadge()
+    }
+    refreshBadge()
+    window.addEventListener('storage', handleStorage)
+    return () => {
+      cancelled = true
+      window.removeEventListener('storage', handleStorage)
+    }
+  }, [adminApiBaseUrl, authToken, currentUser])
 
   useEffect(() => {
     document.documentElement.classList.add('floating-assist-html')
@@ -1175,6 +1202,14 @@ const SystemFloatingAssist: React.FC = () => {
             <span className="system-floating-assist__sparkles" />
             <span className="system-floating-assist__bread-sweat" />
           </span>
+          {floatingBadge && (
+            <span
+              className={`system-floating-assist__equipped-badge system-floating-assist__equipped-badge--${floatingBadge.palette_key}`}
+              title={`已佩戴 ${floatingBadge.name}`}
+            >
+              <span>{Array.from(floatingBadge.name)[0]}</span>
+            </span>
+          )}
           <span className="system-floating-assist__ball-badge" aria-hidden="true">
             <span className="system-floating-assist__ball-check" />
             <span className="system-floating-assist__ball-alert" />
