@@ -1,23 +1,31 @@
 """inference_queue 的功能测试。"""
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from inference_queue import (
     InferenceQueue,
+    InferencePreemptedError,
     LANE_P0_QUERY,
     LANE_P1_CAPTURE,
     LANE_P1_PREEXTRACT,
     LANE_P2_BAKE,
     Priority,
     QueueEvictedError,
+    raise_if_preempted,
 )
 
 
 @pytest.fixture
 def small_queue():
-    q = InferenceQueue(per_priority_limit=3, total_limit=10, low_memory_threshold_mb=10)
+    q = InferenceQueue(
+        per_priority_limit=3,
+        total_limit=10,
+        low_memory_threshold_mb=10,
+        max_concurrency=1,
+    )
     yield q
     q.shutdown()
 
@@ -31,25 +39,28 @@ def _delayed_factory(order: list, label: str, delay: float = 0.02):
 
 
 def test_priority_order_p0_beats_p2(small_queue):
-    """正在执行的 P2 完成后，P0 应在 P1 之前出队。"""
+    """P0 到达后，正在执行的 P2 必须主动让出，而不是等它自然完成。"""
     order: list[str] = []
-    # 卡住 worker 一段时间
-    long_fut = small_queue.submit(Priority.P2, _delayed_factory(order, "P2-long", 0.3))
+    started = time.monotonic()
+
+    def background():
+        while True:
+            raise_if_preempted()
+            time.sleep(0.01)
+
+    long_fut = small_queue.submit(Priority.P2, background)
     time.sleep(0.05)
-    p0_futs = [
-        small_queue.submit(Priority.P0, _delayed_factory(order, f"P0-{i}", 0.01))
-        for i in range(3)
-    ]
-    p1_fut = small_queue.submit(Priority.P1, _delayed_factory(order, "P1-x", 0.01))
+    p0_fut = small_queue.submit(
+        Priority.P0,
+        _delayed_factory(order, "P0", 0.01),
+    )
 
-    long_fut.result(timeout=5)
-    for f in p0_futs:
-        f.result(timeout=5)
-    p1_fut.result(timeout=5)
-
-    assert order[0] == "P2-long"
-    assert order[1:4] == ["P0-0", "P0-1", "P0-2"]
-    assert order[4] == "P1-x"
+    assert p0_fut.result(timeout=1) == "P0"
+    assert isinstance(long_fut.exception(timeout=1), InferencePreemptedError)
+    assert order == ["P0"]
+    assert time.monotonic() - started < 0.5
+    assert small_queue.stats()["totals"]["P2"]["preempted"] == 1
+    assert small_queue.stats()["background_retry_after_ms"] > 0
 
 
 def test_is_idle_tracks_queued_and_running_tasks(small_queue):
@@ -96,7 +107,12 @@ def test_per_priority_eviction_drops_oldest(small_queue):
 
 def test_total_limit_keeps_only_p0():
     """总队列超 total_limit 时，按 P2→P1 顺序丢最老，直到队列长度 ≤ total_limit。"""
-    q = InferenceQueue(per_priority_limit=20, total_limit=4, low_memory_threshold_mb=10)
+    q = InferenceQueue(
+        per_priority_limit=20,
+        total_limit=4,
+        low_memory_threshold_mb=10,
+        max_concurrency=1,
+    )
     try:
         order: list[str] = []
         block = q.submit(Priority.P0, _delayed_factory(order, "block", 1.0))
@@ -127,7 +143,12 @@ def test_total_limit_keeps_only_p0():
 
 def test_low_memory_blocks_worker():
     """可用内存低于阈值时，worker 不取任务。"""
-    q = InferenceQueue(per_priority_limit=8, total_limit=16, low_memory_threshold_mb=999_999)
+    q = InferenceQueue(
+        per_priority_limit=8,
+        total_limit=16,
+        low_memory_threshold_mb=999_999,
+        max_concurrency=1,
+    )
     try:
         order: list[str] = []
         # 阈值离谱地高，所有任务都该被门禁挡住
@@ -154,7 +175,134 @@ def test_max_concurrency_reserves_p0_lane():
 
         p0 = q.submit(Priority.P0, _delayed_factory(order, "p0", 0.01), lane=LANE_P0_QUERY)
         assert p0.result(timeout=5) == "p0"
+        preempted = 0
         for f in (capture, pre, bake):
-            f.result(timeout=5)
+            try:
+                f.result(timeout=5)
+            except InferencePreemptedError:
+                preempted += 1
+        assert preempted >= 1
     finally:
         q.shutdown()
+
+
+def test_power_aware_concurrency_uses_three_when_charging_and_one_on_battery(tmp_path):
+    state = {"plugged": True}
+
+    def _power():
+        return SimpleNamespace(percent=60, power_plugged=state["plugged"])
+
+    q = InferenceQueue(
+        per_priority_limit=8,
+        total_limit=16,
+        low_memory_threshold_mb=10,
+        power_provider=_power,
+        global_slot_prefix=str(tmp_path / "power-slot"),
+    )
+    try:
+        assert q.stats()["max_concurrency"] == 3
+        assert q.stats()["concurrency_mode"] == "power_aware"
+
+        state["plugged"] = False
+        with q._cv:
+            q._refresh_power_state_locked(force=True)
+
+        stats = q.stats()
+        assert stats["max_concurrency"] == 1
+        assert stats["on_external_power"] is False
+        assert stats["lane_limits"][LANE_P2_BAKE] == 1
+    finally:
+        q.shutdown()
+
+
+def test_power_aware_slots_cap_background_across_process_queues_and_reserve_p0(tmp_path):
+    prefix = str(tmp_path / "shared-slot")
+    power = lambda: SimpleNamespace(percent=80, power_plugged=True)
+    q1 = InferenceQueue(
+        per_priority_limit=8,
+        total_limit=16,
+        low_memory_threshold_mb=10,
+        power_provider=power,
+        global_slot_prefix=prefix,
+    )
+    q2 = InferenceQueue(
+        per_priority_limit=8,
+        total_limit=16,
+        low_memory_threshold_mb=10,
+        power_provider=power,
+        global_slot_prefix=prefix,
+    )
+    try:
+        order: list[str] = []
+        background = [
+            q1.submit(Priority.P2, _delayed_factory(order, "q1-a", 0.25)),
+            q1.submit(Priority.P1, _delayed_factory(order, "q1-b", 0.25)),
+            q2.submit(Priority.P2, _delayed_factory(order, "q2-a", 0.25)),
+            q2.submit(Priority.P1, _delayed_factory(order, "q2-b", 0.25)),
+        ]
+        time.sleep(0.05)
+
+        combined_running = q1.stats()["running_total"] + q2.stats()["running_total"]
+        assert combined_running <= 2
+
+        p0 = q2.submit(
+            Priority.P0,
+            _delayed_factory(order, "p0", 0.01),
+            lane=LANE_P0_QUERY,
+        )
+        assert p0.result(timeout=2) == "p0"
+        preempted = 0
+        for future in background:
+            try:
+                future.result(timeout=3)
+            except InferencePreemptedError:
+                preempted += 1
+        assert preempted >= 1
+    finally:
+        q1.shutdown()
+        q2.shutdown()
+
+
+def test_battery_single_slot_p0_preempts_background_in_another_queue(tmp_path):
+    prefix = str(tmp_path / "shared-battery-slot")
+    power = lambda: SimpleNamespace(percent=60, power_plugged=False)
+    q1 = InferenceQueue(
+        per_priority_limit=8,
+        total_limit=16,
+        low_memory_threshold_mb=10,
+        power_provider=power,
+        global_slot_prefix=prefix,
+    )
+    q2 = InferenceQueue(
+        per_priority_limit=8,
+        total_limit=16,
+        low_memory_threshold_mb=10,
+        power_provider=power,
+        global_slot_prefix=prefix,
+    )
+    try:
+        background_started = mock.Mock()
+
+        def background():
+            background_started()
+            while True:
+                raise_if_preempted()
+                time.sleep(0.01)
+
+        background_future = q1.submit(Priority.P2, background)
+        deadline = time.monotonic() + 1
+        while not background_started.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        started = time.monotonic()
+        p0 = q2.submit(Priority.P0, lambda: "interactive")
+
+        assert p0.result(timeout=1) == "interactive"
+        assert isinstance(
+            background_future.exception(timeout=1),
+            InferencePreemptedError,
+        )
+        assert time.monotonic() - started < 0.5
+    finally:
+        q1.shutdown()
+        q2.shutdown()

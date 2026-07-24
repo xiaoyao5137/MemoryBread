@@ -1,13 +1,37 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Copy, ExternalLink, FileText, Image, Loader2, Paperclip, Search, Sparkles, Square, X } from 'lucide-react'
-import { useAppStore } from '../store/useAppStore'
+import { AtSign, CloudOff, CloudUpload, Copy, ExternalLink, Eye, FileText, Image, Library, Loader2, PackageCheck, PackagePlus, Paperclip, Pencil, Search, Sparkles, Square, Store, Trash2, X } from 'lucide-react'
+import { serviceEnvironmentHeaders, useAppStore } from '../store/useAppStore'
 import type { CreationReferenceItem, CreationReferencePreview } from '../store/useAppStore'
 import { fetchWithLocalhostFallback } from '../hooks/useApi'
 import { fetchBillingBalance } from '../utils/authApi'
 import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
+import { toUserFacingError } from '../utils/userFacingError'
+import {
+  buildCreationSkillInstruction,
+  categoryPathFor,
+  creationSkillCategoryOptions,
+  deleteLocalCreationSkill,
+  fetchCreationSkillCategories,
+  listLocalCreationSkills,
+  marketCreationSkillToLocalInput,
+  matchCreationSkills,
+  publishCreationSkill,
+  saveLocalCreationSkill,
+  searchCreationSkillMarket,
+  type CreationSkillMarketItem,
+  type CreationSkillSource,
+  type LocalCreationSkill,
+} from '../utils/creationSkills'
+import { OFFLINE_CREATION_SKILL_CATEGORIES } from '../data/creationSkillCategories'
 import ModelSelect from './ModelSelect'
+import CreationSkillEditor from './CreationSkillEditor'
+import CreationSkillDetail, {
+  localSkillDetail,
+  marketSkillDetail,
+  type CreationSkillDetailData,
+} from './CreationSkillDetail'
 import { HistoryPagination, HistorySearch } from './HistoryBrowserControls'
 
 interface CreationPanelProps {
@@ -34,6 +58,7 @@ type MarkdownBlock =
 
 const defaultPrompt = '请生成一份“数据治理平台建设方案”，参考历史项目方案、知识库和操作手册，风格正式，包含总体架构、功能设计、实施计划和后续核验清单。'
 const HISTORY_PAGE_SIZE = 20
+const SKILL_MARKET_PAGE_SIZE = 18
 
 const sanitizeGeneratedContent = (content: string) =>
   content.replace(/<a\s+(?:id|name)=["'][^"']+["']\s*>\s*<\/a>/gi, '')
@@ -235,7 +260,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const [error, setError] = useState<string | null>(null)
   const [copySuccess, setCopySuccess] = useState(false)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
-  const [topTab, setTopTab] = useState<'creation' | 'history'>('creation')
+  const [topTab, setTopTab] = useState<'creation' | 'history' | 'skills'>('creation')
   const [activeBottomTab, setActiveBottomTab] = useState<'reference' | 'config' | null>(null)
   const toggleBottomTab = (tab: 'reference' | 'config') =>
     setActiveBottomTab(prev => prev === tab ? null : tab)
@@ -249,10 +274,34 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const [lastInferenceMeta, setLastInferenceMeta] = useState<{ model: string; latencyMs: number | null } | null>(null)
   const [attachments, setAttachments] = useState<UserAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
+  const [currentDocumentSource, setCurrentDocumentSource] = useState<CreationSkillSource | null>(null)
+  const [localSkills, setLocalSkills] = useState<LocalCreationSkill[]>([])
+  const [skillsLoading, setSkillsLoading] = useState(false)
+  const [skillsError, setSkillsError] = useState('')
+  const [publishingSkillId, setPublishingSkillId] = useState<number | null>(null)
+  const [skillLibraryView, setSkillLibraryView] = useState<'mine' | 'market'>('mine')
+  const [marketQueryDraft, setMarketQueryDraft] = useState('')
+  const [marketQuery, setMarketQuery] = useState('')
+  const [marketCategoryIdDraft, setMarketCategoryIdDraft] = useState('')
+  const [marketCategoryId, setMarketCategoryId] = useState('')
+  const [marketCategories, setMarketCategories] = useState(OFFLINE_CREATION_SKILL_CATEGORIES)
+  const [marketOffset, setMarketOffset] = useState(0)
+  const [marketSkills, setMarketSkills] = useState<CreationSkillMarketItem[]>([])
+  const [marketTotal, setMarketTotal] = useState(0)
+  const [marketLoading, setMarketLoading] = useState(false)
+  const [marketError, setMarketError] = useState('')
+  const [installingMarketSkillId, setInstallingMarketSkillId] = useState<string | null>(null)
+  const [skillEditor, setSkillEditor] = useState<{ source?: CreationSkillSource; initialSkill?: LocalCreationSkill } | null>(null)
+  const [skillDetail, setSkillDetail] = useState<CreationSkillDetailData | null>(null)
+  const [skillDetailMarketItem, setSkillDetailMarketItem] = useState<CreationSkillMarketItem | null>(null)
+  const [currentDocumentSkills, setCurrentDocumentSkills] = useState<LocalCreationSkill[]>([])
+  const [skillPickerOpen, setSkillPickerOpen] = useState(false)
+  const [skillQuery, setSkillQuery] = useState('')
   const contentRef = useRef<HTMLDivElement>(null)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const promptInputRef = useRef<HTMLTextAreaElement>(null)
 
   const startTimer = () => {
     setElapsedSeconds(0)
@@ -339,17 +388,278 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       },
       references: item.references || [],
     })
+    setCurrentDocumentSource({
+      kind: 'creation_history',
+      id: String(item.id),
+      title: item.prompt,
+      content: item.fullContent,
+      docType: item.docType || docType,
+    })
     if (contentRef.current) {
       setTimeout(() => contentRef.current?.scrollTo({ top: 0, behavior: 'smooth' }), 100)
+    }
+  }
+
+  const loadLocalSkills = useCallback(async () => {
+    setSkillsLoading(true)
+    setSkillsError('')
+    try {
+      setLocalSkills(await listLocalCreationSkills(apiBaseUrl))
+    } catch (err) {
+      setLocalSkills([])
+      setSkillsError(toUserFacingError(err, '创作 Skill 加载失败'))
+    } finally {
+      setSkillsLoading(false)
+    }
+  }, [apiBaseUrl])
+
+  useEffect(() => {
+    void loadLocalSkills()
+  }, [loadLocalSkills])
+
+  const loadMarketSkills = useCallback(async () => {
+    setMarketLoading(true)
+    setMarketError('')
+    try {
+      const page = await searchCreationSkillMarket(adminApiBaseUrl, {
+        query: marketQuery,
+        categoryId: marketCategoryId,
+        limit: SKILL_MARKET_PAGE_SIZE,
+        offset: marketOffset,
+      })
+      setMarketSkills(page.items)
+      setMarketTotal(page.total)
+    } catch (err) {
+      setMarketSkills([])
+      setMarketTotal(0)
+      setMarketError(toUserFacingError(err, '创作 Skill 市场加载失败'))
+    } finally {
+      setMarketLoading(false)
+    }
+  }, [adminApiBaseUrl, marketCategoryId, marketOffset, marketQuery])
+
+  const loadMarketCategories = useCallback(async () => {
+    setMarketCategories(await fetchCreationSkillCategories(adminApiBaseUrl))
+  }, [adminApiBaseUrl])
+
+  useEffect(() => {
+    if (topTab === 'skills' && skillLibraryView === 'market') {
+      void loadMarketSkills()
+      void loadMarketCategories()
+    }
+  }, [loadMarketCategories, loadMarketSkills, skillLibraryView, topTab])
+
+  useEffect(() => {
+    if (!currentDocumentSource) {
+      setCurrentDocumentSkills([])
+      return
+    }
+    let cancelled = false
+    listLocalCreationSkills(apiBaseUrl, {
+      sourceKind: currentDocumentSource.kind,
+      sourceId: currentDocumentSource.id,
+    }).then(items => {
+      if (!cancelled) setCurrentDocumentSkills(items)
+    }).catch(() => {
+      if (!cancelled) setCurrentDocumentSkills([])
+    })
+    return () => { cancelled = true }
+  }, [apiBaseUrl, currentDocumentSource])
+
+  const openCurrentDocumentSkill = () => {
+    if (!generatedContent.trim()) return
+    setSkillEditor({
+      source: currentDocumentSource || {
+        kind: 'creation_history',
+        id: `unsaved-${Date.now()}`,
+        title: prompt.trim() || docType || '创作文档',
+        content: generatedContent,
+        docType,
+      },
+    })
+  }
+
+  const handleSkillSaved = (skill: LocalCreationSkill) => {
+    setLocalSkills(prev => [skill, ...prev.filter(item => item.id !== skill.id)])
+    if (currentDocumentSource?.kind === skill.sourceKind && currentDocumentSource.id === skill.sourceId) {
+      setCurrentDocumentSkills(prev => [skill, ...prev.filter(item => item.id !== skill.id)])
+    }
+  }
+
+  const handleToggleSkillInstalled = async (skill: LocalCreationSkill) => {
+    if (skill.status !== 'saved') {
+      setSkillsError('请先打开草稿并保存 Skill，再安装使用。')
+      return
+    }
+    setSkillsError('')
+    const { id, createdAt: _createdAt, updatedAt: _updatedAt, ...input } = skill
+    try {
+      const saved = await saveLocalCreationSkill(apiBaseUrl, { ...input, installed: !skill.installed }, id)
+      handleSkillSaved(saved)
+    } catch (err) {
+      setSkillsError(toUserFacingError(err, skill.installed ? '卸载 Skill 失败' : '安装 Skill 失败'))
+    }
+  }
+
+  const handlePublishSkill = async (skill: LocalCreationSkill, published: boolean) => {
+    if (skill.status !== 'saved') {
+      setSkillsError('请先打开草稿并保存 Skill，再发布到市场。')
+      return
+    }
+    if (!authToken || !currentUser) {
+      setSkillsError('请先登录 MemoryBread 账户，再发布到创作市场。')
+      return
+    }
+    setPublishingSkillId(skill.id)
+    setSkillsError('')
+    const { id, createdAt: _createdAt, updatedAt: _updatedAt, ...input } = skill
+    try {
+      const cloud = await publishCreationSkill(adminApiBaseUrl, authToken, input, published)
+      const saved = await saveLocalCreationSkill(apiBaseUrl, {
+        ...input,
+        cloudSkillId: cloud.id,
+        published: cloud.published,
+      }, id)
+      handleSkillSaved(saved)
+    } catch (err) {
+      setSkillsError(toUserFacingError(err, published ? '发布 Skill 失败' : '取消发布 Skill 失败'))
+    } finally {
+      setPublishingSkillId(null)
+    }
+  }
+
+  const handleInstallMarketSkill = async (marketSkill: CreationSkillMarketItem) => {
+    setInstallingMarketSkillId(marketSkill.id)
+    setMarketError('')
+    const existing = localSkills.find(skill => skill.cloudSkillId === marketSkill.id)
+    try {
+      const marketInput = marketCreationSkillToLocalInput(marketSkill)
+      let input = marketInput
+      if (existing) {
+        const { id: _id, createdAt: _createdAt, updatedAt: _updatedAt, ...existingInput } = existing
+        input = existing.sourceKind === 'market'
+          ? { ...marketInput, clientSkillKey: existing.clientSkillKey }
+          : { ...existingInput, installed: true }
+      }
+      const saved = await saveLocalCreationSkill(
+        apiBaseUrl,
+        input,
+        existing?.id,
+      )
+      handleSkillSaved(saved)
+      setSkillDetail(current => current?.id === marketSkill.id
+        ? { ...current, installed: true }
+        : current)
+    } catch (err) {
+      setMarketError(toUserFacingError(err, '安装市场 Skill 失败'))
+    } finally {
+      setInstallingMarketSkillId(null)
+    }
+  }
+
+  const showLocalSkillDetail = (skill: LocalCreationSkill) => {
+    const path = categoryPathFor(OFFLINE_CREATION_SKILL_CATEGORIES, skill.categoryId)
+      .map(item => item.name)
+    setSkillDetailMarketItem(null)
+    setSkillDetail(localSkillDetail(skill, path))
+  }
+
+  const showMarketSkillDetail = (skill: CreationSkillMarketItem) => {
+    const installed = localSkills.some(item =>
+      item.cloudSkillId === skill.id && item.installed,
+    )
+    setSkillDetailMarketItem(skill)
+    setSkillDetail(marketSkillDetail(skill, installed))
+  }
+
+  const closeSkillDetail = useCallback(() => {
+    setSkillDetail(null)
+    setSkillDetailMarketItem(null)
+  }, [])
+
+  const handleDeleteSkill = async (skill: LocalCreationSkill) => {
+    if (skill.published) {
+      setSkillsError('已发布的 Skill 暂不能删除。')
+      return
+    }
+    try {
+      await deleteLocalCreationSkill(apiBaseUrl, skill.id)
+      setLocalSkills(prev => prev.filter(item => item.id !== skill.id))
+    } catch (err) {
+      setSkillsError(toUserFacingError(err, '删除创作 Skill 失败'))
     }
   }
 
   const remoteModelAllowed = canUseRemoteCreationModel(currentUser, cloudBalance)
   const activeCreationModelId = getEffectiveCreationModelId(creationModelConfigs, remoteModelAllowed)
   const useGatewayCreation = activeCreationModelId === REMOTE_CREATION_MODEL_ID
+  const installedSkills = useMemo(
+    () => localSkills.filter(skill => skill.status === 'saved' && skill.installed),
+    [localSkills],
+  )
+  const installedMarketSkillIds = useMemo(
+    () => new Set(
+      localSkills
+        .filter(skill => skill.installed && skill.cloudSkillId)
+        .map(skill => skill.cloudSkillId as string),
+    ),
+    [localSkills],
+  )
+  const marketCategoryOptions = useMemo(
+    () => creationSkillCategoryOptions(marketCategories),
+    [marketCategories],
+  )
+  const matchedSkills = useMemo(
+    () => matchCreationSkills(prompt, installedSkills),
+    [installedSkills, prompt],
+  )
+  const skillPickerItems = useMemo(() => {
+    const query = skillQuery.trim().toLowerCase()
+    return installedSkills
+      .filter(skill => !query || `${skill.title}\n${skill.summary}`.toLowerCase().includes(query))
+      .slice(0, 8)
+  }, [installedSkills, skillQuery])
   const promptWithAttachments = () => {
     const attachmentPrompt = buildAttachmentPrompt(attachments)
-    return attachmentPrompt ? `${prompt.trim()}\n\n${attachmentPrompt}` : prompt
+    const basePrompt = attachmentPrompt ? `${prompt.trim()}\n\n${attachmentPrompt}` : prompt.trim()
+    return `${basePrompt}${buildCreationSkillInstruction(matchedSkills)}`
+  }
+
+  const handlePromptChange = (value: string, caret: number | null) => {
+    setPrompt(value)
+    const beforeCaret = value.slice(0, caret ?? value.length)
+    const mention = beforeCaret.match(/@([^@\n]{0,48})$/)
+    setSkillPickerOpen(Boolean(mention))
+    setSkillQuery(mention?.[1] || '')
+  }
+
+  const selectPromptSkill = (skill: LocalCreationSkill) => {
+    const textarea = promptInputRef.current
+    const caret = textarea?.selectionStart ?? prompt.length
+    const beforeCaret = prompt.slice(0, caret)
+    const mentionStart = beforeCaret.lastIndexOf('@')
+    const nextPrompt = `${mentionStart >= 0 ? beforeCaret.slice(0, mentionStart) : beforeCaret}@${skill.title} ${prompt.slice(caret)}`
+    const nextCaret = (mentionStart >= 0 ? mentionStart : beforeCaret.length) + skill.title.length + 2
+    setPrompt(nextPrompt)
+    setSkillPickerOpen(false)
+    setSkillQuery('')
+    window.requestAnimationFrame(() => {
+      textarea?.focus()
+      textarea?.setSelectionRange(nextCaret, nextCaret)
+    })
+  }
+
+  const handleMarketSearch = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const query = marketQueryDraft.trim()
+    const categoryId = marketCategoryIdDraft
+    setMarketOffset(0)
+    if (query === marketQuery && categoryId === marketCategoryId && marketOffset === 0) {
+      void loadMarketSkills()
+    } else {
+      setMarketQuery(query)
+      setMarketCategoryId(categoryId)
+    }
   }
 
   const handleSelectModel = (modelId: string) => {
@@ -439,7 +749,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const postGatewayCreation = async (references: CreationReferenceItem[], signal?: AbortSignal) => {
     const response = await fetch(`${gatewayApiBaseUrl.replace(/\/+$/, '')}/v1/gateway/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { ...serviceEnvironmentHeaders(), 'Content-Type': 'application/json' },
       signal,
       body: JSON.stringify({
         request_id: `creation-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -517,7 +827,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     }
 
     if (!finalContent.trim()) {
-      throw new Error('生成结束但没有返回内容，请检查本地 Ollama 是否运行、当前创作模型是否已安装')
+      throw new Error('生成结束但没有返回内容，请检查本地运行环境和创作模型状态')
     }
     return finalContent
   }
@@ -548,7 +858,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       const next = await filesToAttachments(files, attachments.length)
       setAttachments(prev => [...prev, ...next])
     } catch (err) {
-      setAttachmentError(err instanceof Error ? err.message : '附件读取失败')
+      setAttachmentError(toUserFacingError(err, '附件读取失败'))
     }
   }
 
@@ -564,7 +874,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       const data = await response.json()
       setReferencePreview(data)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '参考资料预览失败')
+      setError(toUserFacingError(err, '参考资料预览失败'))
     } finally {
       setIsPreviewing(false)
     }
@@ -633,7 +943,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       if (finalSaveContent) {
         setLastInferenceMeta({ model: usedModelId, latencyMs: inferenceLatencyMs })
         try {
-          await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`, {
+          const saveResponse = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -647,6 +957,16 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
               latency_ms: inferenceLatencyMs,
             }),
           })
+          if (saveResponse.ok) {
+            const saved = await saveResponse.json()
+            setCurrentDocumentSource({
+              kind: 'creation_history',
+              id: String(saved.id),
+              title: prompt.trim(),
+              content: sanitizeGeneratedContent(finalSaveContent),
+              docType,
+            })
+          }
           if (historyPage === 1) {
             void loadCreationHistory()
           } else {
@@ -661,7 +981,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         setError('已中止本次创作')
         return
       }
-      setError(err instanceof Error ? err.message : '生成失败')
+      setError(toUserFacingError(err, '生成失败，请稍后重试'))
     } finally {
       if (abortRef.current === controller) abortRef.current = null
       setIsGenerating(false)
@@ -754,7 +1074,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
 
       {/* 顶部 Tab 栏 */}
       <div style={{ display: 'flex', borderBottom: '1px solid #e1e5ea', background: '#fff', padding: '0 22px', flexShrink: 0 }}>
-        {(['creation', 'history'] as const).map((tab) => (
+        {(['creation', 'history', 'skills'] as const).map((tab) => (
           <button
             key={tab}
             onClick={() => setTopTab(tab)}
@@ -770,7 +1090,11 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
               marginBottom: -1,
             }}
           >
-            {tab === 'creation' ? '方案创作' : `创作记录${historyTotal ? ` (${historyTotal})` : ''}`}
+            {tab === 'creation'
+              ? '方案创作'
+              : tab === 'history'
+                ? `创作记录${historyTotal ? ` (${historyTotal})` : ''}`
+                : `创作 Skill${localSkills.length ? ` (${localSkills.length})` : ''}`}
           </button>
         ))}
       </div>
@@ -796,18 +1120,32 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             ) : creationHistory.length > 0 ? (
               <div className="creation-history__list">
                 {creationHistory.map((item) => (
-                  <button
-                    type="button"
-                    key={item.id}
-                    className="creation-history__item"
-                    onClick={() => { handleRestoreHistory(item); setTopTab('creation') }}
-                  >
-                    <span className="creation-history__title">{item.prompt}</span>
-                    <span className="creation-history__meta">
-                      {item.timestamp} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latencyMs)}
-                    </span>
-                    <span className="creation-history__preview">{item.preview}</span>
-                  </button>
+                  <article className="creation-history__entry" key={item.id}>
+                    <button
+                      type="button"
+                      className="creation-history__item"
+                      onClick={() => { handleRestoreHistory(item); setTopTab('creation') }}
+                    >
+                      <span className="creation-history__title">{item.prompt}</span>
+                      <span className="creation-history__meta">
+                        {item.timestamp} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latencyMs)}
+                      </span>
+                      <span className="creation-history__preview">{item.preview}</span>
+                    </button>
+                    <button
+                      className="creation-history__skill-action"
+                      type="button"
+                      onClick={() => setSkillEditor({ source: {
+                        kind: 'creation_history',
+                        id: String(item.id),
+                        title: item.prompt,
+                        content: item.fullContent,
+                        docType: item.docType,
+                      } })}
+                    >
+                      <Sparkles size={14} /> 沉淀 Skill
+                    </button>
+                  </article>
                 ))}
               </div>
             ) : (
@@ -824,20 +1162,288 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             onPageChange={setHistoryPage}
           />
         </div>
+      ) : topTab === 'skills' ? (
+        <div className="creation-skill-library">
+          <header>
+            <div>
+              <h2>{skillLibraryView === 'mine' ? '我的创作 Skill' : '创作 Skill 市场'}</h2>
+              <p>{skillLibraryView === 'mine' ? '管理本地 Skill、发布状态和安装状态。' : '直接在客户端搜索并安装公开 Skill。'}</p>
+            </div>
+            <div className="creation-skill-library__header-actions">
+              <div className="creation-skill-library__switcher" role="tablist" aria-label="创作 Skill 来源">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={skillLibraryView === 'mine'}
+                  className={skillLibraryView === 'mine' ? 'is-active' : ''}
+                  onClick={() => setSkillLibraryView('mine')}
+                >
+                  <Library size={14} /> 我的 Skill
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={skillLibraryView === 'market'}
+                  className={skillLibraryView === 'market' ? 'is-active' : ''}
+                  onClick={() => setSkillLibraryView('market')}
+                >
+                  <Store size={14} /> Skill 市场
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => void (skillLibraryView === 'mine'
+                  ? loadLocalSkills()
+                  : Promise.all([loadMarketSkills(), loadMarketCategories()]))}
+                disabled={skillLibraryView === 'mine' ? skillsLoading : marketLoading}
+              >
+                刷新
+              </button>
+            </div>
+          </header>
+
+          {skillLibraryView === 'market' && (
+            <form className="creation-skill-market-search" onSubmit={handleMarketSearch} role="search">
+              <label className="creation-skill-market-search__field">
+                <span>搜索市场 Skill</span>
+                <span className="creation-skill-market-search__query">
+                  <Search size={16} />
+                  <input
+                    value={marketQueryDraft}
+                    onChange={event => setMarketQueryDraft(event.target.value)}
+                    placeholder="搜索标题或适用场景"
+                  />
+                </span>
+              </label>
+              <label className="creation-skill-market-search__field">
+                <span>创作类目</span>
+                <select
+                  value={marketCategoryIdDraft}
+                  onChange={event => setMarketCategoryIdDraft(event.target.value)}
+                >
+                  <option value="">全部行业与工种</option>
+                  {marketCategoryOptions.map(category => (
+                    <option key={category.id} value={category.id}>
+                      {`${'　'.repeat(category.depth)}${category.depth > 0 ? '└ ' : ''}${category.name}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button type="submit" disabled={marketLoading}>搜索</button>
+            </form>
+          )}
+
+          {skillLibraryView === 'mine' ? (
+            <>
+              {skillsError && <div className="creation-skill-library__feedback is-error" role="alert">{skillsError}</div>}
+              {skillsLoading && localSkills.length === 0 ? (
+                <div className="history-browser__state"><Loader2 className="spin" size={17} /> 正在加载创作 Skill…</div>
+              ) : localSkills.length === 0 ? (
+                <div className="creation-skill-library__empty"><Library size={32} /><strong>还没有创作 Skill</strong><span>可以从创作记录沉淀，或去市场安装一份。</span><button type="button" onClick={() => setSkillLibraryView('market')}>浏览 Skill 市场</button></div>
+              ) : (
+                <div className="creation-skill-library__grid">
+                  {localSkills.map(skill => {
+                    const fromMarket = skill.sourceKind === 'market'
+                    return (
+                      <article key={skill.id}>
+                        <div className="creation-skill-library__status-row">
+                          <div className="creation-skill-library__status">
+                            {fromMarket ? '来自市场' : skill.published ? '已发布' : skill.status === 'draft' ? '草稿' : '已保存'}
+                          </div>
+                          <span className={skill.installed ? 'is-installed' : ''}>{skill.installed ? '已安装' : '未安装'}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="creation-skill-library__title"
+                          onClick={() => showLocalSkillDetail(skill)}
+                        >
+                          {skill.title}
+                        </button>
+                        <p>{skill.summary}</p>
+                        <div className="creation-skill-library__meta">{skill.commonTitles.length} 个标题 · {skill.structurePattern.length} 个章节</div>
+                        <footer className={fromMarket ? 'is-compact' : ''}>
+                          <button
+                            type="button"
+                            className={skill.installed ? 'is-installed' : ''}
+                            onClick={() => void handleToggleSkillInstalled(skill)}
+                            disabled={skill.status === 'draft'}
+                            title={skill.status === 'draft' ? '保存 Skill 后才能安装' : undefined}
+                          >
+                            {skill.installed ? <PackageCheck size={14} /> : <PackagePlus size={14} />}
+                            {skill.installed ? '卸载' : '安装'}
+                          </button>
+                          <button type="button" onClick={() => showLocalSkillDetail(skill)}>
+                            <Eye size={14} /> 查看详情
+                          </button>
+                          {!fromMarket && (
+                            <>
+                              <button
+                                type="button"
+                                className={skill.published ? 'is-unpublish' : ''}
+                                onClick={() => void handlePublishSkill(skill, !skill.published)}
+                                disabled={skill.status === 'draft' || publishingSkillId === skill.id}
+                                title={skill.status === 'draft'
+                                  ? '保存 Skill 后才能发布'
+                                  : skill.published
+                                    ? '从创作市场取消发布'
+                                    : '发布到创作市场'}
+                              >
+                                {publishingSkillId === skill.id
+                                  ? <Loader2 className="spin" size={14} />
+                                  : skill.published
+                                    ? <CloudOff size={14} />
+                                    : <CloudUpload size={14} />}
+                                {skill.published ? '取消发布' : '发布'}
+                              </button>
+                              <button type="button" onClick={() => setSkillEditor({ initialSkill: skill })}><Pencil size={14} /> 编辑</button>
+                              <button type="button" onClick={() => void handleDeleteSkill(skill)} disabled={skill.published}><Trash2 size={14} /> 删除</button>
+                            </>
+                          )}
+                        </footer>
+                      </article>
+                    )
+                  })}
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              {marketError && <div className="creation-skill-library__feedback is-error" role="alert">{marketError}</div>}
+              {marketLoading && marketSkills.length === 0 ? (
+                <div className="history-browser__state"><Loader2 className="spin" size={17} /> 正在搜索市场 Skill…</div>
+              ) : marketSkills.length === 0 ? (
+                <div className="creation-skill-library__empty">
+                  <Store size={32} />
+                  <strong>{marketQuery || marketCategoryId ? '没有找到匹配的 Skill' : '市场暂时还没有公开 Skill'}</strong>
+                  <span>{marketQuery || marketCategoryId ? '换个关键词或类目再试试。' : '稍后刷新即可看到新发布的 Skill。'}</span>
+                </div>
+              ) : (
+                <>
+                  <div className="creation-skill-market-count">找到 {marketTotal} 个公开 Skill</div>
+                  <div className="creation-skill-library__grid creation-skill-market-grid">
+                    {marketSkills.map(skill => {
+                      const installed = installedMarketSkillIds.has(skill.id)
+                      return (
+                        <article key={skill.id}>
+                          <div className="creation-skill-library__status-row">
+                            <div className="creation-skill-library__status">市场 Skill</div>
+                            <span className={installed ? 'is-installed' : ''}>{installed ? '已安装' : '可安装'}</span>
+                          </div>
+                          <button
+                            type="button"
+                            className="creation-skill-library__title"
+                            onClick={() => showMarketSkillDetail(skill)}
+                          >
+                            {skill.title}
+                          </button>
+                          <p>{skill.summary}</p>
+                          <div className="creation-skill-library__meta">
+                            {skill.author.nickname} · {skill.categoryPath.map(item => item.name).join(' / ')}
+                          </div>
+                          <footer className="is-compact">
+                            <button type="button" onClick={() => showMarketSkillDetail(skill)}>
+                              <Eye size={14} /> 查看详情
+                            </button>
+                            <button
+                              type="button"
+                              className={installed ? 'is-installed' : ''}
+                              disabled={installed || installingMarketSkillId === skill.id}
+                              onClick={() => void handleInstallMarketSkill(skill)}
+                            >
+                              {installingMarketSkillId === skill.id
+                                ? <Loader2 className="spin" size={14} />
+                                : installed
+                                  ? <PackageCheck size={14} />
+                                  : <PackagePlus size={14} />}
+                              {installed ? '已安装' : '安装'}
+                            </button>
+                          </footer>
+                        </article>
+                      )
+                    })}
+                  </div>
+                  {marketTotal > SKILL_MARKET_PAGE_SIZE && (
+                    <div className="creation-skill-market-pagination">
+                      <button
+                        type="button"
+                        disabled={marketOffset === 0 || marketLoading}
+                        onClick={() => setMarketOffset(offset => Math.max(0, offset - SKILL_MARKET_PAGE_SIZE))}
+                      >
+                        上一页
+                      </button>
+                      <span>{Math.floor(marketOffset / SKILL_MARKET_PAGE_SIZE) + 1} / {Math.ceil(marketTotal / SKILL_MARKET_PAGE_SIZE)}</span>
+                      <button
+                        type="button"
+                        disabled={marketOffset + SKILL_MARKET_PAGE_SIZE >= marketTotal || marketLoading}
+                        onClick={() => setMarketOffset(offset => offset + SKILL_MARKET_PAGE_SIZE)}
+                      >
+                        下一页
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+        </div>
       ) : (
         <main style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
           <section style={{ padding: 22, borderBottom: '1px solid #e1e5ea', background: '#fff', flexShrink: 0 }}>
-            <textarea
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              onPaste={(event) => {
-                const files = Array.from(event.clipboardData.files || [])
-                if (files.length) void addFiles(files)
-              }}
-              placeholder={defaultPrompt}
-              style={{ ...inputStyle, minHeight: 118, resize: 'vertical', lineHeight: 1.6 }}
-              disabled={isGenerating}
-            />
+            <div className="creation-prompt-skill-shell">
+              <textarea
+                ref={promptInputRef}
+                value={prompt}
+                onChange={(event) => handlePromptChange(event.target.value, event.target.selectionStart)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape' && skillPickerOpen) {
+                    event.preventDefault()
+                    setSkillPickerOpen(false)
+                  }
+                }}
+                onPaste={(event) => {
+                  const files = Array.from(event.clipboardData.files || [])
+                  if (files.length) void addFiles(files)
+                }}
+                placeholder={`${defaultPrompt}\n输入 @ 可选择已安装的创作 Skill。`}
+                style={{ ...inputStyle, minHeight: 118, resize: 'vertical', lineHeight: 1.6 }}
+                disabled={isGenerating}
+                aria-expanded={skillPickerOpen}
+                aria-controls="creation-skill-picker"
+              />
+              {skillPickerOpen && (
+                <div className="creation-skill-picker" id="creation-skill-picker" role="listbox" aria-label="选择创作 Skill">
+                  <header><AtSign size={15} /><span>选择已安装的 Skill</span><small>{skillPickerItems.length} 项</small></header>
+                  {skillPickerItems.length ? skillPickerItems.map(skill => (
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected="false"
+                      key={skill.id}
+                      onMouseDown={event => event.preventDefault()}
+                      onClick={() => selectPromptSkill(skill)}
+                    >
+                      <strong>{skill.title}</strong>
+                      <span>{skill.summary}</span>
+                    </button>
+                  )) : (
+                    <div className="creation-skill-picker__empty">
+                      {installedSkills.length ? '没有匹配的已安装 Skill。' : '还没有已安装的 Skill，请先到「创作 Skill」页面安装。'}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            {matchedSkills.length > 0 && (
+              <div className="creation-matched-skills" aria-label="本次使用的创作 Skill">
+                <span>本次将使用</span>
+                {matchedSkills.map(match => (
+                  <button type="button" key={match.skill.id} onClick={() => showLocalSkillDetail(match.skill)}>
+                    <Sparkles size={13} /> {match.skill.title}
+                    <small>{match.reason === 'mentioned' ? '@ 已选择' : '自动匹配'}</small>
+                  </button>
+                ))}
+              </div>
+            )}
             {attachments.length > 0 && (
               <div style={{ marginTop: 10, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                 {attachments.map(item => (
@@ -929,8 +1535,22 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                     <Copy size={15} />
                     {copySuccess ? '已复制' : '复制'}
                   </button>
+                  <button onClick={openCurrentDocumentSkill} disabled={!generatedContent || isGenerating} style={compactButtonStyle}>
+                    <Sparkles size={15} /> 沉淀 Skill
+                  </button>
                 </div>
               </div>
+              {currentDocumentSkills.length > 0 && (
+                <div className="creation-document-skills" aria-label="当前文档关联 Skill">
+                  <span>关联 Skill</span>
+                  {currentDocumentSkills.map(skill => (
+                    <button type="button" key={skill.id} onClick={() => showLocalSkillDetail(skill)}>
+                      <Sparkles size={13} /> {skill.title}
+                      <small>{skill.status === 'draft' ? '草稿' : skill.installed ? '已安装' : '已保存'}</small>
+                    </button>
+                  ))}
+                </div>
+              )}
               <div ref={contentRef} style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
                 {generatedContent ? (
                   <MarkdownContent content={generatedContent} components={markdownComponents} />
@@ -1026,6 +1646,30 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             )}
           </div>
         </main>
+      )}
+
+      {skillEditor && (
+        <CreationSkillEditor
+          source={skillEditor.source}
+          initialSkill={skillEditor.initialSkill}
+          onClose={() => setSkillEditor(null)}
+          onSaved={handleSkillSaved}
+        />
+      )}
+
+      {skillDetail && (
+        <CreationSkillDetail
+          skill={skillDetail}
+          onClose={closeSkillDetail}
+          primaryAction={skillDetailMarketItem && !skillDetail.installed
+            ? {
+              label: '安装 Skill',
+              loadingLabel: '正在安装…',
+              loading: installingMarketSkillId === skillDetailMarketItem.id,
+              onClick: () => void handleInstallMarketSkill(skillDetailMarketItem),
+            }
+            : undefined}
+        />
       )}
 
     </div>

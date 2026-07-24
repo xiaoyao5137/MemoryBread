@@ -11,6 +11,7 @@ import React, { useCallback, useRef, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { RAG_REFERENCE_LIMIT, useRagQuery } from '../hooks/useApi'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
+import { toUserFacingError } from '../utils/userFacingError'
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false)
@@ -86,14 +87,15 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
       const next = await filesToAttachments(files, attachments.length)
       setAttachments(prev => [...prev, ...next])
     } catch (err) {
-      setAttachmentError(err instanceof Error ? err.message : '附件读取失败')
+      setAttachmentError(toUserFacingError(err, '附件读取失败'))
     }
   }, [attachments.length])
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault()
-      const q = inputValue.trim()
+      const submittedValue = (e.currentTarget as HTMLFormElement).elements.namedItem('query') as HTMLTextAreaElement | null
+      const q = (submittedValue?.value || inputValue).trim()
       if (!q) return
       setRagQuery(q)
       const controller = new AbortController()
@@ -104,7 +106,9 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
         await doQuery(queryWithAttachments, RAG_REFERENCE_LIMIT, attachments.length ? { attachments: buildAttachmentMetadata(attachments) } : {}, controller.signal)
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') return
-        // error is set in store by useRagQuery
+        if (!useAppStore.getState().ragError) {
+          useAppStore.getState().setRagError(toUserFacingError(err, '咨询暂时无法完成，请稍后重试'))
+        }
       } finally {
         if (abortRef.current === controller) abortRef.current = null
       }
@@ -143,7 +147,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           </svg>
           <h2 className="rag-panel__title">记忆面包</h2>
         </div>
-        <p className="rag-panel__subtitle">看过就会记住,记住就会理解</p>
+        <p className="rag-panel__subtitle">让看过的内容，在下一次工作中继续发挥作用</p>
       </div>
 
       {/* 输入区域 */}
@@ -155,6 +159,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
         <textarea
           className="rag-panel__input"
           data-testid="rag-panel-input"
+          name="query"
           placeholder="问我任何工作相关的问题..."
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}

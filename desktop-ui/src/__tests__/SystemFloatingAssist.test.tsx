@@ -4,11 +4,15 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import SystemFloatingAssist from '../components/SystemFloatingAssist'
 import { useAppStore } from '../store/useAppStore'
-import { runRagQueryJob } from '../hooks/useApi'
+import { runRagQueryStream } from '../hooks/useApi'
 import {
   FLOATING_ASSIST_AUTO_TASK_KEY,
   FLOATING_ASSIST_ENABLED_KEY,
 } from '../utils/floatingAssistAutoTask'
+import {
+  INTERACTION_SETTINGS_KEY,
+  readInteractionSettings,
+} from '../utils/interactionSettings'
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
@@ -20,19 +24,17 @@ vi.mock('@tauri-apps/api/event', () => ({
 
 vi.mock('../hooks/useApi', () => ({
   RAG_REFERENCE_LIMIT: 5,
-  runGatewayRagQuery: vi.fn(),
-  runRagQueryJob: vi.fn(),
+  runGatewayRagQueryStream: vi.fn(),
+  runRagQueryStream: vi.fn(),
 }))
 
 vi.mock('../utils/authApi', () => ({
-  ACHIEVEMENTS_CHANGED_KEY: 'memorybread.achievements.changed',
-  fetchAchievementProfile: vi.fn().mockResolvedValue({ badges: [], equipped: {} }),
   fetchBillingBalance: vi.fn().mockResolvedValue(null),
 }))
 
 const mockedInvoke = vi.mocked(invoke)
 const mockedListen = vi.mocked(listen)
-const mockedRunRagQueryJob = vi.mocked(runRagQueryJob)
+const mockedRunRagQueryStream = vi.mocked(runRagQueryStream)
 const assistButton = () => screen.getByRole('button', { name: '识别当前屏幕并咨询记忆面包' })
 const AUTO_TASK_SCAN_INITIAL_DELAY_MS = 10_000
 const AUTO_TASK_SCAN_INTERVAL_MS = 120_000
@@ -159,8 +161,8 @@ beforeEach(() => {
   })
   mockedListen.mockReset()
   mockedListen.mockResolvedValue(() => {})
-  mockedRunRagQueryJob.mockReset()
-  mockedRunRagQueryJob.mockResolvedValue({
+  mockedRunRagQueryStream.mockReset()
+  mockedRunRagQueryStream.mockResolvedValue({
     answer: '自动识别任务的咨询输出',
     contexts: [],
     output_truncated: false,
@@ -266,17 +268,83 @@ describe('SystemFloatingAssist', () => {
     expect(screen.getByText('已生成的咨询输出')).toBeInTheDocument()
   })
 
+  it('默认单击打开悬浮球咨询框，双击打开主面板', async () => {
+    render(<SystemFloatingAssist />)
+    const button = assistButton()
+
+    fireEvent.click(button)
+    act(() => {
+      vi.advanceTimersByTime(220)
+    })
+    expect(screen.getByPlaceholderText('输入你的指令，直接向记忆面包咨询')).toBeInTheDocument()
+
+    fireEvent.doubleClick(button)
+    await act(async () => flushMicrotasks())
+    expect(mockedInvoke).toHaveBeenCalledWith('show_main_panel_from_floating_assist')
+    expect(captureOcrCalls()).toHaveLength(0)
+  })
+
+  it('展开后窗口失焦或点击外层区域时保持展开', () => {
+    const { container } = render(<SystemFloatingAssist />)
+    fireEvent.click(assistButton())
+    act(() => {
+      vi.advanceTimersByTime(220)
+    })
+    expect(screen.getByPlaceholderText('输入你的指令，直接向记忆面包咨询')).toBeInTheDocument()
+
+    mockedInvoke.mockClear()
+    act(() => {
+      window.dispatchEvent(new Event('blur'))
+    })
+    fireEvent.pointerDown(container.querySelector('.system-floating-assist')!)
+
+    expect(screen.getByPlaceholderText('输入你的指令，直接向记忆面包咨询')).toBeInTheDocument()
+    expect(mockedInvoke.mock.calls).not.toContainEqual([
+      'set_floating_assist_size',
+      { width: 82, height: 82 },
+    ])
+  })
+
+  it('按配置将单击设为无事件、双击设为当屏任务识别', async () => {
+    window.localStorage.setItem(INTERACTION_SETTINGS_KEY, JSON.stringify({
+      ...readInteractionSettings(),
+      floatingBall: {
+        singleClick: 'none',
+        doubleClick: 'recognize_screen_task',
+      },
+    }))
+    render(<SystemFloatingAssist />)
+    const button = assistButton()
+
+    fireEvent.click(button)
+    act(() => {
+      vi.advanceTimersByTime(220)
+    })
+    expect(screen.queryByPlaceholderText('输入你的指令，直接向记忆面包咨询')).not.toBeInTheDocument()
+
+    fireEvent.doubleClick(button)
+    await act(async () => {
+      await flushMicrotasks()
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(900)
+      await flushMicrotasks()
+    })
+    expect(captureOcrCalls()).toHaveLength(1)
+  })
+
   it('默认显示 5 条参考资料并支持展开和收起更多资料', async () => {
-    mockedRunRagQueryJob.mockResolvedValue({
+    const sourceTypes = ['bake_knowledge', 'document', 'operation', 'knowledge', 'document', 'operation', 'bake_knowledge']
+    mockedRunRagQueryStream.mockResolvedValue({
       answer: '已生成的咨询输出',
       contexts: Array.from({ length: 7 }, (_, index) => ({
         capture_id: index + 1,
-        doc_key: `document:${index + 1}`,
+        doc_key: `${sourceTypes[index]}:${index + 1}`,
         title: `参考资料 ${index + 1}`,
         text: `参考内容 ${index + 1}`,
         score: 1 - index / 10,
-        source: 'document',
-        source_type: 'document',
+        source: sourceTypes[index],
+        source_type: sourceTypes[index],
       })),
       output_truncated: false,
     } as any)
@@ -303,6 +371,10 @@ describe('SystemFloatingAssist', () => {
 
     expect(screen.getByText('参考资料 5')).toBeInTheDocument()
     expect(screen.queryByText('参考资料 6')).not.toBeInTheDocument()
+    expect(screen.getByText('参考资料 1').closest('button')?.firstElementChild).toHaveTextContent('知识')
+    expect(screen.getByText('参考资料 2').closest('button')?.firstElementChild).toHaveTextContent('文档')
+    expect(screen.getByText('参考资料 3').closest('button')?.firstElementChild).toHaveTextContent('操作')
+    expect(screen.getByText('参考资料 4').closest('button')?.firstElementChild).toHaveTextContent('时间线')
 
     fireEvent.click(screen.getByRole('button', { name: '展开更多（2）' }))
     expect(screen.getByText('参考资料 6')).toBeInTheDocument()
@@ -310,6 +382,131 @@ describe('SystemFloatingAssist', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '收起' }))
     expect(screen.queryByText('参考资料 6')).not.toBeInTheDocument()
+  })
+
+  it('流式生成时先展示参考资料和部分答案，完成后展示推理耗时', async () => {
+    let finishStream: ((value: any) => void) | null = null
+    let emitAnswerDelta: (() => void) | null = null
+    const streamedReference = {
+      capture_id: 1,
+      doc_key: 'document:1',
+      title: '提前召回的资料',
+      text: '参考内容',
+      score: 0.9,
+      source: 'document',
+      source_type: 'document',
+    }
+    mockedRunRagQueryStream.mockImplementation((...args: any[]) => {
+      const callbacks = args[7]
+      callbacks.onStatus?.({ stage: 'retrieving', message: '正在召回相关资料', progress: 42 })
+      callbacks.onReferences?.([streamedReference])
+      callbacks.onStatus?.({ stage: 'answering', message: '正在生成答案', progress: 58 })
+      emitAnswerDelta = () => callbacks.onDelta?.('这是部分答案', '这是部分答案')
+      return new Promise(resolve => {
+        finishStream = resolve
+      }) as any
+    })
+
+    render(<SystemFloatingAssist />)
+    fireEvent.click(assistButton())
+    act(() => {
+      vi.advanceTimersByTime(220)
+    })
+    const textarea = screen.getByPlaceholderText('输入你的指令，直接向记忆面包咨询')
+    fireEvent.change(textarea, { target: { value: '分析这份资料' } })
+    await act(async () => {
+      fireEvent.submit(textarea.closest('form')!)
+      await flushMicrotasks()
+    })
+
+    expect(screen.getByText('提前召回的资料')).toBeInTheDocument()
+    expect(screen.getByText('咨询输出 · 正在生成').closest('.system-floating-assist__answer'))
+      .toHaveClass('system-floating-assist__answer--streaming')
+    expect(mockedInvoke.mock.calls).toContainEqual([
+      'set_floating_assist_size',
+      { width: 392, height: 590 },
+    ])
+
+    act(() => {
+      emitAnswerDelta?.()
+    })
+
+    expect(screen.getByText('这是部分答案')).toBeInTheDocument()
+    expect(screen.getAllByText(/正在生成答案/)).toHaveLength(2)
+    expect(screen.getByText('这是部分答案').closest('.system-floating-assist__answer'))
+      .toHaveClass('system-floating-assist__answer--streaming')
+
+    await act(async () => {
+      finishStream?.({
+        answer: '这是完整答案',
+        contexts: [streamedReference],
+        model: 'test-model',
+        inference_elapsed_ms: 1234,
+      })
+      await flushMicrotasks()
+    })
+
+    expect(screen.getByText('这是完整答案')).toBeInTheDocument()
+    expect(screen.getByText('推理耗时 1.2 秒')).toBeInTheDocument()
+  })
+
+  it('阶段状态等待期间持续推进进度，不停在服务端建议值', async () => {
+    mockedRunRagQueryStream.mockImplementation((...args: any[]) => {
+      const callbacks = args[7]
+      callbacks.onStatus?.({ stage: 'understanding', message: '正在理解当前问题', progress: 28 })
+      return new Promise(() => {}) as any
+    })
+
+    const { container } = render(<SystemFloatingAssist />)
+    fireEvent.click(assistButton())
+    act(() => {
+      vi.advanceTimersByTime(220)
+    })
+    const textarea = screen.getByPlaceholderText('输入你的指令，直接向记忆面包咨询')
+    fireEvent.change(textarea, { target: { value: '分析当前问题' } })
+    await act(async () => {
+      fireEvent.submit(textarea.closest('form')!)
+      await flushMicrotasks()
+    })
+
+    const progressBar = container.querySelector<HTMLElement>('.system-floating-assist__progress span')
+    expect(progressBar?.style.width).toBe('28%')
+
+    act(() => {
+      vi.advanceTimersByTime(3_000)
+    })
+
+    expect(Number.parseFloat(progressBar?.style.width || '0')).toBeGreaterThan(28)
+    expect(screen.getAllByText(/正在理解当前问题/)).toHaveLength(2)
+  })
+
+  it('咨询输入框使用 Enter 发送，并保留 Shift+Enter 换行', async () => {
+    render(<SystemFloatingAssist />)
+    fireEvent.click(assistButton())
+    act(() => {
+      vi.advanceTimersByTime(220)
+    })
+
+    const textarea = screen.getByPlaceholderText('输入你的指令，直接向记忆面包咨询')
+    fireEvent.change(textarea, { target: { value: '第一行' } })
+
+    expect(fireEvent.keyDown(textarea, { key: 'Enter', code: 'Enter', shiftKey: true })).toBe(true)
+    expect(mockedRunRagQueryStream).not.toHaveBeenCalled()
+
+    fireEvent.change(textarea, { target: { value: '第一行\n第二行' } })
+    let enterHandled = true
+    await act(async () => {
+      enterHandled = fireEvent.keyDown(textarea, { key: 'Enter', code: 'Enter' })
+      await flushMicrotasks()
+    })
+    expect(enterHandled).toBe(false)
+    await act(async () => {
+      vi.advanceTimersByTime(900)
+      await flushMicrotasks()
+    })
+
+    expect(mockedRunRagQueryStream).toHaveBeenCalledTimes(1)
+    expect(mockedRunRagQueryStream.mock.calls[0]?.[2]).toContain('第一行\n第二行')
   })
 
   it('自动识别任务开启后在面包人左上角显示 auto 标识', () => {
@@ -324,10 +521,10 @@ describe('SystemFloatingAssist', () => {
     expect(screen.getByText('auto')).toBeInTheDocument()
   })
 
-  it('自动识别命中任务后进入面包人接任务动画', async () => {
+  it('自动识别命中任务后进入持续回答动画', async () => {
     window.localStorage.setItem(FLOATING_ASSIST_ENABLED_KEY, 'true')
     window.localStorage.setItem(FLOATING_ASSIST_AUTO_TASK_KEY, 'true')
-    mockedRunRagQueryJob.mockImplementation(() => new Promise(() => {}) as any)
+    mockedRunRagQueryStream.mockImplementation(() => new Promise(() => {}) as any)
 
     render(<SystemFloatingAssist />)
 
@@ -337,7 +534,7 @@ describe('SystemFloatingAssist', () => {
     })
 
     expect(captureOcrCalls()).toHaveLength(1)
-    expect(assistButton()).toHaveClass('system-floating-assist__ball--receiving')
+    expect(assistButton()).toHaveClass('system-floating-assist__ball--answering')
   })
 
   it('自动识别只把疑似任务片段发送给 RAG', async () => {
@@ -358,7 +555,7 @@ describe('SystemFloatingAssist', () => {
 
     await completeNextAutoScan(AUTO_TASK_SCAN_INITIAL_DELAY_MS)
 
-    const sentQuery = mockedRunRagQueryJob.mock.calls[0]?.[2] as string
+    const sentQuery = mockedRunRagQueryStream.mock.calls[0]?.[2] as string
     expect(sentQuery).toContain('修复登录验证码异常')
     expect(sentQuery).not.toContain('账号密码')
   })
@@ -380,7 +577,7 @@ describe('SystemFloatingAssist', () => {
     })
 
     expect(captureOcrCalls()).toHaveLength(1)
-    expect(mockedRunRagQueryJob).not.toHaveBeenCalled()
+    expect(mockedRunRagQueryStream).not.toHaveBeenCalled()
     expect(screen.queryByText('发现可能任务')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '咨询' })).not.toBeInTheDocument()
   })
@@ -388,6 +585,7 @@ describe('SystemFloatingAssist', () => {
   it('手动任务执行中时跳过自动识别的新任务', async () => {
     window.localStorage.setItem(FLOATING_ASSIST_ENABLED_KEY, 'true')
     window.localStorage.setItem(FLOATING_ASSIST_AUTO_TASK_KEY, 'true')
+    mockedRunRagQueryStream.mockImplementation(() => new Promise(() => {}) as any)
     render(<SystemFloatingAssist />)
 
     fireEvent.click(assistButton())
@@ -402,7 +600,7 @@ describe('SystemFloatingAssist', () => {
       await flushMicrotasks()
     })
 
-    expect(assistButton()).toHaveClass('system-floating-assist__ball--receiving')
+    expect(assistButton()).toHaveClass('system-floating-assist__ball--answering')
 
     await act(async () => {
       vi.advanceTimersByTime(AUTO_TASK_SCAN_INITIAL_DELAY_MS)
@@ -428,11 +626,11 @@ describe('SystemFloatingAssist', () => {
     render(<SystemFloatingAssist />)
 
     await completeNextAutoScan(AUTO_TASK_SCAN_INITIAL_DELAY_MS)
-    expect(mockedRunRagQueryJob).toHaveBeenCalledTimes(1)
+    expect(mockedRunRagQueryStream).toHaveBeenCalledTimes(1)
 
     await closeDoneSurfaceAndReturnIdle()
     await completeNextAutoScan(AUTO_TASK_SCAN_INTERVAL_MS)
-    expect(mockedRunRagQueryJob).toHaveBeenCalledTimes(2)
+    expect(mockedRunRagQueryStream).toHaveBeenCalledTimes(2)
 
     await closeDoneSurfaceAndReturnIdle()
     await act(async () => {
@@ -441,6 +639,6 @@ describe('SystemFloatingAssist', () => {
     })
 
     expect(captureOcrCalls()).toHaveLength(3)
-    expect(mockedRunRagQueryJob).toHaveBeenCalledTimes(2)
+    expect(mockedRunRagQueryStream).toHaveBeenCalledTimes(2)
   })
 })

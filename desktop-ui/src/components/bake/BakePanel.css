@@ -642,7 +642,7 @@ button.bake-list-item.bake-list-item--active {
 }
 
 .bake-memory-detail-card--stacked {
-  align-self: start;
+  align-self: stretch;
 }
 
 .bake-memory-list-card--fixed,
@@ -669,6 +669,27 @@ button.bake-list-item.bake-list-item--active {
   max-height: min(68vh, 760px);
   overflow-y: auto;
   padding-right: 2px;
+}
+
+@media (min-width: 769px) {
+  .bake-split-list-detail > .bake-memory-list-card,
+  .bake-split-list-detail > .bake-knowledge-list-card,
+  .bake-split-list-detail > .bake-capture-list-card {
+    align-self: stretch;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+
+  .bake-split-list-detail > .bake-memory-list-card > .bake-list,
+  .bake-split-list-detail > .bake-knowledge-list-card > .bake-list,
+  .bake-split-list-detail > .bake-capture-list-card > .bake-list {
+    flex: 1 1 0;
+    min-height: min(68vh, 760px);
+    max-height: none;
+    grid-auto-rows: max-content;
+    align-content: start;
+  }
 }
 
 .bake-memory-list-item,
@@ -2099,3 +2120,11 @@ button.bake-list-item.bake-list-item--active {
   gap: 12px;
   justify-content: flex-end;
 }
+.bake-related-skills__list { display: grid; gap: 8px; }
+.bake-related-skills__list > button { width: 100%; padding: 10px 12px; border: 1px solid #ead8bd; border-radius: 9px; background: #fffaf1; color: #344054; text-align: left; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.bake-related-skills__list > button:hover { border-color: #c98a4a; background: #fff5e5; }
+.bake-related-skills__list > button:focus-visible { outline: 3px solid rgba(185, 111, 45, .2); outline-offset: 2px; }
+.bake-related-skills__list > button > span { min-width: 0; display: grid; gap: 4px; }
+.bake-related-skills__list strong { color: #4f321b; font-size: 12px; }
+.bake-related-skills__list small { color: #7b6a59; font-size: 11px; line-height: 1.45; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bake-related-skills__list em { flex: 0 0 auto; color: #a15f28; font-size: 10px; font-style: normal; font-weight: 700; }

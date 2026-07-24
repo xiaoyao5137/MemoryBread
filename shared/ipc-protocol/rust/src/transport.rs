@@ -8,12 +8,12 @@
 
 use std::time::Duration;
 
+#[cfg(windows)]
+use tokio::net::TcpStream;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::timeout,
 };
-#[cfg(windows)]
-use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use crate::{
@@ -51,7 +51,7 @@ pub fn encode_request(req: &IpcRequest) -> Result<Vec<u8>, IpcError> {
     if payload.len() > MAX_MESSAGE_BYTES {
         return Err(IpcError::MessageTooLarge {
             size: payload.len(),
-            max:  MAX_MESSAGE_BYTES,
+            max: MAX_MESSAGE_BYTES,
         });
     }
     let mut buf = Vec::with_capacity(4 + payload.len());
@@ -116,8 +116,7 @@ impl IpcClient {
     ///
     /// 场景：Core Engine 先于 Sidecar 启动，需要轮询直到 Sidecar 就绪。
     pub async fn wait_for_sidecar() -> Result<Self, IpcError> {
-        let deadline = std::time::Instant::now()
-            + Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS);
+        let deadline = std::time::Instant::now() + Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS);
 
         loop {
             let remaining = deadline
@@ -140,10 +139,7 @@ impl IpcClient {
                     }
                 }
                 Ok(Err(_)) | Err(_) => {
-                    debug!(
-                        "Sidecar 尚未就绪，剩余等待 {:.1}s",
-                        remaining.as_secs_f32()
-                    );
+                    debug!("Sidecar 尚未就绪，剩余等待 {:.1}s", remaining.as_secs_f32());
                 }
             }
 
@@ -170,7 +166,7 @@ impl IpcClient {
         if resp.id != req_id {
             return Err(IpcError::IdMismatch {
                 expected: req_id,
-                actual:   resp.id,
+                actual: resp.id,
             });
         }
 
@@ -210,7 +206,7 @@ impl IpcClient {
         if msg_len > MAX_MESSAGE_BYTES {
             return Err(IpcError::MessageTooLarge {
                 size: msg_len,
-                max:  MAX_MESSAGE_BYTES,
+                max: MAX_MESSAGE_BYTES,
             });
         }
 
@@ -233,11 +229,11 @@ impl TaskRequest {
     /// 返回任务类型名称字符串（用于日志）
     pub fn type_name(&self) -> &'static str {
         match self {
-            TaskRequest::Ping        => "ping",
-            TaskRequest::Ocr(_)     => "ocr",
-            TaskRequest::Asr(_)     => "asr",
-            TaskRequest::Vlm(_)     => "vlm",
-            TaskRequest::Embed(_)   => "embed",
+            TaskRequest::Ping => "ping",
+            TaskRequest::Ocr(_) => "ocr",
+            TaskRequest::Asr(_) => "asr",
+            TaskRequest::Vlm(_) => "vlm",
+            TaskRequest::Embed(_) => "embed",
             TaskRequest::PiiScrub(_) => "pii_scrub",
             TaskRequest::ProfileAnalysis(_) => "profile_analysis",
         }
@@ -256,7 +252,7 @@ mod tests {
     #[test]
     fn test_encode_decode_frame() {
         let req = IpcRequest::new(TaskRequest::Ocr(OcrRequest {
-            capture_id:      1,
+            capture_id: 1,
             screenshot_path: "/tmp/shot.jpg".into(),
         }));
 
@@ -276,7 +272,7 @@ mod tests {
     fn test_encode_too_large_fails() {
         let huge_text = "x".repeat(MAX_MESSAGE_BYTES + 1);
         let req = IpcRequest::new(TaskRequest::Ocr(OcrRequest {
-            capture_id:      1,
+            capture_id: 1,
             screenshot_path: huge_text,
         }));
         let result = encode_request(&req);

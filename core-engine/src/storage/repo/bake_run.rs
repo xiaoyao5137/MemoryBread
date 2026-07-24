@@ -50,6 +50,32 @@ impl StorageManager {
         })
     }
 
+    /// 将已超过正常批次上限、但因进程退出未写终态的 run 收敛为 failed。
+    ///
+    /// 这类历史 ``running`` 行不代表真实执行，若永久保留会污染监控并让用户
+    /// 误以为仍有多个批次占用推理资源。
+    pub fn fail_stale_running_bake_runs(&self) -> Result<i64, StorageError> {
+        self.with_conn(|conn| {
+            let now = current_ts_ms();
+            let fresh_after_ms = now - STALE_RUNNING_BAKE_RUN_MS;
+            let affected = conn.execute(
+                "UPDATE bake_runs
+                 SET status = 'failed',
+                     completed_at = COALESCE(completed_at, ?1),
+                     error_message = CASE
+                         WHEN COALESCE(error_message, '') = ''
+                         THEN 'stale running bake run recovered on startup'
+                         ELSE error_message
+                     END,
+                     latency_ms = COALESCE(latency_ms, MAX(0, ?1 - started_at))
+                 WHERE status = 'running'
+                   AND started_at < ?2",
+                params![now, fresh_after_ms],
+            )?;
+            Ok(affected as i64)
+        })
+    }
+
     /// 更新 bake run 的实时进度字段（candidate_count / processed_episode_count），
     /// 用于监控页实时展示"提炼中"数量，不改变 run 状态。
     pub fn update_bake_run_progress(
@@ -65,6 +91,31 @@ impl StorageManager {
                      processed_episode_count = ?2
                  WHERE id = ?3",
                 params![candidate_count, processed_episode_count, id],
+            )?;
+            Ok(affected > 0)
+        })
+    }
+
+    /// 将 run 标记为失败，但保留已实时写入的候选数和处理进度。
+    ///
+    /// 一个批次可能在成功持久化若干候选后被 P0 抢占；若用全 0 覆盖终态，
+    /// 监控会错误显示本轮毫无进展。
+    pub fn fail_bake_run_preserving_progress(
+        &self,
+        id: i64,
+        completed_at: i64,
+        error_message: &str,
+        latency_ms: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        self.with_conn(|conn| {
+            let affected = conn.execute(
+                "UPDATE bake_runs
+                 SET status = 'failed',
+                     completed_at = ?1,
+                     error_message = ?2,
+                     latency_ms = ?3
+                 WHERE id = ?4",
+                params![completed_at, error_message, latency_ms, id],
             )?;
             Ok(affected > 0)
         })
@@ -184,6 +235,40 @@ impl StorageManager {
             Ok(count)
         })
     }
+
+    /// 候选成功处理后移除旧失败记录，避免历史失败继续污染监控或后续增量处理。
+    pub fn clear_bake_retry_failure(&self, timeline_id: i64) -> Result<bool, StorageError> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "DELETE FROM bake_retry_state WHERE timeline_id = ?1",
+                params![timeline_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// 清理由资源竞争或已修复的兼容性问题造成的历史失败记录，使候选可重新入队。
+    ///
+    /// 这里只匹配可明确判定为可恢复的错误；真正的内容解析失败仍保留为死信，
+    /// 以免无休止重试同一份坏数据。
+    pub fn clear_recoverable_bake_retry_failures(&self) -> Result<usize, StorageError> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "DELETE FROM bake_retry_state
+                 WHERE last_error LIKE 'upstream error (502%'
+                    OR last_error LIKE 'upstream error (503%'
+                    OR last_error LIKE 'upstream error (504%'
+                    OR (
+                        last_error LIKE 'internal error: 解析 merge_document 响应失败:%'
+                        AND last_error LIKE '%missing field `title`%'
+                    )
+                    OR last_error LIKE 'internal error: 解析 bake sop payload 失败: invalid type:%'
+                    OR last_error LIKE 'internal error: 解析 bake design payload 失败: invalid type:%'",
+                [],
+            )?;
+            Ok(changed)
+        })
+    }
 }
 
 fn insert_bake_run_inner(conn: &Connection, run: &NewBakeRun) -> Result<i64, StorageError> {
@@ -263,6 +348,67 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_retry_failure_and_recoverable_history() {
+        let mgr = make_mgr();
+        mgr.with_conn(|conn| {
+            for id in [101_i64, 102, 103, 104] {
+                conn.execute(
+                    "INSERT INTO captures (id, ts, event_type) VALUES (?1, ?1, 'manual')",
+                    params![id],
+                )?;
+                conn.execute(
+                    "INSERT INTO timelines (id, capture_id, summary) VALUES (?1, ?1, 'test')",
+                    params![id],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        mgr.bump_bake_retry_failure(101, "upstream error (503 Service Unavailable): busy")
+            .unwrap();
+        mgr.bump_bake_retry_failure(
+            102,
+            "internal error: 解析 merge_document 响应失败: missing field `title`",
+        )
+        .unwrap();
+        mgr.bump_bake_retry_failure(103, "internal error: invalid permanent payload")
+            .unwrap();
+        mgr.bump_bake_retry_failure(
+            104,
+            "internal error: 解析 bake sop payload 失败: invalid type: map, expected a string",
+        )
+        .unwrap();
+
+        assert_eq!(mgr.clear_recoverable_bake_retry_failures().unwrap(), 3);
+        assert!(!mgr.clear_bake_retry_failure(101).unwrap());
+        assert!(!mgr.clear_bake_retry_failure(104).unwrap());
+        assert!(mgr.clear_bake_retry_failure(103).unwrap());
+        assert!(!mgr.clear_bake_retry_failure(103).unwrap());
+    }
+
+    #[test]
+    fn test_fail_bake_run_preserves_recorded_progress() {
+        let mgr = make_mgr();
+        let id = mgr
+            .insert_bake_run(&NewBakeRun {
+                trigger_reason: "preempted".to_string(),
+                status: "running".to_string(),
+                started_at: 100,
+            })
+            .unwrap();
+        mgr.update_bake_run_progress(id, 7, 2).unwrap();
+        mgr.fail_bake_run_preserving_progress(id, 300, "retry later", Some(200))
+            .unwrap();
+
+        let run = mgr.get_latest_bake_run().unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.candidate_count, 7);
+        assert_eq!(run.processed_episode_count, 2);
+        assert_eq!(run.error_message.as_deref(), Some("retry later"));
+        assert_eq!(run.latency_ms, Some(200));
+    }
+
+    #[test]
     fn test_upsert_and_get_bake_watermark() {
         let mgr = make_mgr();
         mgr.upsert_bake_watermark("unified", 100).unwrap();
@@ -270,5 +416,45 @@ mod tests {
         let watermark = mgr.get_bake_watermark("unified").unwrap().unwrap();
         assert_eq!(watermark.pipeline_name, "unified");
         assert_eq!(watermark.last_processed_ts, 200);
+    }
+
+    #[test]
+    fn test_fail_stale_running_bake_runs_preserves_fresh_run() {
+        let mgr = make_mgr();
+        let now = current_ts_ms();
+        let stale_id = mgr
+            .insert_bake_run(&NewBakeRun {
+                trigger_reason: "stale".to_string(),
+                status: "running".to_string(),
+                started_at: now - STALE_RUNNING_BAKE_RUN_MS - 1,
+            })
+            .unwrap();
+        let fresh_id = mgr
+            .insert_bake_run(&NewBakeRun {
+                trigger_reason: "fresh".to_string(),
+                status: "running".to_string(),
+                started_at: now,
+            })
+            .unwrap();
+
+        assert_eq!(mgr.fail_stale_running_bake_runs().unwrap(), 1);
+        let (stale_status, stale_completed, fresh_status): (String, Option<i64>, String) = mgr
+            .with_conn(|conn| {
+                let (stale_status, stale_completed) = conn.query_row(
+                    "SELECT status, completed_at FROM bake_runs WHERE id = ?1",
+                    params![stale_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let fresh_status = conn.query_row(
+                    "SELECT status FROM bake_runs WHERE id = ?1",
+                    params![fresh_id],
+                    |row| row.get(0),
+                )?;
+                Ok((stale_status, stale_completed, fresh_status))
+            })
+            .unwrap();
+        assert_eq!(stale_status, "failed");
+        assert!(stale_completed.is_some());
+        assert_eq!(fresh_status, "running");
     }
 }

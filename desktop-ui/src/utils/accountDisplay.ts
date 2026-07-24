@@ -59,10 +59,10 @@ export const getUserDisplayName = (user?: CloudUser | null): string => {
   if (!user) return '登录账户'
   return (
     firstNonEmpty(
-      user.username,
-      user.display_name,
       user.nickname,
+      user.display_name,
       user.name,
+      user.username,
       user.email,
       user.phone,
     ) ||

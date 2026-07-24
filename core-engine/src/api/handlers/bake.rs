@@ -78,6 +78,7 @@ pub struct InitializeBakeMemoriesRequest {
 pub struct RunBakeRequest {
     pub trigger_reason: Option<String>,
     pub limit: Option<usize>,
+    pub max_concurrency: Option<usize>,
 }
 
 pub async fn get_bake_style_config(
@@ -446,6 +447,7 @@ pub async fn run_bake_pipeline(
         .trigger_reason
         .unwrap_or_else(|| "manual_debug".to_string());
     let limit = body.limit.unwrap_or(20).clamp(1, 100);
+    let max_concurrency = body.max_concurrency.unwrap_or(3).clamp(1, 3);
 
     // 统一 bake pipeline 使用全局 watermark，多个 run 并发会重复扫描同一段历史候选，
     // 让监控页出现多个长期“生成中”占位，并拖慢队列收敛。
@@ -459,7 +461,7 @@ pub async fn run_bake_pipeline(
         })));
     }
 
-    let run_id = service.spawn_bake_pipeline(trigger_reason, limit)?;
+    let run_id = service.spawn_bake_pipeline(trigger_reason, limit, max_concurrency)?;
     Ok(Json(serde_json::json!({
         "id": run_id,
         "status": "accepted",

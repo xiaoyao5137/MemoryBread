@@ -193,15 +193,21 @@ def _start_vector_search_server() -> None:
                 results = client.query_points(
                     collection_name=vs._collection_name,
                     query=query_vector,
-                    limit=top_k,
+                    # 文档分块后一个 URL 可能命中多个 chunk；先多取一些，
+                    # 再按 doc_key 折叠，避免长文档挤掉其他来源。
+                    limit=min(max(top_k * 4, top_k), 100),
                     score_threshold=score_threshold,
                     query_filter=qdrant_filter,
                 ).points
                 hits = []
+                seen_doc_keys = set()
                 for hit in results:
                     payload = dict(hit.payload or {})
                     capture_id = int(payload.get('capture_id') or 0)
                     doc_key = payload.get('doc_key') or f"capture:{capture_id}"
+                    if doc_key in seen_doc_keys:
+                        continue
+                    seen_doc_keys.add(doc_key)
                     hits.append({
                         'capture_id': capture_id,
                         'doc_key': doc_key,
@@ -210,6 +216,8 @@ def _start_vector_search_server() -> None:
                         'source': 'vector',
                         'metadata': payload,
                     })
+                    if len(hits) >= top_k:
+                        break
                 return jsonify({'results': hits})
             except Exception as e:
                 logging.getLogger(__name__).error("vector_search 失败: %s", e)
@@ -328,6 +336,7 @@ async def _run_main(args: argparse.Namespace) -> None:
             bg_processor = BackgroundProcessor(db_path=db_path, interval=30, batch_size=20)
             runtime_state["bg_processor"] = bg_processor
             asyncio.create_task(bg_processor.run())
+            asyncio.create_task(bg_processor.backfill_document_vectors())
             issues = [] if checks_result.get('embedding_ok') else ["向量模型不可用，RAG 向量检索降级"]
             _write_runtime_status(
                 mode="full",

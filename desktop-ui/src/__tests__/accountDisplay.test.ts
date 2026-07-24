@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { getRunModeLabel } from '../utils/accountDisplay'
+import { getRunModeLabel, getUserDisplayName } from '../utils/accountDisplay'
 import type { CloudUser } from '../types'
 
 const user: CloudUser = {
@@ -23,5 +23,20 @@ describe('getRunModeLabel', () => {
 
   it('登录用户没有模式信息时默认显示标准模式', () => {
     expect(getRunModeLabel(user)).toBe('标准模式')
+  })
+})
+
+describe('getUserDisplayName', () => {
+  it('uses nickname before the immutable account name', () => {
+    expect(getUserDisplayName({
+      ...user,
+      username: 'account-name',
+      display_name: 'legacy display name',
+      nickname: '小麦',
+    })).toBe('小麦')
+  })
+
+  it('falls back to the account name for old sessions', () => {
+    expect(getUserDisplayName({ ...user, username: 'account-name' })).toBe('account-name')
   })
 })

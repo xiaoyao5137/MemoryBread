@@ -1,8 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
+import BakeKnowledgeTab from '../components/bake/BakeKnowledgeTab'
 import BakeTemplatesTab from '../components/bake/BakeTemplatesTab'
 import BakeSopTab from '../components/bake/BakeSopTab'
-import type { ArticleTemplate, SopCandidate } from '../types'
+import type { ArticleTemplate, BakeKnowledgeItem, SopCandidate } from '../types'
+import {
+  DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
+  DEFAULT_CREATION_SKILL_FIELD_EXAMPLES,
+  DEFAULT_CREATION_SKILL_SECTION_HEADINGS,
+  type LocalCreationSkill,
+} from '../utils/creationSkills'
 
 const noop = vi.fn()
 
@@ -26,6 +33,39 @@ const template: ArticleTemplate = {
   promptHint: '先总结再细化',
   usageCount: 3,
   reviewStatus: 'confirmed',
+  matchScore: 0.98,
+  matchLevel: 'high',
+}
+
+const draftTemplate: ArticleTemplate = {
+  ...template,
+  id: 'tpl-2',
+  title: '月报模板',
+  status: 'pending_review',
+  usageCount: 5,
+}
+
+const knowledge: BakeKnowledgeItem = {
+  id: 'knowledge-1',
+  captureId: 'c-1',
+  sourceCaptureIds: ['c-1'],
+  sourceTimelineId: 'm-1',
+  summary: '本地优先知识',
+  overview: '用户数据优先在本地处理',
+  details: '',
+  detailedContent: '这是一条详细知识。',
+  entities: ['MemoryBread', '本地优先'],
+  category: 'bake_knowledge',
+  importance: 8,
+  occurrenceCount: 4,
+  status: 'active',
+  reviewStatus: 'confirmed',
+  matchScore: 0.96,
+  matchLevel: 'high',
+  createdAt: '2026-07-23 10:00',
+  createdAtMs: 0,
+  updatedAt: '2026-07-23 10:00',
+  updatedAtMs: 0,
 }
 
 const sop: SopCandidate = {
@@ -44,12 +84,38 @@ const sop: SopCandidate = {
   status: 'confirmed',
 }
 
+const relatedSkill: LocalCreationSkill = {
+  id: 2,
+  clientSkillKey: 'skill-cross-team-tech-meeting',
+  cloudSkillId: null,
+  sourceKind: 'bake_document',
+  sourceId: template.id,
+  title: '跨部门技术沟通会文档',
+  summary: '用于跨部门技术沟通、阶段复盘与规划。',
+  categoryId: '11401',
+  commonTitles: ['跨部门技术沟通会'],
+  titleStyle: '标题概括目标',
+  textStyle: '结论先行',
+  diagramStyle: '简洁流程图',
+  structurePattern: ['目标', '进展', '行动项'],
+  writingGuidelines: ['明确负责人'],
+  sectionHeadings: { ...DEFAULT_CREATION_SKILL_SECTION_HEADINGS },
+  fieldExamples: DEFAULT_CREATION_SKILL_FIELD_EXAMPLES,
+  exampleDocument: DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
+  status: 'saved',
+  installed: true,
+  published: false,
+  createdAt: 1_720_000_000_000,
+  updatedAt: 1_720_000_000_000,
+}
+
 describe('Bake 详情展示优化', () => {
   it('模板详情使用更明确的结构/风格说明文案', () => {
+    const onOpenSkill = vi.fn()
     render(
       <BakeTemplatesTab
-        templates={[template]}
-        total={1}
+        templates={[template, draftTemplate]}
+        total={2}
         limit={20}
         offset={0}
         query=""
@@ -64,6 +130,8 @@ describe('Bake 详情展示优化', () => {
         onUpdateTemplate={noop}
         onToggleTemplateStatus={noop}
         onDeleteTemplate={noop}
+        relatedSkills={[relatedSkill]}
+        onOpenSkill={onOpenSkill}
         onViewSourceMemory={noop}
         onPageChange={noop}
         onLimitChange={noop}
@@ -78,6 +146,53 @@ describe('Bake 详情展示优化', () => {
     expect(screen.getByText('结构骨架（决定输出结构）')).toBeInTheDocument()
     expect(screen.getByText('表达风格（决定措辞）')).toBeInTheDocument()
     expect(screen.getByText('常用短语：整体看、先结论后展开')).toBeInTheDocument()
+    expect(screen.queryByText('已启用')).not.toBeInTheDocument()
+    expect(screen.queryByText('草稿')).not.toBeInTheDocument()
+    expect(screen.queryByText(/使用 \d+ 次/)).not.toBeInTheDocument()
+    expect(screen.queryByText('high')).not.toBeInTheDocument()
+    expect(screen.queryByText(/匹配分|匹配等级|来源记忆|提炼状态/)).not.toBeInTheDocument()
+    expect(screen.getByText('关联创作 Skill')).toBeInTheDocument()
+    expect(screen.getByText('跨部门技术沟通会文档')).toBeInTheDocument()
+    expect(screen.getByText('已安装')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /跨部门技术沟通会文档/ }))
+    expect(onOpenSkill).toHaveBeenCalledWith(relatedSkill)
+  })
+
+  it('知识列表和详情不展示内部提炼字段', () => {
+    render(
+      <BakeKnowledgeTab
+        items={[knowledge]}
+        total={1}
+        limit={20}
+        offset={0}
+        query=""
+        draftQuery=""
+        from=""
+        to=""
+        draftFrom=""
+        draftTo=""
+        selectedKnowledgeId={knowledge.id}
+        onSelectKnowledge={noop}
+        onPageChange={noop}
+        onLimitChange={noop}
+        onDraftQueryChange={noop}
+        onDraftFromChange={noop}
+        onDraftToChange={noop}
+        onSearch={noop}
+        onClearFilters={noop}
+        onDeleteKnowledge={noop}
+        onOpenCapture={noop}
+        onViewSourceTimeline={noop}
+      />,
+    )
+
+    expect(screen.getAllByText('本地优先知识').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/bake_knowledge/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/重复观察/)).not.toBeInTheDocument()
+    expect(screen.queryByText('high')).not.toBeInTheDocument()
+    expect(screen.queryByText(/匹配分|匹配等级|提炼状态/)).not.toBeInTheDocument()
+    expect(screen.queryByText('实体 / 标签')).not.toBeInTheDocument()
+    expect(screen.queryByText('MemoryBread')).not.toBeInTheDocument()
   })
 
   it('SOP详情不展示原始关联ID与工作提示预览', () => {
@@ -104,6 +219,7 @@ describe('Bake 详情展示优化', () => {
         onDraftToChange={noop}
         onSearch={noop}
         onClearFilters={noop}
+        onCreateSop={noop}
       />,
     )
 
@@ -114,5 +230,12 @@ describe('Bake 详情展示优化', () => {
     expect(screen.queryByText('101、202')).not.toBeInTheDocument()
     expect(screen.queryByText('工作提示预览')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '复制工作提示' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/置信度/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/来源：/)).not.toBeInTheDocument()
+    expect(screen.queryByText('启动失败排查')).not.toBeInTheDocument()
+    expect(screen.queryByPlaceholderText(/来源/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '新建' }))
+    expect(screen.queryByText(/置信度/)).not.toBeInTheDocument()
   })
 })

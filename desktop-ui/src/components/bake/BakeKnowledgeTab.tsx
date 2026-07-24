@@ -192,12 +192,8 @@ const BakeKnowledgeTab: React.FC<{
                 <div className="bake-list-item__title bake-line-clamp-2">{item.summary}</div>
                 <div className="bake-muted bake-line-clamp-2">{item.overview || '暂无概述'}</div>
                 <div className="bake-memory-list-item__meta">
-                  <span>{item.category || '未分类'}</span>
                   <span>创建 {formatCreatedTime(item)}</span>
                   <span>重要度 {item.importance}</span>
-                  <span>重复观察 {item.occurrenceCount} 次</span>
-                  {item.matchLevel && <span>{item.matchLevel}</span>}
-                  {item.matchScore != null && <span>匹配 {item.matchScore.toFixed(2)}</span>}
                 </div>
               </button>
             )
@@ -248,16 +244,10 @@ const BakeKnowledgeTab: React.FC<{
       <BakeCard className="bake-knowledge-detail-card">
         {selected ? (
           <div className="bake-kv bake-capture-detail bake-knowledge-detail">
-            <div className="bake-inline-meta">
-              <div>
-                <div className="bake-title" style={{ fontSize: 18 }}>{selected.summary}</div>
-                <div className="bake-muted" style={{ marginTop: 4 }}>
-                  分类：{selected.category || '—'} · ID: {selected.id} · 创建：{formatCreatedTime(selected)}
-                </div>
-              </div>
-              <div className="bake-inline-pills">
-                {selected.matchLevel && <BakePill text={selected.matchLevel} />}
-                {selected.matchScore != null && <BakePill text={`匹配 ${selected.matchScore.toFixed(2)}`} />}
+            <div>
+              <div className="bake-title" style={{ fontSize: 18 }}>{selected.summary}</div>
+              <div className="bake-muted" style={{ marginTop: 4 }}>
+                ID: {selected.id} · 创建：{formatCreatedTime(selected)}
               </div>
             </div>
             <div className="bake-knowledge-detail__section">
@@ -282,22 +272,6 @@ const BakeKnowledgeTab: React.FC<{
                     return selected.details
                   }
                 })()}
-              </div>
-            </div>
-            <div className="bake-knowledge-detail__section">
-              <div className="bake-kv__title">提炼状态</div>
-              <div className="bake-memory-detail__stats">
-                {selected.matchScore != null && <span className="bake-stat-chip">匹配分：{selected.matchScore.toFixed(2)}</span>}
-                {selected.matchLevel && <span className="bake-stat-chip">匹配等级：{selected.matchLevel}</span>}
-                <span className="bake-stat-chip">重复观察：{selected.occurrenceCount} 次</span>
-              </div>
-            </div>
-            <div className="bake-knowledge-detail__section">
-              <div className="bake-kv__title">实体 / 标签</div>
-              <div className="bake-memory-detail__stats">
-                {selected.entities.length > 0 ? selected.entities.map(entity => (
-                  <span key={entity} className="bake-stat-chip">{entity}</span>
-                )) : <span className="bake-muted">暂无实体</span>}
               </div>
             </div>
             <div className="bake-knowledge-detail__section">

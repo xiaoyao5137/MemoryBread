@@ -189,6 +189,72 @@ is_running() {
     return 1
 }
 
+any_file_newer_than() {
+    local marker=$1
+    shift
+
+    if [ ! -e "$marker" ]; then
+        return 0
+    fi
+
+    local path
+    local newer_file
+    for path in "$@"; do
+        if [ -f "$path" ]; then
+            if [ "$path" -nt "$marker" ]; then
+                return 0
+            fi
+            continue
+        fi
+        if [ -d "$path" ]; then
+            newer_file=$(find "$path" -type f -newer "$marker" -print -quit 2>/dev/null)
+            if [ -n "$newer_file" ]; then
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+creation_service_sources_changed() {
+    any_file_newer_than \
+        "$CREATION_PID_FILE" \
+        "$PROJECT_ROOT/ai-sidecar/creation" \
+        "$PROJECT_ROOT/ai-sidecar/start_creation_service.py" \
+        "$PROJECT_ROOT/ai-sidecar/model_registry_global.py" \
+        "$PROJECT_ROOT/ai-sidecar/model_manager.py"
+}
+
+core_sources_changed() {
+    any_file_newer_than \
+        "$CORE_PID_FILE" \
+        "$PROJECT_ROOT/core-engine/src" \
+        "$PROJECT_ROOT/core-engine/Cargo.toml" \
+        "$PROJECT_ROOT/core-engine/Cargo.lock" \
+        "$PROJECT_ROOT/shared/ipc-protocol/rust"
+}
+
+stop_managed_process() {
+    local pid_file=$1
+    local label=$2
+    local pid
+
+    if ! is_running "$pid_file"; then
+        rm -f "$pid_file"
+        return 0
+    fi
+
+    pid=$(cat "$pid_file")
+    log_info "重启已过期的 ${label} (PID: $pid)"
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    if ps -p "$pid" > /dev/null 2>&1; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+}
+
 find_sidecar_pids() {
     local pid command
     while read -r pid command; do
@@ -789,9 +855,14 @@ start_sidecar() {
 # 启动 Creation Service
 start_creation_service() {
     if is_running "$CREATION_PID_FILE"; then
-        log_info "Creation Service 已在运行，复用现有进程"
-        wait_for_http "http://localhost:${CREATION_PORT}/health" "Creation Service" 10 1 || log_warn "现有 Creation Service 进程健康检查失败，建议执行 ./start.sh restart"
-        return 0
+        if creation_service_sources_changed; then
+            log_info "检测到 Creation Service 源码晚于当前进程，将加载最新代码"
+            stop_managed_process "$CREATION_PID_FILE" "Creation Service"
+        else
+            log_info "Creation Service 已在运行且代码未变化，复用现有进程"
+            wait_for_http "http://localhost:${CREATION_PORT}/health" "Creation Service" 10 1 || log_warn "现有 Creation Service 进程健康检查失败，建议执行 ./start.sh restart"
+            return 0
+        fi
     fi
 
     log_info "启动 Creation Service..."
@@ -828,9 +899,14 @@ start_creation_service() {
 # 启动 Core Engine
 start_core() {
     if is_running "$CORE_PID_FILE"; then
-        log_info "Core Engine 已在运行，复用现有进程"
-        check_core_api_readiness || log_warn "当前 Core Engine 进程存在接口异常，建议执行 ./start.sh restart 进行完整重启"
-        return 0
+        if core_sources_changed; then
+            log_info "检测到 Core Engine 源码晚于当前进程，将重新构建并加载最新代码"
+            stop_managed_process "$CORE_PID_FILE" "Core Engine"
+        else
+            log_info "Core Engine 已在运行且代码未变化，复用现有进程"
+            check_core_api_readiness || log_warn "当前 Core Engine 进程存在接口异常，建议执行 ./start.sh restart 进行完整重启"
+            return 0
+        fi
     fi
 
     log_info "启动 Core Engine..."
@@ -992,8 +1068,10 @@ main() {
     esac
 }
 
-# 捕获 Ctrl+C 信号
-trap 'echo ""; log_info "收到中断信号，正在停止服务..."; stop_all; exit 0' INT TERM
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    # 捕获 Ctrl+C 信号
+    trap 'echo ""; log_info "收到中断信号，正在停止服务..."; stop_all; exit 0' INT TERM
 
-# 执行主函数
-main "$@"
+    # 执行主函数
+    main "$@"
+fi

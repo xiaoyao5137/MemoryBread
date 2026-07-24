@@ -15,10 +15,12 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
 _NOISE_OVERVIEW_PREFIX = "低价值工作片段（"
+_MAX_FALLBACK_TERMS = 12
 
 
 @dataclass
@@ -88,6 +90,11 @@ def _extract_query_terms(query: str) -> list[str]:
     return terms
 
 
+def _bounded_fallback_terms(terms: list[str]) -> list[str]:
+    """限制 LIKE 兜底词数量，避免长中文查询扩展成大量重复全表扫描。"""
+    return list(dict.fromkeys(term for term in terms if term))[:_MAX_FALLBACK_TERMS]
+
+
 
 def _build_like_clauses(expression: str, terms: list[str]) -> tuple[str, list[str]]:
     if not terms:
@@ -145,6 +152,33 @@ def _knowledge_doc_key(knowledge_id: int) -> str:
 
 def _artifact_doc_key(source_type: str, artifact_id: int) -> str:
     return f"{source_type}:{artifact_id}"
+
+
+def _canonical_document_url(url: str | None) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ""
+    if not parsed.netloc:
+        return ""
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return urlunsplit(
+        (
+            parsed.scheme.lower() or "https",
+            parsed.netloc.lower(),
+            path,
+            "",
+            "",
+        )
+    )
+
+
+def _document_url_doc_key(url: str | None) -> str:
+    canonical = _canonical_document_url(url)
+    return f"document_url:{canonical}" if canonical else ""
 
 
 def _is_link_lookup_query(query: str) -> bool:
@@ -358,8 +392,13 @@ class VectorRetriever:
                         metadata=metadata,
                         doc_key=item.get('doc_key', ''),
                     ))
-                logger.debug(f"内部向量检索返回 {len(chunks)} 条结果")
-                return chunks
+                collapsed = _merge_chunks(chunks, top_k)
+                logger.debug(
+                    "内部向量检索返回 %d 个 chunk，按文档折叠为 %d 条",
+                    len(chunks),
+                    len(collapsed),
+                )
+                return collapsed
             raise RuntimeError("内部向量搜索服务不可用，已阻止降级到关键词兜底")
 
         client = self._get_client()
@@ -370,7 +409,7 @@ class VectorRetriever:
             query_kwargs: dict[str, Any] = {
                 "collection_name": self.collection,
                 "query": query_vector,
-                "limit": top_k,
+                "limit": min(max(top_k * 4, top_k), 100),
                 "score_threshold": score_threshold,
             }
             qdrant_filter = self._build_qdrant_filter(filters)
@@ -406,8 +445,13 @@ class VectorRetriever:
                     doc_key=doc_key,
                 ))
 
-            logger.debug(f"向量检索返回 {len(chunks)} 条结果")
-            return chunks
+            collapsed = _merge_chunks(chunks, top_k)
+            logger.debug(
+                "向量检索返回 %d 个 chunk，按文档折叠为 %d 条",
+                len(chunks),
+                len(collapsed),
+            )
+            return collapsed
         except Exception as e:
             logger.error(f"向量检索失败: {e}")
             raise RuntimeError(f"向量检索失败: {e}") from e
@@ -818,22 +862,8 @@ class KnowledgeFts5Retriever:
                 k.is_self_generated,
                 k.evidence_strength,
                 k.importance,
-                (
-                    SELECT c.url
-                    FROM captures c
-                    WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
-                      AND COALESCE(c.url, '') != ''
-                    ORDER BY c.ts DESC
-                    LIMIT 1
-                ) AS linked_url,
-                (
-                    SELECT c.webpage_title
-                    FROM captures c
-                    WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
-                      AND COALESCE(c.webpage_title, '') != ''
-                    ORDER BY c.ts DESC
-                    LIMIT 1
-                ) AS linked_webpage_title,
+                NULL AS linked_url,
+                NULL AS linked_webpage_title,
                 fts.rank as score
             FROM knowledge_fts fts
             JOIN timelines k ON fts.rowid = k.id
@@ -888,18 +918,22 @@ class KnowledgeFts5Retriever:
             params.append(created_end_ts)
         sql, params = _apply_noise_filters(sql, params)
         if entity_terms:
-            clause, clause_params = _build_like_clauses(
-                "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, '') || ' ' || COALESCE((SELECT group_concat(COALESCE(c.webpage_title, '') || ' ' || COALESCE(c.url, ''), ' ') FROM captures c WHERE c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%')), ''))",
-                entity_terms,
-            )
-            sql += f" AND {clause}"
-            params.extend(clause_params)
+            bounded_entity_terms = _bounded_fallback_terms(entity_terms)
+            if bounded_entity_terms:
+                clause, clause_params = _build_like_clauses(
+                    "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, ''))",
+                    bounded_entity_terms,
+                )
+                sql += f" AND {clause}"
+                params.extend(clause_params)
 
         sql += " ORDER BY rank LIMIT ?"
         params.append(top_k)
         cursor.execute(sql, params)
         rows = cursor.fetchall()
-        return [self._row_to_chunk(row, abs(row["score"])) for row in rows]
+        chunks = [self._row_to_chunk(row, abs(row["score"])) for row in rows]
+        self._attach_primary_capture_links(cursor, chunks)
+        return chunks
 
     def _search_by_app_fields(
         self,
@@ -925,7 +959,7 @@ class KnowledgeFts5Retriever:
         terms = entity_terms or _extract_query_terms(query)
         if query_mode == "summary":
             terms = [term for term in terms if not _is_app_like_term(term)] or terms
-        terms = list(dict.fromkeys(terms))
+        terms = _bounded_fallback_terms(terms)
         # 任务型宽松检索：terms 为空时允许继续，纯按时间段和 activity_types 扫描
         # 非任务型检索：terms 为空则无意义，直接返回
         is_time_scan = not terms and (observed_start_ts is not None or start_ts is not None or created_start_ts is not None)
@@ -955,22 +989,8 @@ class KnowledgeFts5Retriever:
                 k.is_self_generated,
                 k.evidence_strength,
                 k.importance,
-                (
-                    SELECT c.url
-                    FROM captures c
-                    WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
-                      AND COALESCE(c.url, '') != ''
-                    ORDER BY c.ts DESC
-                    LIMIT 1
-                ) AS linked_url,
-                (
-                    SELECT c.webpage_title
-                    FROM captures c
-                    WHERE (c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%'))
-                      AND COALESCE(c.webpage_title, '') != ''
-                    ORDER BY c.ts DESC
-                    LIMIT 1
-                ) AS linked_webpage_title
+                NULL AS linked_url,
+                NULL AS linked_webpage_title
             FROM timelines k
             WHERE 1=1
         """
@@ -1025,7 +1045,7 @@ class KnowledgeFts5Retriever:
         sql, params = _apply_noise_filters(sql, params)
         if terms:
             clause, clause_params = _build_like_clauses(
-                "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, '') || ' ' || COALESCE((SELECT group_concat(COALESCE(c.webpage_title, '') || ' ' || COALESCE(c.url, ''), ' ') FROM captures c WHERE c.id = k.capture_id OR COALESCE(k.capture_ids, '') LIKE ('%' || c.id || '%')), ''))",
+                "LOWER(COALESCE(k.summary, '') || ' ' || COALESCE(k.overview, '') || ' ' || COALESCE(k.details, '') || ' ' || COALESCE(k.frag_app_name, '') || ' ' || COALESCE(k.frag_win_title, ''))",
                 terms,
             )
             sql += f" AND {clause}"
@@ -1041,7 +1061,49 @@ class KnowledgeFts5Retriever:
 
         rows = cursor.fetchall()
         chunks = [self._row_to_chunk(row, float(len(terms)) if terms else 1.0) for row in rows]
+        self._attach_primary_capture_links(cursor, chunks)
         return _rank_keyword_chunks(chunks, terms, prefer_url=_is_link_lookup_query(query))[:top_k]
+
+    @staticmethod
+    def _attach_primary_capture_links(
+        cursor: sqlite3.Cursor,
+        chunks: list[RetrievedChunk],
+    ) -> None:
+        """仅为已命中的少量知识批量补链接，避免检索 SQL 对 captures 做相关扫描。"""
+        capture_ids = list(dict.fromkeys(
+            int(chunk.capture_id)
+            for chunk in chunks
+            if chunk.capture_id
+        ))
+        if not capture_ids:
+            return
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='captures'")
+        if not cursor.fetchone():
+            return
+
+        placeholders = ", ".join("?" for _ in capture_ids)
+        cursor.execute(
+            f"""
+            SELECT id, url, webpage_title
+            FROM captures
+            WHERE id IN ({placeholders})
+            """,
+            capture_ids,
+        )
+        links = {
+            int(row["id"]): (row["url"], row["webpage_title"])
+            for row in cursor.fetchall()
+        }
+        for chunk in chunks:
+            link = links.get(int(chunk.capture_id or 0))
+            if not link:
+                continue
+            url, webpage_title = link
+            if url:
+                chunk.metadata["url"] = url
+            if webpage_title:
+                chunk.metadata["webpage_title"] = webpage_title
 
     def _row_to_chunk(self, row: sqlite3.Row, score: float) -> RetrievedChunk:
         knowledge_id = row["id"]
@@ -1255,7 +1317,10 @@ class KnowledgeFts5Retriever:
 
     def _document_row_to_chunk(self, row: sqlite3.Row, terms: list[str]) -> RetrievedChunk:
         artifact_id = int(row["id"])
-        doc_key = _artifact_doc_key("document", artifact_id)
+        doc_key = (
+            _document_url_doc_key(row["source_url"])
+            or _artifact_doc_key("document", artifact_id)
+        )
         source_timeline_ids = self._json_ids(row["source_memory_ids"])
         linked_knowledge_ids = self._json_ids(row["linked_knowledge_ids"])
         text = self._build_document_text(row)

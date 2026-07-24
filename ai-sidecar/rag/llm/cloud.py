@@ -11,6 +11,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+from typing import Callable
 
 from .base import LlmBackend, LlmResponse
 
@@ -45,6 +46,17 @@ class CloudChatBackend(LlmBackend):
         if "claude" in self._model.lower() or "anthropic.com" in self._base_url:
             return self._complete_anthropic(prompt, system, **kwargs)
         return self._complete_openai_compatible(prompt, system, **kwargs)
+
+    def complete_stream(
+        self,
+        prompt: str,
+        system: str = "",
+        on_delta: Callable[[str], None] | None = None,
+        **kwargs,
+    ) -> LlmResponse:
+        if "claude" in self._model.lower() or "anthropic.com" in self._base_url:
+            return self._stream_anthropic(prompt, system, on_delta=on_delta, **kwargs)
+        return self._stream_openai_compatible(prompt, system, on_delta=on_delta, **kwargs)
 
     def _complete_openai_compatible(self, prompt: str, system: str = "", **kwargs) -> LlmResponse:
         base_url = self._base_url or self._default_base_url()
@@ -104,6 +116,134 @@ class CloudChatBackend(LlmBackend):
             tokens=usage.get("output_tokens", 0),
             done_reason=data.get("stop_reason"),
         )
+
+    def _stream_openai_compatible(
+        self,
+        prompt: str,
+        system: str = "",
+        on_delta: Callable[[str], None] | None = None,
+        **kwargs,
+    ) -> LlmResponse:
+        base_url = self._base_url or self._default_base_url()
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        payload = {
+            "model": self._model,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": kwargs.get("temperature", 0.5),
+            "top_p": kwargs.get("top_p", 0.9),
+            "max_tokens": kwargs.get("num_predict", 1536),
+        }
+        parts: list[str] = []
+        model = self._model
+        tokens = 0
+        done_reason = None
+        for data in self._iter_sse_json(
+            url,
+            payload,
+            {
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+        ):
+            model = data.get("model", model)
+            usage = data.get("usage") or {}
+            tokens = usage.get("completion_tokens", tokens)
+            choice = (data.get("choices") or [{}])[0]
+            delta = (choice.get("delta") or {}).get("content") or ""
+            if delta:
+                parts.append(delta)
+                if on_delta:
+                    on_delta(delta)
+            done_reason = choice.get("finish_reason") or done_reason
+        return LlmResponse(
+            text="".join(parts),
+            model=model,
+            tokens=tokens,
+            done_reason=done_reason,
+        )
+
+    def _stream_anthropic(
+        self,
+        prompt: str,
+        system: str = "",
+        on_delta: Callable[[str], None] | None = None,
+        **kwargs,
+    ) -> LlmResponse:
+        url = self._anthropic_messages_url(self._base_url)
+        payload = {
+            "model": self._model,
+            "max_tokens": kwargs.get("num_predict", 1536),
+            "stream": True,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        parts: list[str] = []
+        model = self._model
+        tokens = 0
+        done_reason = None
+        for data in self._iter_sse_json(
+            url,
+            payload,
+            {
+                "x-api-key": self._api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+        ):
+            event_type = data.get("type")
+            if event_type == "message_start":
+                message = data.get("message") or {}
+                model = message.get("model", model)
+            elif event_type == "content_block_delta":
+                delta = (data.get("delta") or {}).get("text") or ""
+                if delta:
+                    parts.append(delta)
+                    if on_delta:
+                        on_delta(delta)
+            elif event_type == "message_delta":
+                delta = data.get("delta") or {}
+                usage = data.get("usage") or {}
+                tokens = usage.get("output_tokens", tokens)
+                done_reason = delta.get("stop_reason") or done_reason
+        return LlmResponse(
+            text="".join(parts),
+            model=model,
+            tokens=tokens,
+            done_reason=done_reason,
+        )
+
+    def _iter_sse_json(self, url: str, payload: dict, headers: dict):
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_text = line[5:].strip()
+                    if not data_text or data_text == "[DONE]":
+                        continue
+                    yield json.loads(data_text)
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"云端模型请求失败 HTTP {exc.code}: {body_text}") from exc
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError, ConnectionError) as exc:
+            detail = self._network_error_detail(exc)
+            raise RuntimeError(
+                "云端模型服务不可达：网络或 TLS 连接被中断，请检查网络、代理/VPN、"
+                f"模型服务 base_url 配置后重试。技术细节：{detail}"
+            ) from exc
 
     def _post_json(self, url: str, payload: dict, headers: dict) -> dict:
         body = json.dumps(payload).encode("utf-8")

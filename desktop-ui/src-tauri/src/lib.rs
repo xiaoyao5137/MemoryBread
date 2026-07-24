@@ -1,9 +1,14 @@
+#[cfg(not(debug_assertions))]
+use std::fs::OpenOptions;
 use std::{
     fs,
     io::{Read, Write},
     path::PathBuf,
-    process::{Command, Stdio},
-    sync::atomic::{AtomicBool, AtomicI64, Ordering},
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, AtomicI64, Ordering},
+        Mutex, OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,6 +21,7 @@ use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, RunEvent, WebviewUrl,
     WebviewWindowBuilder, WindowEvent,
 };
+#[cfg(not(feature = "app-store"))]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 #[cfg(target_os = "macos")]
@@ -25,18 +31,22 @@ use objc2::{
     msg_send,
     rc::Retained,
     runtime::AnyObject,
-    AllocAnyThread, DeclaredClass, MainThreadMarker,
+    AllocAnyThread, DeclaredClass, MainThreadMarker, MainThreadOnly,
 };
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
-    NSEvent, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSApplication, NSEvent, NSImageView, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWorkspace,
 };
 use tauri_plugin_shell::ShellExt;
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
+#[cfg(debug_assertions)]
 static FULL_SHUTDOWN_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static LAST_FLOATING_ASSIST_TEMP_CLEANUP_MS: AtomicI64 = AtomicI64::new(0);
+static PACKAGED_RUNTIME_HOME: OnceLock<PathBuf> = OnceLock::new();
 const FLOATING_ASSIST_LABEL: &str = "floating-assist";
+#[cfg(debug_assertions)]
 const SUPERVISOR_SHUTDOWN_MARKER: &str = "supervisor-shutdown-in-progress";
 const FLOATING_ASSIST_DEFAULT_MARGIN: i32 = 24;
 const FLOATING_ASSIST_DEFAULT_TOP: i32 = 140;
@@ -44,6 +54,8 @@ const FLOATING_ASSIST_DEFAULT_SIZE: i32 = 82;
 const FLOATING_ASSIST_TEMP_KEEP_SECS: u64 = 24 * 60 * 60;
 const FLOATING_ASSIST_TEMP_CLEANUP_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 const TRAY_TEMPLATE_ICON_SIZE: u32 = 64;
+#[cfg(target_os = "macos")]
+const DOCK_ICON_SCALE: f64 = 0.84;
 
 #[cfg(target_os = "macos")]
 static FLOATING_ASSIST_HOVER_OWNER_KEY: u8 = 0;
@@ -181,6 +193,26 @@ struct TrayMenuState {
     autostart: CheckMenuItem<tauri::Wry>,
 }
 
+struct BundledBackendProcess {
+    name: &'static str,
+    child: Child,
+}
+
+#[derive(Default)]
+struct BundledBackendState {
+    children: Mutex<Vec<BundledBackendProcess>>,
+}
+
+#[derive(Default)]
+struct FloatingAssistWindowState {
+    expand_origin: Mutex<Option<PhysicalPosition<i32>>>,
+}
+
+#[derive(Default)]
+struct PendingFloatingAssistActionState {
+    action: Mutex<Option<String>>,
+}
+
 #[derive(Debug, Serialize)]
 struct FloatingAssistOcrResult {
     text: String,
@@ -243,7 +275,58 @@ struct FloatingAssistScreenCapture {
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
+#[cfg(target_os = "macos")]
+fn configure_macos_dock_icon() {
+    let Some(main_thread_marker) = MainThreadMarker::new() else {
+        eprintln!("无法在主线程配置 macOS Dock 图标");
+        return;
+    };
+    let application = NSApplication::sharedApplication(main_thread_marker);
+    let Some(application_icon) = application.applicationIconImage() else {
+        eprintln!("无法读取 macOS 应用图标");
+        return;
+    };
+    let dock_tile = application.dockTile();
+    let tile_size = dock_tile.size();
+
+    let container = NSView::initWithFrame(NSView::alloc(main_thread_marker), Default::default());
+    container.setFrameSize(tile_size);
+
+    let icon_view = NSImageView::imageViewWithImage(&application_icon, main_thread_marker);
+    let mut icon_frame = icon_view.frame();
+    icon_frame.size.width = tile_size.width * DOCK_ICON_SCALE;
+    icon_frame.size.height = tile_size.height * DOCK_ICON_SCALE;
+    icon_frame.origin.x = (tile_size.width - icon_frame.size.width) / 2.0;
+    icon_frame.origin.y = (tile_size.height - icon_frame.size.height) / 2.0;
+    icon_view.setFrame(icon_frame);
+
+    container.addSubview(&icon_view);
+    dock_tile.setContentView(Some(&container));
+    dock_tile.display();
+}
+
+#[cfg(target_os = "macos")]
+fn set_main_window_background_mode(app: &AppHandle, enabled: bool) {
+    let policy = if enabled {
+        tauri::ActivationPolicy::Accessory
+    } else {
+        tauri::ActivationPolicy::Regular
+    };
+    if let Err(error) = app.set_activation_policy(policy) {
+        eprintln!("更新 macOS 应用显示模式失败: {error}");
+    }
+    if !enabled {
+        if let Err(error) = app.run_on_main_thread(configure_macos_dock_icon) {
+            eprintln!("配置 macOS Dock 图标失败: {error}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_main_window_background_mode(_app: &AppHandle, _enabled: bool) {}
+
 fn show_main_window(app: &AppHandle) {
+    set_main_window_background_mode(app, false);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -257,7 +340,7 @@ fn ensure_floating_assist_window(app: &AppHandle) -> Result<tauri::WebviewWindow
         return Ok(window);
     }
 
-    let window = WebviewWindowBuilder::new(
+    let window_builder = WebviewWindowBuilder::new(
         app,
         FLOATING_ASSIST_LABEL,
         WebviewUrl::App("index.html?view=floating-assist".into()),
@@ -272,17 +355,19 @@ fn ensure_floating_assist_window(app: &AppHandle) -> Result<tauri::WebviewWindow
         FLOATING_ASSIST_DEFAULT_SIZE as f64,
     )
     .resizable(false)
-    .decorations(false)
-    .transparent(true)
-    .shadow(false)
-    .always_on_top(true)
-    .accept_first_mouse(true)
-    .content_protected(false)
-    .skip_taskbar(true)
-    .visible(false)
-    .position(960.0, 140.0)
-    .build()
-    .map_err(|error| error.to_string())?;
+    .decorations(false);
+    #[cfg(not(feature = "app-store"))]
+    let window_builder = window_builder.transparent(true);
+    let window = window_builder
+        .shadow(false)
+        .always_on_top(true)
+        .accept_first_mouse(true)
+        .content_protected(false)
+        .skip_taskbar(true)
+        .visible(false)
+        .position(960.0, 140.0)
+        .build()
+        .map_err(|error| error.to_string())?;
     configure_floating_assist_macos_window(&window);
     Ok(window)
 }
@@ -366,9 +451,9 @@ fn clamp_position_to_monitor_work_area(
 
 fn floating_assist_outer_size(
     window: &tauri::WebviewWindow,
-    fallback_logical_size: Option<(f64, f64)>,
+    target_logical_size: Option<(f64, f64)>,
 ) -> (i32, i32) {
-    let fallback_size = fallback_logical_size.map(|(width, height)| {
+    let target_size = target_logical_size.map(|(width, height)| {
         let scale_factor = window
             .current_monitor()
             .ok()
@@ -381,27 +466,24 @@ fn floating_assist_outer_size(
         )
     });
 
-    if let Ok(size) = window.outer_size() {
-        let outer_size = (size.width as i32, size.height as i32);
-        if let Some(fallback_size) = fallback_size {
-            return (
-                outer_size.0.max(fallback_size.0),
-                outer_size.1.max(fallback_size.1),
-            );
-        }
-        return outer_size;
+    if let Some(target_size) = target_size {
+        return target_size;
     }
 
-    fallback_size.unwrap_or((FLOATING_ASSIST_DEFAULT_SIZE, FLOATING_ASSIST_DEFAULT_SIZE))
+    if let Ok(size) = window.outer_size() {
+        return (size.width as i32, size.height as i32);
+    }
+
+    (FLOATING_ASSIST_DEFAULT_SIZE, FLOATING_ASSIST_DEFAULT_SIZE)
 }
 
 fn set_floating_assist_position_clamped(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
     position: PhysicalPosition<i32>,
-    fallback_logical_size: Option<(f64, f64)>,
+    target_logical_size: Option<(f64, f64)>,
 ) -> Result<(), String> {
-    let (window_width, window_height) = floating_assist_outer_size(window, fallback_logical_size);
+    let (window_width, window_height) = floating_assist_outer_size(window, target_logical_size);
     let clamped_position = monitor_for_position(app, window, position)
         .map(|monitor| {
             clamp_position_to_monitor_work_area(&monitor, position, window_width, window_height)
@@ -413,8 +495,39 @@ fn set_floating_assist_position_clamped(
         .map_err(|error| error.to_string())
 }
 
+fn floating_assist_is_collapsed_size(width: f64, height: f64) -> bool {
+    width <= FLOATING_ASSIST_DEFAULT_SIZE as f64 && height <= FLOATING_ASSIST_DEFAULT_SIZE as f64
+}
+
+fn floating_assist_position_after_resize(
+    expand_origin: &mut Option<PhysicalPosition<i32>>,
+    current_position: PhysicalPosition<i32>,
+    width: f64,
+    height: f64,
+) -> PhysicalPosition<i32> {
+    if floating_assist_is_collapsed_size(width, height) {
+        expand_origin.take().unwrap_or(current_position)
+    } else {
+        if expand_origin.is_none() {
+            *expand_origin = Some(current_position);
+        }
+        current_position
+    }
+}
+
+fn clear_floating_assist_expand_origin(app: &AppHandle) {
+    if let Ok(mut expand_origin) = app
+        .state::<FloatingAssistWindowState>()
+        .expand_origin
+        .lock()
+    {
+        *expand_origin = None;
+    }
+}
+
 fn set_floating_assist_visible_inner(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let menu_state = app.state::<TrayMenuState>();
+    clear_floating_assist_expand_origin(app);
     if enabled {
         let window = ensure_floating_assist_window(app)?;
         let _ = window.set_size(LogicalSize::new(
@@ -463,8 +576,7 @@ fn set_floating_assist_visible_inner(app: &AppHandle, enabled: bool) -> Result<(
 }
 
 fn floating_assist_temp_dir() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "无法定位用户目录".to_string())?;
-    let dir = PathBuf::from(home)
+    let dir = memory_bread_home()?
         .join(".memory-bread")
         .join("floating-screenshots");
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
@@ -625,16 +737,10 @@ fn capture_all_screens_for_floating_assist() -> Result<FloatingAssistScreenCaptu
 
 #[cfg(target_os = "macos")]
 fn frontmost_bundle_id_for_floating_assist() -> Option<String> {
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg("tell application \"System Events\" to get bundle identifier of first application process whose frontmost is true")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()?
+        .bundleIdentifier()
+        .map(|identifier| identifier.to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -828,17 +934,146 @@ fn send_sidecar_ocr(path: &str) -> Result<IpcOcrResult, String> {
     serde_json::from_value(result).map_err(|error| error.to_string())
 }
 
+fn memory_bread_home() -> Result<PathBuf, String> {
+    if let Some(path) = PACKAGED_RUNTIME_HOME.get() {
+        return Ok(path.clone());
+    }
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|_| "无法定位用户目录".to_string())
+}
+
+#[cfg(not(debug_assertions))]
+fn bundled_helper_path(name: &str) -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| "无法定位 App 内置服务目录".to_string())?;
+    let helper = if name == "memory-bread-ai" {
+        directory
+            .parent()
+            .ok_or_else(|| "无法定位 App Contents 目录".to_string())?
+            .join("Helpers")
+            .join("memory-bread-ai.app")
+            .join("Contents")
+            .join("MacOS")
+            .join(name)
+    } else {
+        directory.join(name)
+    };
+    if !helper.is_file() {
+        return Err(format!("App 缺少内置服务: {}", helper.display()));
+    }
+    Ok(helper)
+}
+
+#[cfg(not(debug_assertions))]
+fn spawn_bundled_backend(
+    name: &'static str,
+    executable: &PathBuf,
+    args: &[&str],
+    runtime_home: &PathBuf,
+    log_dir: &PathBuf,
+) -> Result<BundledBackendProcess, String> {
+    let log_path = log_dir.join(format!("{name}.log"));
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|error| format!("无法打开 {} 日志: {error}", log_path.display()))?;
+    let stderr = log.try_clone().map_err(|error| error.to_string())?;
+    let working_directory = executable
+        .parent()
+        .ok_or_else(|| format!("无法定位 {name} 工作目录"))?;
+    let child = Command::new(executable)
+        .args(args)
+        .current_dir(working_directory)
+        .env("HOME", runtime_home)
+        .env("MEMORY_BREAD_PACKAGED", "1")
+        .env("PYTHONUNBUFFERED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|error| format!("启动内置服务 {name} 失败: {error}"))?;
+    Ok(BundledBackendProcess { name, child })
+}
+
+#[cfg(not(debug_assertions))]
+fn start_bundled_backends(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<BundledBackendState>();
+    let mut children = state
+        .children
+        .lock()
+        .map_err(|_| "内置服务状态锁已损坏".to_string())?;
+    if !children.is_empty() {
+        return Ok(());
+    }
+
+    let runtime_home = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("runtime");
+    let log_dir = runtime_home.join(".memory-bread").join("logs");
+    fs::create_dir_all(&log_dir).map_err(|error| error.to_string())?;
+    let _ = PACKAGED_RUNTIME_HOME.set(runtime_home.clone());
+
+    let ai = bundled_helper_path("memory-bread-ai")?;
+    let core = bundled_helper_path("memory-bread-core")?;
+    let services: [(&'static str, &PathBuf, &[&str]); 4] = [
+        ("sidecar", &ai, &["sidecar"]),
+        ("model_api", &ai, &["model-api"]),
+        ("creation", &ai, &["creation"]),
+        ("core", &core, &[]),
+    ];
+
+    let mut started = Vec::with_capacity(services.len());
+    for (name, executable, args) in services {
+        match spawn_bundled_backend(name, executable, args, &runtime_home, &log_dir) {
+            Ok(child) => started.push(child),
+            Err(error) => {
+                for process in started.iter_mut().rev() {
+                    let _ = process.child.kill();
+                    let _ = process.child.wait();
+                }
+                return Err(error);
+            }
+        }
+    }
+    *children = started;
+    Ok(())
+}
+
+fn stop_bundled_backends(app: &AppHandle) {
+    let state = app.state::<BundledBackendState>();
+    let Ok(mut children) = state.children.lock() else {
+        return;
+    };
+    for process in children.iter_mut().rev() {
+        if process.child.try_wait().ok().flatten().is_none() {
+            if let Err(error) = process.child.kill() {
+                eprintln!("停止内置服务 {} 失败: {error}", process.name);
+            }
+        }
+        let _ = process.child.wait();
+    }
+    children.clear();
+}
+
+#[cfg(debug_assertions)]
 fn start_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("start.sh")
 }
 
+#[cfg(debug_assertions)]
 fn supervisor_shutdown_in_progress() -> bool {
-    let Ok(home) = std::env::var("HOME") else {
+    let Ok(home) = memory_bread_home() else {
         return false;
     };
-    let marker = PathBuf::from(home)
+    let marker = home
         .join(".memory-bread")
         .join("state")
         .join(SUPERVISOR_SHUTDOWN_MARKER);
@@ -857,6 +1092,7 @@ fn supervisor_shutdown_in_progress() -> bool {
 }
 
 /// 退出 App 后再由独立脚本停止启动器和所有后台服务，避免脚本先杀掉当前进程。
+#[cfg(debug_assertions)]
 fn schedule_full_shutdown() {
     if supervisor_shutdown_in_progress() {
         return;
@@ -884,6 +1120,10 @@ fn schedule_full_shutdown() {
     }
 }
 
+#[cfg(not(debug_assertions))]
+fn schedule_full_shutdown() {}
+
+#[cfg(debug_assertions)]
 fn schedule_backend_startup() {
     let script = start_script_path();
     if !script.is_file() {
@@ -901,6 +1141,35 @@ fn schedule_backend_startup() {
     {
         eprintln!("启动后台服务失败: {error}");
     }
+}
+
+#[cfg(not(debug_assertions))]
+fn schedule_backend_startup() {}
+
+#[cfg(not(feature = "app-store"))]
+fn autostart_enabled(app: &AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[cfg(feature = "app-store")]
+fn autostart_enabled(_app: &AppHandle) -> bool {
+    false
+}
+
+#[cfg(not(feature = "app-store"))]
+fn update_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    if enabled {
+        app.autolaunch().enable().map_err(|error| error.to_string())
+    } else {
+        app.autolaunch()
+            .disable()
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(feature = "app-store")]
+fn update_autostart(_app: &AppHandle, _enabled: bool) -> Result<(), String> {
+    Err("Mac App Store 版本暂不支持登录时自动启动".to_string())
 }
 
 #[tauri::command]
@@ -961,6 +1230,39 @@ fn show_main_panel_from_floating_assist(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn trigger_floating_assist_action(app: AppHandle, action: String) -> Result<(), String> {
+    if action != "recognize_screen_task" {
+        return Err(format!("不支持的悬浮球动作: {action}"));
+    }
+
+    {
+        let state = app.state::<PendingFloatingAssistActionState>();
+        let mut pending = state.action.lock().map_err(|error| error.to_string())?;
+        *pending = Some(action.clone());
+    }
+
+    if let Err(error) = set_floating_assist_visible_inner(&app, true) {
+        if let Ok(mut pending) = app
+            .state::<PendingFloatingAssistActionState>()
+            .action
+            .lock()
+        {
+            *pending = None;
+        }
+        return Err(error);
+    }
+    app.emit("floating-assist-action-triggered", action)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn take_pending_floating_assist_action(app: AppHandle) -> Result<Option<String>, String> {
+    let state = app.state::<PendingFloatingAssistActionState>();
+    let mut pending = state.action.lock().map_err(|error| error.to_string())?;
+    Ok(pending.take())
+}
+
+#[tauri::command]
 fn set_floating_assist_position(app: AppHandle, x: f64, y: f64) -> Result<(), String> {
     let window = ensure_floating_assist_window(&app)?;
     set_floating_assist_position_clamped(
@@ -1000,13 +1302,19 @@ fn update_floating_assist_drag(app: AppHandle, offset_x: f64, offset_y: f64) -> 
 #[tauri::command]
 fn set_floating_assist_size(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
     let window = ensure_floating_assist_window(&app)?;
+    let current_position = window.outer_position().map_err(|error| error.to_string())?;
+    let window_state = app.state::<FloatingAssistWindowState>();
+    let mut expand_origin = window_state
+        .expand_origin
+        .lock()
+        .map_err(|error| error.to_string())?;
     window
         .set_size(LogicalSize::new(width, height))
         .map_err(|error| error.to_string())?;
 
-    if let Ok(position) = window.outer_position() {
-        set_floating_assist_position_clamped(&app, &window, position, Some((width, height)))?;
-    }
+    let target_position =
+        floating_assist_position_after_resize(&mut expand_origin, current_position, width, height);
+    set_floating_assist_position_clamped(&app, &window, target_position, Some((width, height)))?;
     configure_floating_assist_macos_window(&window);
 
     Ok(())
@@ -1106,18 +1414,26 @@ async fn capture_screen_ocr_for_floating_assist(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec!["--autostart"]),
-        ))
+    let builder = tauri::Builder::default().plugin(tauri_plugin_shell::init());
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    #[cfg(not(feature = "app-store"))]
+    let builder = builder.plugin(tauri_plugin_autostart::init(
+        MacosLauncher::LaunchAgent,
+        Some(vec!["--autostart"]),
+    ));
+    builder
+        .manage(BundledBackendState::default())
+        .manage(FloatingAssistWindowState::default())
+        .manage(PendingFloatingAssistActionState::default())
         .invoke_handler(tauri::generate_handler![
             set_capture_menu_state,
             set_floating_assist_menu_state,
             set_floating_assist_auto_task_menu_state,
             set_floating_assist_visible,
             show_main_panel_from_floating_assist,
+            trigger_floating_assist_action,
+            take_pending_floating_assist_action,
             set_floating_assist_position,
             begin_floating_assist_drag,
             update_floating_assist_drag,
@@ -1128,12 +1444,17 @@ pub fn run() {
             capture_screen_ocr_for_floating_assist,
         ])
         .setup(|app| {
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            let started_in_background = std::env::args().any(|argument| argument == "--autostart");
+            set_main_window_background_mode(app.handle(), started_in_background);
+
+            #[cfg(not(debug_assertions))]
+            if let Err(error) = start_bundled_backends(app.handle()) {
+                eprintln!("内置服务启动失败: {error}");
+            }
 
             let main_panel = MenuItem::with_id(app, "main-panel", "主面板", true, None::<&str>)?;
             let capture =
-                CheckMenuItem::with_id(app, "capture", "打开/关闭采集", true, true, None::<&str>)?;
+                CheckMenuItem::with_id(app, "capture", "打开/关闭采集", true, false, None::<&str>)?;
             let floating_assist = CheckMenuItem::with_id(
                 app,
                 "floating-assist",
@@ -1150,12 +1471,12 @@ pub fn run() {
                 false,
                 None::<&str>,
             )?;
-            let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+            let autostart_enabled = autostart_enabled(app.handle());
             let autostart = CheckMenuItem::with_id(
                 app,
                 "autostart",
                 "开机默认启动",
-                true,
+                !cfg!(feature = "app-store"),
                 autostart_enabled,
                 None::<&str>,
             )?;
@@ -1231,11 +1552,7 @@ pub fn run() {
                     "autostart" => {
                         let state = app.state::<TrayMenuState>();
                         let requested = state.autostart.is_checked().unwrap_or(false);
-                        let result = if requested {
-                            app.autolaunch().enable()
-                        } else {
-                            app.autolaunch().disable()
-                        };
+                        let result = update_autostart(app, requested);
                         if let Err(error) = result {
                             eprintln!("更新开机启动状态失败: {error}");
                             let _ = state.autostart.set_checked(!requested);
@@ -1247,6 +1564,7 @@ pub fn run() {
                     }
                     "quit" => {
                         QUITTING.store(true, Ordering::SeqCst);
+                        stop_bundled_backends(app);
                         schedule_full_shutdown();
                         app.exit(0);
                     }
@@ -1270,7 +1588,7 @@ pub fn run() {
             }
             tray.build(app)?;
 
-            if std::env::args().any(|argument| argument == "--autostart") {
+            if started_in_background {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
@@ -1284,15 +1602,78 @@ pub fn run() {
                 if !QUITTING.load(Ordering::SeqCst) {
                     api.prevent_close();
                     let _ = window.hide();
+                    if window.label() == "main" {
+                        set_main_window_background_mode(window.app_handle(), true);
+                    }
                 }
             }
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(&event, RunEvent::Reopen { .. }) {
+                show_main_window(app);
+            }
             if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
                 QUITTING.store(true, Ordering::SeqCst);
+                stop_bundled_backends(app);
                 schedule_full_shutdown();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floating_assist_collapse_restores_the_expand_origin() {
+        let collapsed_position = PhysicalPosition::new(1814, 140);
+        let expanded_position = PhysicalPosition::new(1504, 140);
+        let mut expand_origin = None;
+
+        let expand_target = floating_assist_position_after_resize(
+            &mut expand_origin,
+            collapsed_position,
+            392.0,
+            502.0,
+        );
+        assert_eq!(expand_target, collapsed_position);
+        assert_eq!(expand_origin, Some(collapsed_position));
+
+        let resized_target = floating_assist_position_after_resize(
+            &mut expand_origin,
+            expanded_position,
+            720.0,
+            540.0,
+        );
+        assert_eq!(resized_target, expanded_position);
+        assert_eq!(expand_origin, Some(collapsed_position));
+
+        let collapse_target = floating_assist_position_after_resize(
+            &mut expand_origin,
+            expanded_position,
+            FLOATING_ASSIST_DEFAULT_SIZE as f64,
+            FLOATING_ASSIST_DEFAULT_SIZE as f64,
+        );
+        assert_eq!(collapse_target, collapsed_position);
+        assert_eq!(expand_origin, None);
+    }
+
+    #[test]
+    fn floating_assist_collapsed_resize_keeps_the_current_position_without_an_origin() {
+        let current_position = PhysicalPosition::new(320, 240);
+        let mut expand_origin = None;
+
+        let target = floating_assist_position_after_resize(
+            &mut expand_origin,
+            current_position,
+            FLOATING_ASSIST_DEFAULT_SIZE as f64,
+            FLOATING_ASSIST_DEFAULT_SIZE as f64,
+        );
+
+        assert_eq!(target, current_position);
+        assert_eq!(expand_origin, None);
+    }
 }

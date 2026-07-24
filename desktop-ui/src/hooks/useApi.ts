@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useAppStore }  from '../store/useAppStore'
+import { serviceEnvironmentHeaders, useAppStore } from '../store/useAppStore'
 import type { CreationModelConfig } from '../store/useAppStore'
 import { LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, getEffectiveCreationModelId } from '../utils/modelSelection'
+import { toUserFacingError } from '../utils/userFacingError'
 import type {
   ArticleTemplate,
   BakeBucket,
@@ -96,6 +97,33 @@ interface RagJobStatusResponse {
   updated_at_ms: number
 }
 
+export interface RagStreamStatus {
+  stage: 'queued' | 'understanding' | 'retrieving' | 'answering' | string
+  message: string
+  progress: number
+}
+
+export interface RagStreamCallbacks {
+  onStatus?: (status: RagStreamStatus) => void
+  onReferences?: (contexts: RagContext[]) => void
+  onDelta?: (text: string, accumulated: string) => void
+}
+
+interface RagStreamEvent {
+  type: 'status' | 'references' | 'delta' | 'done' | 'error' | string
+  stage?: string
+  message?: string
+  progress?: number
+  contexts?: RagContext[]
+  text?: string
+  answer?: string
+  model?: string
+  done_reason?: string | null
+  output_truncated?: boolean
+  elapsed_ms?: number
+  inference_elapsed_ms?: number
+}
+
 export const getActiveCreationModelPayload = (configs: CreationModelConfig[], remoteAllowed = false) => {
   const effectiveId = getEffectiveCreationModelId(configs, remoteAllowed)
   if (effectiveId !== LOCAL_CREATION_MODEL_ID) return {}
@@ -108,6 +136,118 @@ export const getActiveCreationModelPayload = (configs: CreationModelConfig[], re
     payload.creation_base_url = active.baseUrl
   }
   return payload
+}
+
+const consumeRagEventStream = async (
+  response: Response,
+  callbacks: RagStreamCallbacks,
+): Promise<RagQueryResponse> => {
+  if (!response.body) throw new Error('咨询流式响应不可读，请重试')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let accumulated = ''
+  let result: RagQueryResponse | null = null
+  let streamError: Error | null = null
+
+  const consumeEventBlock = (block: string) => {
+    const dataText = block
+      .split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n')
+    if (!dataText || dataText === '[DONE]') return
+    let event: RagStreamEvent
+    try {
+      event = JSON.parse(dataText)
+    } catch {
+      return
+    }
+    if (event.type === 'status') {
+      callbacks.onStatus?.({
+        stage: event.stage || 'answering',
+        message: event.message || '正在处理',
+        progress: Math.max(0, Math.min(100, Number(event.progress) || 0)),
+      })
+      return
+    }
+    if (event.type === 'references') {
+      callbacks.onReferences?.(Array.isArray(event.contexts) ? event.contexts : [])
+      return
+    }
+    if (event.type === 'delta') {
+      const delta = event.text || ''
+      if (!delta) return
+      accumulated += delta
+      callbacks.onDelta?.(delta, accumulated)
+      return
+    }
+    if (event.type === 'error') {
+      streamError = new Error(event.message || '咨询流式生成失败，请重试')
+      return
+    }
+    if (event.type === 'done') {
+      const answer = String(event.answer ?? accumulated).trim()
+      result = {
+        answer,
+        contexts: Array.isArray(event.contexts) ? event.contexts : [],
+        model: event.model || '',
+        done_reason: event.done_reason,
+        output_truncated: Boolean(event.output_truncated),
+        elapsed_ms: Number.isFinite(event.elapsed_ms) ? event.elapsed_ms : undefined,
+        inference_elapsed_ms: Number.isFinite(event.inference_elapsed_ms) ? event.inference_elapsed_ms : undefined,
+      }
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value, { stream: !done })
+    let boundary = buffer.search(/\r?\n\r?\n/)
+    while (boundary >= 0) {
+      const match = buffer.slice(boundary).match(/^\r?\n\r?\n/)?.[0] || '\n\n'
+      consumeEventBlock(buffer.slice(0, boundary))
+      buffer = buffer.slice(boundary + match.length)
+      boundary = buffer.search(/\r?\n\r?\n/)
+    }
+    if (streamError) {
+      await reader.cancel().catch(() => undefined)
+      throw streamError
+    }
+    if (done) break
+  }
+  if (buffer.trim()) consumeEventBlock(buffer)
+  if (streamError) throw streamError
+  if (!result) throw new Error('咨询流式响应提前结束，请重试')
+  return result
+}
+
+export async function runRagQueryStream(
+  apiBaseUrl: string,
+  creationModelConfigs: CreationModelConfig[],
+  query: string,
+  topK = RAG_REFERENCE_LIMIT,
+  extraPayload: Record<string, unknown> = {},
+  remoteAllowed = false,
+  signal?: AbortSignal,
+  callbacks: RagStreamCallbacks = {},
+): Promise<RagQueryResponse> {
+  const normalizedApiBaseUrl = normalizeLocalApiBaseUrl(apiBaseUrl)
+  const response = await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    signal,
+    body: JSON.stringify({
+      query,
+      top_k: topK,
+      ...getActiveCreationModelPayload(creationModelConfigs, remoteAllowed),
+      ...extraPayload,
+    }),
+  })
+  if (!response.ok) {
+    throw new Error(await parseApiErrorMessage(response, `query stream failed: ${response.status}`))
+  }
+  return consumeRagEventStream(response, callbacks)
 }
 
 export async function runRagQueryJob(
@@ -238,7 +378,7 @@ export async function runGatewayRagQuery(
   const normalizedGateway = gatewayApiBaseUrl.replace(/\/+$/, '')
   const response = await fetch(`${normalizedGateway}/v1/gateway/chat`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { ...serviceEnvironmentHeaders(), 'Content-Type': 'application/json' },
     signal,
     body: JSON.stringify({
       request_id: `rag-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -279,6 +419,84 @@ export async function runGatewayRagQuery(
       answer,
       contexts: historyContexts,
       latency_ms: Date.now() - startedAt,
+      model: REMOTE_CREATION_MODEL_ID,
+      source: historyOptions?.source,
+      scene_type: historyOptions?.source === 'floating_assist' ? 'floating_assist' : undefined,
+    }),
+  }).catch(() => undefined)
+  return result
+}
+
+export async function runGatewayRagQueryStream(
+  apiBaseUrl: string,
+  gatewayApiBaseUrl: string,
+  query: string,
+  userId: string,
+  signal?: AbortSignal,
+  historyOptions?: GatewayRagHistoryOptions,
+  callbacks: RagStreamCallbacks = {},
+): Promise<RagQueryResponse> {
+  const startedAt = Date.now()
+  callbacks.onStatus?.({ stage: 'retrieving', message: '正在召回相关资料', progress: 42 })
+  const contexts = await fetchRagReferences(apiBaseUrl, query, signal)
+  callbacks.onReferences?.(contexts)
+  callbacks.onStatus?.({ stage: 'answering', message: '正在生成答案', progress: 58 })
+  const referenceText = contexts.length
+    ? `\n\n本地记忆参考资料：\n${contexts.map((item, index) => {
+      const title = item.title || item.win_title || item.app_name || item.doc_key || `参考资料 ${index + 1}`
+      const rawText = item.summary || item.overview || item.text || ''
+      const text = rawText.length > 800 ? `${rawText.slice(0, 800)}...` : rawText
+      return `R#${index + 1} ${title}\n${text}`.trim()
+    }).join('\n\n')}`
+    : ''
+  const normalizedGateway = gatewayApiBaseUrl.replace(/\/+$/, '')
+  const response = await fetch(`${normalizedGateway}/v1/gateway/chat`, {
+    method: 'POST',
+    headers: {
+      ...serviceEnvironmentHeaders(),
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    },
+    signal,
+    body: JSON.stringify({
+      request_id: `rag-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      user_id: userId,
+      brand_model_id: REMOTE_CREATION_MODEL_ID,
+      caller: 'rag',
+      messages: [
+        {
+          role: 'system',
+          content: '你是 MemoryBread 的咨询助手。请用清晰、结构化的中文回答，不要提及底层供应商或模型实现。',
+        },
+        { role: 'user', content: `${query}${referenceText}` },
+      ],
+      stream: true,
+      privacy: { content_logging: false, client_scrubbed: true },
+      limits: { max_output_tokens: 4096, max_credit: '50.0000' },
+    }),
+  })
+  if (!response.ok) {
+    throw new Error(await readGatewayError(response, `云端咨询失败: ${response.status}`))
+  }
+  const streamed = await consumeRagEventStream(response, callbacks)
+  const result: RagQueryResponse = {
+    ...streamed,
+    contexts,
+    model: REMOTE_CREATION_MODEL_ID,
+    elapsed_ms: streamed.elapsed_ms ?? Date.now() - startedAt,
+  }
+
+  const normalizedApiBaseUrl = normalizeLocalApiBaseUrl(apiBaseUrl)
+  const floatingContext = buildFloatingAssistHistoryContext(historyOptions?.metadata)
+  const historyContexts = floatingContext ? [floatingContext, ...contexts] : contexts
+  await fetchWithLocalhostFallback(`${normalizedApiBaseUrl}/api/rag/history`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query,
+      answer: result.answer,
+      contexts: historyContexts,
+      latency_ms: result.elapsed_ms,
       model: REMOTE_CREATION_MODEL_ID,
       source: historyOptions?.source,
       scene_type: historyOptions?.source === 'floating_assist' ? 'floating_assist' : undefined,
@@ -392,11 +610,7 @@ export function useRagQuery() {
         setLoading(false)
         throw err
       }
-      const rawMsg = err instanceof Error ? err.message : String(err)
-      const msg = rawMsg === 'Load failed'
-        ? '咨询请求连接失败，请确认本机服务已启动，并稍后重试'
-        : rawMsg
-      setError(msg)
+      setError(toUserFacingError(err, '咨询暂时无法完成，请确认应用运行状态后重试'))
       throw err
     }
   }, [apiBaseUrl, gatewayApiBaseUrl, creationModelConfigs, currentUser, cloudBalance, setLoading, setResult, setError])
@@ -593,6 +807,7 @@ export function useBackupMemoryPackageToCloud() {
 
   return useCallback(async (payload: {
     admin_base_url: string
+    service_environment: 'production' | 'staging'
     access_token: string
     device_id: string
     recovery_key_base64?: string
@@ -614,6 +829,7 @@ export function useRestoreMemoryPackageFromCloud() {
 
   return useCallback(async (payload: {
     admin_base_url: string
+    service_environment: 'production' | 'staging'
     access_token: string
     snapshot_id: string
     recovery_key_base64: string
@@ -1015,7 +1231,6 @@ function mapKnowledgeEntryToTimeline(item: any): TimelineItem {
     sourceCaptureId: item.capture_id != null ? String(item.capture_id) : '',
     weight: item.importance ?? 3,
     openCount: item.occurrence_count ?? 0,
-    dwellSeconds: 0,
     hasEditAction: false,
     knowledgeRefCount: 0,
     status: 'confirmed' as const,
@@ -1040,7 +1255,6 @@ function mapBakeMemory(item: any): TimelineItem {
     summary: item.summary,
     weight: item.weight,
     openCount: item.open_count,
-    dwellSeconds: item.dwell_seconds,
     hasEditAction: item.has_edit_action,
     knowledgeRefCount: item.knowledge_ref_count,
     status: item.status,

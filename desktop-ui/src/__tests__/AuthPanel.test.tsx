@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import AuthPanel from '../components/AuthPanel'
 import { useAppStore } from '../store/useAppStore'
+import { toLocalDateKey } from '../utils/workProfile'
 
 beforeEach(() => {
   useAppStore.getState().reset()
@@ -19,6 +20,118 @@ const fillPasswordLogin = () => {
     target: { value: 'MemoryBread@2026!' },
   })
 }
+
+const mockSignedInProfileFetch = () => vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  const url = String(input)
+  if (url.includes('/api/work-profile')) {
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const previousDay = new Date(today)
+    previousDay.setDate(previousDay.getDate() - 1)
+    return {
+      ok: true,
+      json: async () => ({
+        range_start: Date.now() - 365 * 86400_000,
+        range_end: Date.now() + 86400_000,
+        idle_gap_cap_minutes: 5,
+        total_minutes: 1860,
+        active_days: 16,
+        current_streak: 4,
+        longest_streak: 9,
+        longest_day_minutes: 382,
+        today: {
+          date: toLocalDateKey(today),
+          total_minutes: 205,
+          capture_count: 42,
+          first_capture_at: today.getTime() + 9 * 3_600_000 + 12 * 60_000,
+          last_capture_at: today.getTime() + 16 * 3_600_000 + 48 * 60_000,
+          apps: [
+            { name: 'Code', minutes: 138, capture_count: 24 },
+            { name: '飞书', minutes: 67, capture_count: 18 },
+          ],
+          mood: {
+            inferred: true,
+            mood: 'focused',
+            expression_count: 12,
+            source_apps: ['飞书', 'Slack'],
+          },
+        },
+        days: [
+          { date: toLocalDateKey(previousDay), minutes: 280, capture_count: 56 },
+          { date: toLocalDateKey(today), minutes: 205, capture_count: 42 },
+        ],
+      }),
+    }
+  }
+
+  if (url.includes('/v1/achievements')) {
+    const badge = {
+      id: '01910000-0000-7000-8000-000000000001',
+      badge_key: 'code_elite',
+      name: '代码精英',
+      tagline: '逻辑在指尖升温',
+      description: '一周内累计完成 50 小时代码编写工作。',
+      icon_key: 'code',
+      palette_key: 'ember',
+      rarity: 'epic',
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        data: {
+          badges: [{
+            badge,
+            quantity: 3,
+            total_credit_earned: '600.0000',
+            first_earned_at: '2026-07-01T00:00:00Z',
+            last_earned_at: '2026-07-18T00:00:00Z',
+          }],
+          equipped: init?.method === 'PUT' ? { profile_avatar: badge } : {},
+        },
+      }),
+    }
+  }
+
+  if (url.endsWith('/v1/auth/profile') && init?.method === 'PUT') {
+    return {
+      ok: true,
+      json: async () => ({
+        data: {
+          id: '018f0000-0000-7000-8000-000000000003',
+          username: '烘焙师土豆',
+          nickname: '小麦',
+          company_name: '记忆面包科技',
+          email: 'tudou@memorybread.local',
+          status: 'active',
+          roles: ['user'],
+          locale: 'zh-CN',
+          timezone: 'Asia/Shanghai',
+          created_at: new Date().toISOString(),
+        },
+      }),
+    }
+  }
+
+  return {
+    ok: true,
+    json: async () => ({
+      data: {
+        balance: {
+          available: '120.0000',
+          reserved: '0.0000',
+          currency: 'CREDIT',
+          as_of: new Date().toISOString(),
+        },
+        current_subscription: {
+          id: 'sub_001',
+          status: 'active',
+          plan_key: 'gold',
+          name: '黄金',
+        },
+      },
+    }),
+  }
+})
 
 describe('AuthPanel', () => {
   it('普通启动时隐藏账户连接地址输入框', () => {
@@ -82,8 +195,8 @@ describe('AuthPanel', () => {
     fillPasswordLogin()
     fireEvent.click(screen.getByRole('button', { name: '登录' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('账户服务暂时无法连接')
-    expect(screen.getByRole('alert')).toHaveTextContent('http://127.0.0.1:8080')
+    expect(await screen.findByRole('alert')).toHaveTextContent('登录失败，请检查网络或账户信息')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('http://127.0.0.1:8080')
   })
 
   it('账户服务未就绪时提示稍后重试', async () => {
@@ -106,7 +219,7 @@ describe('AuthPanel', () => {
     expect(screen.getByRole('alert')).not.toHaveTextContent('mb-admin/.env')
   })
 
-  it('用户详情显示中文运行模式和可用 Credit，并隐藏未开放的钱包操作与字段', async () => {
+  it('使用顶部多 Tab 展示全宽内容，并在个人信息中显示账户资料', async () => {
     useAppStore.getState().setAuthSession({
       access_token: 'mbs_test_token',
       expires_at: new Date(Date.now() + 86400_000).toISOString(),
@@ -114,6 +227,8 @@ describe('AuthPanel', () => {
         id: '018f0000-0000-7000-8000-000000000003',
         username: '烘焙师土豆',
         display_name: '土豆账户',
+        nickname: '土豆',
+        company_name: '旧公司',
         email: 'tudou@memorybread.local',
         status: 'active',
         roles: ['user'],
@@ -122,48 +237,79 @@ describe('AuthPanel', () => {
         created_at: new Date().toISOString(),
       },
     })
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: {
-          balance: {
-            available: '120.0000',
-            reserved: '0.0000',
-            currency: 'CREDIT',
-            as_of: new Date().toISOString(),
-          },
-          current_subscription: {
-            id: 'sub_001',
-            status: 'active',
-            plan_key: 'gold',
-            name: '黄金',
-          },
-        },
-      }),
-    }))
+    const fetchMock = mockSignedInProfileFetch()
+    vi.stubGlobal('fetch', fetchMock)
     render(<AuthPanel />)
 
-    expect(screen.getByText('烘焙师土豆')).toBeInTheDocument()
+    expect(await screen.findByText('120.0000')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '土豆' })).toBeInTheDocument()
+    expect(screen.getAllByText('烘焙师土豆')).not.toHaveLength(0)
     expect(screen.queryByText('土豆账户')).not.toBeInTheDocument()
+    expect(screen.getByText('旧公司')).toBeInTheDocument()
+    expect(screen.getByText(/每项每个自然月最多修改 3 次/)).toBeInTheDocument()
+    expect(screen.getByRole('tablist', { name: '个人信息页面导航' })).toBeInTheDocument()
+    expect(screen.getAllByRole('tab')).toHaveLength(4)
+    expect(screen.getByRole('tab', { name: '个人信息' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tab', { name: '标签卡片' })).toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: '工作热力图' })).not.toBeInTheDocument()
     expect(screen.getByText('运行模式')).toBeInTheDocument()
     expect(await screen.findAllByText('增强模式')).not.toHaveLength(0)
+    expect(screen.getAllByRole('button', { name: '退出登录' })).toHaveLength(1)
+    expect(screen.queryByText('退出后需要重新登录，本机工作记录会继续保留。')).not.toBeInTheDocument()
     expect(screen.queryByText('会员套餐')).not.toBeInTheDocument()
-    expect(await screen.findByText('120.0000')).toBeInTheDocument()
     expect(screen.queryByText('冻结 Credit')).not.toBeInTheDocument()
     expect(screen.queryByText('币种')).not.toBeInTheDocument()
     expect(screen.queryByText('更新时间')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '充值' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '刷新' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑个人资料' }))
+    fireEvent.change(screen.getByLabelText('昵称'), { target: { value: '小麦' } })
+    fireEvent.change(screen.getByLabelText('公司名称（可选）'), { target: { value: '记忆面包科技' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+    expect(await screen.findByRole('status')).toHaveTextContent('个人资料已更新')
+    expect(screen.getByRole('heading', { name: '小麦' })).toBeInTheDocument()
+    expect(useAppStore.getState().currentUser?.nickname).toBe('小麦')
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:8080/v1/auth/profile',
+      expect.objectContaining({ method: 'PUT' }),
+    )
+
+    fireEvent.click(screen.getByRole('tab', { name: '标签卡片' }))
+    expect(await screen.findByText('代码精英')).toBeInTheDocument()
+    expect(screen.getByText('×3')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '佩戴到头像' }))
+    expect(await screen.findByText('已将「代码精英」佩戴到个人头像。')).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:8080/v1/achievements/equipped',
+      expect.objectContaining({ method: 'PUT' }),
+    )
+
+    fireEvent.click(screen.getByRole('tab', { name: '工作投入' }))
+    expect(await screen.findByText('3 小时 25 分钟')).toBeInTheDocument()
+    expect(screen.getByText('应用分布')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '工作热力图' })).toBeInTheDocument()
+    const heatmapCell = screen.getByRole('button', { name: /工作时长 3 小时 25 分钟.*42 条工作记录/ })
+    fireEvent.mouseEnter(heatmapCell)
+    expect(within(heatmapCell).getByRole('tooltip')).toHaveTextContent('工作时长 3 小时 25 分钟')
+    expect(within(heatmapCell).getByRole('tooltip')).toHaveTextContent('42 条工作记录')
+    fireEvent.click(heatmapCell)
+    expect(heatmapCell).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.queryByText('近一年工作时长')).not.toBeInTheDocument()
+    expect(screen.queryByText('当前连续天数')).not.toBeInTheDocument()
+    expect(screen.queryByText('最长连续天数')).not.toBeInTheDocument()
+    expect(screen.queryByText('单日最长时长')).not.toBeInTheDocument()
+    expect(screen.queryByText('根据本机采集间隔聚合，连续空闲超过 5 分钟不计入工作时长。')).not.toBeInTheDocument()
   })
 
-  it('在标签卡片页展示数量与 Credit，并支持佩戴到个人头像', async () => {
+  it('展示根据工作 IM 推测的心情，不提供手工工作标签', async () => {
     useAppStore.getState().setAuthSession({
       access_token: 'mbs_test_token',
       expires_at: new Date(Date.now() + 86400_000).toISOString(),
       user: {
         id: '018f0000-0000-7000-8000-000000000004',
-        username: '代码师傅',
-        email: 'coder@memorybread.local',
+        username: '烘焙师土豆',
+        email: 'tudou@memorybread.local',
         status: 'active',
         roles: ['user'],
         locale: 'zh-CN',
@@ -171,50 +317,104 @@ describe('AuthPanel', () => {
         created_at: new Date().toISOString(),
       },
     })
-    const badge = {
-      id: 'badge-code-elite',
-      badge_key: 'code_elite',
-      name: '代码精英',
-      tagline: '键盘上的耐力赛冠军',
-      description: '一周内累计完成超过 50 小时的代码编写工作。',
-      icon_key: 'code',
-      palette_key: 'cobalt',
-      rarity: 'epic',
-    }
-    const profile = {
-      badges: [{
-        badge,
-        quantity: 3,
-        total_credit_earned: '180.0000',
-        first_earned_at: '2026-06-01T00:00:00Z',
-        last_earned_at: '2026-07-18T00:00:00Z',
-      }],
-      equipped: {},
-    }
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input)
-      if (url.endsWith('/v1/console/summary')) {
-        return { ok: true, json: async () => ({ data: {} }) }
-      }
-      if (url.endsWith('/v1/achievements/equipped') && init?.method === 'PUT') {
-        return { ok: true, json: async () => ({ data: { ...profile, equipped: { profile_avatar: badge } } }) }
-      }
-      return { ok: true, json: async () => ({ data: profile }) }
-    })
-    vi.stubGlobal('fetch', fetchMock)
-
+    vi.stubGlobal('fetch', mockSignedInProfileFetch())
     render(<AuthPanel />)
-    fireEvent.click(screen.getByRole('tab', { name: '标签卡片' }))
 
-    expect(await screen.findByText('代码精英')).toBeInTheDocument()
-    expect(screen.getByText('×3')).toBeInTheDocument()
-    expect(screen.getByText(/累计奖励/)).toHaveTextContent('180 Credit')
+    await waitFor(() => {
+      expect(useAppStore.getState().cloudBalance?.available).toBe('120.0000')
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '工作心情' }))
+    expect(await screen.findByText('专注投入')).toBeInTheDocument()
+    expect(screen.getByText('12')).toBeInTheDocument()
+    expect(screen.getByText('条工作 IM 表达')).toBeInTheDocument()
+    expect(screen.getByText('飞书、Slack')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '专注投入' })).not.toBeInTheDocument()
+    expect(screen.queryByText('心情和标签仅保存在本机，可随时修改。')).not.toBeInTheDocument()
+    expect(screen.queryByText('今日工作标签')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('添加自定义标签')).not.toBeInTheDocument()
+  })
 
-    fireEvent.click(screen.getByRole('button', { name: '佩戴到头像' }))
-    expect(await screen.findByText('已将「代码精英」佩戴到个人头像。')).toBeInTheDocument()
-    expect(fetchMock).toHaveBeenCalledWith(
-      'http://127.0.0.1:8080/v1/achievements/equipped',
-      expect.objectContaining({ method: 'PUT' }),
-    )
+  it('没有有效工作 IM 输入时默认展示心情良好', async () => {
+    useAppStore.getState().setAuthSession({
+      access_token: 'mbs_test_token',
+      expires_at: new Date(Date.now() + 86400_000).toISOString(),
+      user: {
+        id: '018f0000-0000-7000-8000-000000000006',
+        username: '烘焙师土豆',
+        email: 'tudou@memorybread.local',
+        status: 'active',
+        roles: ['user'],
+        locale: 'zh-CN',
+        timezone: 'Asia/Shanghai',
+        created_at: new Date().toISOString(),
+      },
+    })
+    const fetchMock = mockSignedInProfileFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const response = await fetchMock(input)
+      if (!String(input).includes('/api/work-profile')) return response
+      const profile = await response.json() as Record<string, unknown> & {
+        today: Record<string, unknown>
+      }
+      return {
+        ...response,
+        json: async () => ({
+          ...profile,
+          today: {
+            ...profile.today,
+            mood: {
+              inferred: false,
+              mood: null,
+              expression_count: 0,
+              source_apps: [],
+            },
+          },
+        }),
+      }
+    }))
+    render(<AuthPanel />)
+
+    await waitFor(() => {
+      expect(useAppStore.getState().cloudBalance?.available).toBe('120.0000')
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '工作心情' }))
+    expect(await screen.findByText('心情良好')).toBeInTheDocument()
+    expect(screen.queryByText('今天还没有可分析的工作 IM 输入。')).not.toBeInTheDocument()
+    expect(screen.queryByText('暂无今日心情推测')).not.toBeInTheDocument()
+  })
+
+  it('退出登录前要求二次确认，并可取消操作', async () => {
+    useAppStore.getState().setAuthSession({
+      access_token: 'mbs_test_token',
+      expires_at: new Date(Date.now() + 86400_000).toISOString(),
+      user: {
+        id: '018f0000-0000-7000-8000-000000000005',
+        username: '烘焙师土豆',
+        email: 'tudou@memorybread.local',
+        status: 'active',
+        roles: ['user'],
+        locale: 'zh-CN',
+        timezone: 'Asia/Shanghai',
+        created_at: new Date().toISOString(),
+      },
+    })
+    vi.stubGlobal('fetch', mockSignedInProfileFetch())
+    render(<AuthPanel />)
+
+    fireEvent.click(screen.getByRole('button', { name: '退出登录' }))
+
+    const dialog = screen.getByRole('alertdialog', { name: '确认退出登录？' })
+    expect(dialog).toBeInTheDocument()
+    expect(within(dialog).getByText('确定要退出当前账号吗？')).toBeInTheDocument()
+    const cancelButton = within(dialog).getByRole('button', { name: '取消' })
+    const confirmButton = within(dialog).getByRole('button', { name: '确认退出' })
+    await waitFor(() => expect(cancelButton).toHaveFocus())
+    fireEvent.keyDown(cancelButton, { key: 'Tab', shiftKey: true })
+    expect(confirmButton).toHaveFocus()
+    fireEvent.keyDown(confirmButton, { key: 'Tab' })
+    expect(cancelButton).toHaveFocus()
+    fireEvent.click(cancelButton)
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument())
+    expect(useAppStore.getState().authToken).toBe('mbs_test_token')
   })
 })

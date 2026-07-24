@@ -24,8 +24,9 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
-MIN_MACOS_MAJOR_FOR_OLLAMA = 13
+MIN_MACOS_MAJOR_FOR_OLLAMA = 14
 OLLAMA_API_BASE = "http://localhost:11434"
+OLLAMA_MACOS_DOWNLOAD_URL = "https://ollama.com/download/mac"
 MODEL_ID_ALIASES = {
     "qwen3.5-4b": "mbem-v1-local",
     "qwen2.5-3b": "mbem-v1-local",
@@ -129,6 +130,8 @@ class ModelManager:
             active_embedding = MODEL_ID_ALIASES.get(config.get('active_embedding'), config.get('active_embedding', 'bge-small-zh'))
             config['active_llm'] = active_llm if active_llm in AVAILABLE_MODELS else 'mbem-v1-local'
             config['active_embedding'] = active_embedding if active_embedding in AVAILABLE_MODELS else 'bge-small-zh'
+            # 推理并发由供电状态自动控制，不再读取或向用户暴露持久化配置。
+            config.pop('llm_max_concurrency', None)
             return config
 
         # 默认配置
@@ -136,7 +139,6 @@ class ModelManager:
             "active_llm": "mbem-v1-local",
             "active_embedding": "bge-small-zh",
             "active_image": None,
-            "llm_max_concurrency": 1,
             "api_keys": {}
         }
 
@@ -170,6 +172,7 @@ class ModelManager:
         else:
             candidates.append('/opt/homebrew/bin/ollama')
             candidates.append('/usr/local/bin/ollama')
+        candidates.append('/Applications/Ollama.app/Contents/Resources/ollama')
 
         for candidate in candidates:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
@@ -194,8 +197,9 @@ class ModelManager:
         version_compatible = True if not is_macos else (major is not None and major >= MIN_MACOS_MAJOR_FOR_OLLAMA)
 
         ollama_path = self._resolve_ollama_command()
-        installed = bool(ollama_path)
-        running = self._is_ollama_running() if installed else False
+        # Ollama.app 可以正常运行但尚未把 CLI 链接到 PATH；此时 API 可用也应视为已安装。
+        running = self._is_ollama_running()
+        installed = bool(ollama_path) or running
         brew_path = shutil.which('brew')
         brew_available = bool(brew_path)
 
@@ -247,6 +251,8 @@ class ModelManager:
             'brew_available': brew_available,
             'brew_path': brew_path,
             'recommended_install_method': recommended,
+            'official_download_url': OLLAMA_MACOS_DOWNLOAD_URL,
+            'minimum_macos_major': MIN_MACOS_MAJOR_FOR_OLLAMA,
             'can_auto_install': can_auto_install,
             'message': message,
         }
@@ -260,7 +266,13 @@ class ModelManager:
         if status['ollama_installed']:
             return {'status': 'ok', 'stage': 'install', 'message': 'Ollama 已安装，无需重复安装。', 'detail': status}
         if not status['brew_available']:
-            return {'status': 'error', 'stage': 'install', 'message': '未检测到 Homebrew，无法自动安装 Ollama。', 'detail': status}
+            return {
+                'status': 'error',
+                'stage': 'manual_install',
+                'message': '未检测到 Homebrew，请从官方安装页下载 Ollama。',
+                'official_download_url': OLLAMA_MACOS_DOWNLOAD_URL,
+                'detail': status,
+            }
 
         try:
             result = subprocess.run(
@@ -511,6 +523,11 @@ class ModelManager:
     def _download_ollama_model(self, model_info: ModelInfo) -> Dict:
         """下载 Ollama 模型"""
         try:
+            with self._download_lock:
+                self._download_progress[model_info.id] = 0
+                # 重试时清理上一次下载错误。
+                self._download_errors.pop(model_info.id, None)
+
             def download_thread():
                 url = "http://localhost:11434/api/pull"
                 data = json.dumps({"name": model_info.model_id}).encode('utf-8')
@@ -569,14 +586,10 @@ class ModelManager:
                     logger.error(f"下载失败: {e}")
                     with self._download_lock:
                         self._download_progress.pop(model_info.id, None)
+                        self._download_errors[model_info.id] = "下载失败，请检查网络和本地运行环境"
 
             thread = threading.Thread(target=download_thread, daemon=True)
             thread.start()
-
-            with self._download_lock:
-                self._download_progress[model_info.id] = 0
-                # 清理之前的错误
-                self._download_errors.pop(model_info.id, None)
 
             logger.info(f"开始下载 Ollama 模型: {model_info.model_id}")
             return {
@@ -693,7 +706,7 @@ class ModelManager:
                 elif model_id in self._download_errors:
                     # 有下载错误
                     error_msg = self._download_errors[model_id]
-                    status = 'not_installed'
+                    status = 'error'
                     progress = 0
                 elif self._is_installed(model_id, info):
                     status = 'installed'

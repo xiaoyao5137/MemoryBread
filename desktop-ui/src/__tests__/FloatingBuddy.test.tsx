@@ -6,6 +6,11 @@ import { useAppStore } from '../store/useAppStore'
 
 beforeEach(() => {
   useAppStore.getState().reset()
+  useAppStore.setState({
+    debugModeEnabled: false,
+    localDebugModeEnabled: false,
+    serviceEnvironment: 'production',
+  })
 })
 
 describe('FloatingBuddy', () => {
@@ -38,8 +43,14 @@ describe('FloatingBuddy', () => {
     expect(screen.getByText('记忆')).toBeInTheDocument()
   })
 
-  it('平台管理员可以切换测试和正式环境并持久化', () => {
-    useAppStore.getState().setAccountType('platform_admin')
+  it('普通模式隐藏环境切换', () => {
+    render(<FloatingBuddy />)
+
+    expect(screen.queryByLabelText('服务环境切换')).not.toBeInTheDocument()
+  })
+
+  it('调试模式可以切换测试和正式环境并同步请求环境', () => {
+    useAppStore.getState().setDebugModeEnabled(true)
     render(<FloatingBuddy />)
 
     expect(screen.getByLabelText('服务环境切换')).toBeInTheDocument()
@@ -59,6 +70,7 @@ describe('FloatingBuddy', () => {
         id: '018f0000-0000-7000-8000-000000000002',
         username: '烘焙师土豆',
         display_name: '土豆账户',
+        nickname: '土豆',
         email: 'tudou@memorybread.local',
         status: 'active',
         roles: ['user'],
@@ -76,10 +88,24 @@ describe('FloatingBuddy', () => {
 
     render(<FloatingBuddy />)
 
-    expect(screen.getByText('烘焙师土豆')).toBeInTheDocument()
+    expect(screen.getByText('土豆')).toBeInTheDocument()
+    expect(screen.queryByText('烘焙师土豆')).not.toBeInTheDocument()
     expect(screen.queryByText('土豆账户')).not.toBeInTheDocument()
     expect(screen.getByText('增强模式')).toBeInTheDocument()
     expect(screen.queryByText('云账户已连接')).not.toBeInTheDocument()
+    expect(screen.getByTestId('account-avatar')).toHaveTextContent('土')
+  })
+
+  it('账号入口是侧栏底部导航并支持当前页面状态', () => {
+    render(<FloatingBuddy />)
+
+    const accountEntry = screen.getByTestId('account-entry')
+    expect(accountEntry.closest('footer')).toHaveClass('buddy-sidebar-footer')
+
+    fireEvent.click(accountEntry)
+
+    expect(useAppStore.getState().windowMode).toBe('account')
+    expect(accountEntry).toHaveAttribute('aria-current', 'page')
   })
 })
 

@@ -52,6 +52,8 @@ def execute_task(req: ExecuteRequest):
 
     logger.info(f"收到任务执行请求: task_id={req.task_id}")
     result = executor.execute_task(req.task_id)
+    if result["status"] == "deferred":
+        raise HTTPException(status_code=503, detail=result)
     if result["status"] == "failed":
         raise HTTPException(status_code=500, detail=result.get("error", "执行失败"))
     return result

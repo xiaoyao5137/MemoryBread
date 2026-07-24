@@ -36,6 +36,7 @@ pub struct ImportAssetSnapshotRequest {
 #[derive(Debug, Deserialize)]
 pub struct CloudBackupRequest {
     pub admin_base_url: String,
+    pub service_environment: String,
     pub access_token: String,
     pub device_id: String,
     /// 32-byte base64 key. If omitted, core-engine generates a one-time recovery key.
@@ -56,6 +57,7 @@ pub struct CloudBackupResponse {
 #[derive(Debug, Deserialize)]
 pub struct CloudRestoreRequest {
     pub admin_base_url: String,
+    pub service_environment: String,
     pub access_token: String,
     pub snapshot_id: String,
     pub recovery_key_base64: String,
@@ -154,6 +156,7 @@ pub async fn backup_asset_snapshot_to_cloud(
     Json(body): Json<CloudBackupRequest>,
 ) -> Result<Json<CloudBackupResponse>, ApiError> {
     let admin_base_url = normalize_admin_base_url(&body.admin_base_url)?;
+    let service_environment = normalize_service_environment(&body.service_environment)?;
     let access_token = clean_required(&body.access_token, "access_token")?;
     let device_id = clean_required(&body.device_id, "device_id")?;
     let (key, generated_recovery_key_base64) = recovery_key(body.recovery_key_base64.as_deref())?;
@@ -186,6 +189,7 @@ pub async fn backup_asset_snapshot_to_cloud(
     let prepare: CloudEnvelope<PreparedUploadData> = send_json(
         client
             .post(format!("{admin_base_url}/v1/snapshots/upload-url"))
+            .header("x-memorybread-environment", &service_environment)
             .bearer_auth(&access_token)
             .json(&json!({
                 "device_id": device_id,
@@ -214,6 +218,7 @@ pub async fn backup_asset_snapshot_to_cloud(
     let completed: CloudEnvelope<Value> = send_json(
         client
             .post(format!("{admin_base_url}/v1/snapshots"))
+            .header("x-memorybread-environment", &service_environment)
             .bearer_auth(&access_token)
             .json(&json!({
                 "device_id": device_id,
@@ -243,6 +248,7 @@ pub async fn restore_asset_snapshot_from_cloud(
     Json(body): Json<CloudRestoreRequest>,
 ) -> Result<Json<CloudRestoreResponse>, ApiError> {
     let admin_base_url = normalize_admin_base_url(&body.admin_base_url)?;
+    let service_environment = normalize_service_environment(&body.service_environment)?;
     let access_token = clean_required(&body.access_token, "access_token")?;
     let snapshot_id = clean_required(&body.snapshot_id, "snapshot_id")?;
     let (key, _) = recovery_key(Some(&body.recovery_key_base64))?;
@@ -261,6 +267,7 @@ pub async fn restore_asset_snapshot_from_cloud(
             .get(format!(
                 "{admin_base_url}/v1/snapshots/{snapshot_id}/download-url"
             ))
+            .header("x-memorybread-environment", &service_environment)
             .bearer_auth(&access_token),
         "CLOUD_PREPARE_DOWNLOAD_FAILED",
     )
@@ -384,6 +391,16 @@ fn normalize_admin_base_url(value: &str) -> Result<String, ApiError> {
         ));
     }
     Ok(value.trim_end_matches('/').to_string())
+}
+
+fn normalize_service_environment(value: &str) -> Result<String, ApiError> {
+    match value.trim() {
+        "production" => Ok("production".to_string()),
+        "staging" => Ok("staging".to_string()),
+        _ => Err(ApiError::BadRequest(
+            "service_environment 必须是 production 或 staging".to_string(),
+        )),
+    }
 }
 
 fn clean_required(value: &str, field: &str) -> Result<String, ApiError> {
@@ -514,7 +531,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_snapshot_bytes, encrypt_snapshot_bytes, recovery_key};
+    use super::{
+        decrypt_snapshot_bytes, encrypt_snapshot_bytes, normalize_service_environment, recovery_key,
+    };
 
     #[test]
     fn encrypts_and_decrypts_snapshot_bytes() {
@@ -527,5 +546,15 @@ mod tests {
 
         let decrypted = decrypt_snapshot_bytes(&encrypted, &key).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn cloud_snapshot_environment_is_explicit() {
+        assert_eq!(
+            normalize_service_environment("production").unwrap(),
+            "production"
+        );
+        assert_eq!(normalize_service_environment("staging").unwrap(), "staging");
+        assert!(normalize_service_environment("test").is_err());
     }
 }

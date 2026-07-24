@@ -5,9 +5,10 @@
  * 用户可以查看、编辑、删除、验证知识条目
  */
 
-import React, { useCallback, useState, useEffect } from 'react'
+import React, { useCallback, useState, useEffect, useMemo } from 'react'
 
 import { useAppStore } from '../store/useAppStore'
+import { toUserFacingError } from '../utils/userFacingError'
 
 interface KnowledgeEntry {
   id: number
@@ -63,7 +64,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
       const data = await response.json()
       setEntries(data.entries || [])
     } catch (err) {
-      setError(err instanceof Error ? err.message : '未知错误')
+      setError(toUserFacingError(err, '知识加载失败'))
     } finally {
       setLoading(false)
     }
@@ -88,7 +89,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
       // 刷新列表
       loadEntries()
     } catch (err) {
-      alert(err instanceof Error ? err.message : '验证失败')
+      setError(toUserFacingError(err, '验证失败'))
     }
   }
 
@@ -110,7 +111,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
       // 刷新列表
       loadEntries()
     } catch (err) {
-      alert(err instanceof Error ? err.message : '删除失败')
+      setError(toUserFacingError(err, '删除失败'))
     }
   }
 
@@ -122,14 +123,21 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
     }))
   }
 
-  // 搜索
-  const handleSearch = async () => {
-    if (!searchQuery.trim()) {
-      loadEntries()
-      return
-    }
+  const visibleEntries = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase()
+    if (!query) return entries
+    return entries.filter(entry => [
+      entry.summary,
+      entry.overview,
+      entry.details,
+      entry.category,
+      ...(entry.entities || []),
+    ].some(value => String(value || '').toLowerCase().includes(query)))
+  }, [entries, searchQuery])
 
-    setError('当前版本暂不支持搜索，请先使用分类筛选或直接刷新列表')
+  // 搜索在当前已加载的知识中即时完成。
+  const handleSearch = async () => {
+    setError(null)
   }
 
   const handleExtract = async () => {
@@ -149,10 +157,10 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
         throw new Error(data.message || data.error || '触发提炼失败')
       }
 
-      setExtractMessage(data.message || '已触发知识提炼')
+      setExtractMessage('已开始整理新的知识')
       await loadEntries()
     } catch (err) {
-      setError(err instanceof Error ? err.message : '触发提炼失败')
+      setError(toUserFacingError(err, '知识整理启动失败'))
     } finally {
       setExtracting(false)
     }
@@ -250,7 +258,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
             onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
             className="search-input"
           />
-          <button onClick={handleSearch} className="search-btn">
+          <button onClick={handleSearch} className="search-btn" aria-label="搜索知识">
             🔍
           </button>
         </div>
@@ -278,9 +286,9 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
       )}
 
       {/* 知识条目列表 */}
-      {!loading && entries.length > 0 && (
+      {!loading && visibleEntries.length > 0 && (
         <div className="knowledge-panel__list" data-testid="knowledge-list">
-          {entries.map((entry) => (
+          {visibleEntries.map((entry) => (
             <div
               key={entry.id}
               className="knowledge-item"
@@ -387,6 +395,12 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
         <div className="knowledge-panel__empty" data-testid="knowledge-empty">
           <p>暂无知识条目</p>
           <p className="empty-hint">系统会自动从采集记录中提炼知识</p>
+        </div>
+      )}
+      {!loading && entries.length > 0 && visibleEntries.length === 0 && (
+        <div className="knowledge-panel__empty" role="status">
+          <p>没有找到匹配的知识</p>
+          <p className="empty-hint">换个关键词试试</p>
         </div>
       )}
     </div>

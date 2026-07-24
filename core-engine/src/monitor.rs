@@ -13,8 +13,11 @@ const CORE_CPU_ENTER_PERCENT: f64 = 80.0;
 const CORE_CPU_RELEASE_PERCENT: f64 = 60.0;
 const SYSTEM_CPU_ENTER_PERCENT: f64 = 70.0;
 const SYSTEM_CPU_RELEASE_PERCENT: f64 = 55.0;
-const WINDOW_SERVER_CPU_ENTER_PERCENT: f64 = 35.0;
-const WINDOW_SERVER_CPU_RELEASE_PERCENT: f64 = 25.0;
+// `ps` reports process CPU as a percentage of one logical core. WindowServer
+// routinely consumes 30%-60% of one core on multi-display Macs, so treating
+// 35% as system pressure permanently disables capture during normal use.
+const WINDOW_SERVER_CPU_ENTER_PERCENT: f64 = 120.0;
+const WINDOW_SERVER_CPU_RELEASE_PERCENT: f64 = 80.0;
 
 #[derive(Debug, Default)]
 struct SystemPressureInner {
@@ -277,6 +280,14 @@ mod tests {
         assert!(state.snapshot().under_pressure);
 
         state.update(5.0, 20.0, WINDOW_SERVER_CPU_RELEASE_PERCENT - 1.0);
+        assert!(!state.snapshot().under_pressure);
+    }
+
+    #[test]
+    fn normal_window_server_load_does_not_pause_capture() {
+        let state = SystemPressureState::default();
+        state.update(5.0, 20.0, 50.0);
+
         assert!(!state.snapshot().under_pressure);
     }
 

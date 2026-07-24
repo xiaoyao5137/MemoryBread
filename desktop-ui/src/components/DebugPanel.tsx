@@ -272,9 +272,6 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
           </div>
 
           <div className="flex flex-wrap items-center gap-4">
-            <div className="text-xs text-gray-500 leading-5 sm:max-w-xs">
-              这里的 1/2/5/10 秒仅控制调试面板自动刷新，不会修改后台采集频率。
-            </div>
             <label className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -447,7 +444,6 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <div>
             <h2 className="text-xl font-semibold text-gray-800">关键排查日志</h2>
-            <p className="text-xs text-gray-500 mt-1">查看关键诊断日志，默认展示最新一段内容。</p>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">

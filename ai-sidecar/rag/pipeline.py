@@ -12,6 +12,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from embedding.model import EmbeddingModel
 
@@ -23,6 +24,7 @@ from .retriever import (
     RetrievedChunk,
     VectorRetriever,
     VectorSearchFilter,
+    _document_url_doc_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,6 +129,7 @@ _PROJECT_SUMMARY_SYSTEM_PROMPT = (
 
 _MAX_CHUNK_LEN = 800   # 单个上下文片段最大字符数
 _KEYWORD_RRF_WEIGHT = 0.45
+_PENDING_DOCUMENT_RRF_WEIGHT = 0.7
 _VECTOR_RRF_WEIGHT = 1.0
 _LOOKUP_MIN_RRF_SCORE_WITH_VECTOR = 0.01
 _VECTOR_LOOKUP_SCORE_THRESHOLD = 0.45
@@ -243,11 +246,20 @@ class RagPipeline:
             "- 无法判断时，按正常流程处理"
         )
 
-    def query(self, user_query: str, top_k: int | None = None, llm=None, references_only: bool = False) -> RagResult:
+    def query(
+        self,
+        user_query: str,
+        top_k: int | None = None,
+        llm=None,
+        references_only: bool = False,
+        on_contexts: Callable[[list[RetrievedChunk]], None] | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> RagResult:
         """执行完整 RAG 查询，返回 LLM 答案及引用的上下文片段。"""
         effective_top_k = top_k or self._top_k
         intent = self._parse_query_intent(user_query)
         retrieval_query = _extract_core_retrieval_query(user_query)
+        retrieval_started = time.perf_counter()
 
         # 报告类任务优先保证稳定返回，限制上下文规模，避免 prompt 过大导致本地模型超时
         if intent.task_type == "weekly_report":
@@ -270,6 +282,7 @@ class RagPipeline:
         except Exception as exc:
             logger.warning("Query embedding 失败: %s", exc)
             raise RuntimeError(f"Query embedding 失败，无法执行向量检索: {exc}") from exc
+        embedding_finished = time.perf_counter()
 
         # 任务型意图：不按关键词过滤，纯按时间段和活动类型宽松召回
         knowledge_entity_terms = None if (intent.task_type or retrieval_query != user_query) else (intent.entity_terms or None)
@@ -301,8 +314,29 @@ class RagPipeline:
             created_start_ts=intent.start_ts if _is_report_task else None,
             created_end_ts=intent.end_ts if _is_report_task else None,
         ) if self._knowledge else []
+        knowledge_finished = time.perf_counter()
 
         logger.info(f"知识库检索结果: {len(knowledge_results)} 条")
+
+        # 尚未烘焙完成的文档也应能通过原始 capture 全文命中。这里只在普通
+        # lookup 中启用，并且仅接纳带文档 URL 的结果，避免把普通屏幕噪声
+        # 重新引入 RAG 上下文。
+        pending_document_results: list[RetrievedChunk] = []
+        if intent.query_mode == "lookup" and not intent.task_type:
+            raw_capture_results = self._fts5.search(
+                retrieval_query,
+                top_k=max(effective_top_k * 4, 12),
+                start_ts=intent.observed_start_ts or intent.start_ts,
+                end_ts=intent.observed_end_ts or intent.end_ts,
+                entity_terms=knowledge_entity_terms,
+            )
+            pending_document_results = _build_pending_document_candidates(
+                raw_capture_results,
+                retrieval_query,
+                limit=max(effective_top_k * 2, 6),
+            )
+            logger.info("待烘焙文档检索结果: %s 条", len(pending_document_results))
+        pending_document_finished = time.perf_counter()
 
         # 周报/日报时间兜底：若本周/今天无数据，自动扩大到最近14天
         if intent.task_type in ("weekly_report", "project_weekly_report", "daily_report") and not knowledge_results:
@@ -333,6 +367,7 @@ class RagPipeline:
                     query_mode=intent.query_mode,
                     created_start_ts=fallback_start,
                 ) if self._knowledge else []
+        knowledge_fallback_finished = time.perf_counter()
         vector_results = (
             self._vector.search(
                 query_vector,
@@ -361,6 +396,7 @@ class RagPipeline:
             )
             if query_vector else []
         )
+        vector_finished = time.perf_counter()
 
         keyword_weight = _KEYWORD_RRF_WEIGHT if vector_results else 1.0
         min_rrf_score = (
@@ -369,7 +405,11 @@ class RagPipeline:
             else 0.0
         )
         merged = reciprocal_rank_fusion(
-            [(knowledge_results, keyword_weight), (vector_results, _VECTOR_RRF_WEIGHT)],
+            [
+                (knowledge_results, keyword_weight),
+                (vector_results, _VECTOR_RRF_WEIGHT),
+                (pending_document_results, _PENDING_DOCUMENT_RRF_WEIGHT),
+            ],
             top_k=max(effective_top_k * 2, 6),
             min_score=min_rrf_score,
         )
@@ -380,6 +420,27 @@ class RagPipeline:
                 limit=max(effective_top_k * 3, 12),
             )
         selected_contexts = self._select_contexts(merged, effective_top_k, query_mode=intent.query_mode)
+        retrieval_finished = time.perf_counter()
+        logger.info(
+            "RAG 召回耗时 embedding_ms=%d knowledge_ms=%d pending_document_ms=%d "
+            "vector_ms=%d merge_ms=%d total_ms=%d",
+            round((embedding_finished - retrieval_started) * 1000),
+            round(
+                (
+                    knowledge_finished
+                    - embedding_finished
+                    + knowledge_fallback_finished
+                    - pending_document_finished
+                )
+                * 1000
+            ),
+            round((pending_document_finished - knowledge_finished) * 1000),
+            round((vector_finished - knowledge_fallback_finished) * 1000),
+            round((retrieval_finished - vector_finished) * 1000),
+            round((retrieval_finished - retrieval_started) * 1000),
+        )
+        if on_contexts:
+            on_contexts(selected_contexts)
 
         if references_only:
             return RagResult(
@@ -555,7 +616,15 @@ class RagPipeline:
         # 任何查询都使用当前激活的 LLM 模型
 
         try:
-            llm_resp = primary_llm.complete(prompt, system=system, **llm_kwargs)
+            if on_delta:
+                llm_resp = primary_llm.complete_stream(
+                    prompt,
+                    system=system,
+                    on_delta=on_delta,
+                    **llm_kwargs,
+                )
+            else:
+                llm_resp = primary_llm.complete(prompt, system=system, **llm_kwargs)
             answer = llm_resp.text
         except Exception:
             raise
@@ -884,7 +953,7 @@ class RagPipeline:
             if len(selected) >= top_k:
                 break
             source_type = chunk.metadata.get("source_type") or chunk.source
-            if source_type not in {"knowledge", "document", "bake_knowledge", "operation"}:
+            if source_type not in {"knowledge", "document", "pending_document", "bake_knowledge", "operation"}:
                 logger.info(f"  跳过: source_type={source_type}")
                 continue
             if _is_noise_chunk(chunk):
@@ -1257,12 +1326,106 @@ def _append_missing_artifact_candidates(
     return [*merged, *appended]
 
 
+def _build_pending_document_candidates(
+    chunks: list[RetrievedChunk],
+    query: str,
+    limit: int,
+) -> list[RetrievedChunk]:
+    """Promote raw full-text hits only when they are substantive document captures.
+
+    Capture embeddings intentionally contain only a short AX prefix today, while
+    SQLite FTS indexes the full AX body. A match-centred excerpt keeps a keyword
+    after the first 500/800 characters visible to the answer model.
+    """
+    results: list[RetrievedChunk] = []
+    seen_urls: set[str] = set()
+    terms = _extract_query_terms(query)
+
+    for chunk in chunks:
+        metadata = chunk.metadata or {}
+        url = str(metadata.get("url") or metadata.get("source_url") or "").strip()
+        canonical_url = _normalize_document_url(url)
+        text = str(chunk.text or "").strip()
+        if not canonical_url or not _looks_like_document_url(canonical_url) or len(text) < 200:
+            continue
+        if canonical_url in seen_urls:
+            continue
+
+        excerpt = _match_centered_excerpt(text, terms, max_chars=620)
+        title = str(metadata.get("webpage_title") or metadata.get("win_title") or "待烘焙文档").strip()
+        doc_key = _document_url_doc_key(canonical_url)
+        results.append(
+            RetrievedChunk(
+                capture_id=chunk.capture_id,
+                text=f"页面：{title}\nURL：{canonical_url}\n正文片段：{excerpt}",
+                score=max(float(chunk.score or 0), 5.0),
+                source="capture_fts",
+                doc_key=doc_key,
+                metadata={
+                    **metadata,
+                    "doc_key": doc_key,
+                    "source_type": "pending_document",
+                    "source_url": canonical_url,
+                    "url": canonical_url,
+                    "title": title,
+                    "category": "文档",
+                    "activity_type": "reading",
+                    "content_origin": "document_reference",
+                    "evidence_strength": "medium",
+                    "retrieval_method": "capture_fulltext",
+                },
+            )
+        )
+        seen_urls.add(canonical_url)
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def _match_centered_excerpt(text: str, terms: list[str], max_chars: int) -> str:
+    lowered = text.lower()
+    positions = [lowered.find(term.lower()) for term in terms if term and lowered.find(term.lower()) >= 0]
+    if not positions:
+        return text[:max_chars]
+    match_pos = min(positions)
+    start = max(0, match_pos - min(160, max_chars // 3))
+    return text[start:start + max_chars]
+
+
+def _normalize_document_url(url: str) -> str:
+    return re.split(r"[?#]", str(url or "").strip(), maxsplit=1)[0].rstrip("/")
+
+
+def _looks_like_document_url(url: str) -> bool:
+    lowered = str(url or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "docs.corp.",
+            "/docs/",
+            "docs.google.",
+            "/document/",
+            "yuque.",
+            "feishu.",
+            "notion.",
+            "confluence",
+            "/wiki/",
+            "shimo.",
+            "/d/home/",
+            "/s/home/",
+            "/k/home/",
+        )
+    )
+
+
 def _source_priority(source_type: str | None) -> int:
     return {
         "document": 0,
-        "bake_knowledge": 1,
-        "operation": 2,
-        "knowledge": 3,
+        "pending_document": 1,
+        "bake_knowledge": 2,
+        "operation": 3,
+        "knowledge": 4,
     }.get(str(source_type or ""), 9)
 
 

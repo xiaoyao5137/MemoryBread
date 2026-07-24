@@ -577,14 +577,14 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           fontSize: 13,
           color: '#856404',
         }}>
-          <div style={{ fontWeight: 600, marginBottom: 4 }}>⚠️ 模型未就绪</div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>AI 能力尚未就绪</div>
           <div style={{ marginBottom: 8 }}>
-            {!modelStatus.ollama && '• Ollama 推理引擎未运行'}
-            {!modelStatus.llm && '• LLM 推理模型未加载'}
-            {!modelStatus.embedding && '• 向量模型未加载'}
+            {!modelStatus.ollama && '本地运行环境未启动。'}
+            {!modelStatus.llm && '分析模型尚未加载。'}
+            {!modelStatus.embedding && '语义索引尚未加载。'}
           </div>
           <div style={{ fontSize: 12 }}>
-            请前往「模型」界面检查模型状态
+            请前往「AI 能力」检查状态。
           </div>
         </div>
       )}
@@ -599,7 +599,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           ref={textareaRef}
           className="rag-panel__input"
           data-testid="rag-panel-input"
-          placeholder={modelStatusLoading || modelsReady ? "问我任何工作相关的问题..." : "模型未就绪，请先配置模型"}
+          placeholder={modelStatusLoading || modelsReady ? "问我任何工作相关的问题..." : "AI 能力尚未就绪，请先完成配置"}
           value={inputValue}
           onChange={handleInputChange}
           onWheel={handleInputWheel}

@@ -7,7 +7,7 @@ use rusqlite::{params, Connection};
 use crate::storage::{
     db::current_ts_ms,
     error::StorageError,
-    models::{CaptureRecord, NewCapture},
+    models::{CaptureActivityAggregate, CaptureRecord, NewCapture, WorkImExpression},
     StorageManager,
 };
 
@@ -316,6 +316,160 @@ impl StorageManager {
         self.count_captures(&filter)
     }
 
+    /// 按本地日期和应用聚合工作活动。
+    ///
+    /// 相邻采集记录之间最多计入 `idle_gap_cap_ms`，避免长时间离开电脑被计为工作。
+    /// 末条记录按一分钟计入。敏感采集记录不会进入统计，也不会暴露窗口正文。
+    pub fn summarize_capture_activity(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        timezone_offset_ms: i64,
+        idle_gap_cap_ms: i64,
+    ) -> Result<Vec<CaptureActivityAggregate>, StorageError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "WITH ordered AS (
+                    SELECT
+                        id,
+                        ts,
+                        COALESCE(NULLIF(TRIM(app_name), ''), '其他') AS app_name,
+                        LEAD(ts) OVER (ORDER BY ts, id) AS next_ts
+                    FROM captures
+                    WHERE ts >= ?1 AND ts < ?2 AND is_sensitive = 0
+                ), apportioned AS (
+                    SELECT
+                        CAST((ts + ?3) / 86400000 AS INTEGER) AS day_index,
+                        app_name,
+                        ts,
+                        CASE
+                            WHEN next_ts IS NULL THEN 60000
+                            WHEN next_ts <= ts THEN 0
+                            WHEN next_ts - ts > ?4 THEN ?4
+                            ELSE next_ts - ts
+                        END AS duration_ms
+                    FROM ordered
+                )
+                SELECT
+                    day_index,
+                    app_name,
+                    SUM(duration_ms) AS duration_ms,
+                    COUNT(*) AS capture_count,
+                    MIN(ts) AS first_ts,
+                    MAX(ts) AS last_ts
+                FROM apportioned
+                GROUP BY day_index, app_name
+                ORDER BY day_index ASC, duration_ms DESC, app_name ASC",
+            )?;
+
+            let rows = stmt.query_map(
+                params![from_ts, to_ts, timezone_offset_ms, idle_gap_cap_ms],
+                |row| {
+                    Ok(CaptureActivityAggregate {
+                        day_index: row.get(0)?,
+                        app_name: row.get(1)?,
+                        duration_ms: row.get(2)?,
+                        capture_count: row.get(3)?,
+                        first_ts: row.get(4)?,
+                        last_ts: row.get(5)?,
+                    })
+                },
+            )?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
+        })
+    }
+
+    /// 读取工作画像时间段内的有效采集时间点。
+    ///
+    /// 该接口只返回时间戳，用于在本地计算连续工作和夜间工作峰值；
+    /// 不读取或返回应用名、窗口标题、截图及正文内容。
+    pub fn list_capture_activity_timestamps(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+    ) -> Result<Vec<i64>, StorageError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ts
+                 FROM captures
+                 WHERE ts >= ?1 AND ts < ?2 AND is_sensitive = 0
+                 ORDER BY ts ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ts, to_ts], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
+        })
+    }
+
+    /// 读取指定时段内用户在工作 IM 中主动输入的文本，用于本地心情推断。
+    ///
+    /// 只读取 `input_text`，不使用聊天窗口全文或他人消息；敏感记录与已过滤占位文本会被排除。
+    pub fn list_work_im_expressions(
+        &self,
+        from_ts: i64,
+        to_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<WorkImExpression>, StorageError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT
+                    COALESCE(NULLIF(TRIM(app_name), ''), '工作 IM') AS app_name,
+                    SUBSTR(TRIM(input_text), 1, 500) AS input_text
+                 FROM captures
+                 WHERE ts >= ?1
+                   AND ts < ?2
+                   AND is_sensitive = 0
+                   AND input_text IS NOT NULL
+                   AND TRIM(input_text) != ''
+                   AND TRIM(input_text) != '[已过滤]'
+                   AND (
+                       LOWER(COALESCE(app_name, '')) LIKE '%feishu%'
+                       OR COALESCE(app_name, '') LIKE '%飞书%'
+                       OR LOWER(COALESCE(app_name, '')) LIKE '%lark%'
+                       OR LOWER(COALESCE(app_name, '')) LIKE '%dingtalk%'
+                       OR COALESCE(app_name, '') LIKE '%钉钉%'
+                       OR LOWER(COALESCE(app_name, '')) LIKE '%wecom%'
+                       OR LOWER(COALESCE(app_name, '')) LIKE '%wework%'
+                       OR COALESCE(app_name, '') LIKE '%企业微信%'
+                       OR LOWER(COALESCE(app_name, '')) LIKE '%slack%'
+                       OR LOWER(COALESCE(app_name, '')) LIKE '%teams%'
+                       OR LOWER(COALESCE(app_name, '')) LIKE '%discord%'
+                       OR LOWER(COALESCE(app_name, '')) LIKE '%telegram%'
+                       OR LOWER(COALESCE(app_name, '')) LIKE '%wechat%'
+                       OR COALESCE(app_name, '') LIKE '%微信%'
+                       OR LOWER(TRIM(COALESCE(app_name, ''))) IN ('qq', 'tim')
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%lark%'
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%dingtalk%'
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%wework%'
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%slack%'
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%teams%'
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%discord%'
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%telegram%'
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%wechat%'
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%tencent.qq%'
+                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%mobilesms%'
+                   )
+                 ORDER BY ts ASC, id ASC
+                 LIMIT ?3",
+            )?;
+
+            let rows = stmt.query_map(
+                params![from_ts, to_ts, i64::try_from(limit.min(500)).unwrap_or(500)],
+                |row| {
+                    Ok(WorkImExpression {
+                        app_name: row.get(0)?,
+                        input_text: row.get(1)?,
+                    })
+                },
+            )?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StorageError::Sqlite)
+        })
+    }
+
     /// 查询一批 capture 各自所属时间线的 (timeline_id, summary)。
     ///
     /// 走 captures.timeline_id → timelines 直连，能正确覆盖被合并到时间线的从属
@@ -530,5 +684,103 @@ mod tests {
         let filter = CaptureFilter::new(); // exclude_sensitive = true
         let list = mgr.list_captures(&filter).unwrap();
         assert_eq!(list.len(), 0, "敏感记录应被过滤");
+    }
+
+    #[test]
+    fn test_summarize_capture_activity_caps_idle_time_and_excludes_sensitive_rows() {
+        let mgr = make_mgr();
+        let base = 1_700_000_000_000_i64;
+
+        let mut first = sample_capture();
+        first.ts = base;
+        first.app_name = Some("Code".into());
+        mgr.insert_capture(&first).unwrap();
+
+        let mut second = sample_capture();
+        second.ts = base + 2 * 60_000;
+        second.app_name = Some("Code".into());
+        mgr.insert_capture(&second).unwrap();
+
+        let mut third = sample_capture();
+        third.ts = base + 10 * 60_000;
+        third.app_name = Some("Browser".into());
+        mgr.insert_capture(&third).unwrap();
+
+        let mut sensitive = sample_capture();
+        sensitive.ts = base + 11 * 60_000;
+        sensitive.app_name = Some("Private Chat".into());
+        sensitive.is_sensitive = true;
+        mgr.insert_capture(&sensitive).unwrap();
+
+        let rows = mgr
+            .summarize_capture_activity(base - 1, base + 20 * 60_000, 0, 5 * 60_000)
+            .unwrap();
+
+        let code = rows.iter().find(|row| row.app_name == "Code").unwrap();
+        let browser = rows.iter().find(|row| row.app_name == "Browser").unwrap();
+        assert_eq!(code.duration_ms, 7 * 60_000);
+        assert_eq!(code.capture_count, 2);
+        assert_eq!(browser.duration_ms, 60_000);
+        assert!(!rows.iter().any(|row| row.app_name == "Private Chat"));
+    }
+
+    #[test]
+    fn test_list_capture_activity_timestamps_returns_only_non_sensitive_rows() {
+        let mgr = make_mgr();
+        let base = 1_700_000_000_000_i64;
+
+        let mut first = sample_capture();
+        first.ts = base + 2;
+        mgr.insert_capture(&first).unwrap();
+
+        let mut second = sample_capture();
+        second.ts = base + 1;
+        mgr.insert_capture(&second).unwrap();
+
+        let mut sensitive = sample_capture();
+        sensitive.ts = base + 3;
+        sensitive.is_sensitive = true;
+        mgr.insert_capture(&sensitive).unwrap();
+
+        let timestamps = mgr
+            .list_capture_activity_timestamps(base, base + 4)
+            .unwrap();
+
+        assert_eq!(timestamps, vec![base + 1, base + 2]);
+    }
+
+    #[test]
+    fn test_list_work_im_expressions_uses_only_non_sensitive_user_input() {
+        let mgr = make_mgr();
+        let base = 1_700_000_000_000_i64;
+
+        let mut feishu = sample_capture();
+        feishu.ts = base;
+        feishu.app_name = Some("飞书".into());
+        feishu.input_text = Some("我正在处理，稍后同步结果".into());
+        feishu.ax_text = Some("同事：这个问题什么时候能完成？".into());
+        mgr.insert_capture(&feishu).unwrap();
+
+        let mut editor = sample_capture();
+        editor.ts = base + 1;
+        editor.app_name = Some("Code".into());
+        editor.input_text = Some("这段代码太难了".into());
+        mgr.insert_capture(&editor).unwrap();
+
+        let mut sensitive = sample_capture();
+        sensitive.ts = base + 2;
+        sensitive.app_name = Some("Slack".into());
+        sensitive.input_text = Some("我压力很大".into());
+        sensitive.is_sensitive = true;
+        mgr.insert_capture(&sensitive).unwrap();
+
+        let expressions = mgr
+            .list_work_im_expressions(base - 1, base + 10, 200)
+            .unwrap();
+
+        assert_eq!(expressions.len(), 1);
+        assert_eq!(expressions[0].app_name, "飞书");
+        assert_eq!(expressions[0].input_text, "我正在处理，稍后同步结果");
+        assert!(!expressions[0].input_text.contains("同事"));
     }
 }

@@ -20,7 +20,14 @@ from embedding.model import EmbeddingModel
 from rag.llm.base    import LlmBackend, LlmResponse
 from rag.llm.ollama  import OllamaBackend
 from rag.pipeline    import RagPipeline, RagResult, _normalize_evidence_references, _normalize_weekly_report
-from rag.retriever   import Fts5Retriever, KnowledgeFts5Retriever, RetrievedChunk, VectorRetriever, VectorSearchFilter
+from rag.retriever   import (
+    Fts5Retriever,
+    KnowledgeFts5Retriever,
+    RetrievedChunk,
+    VectorRetriever,
+    VectorSearchFilter,
+    _bounded_fallback_terms,
+)
 from rag.reranker    import reciprocal_rank_fusion
 
 
@@ -210,6 +217,8 @@ def _init_captures_db(db_path: str) -> None:
             ts INTEGER NOT NULL,
             app_name TEXT,
             win_title TEXT,
+            url TEXT,
+            webpage_title TEXT,
             ocr_text TEXT,
             ax_text TEXT,
             input_text TEXT,
@@ -396,6 +405,32 @@ class TestRrf:
 # ── RagPipeline ───────────────────────────────────────────────────────────────
 
 class TestRagPipeline:
+    def test_raw_document_keyword_after_ax_prefix_is_recalled(self):
+        deep_keyword = "潮汐特性"
+        raw_text = "AX：" + ("背景资料 " * 100) + deep_keyword + "可用于弹性调度。"
+        assert raw_text.index(deep_keyword) > 500
+        raw_document = RetrievedChunk(
+            capture_id=77,
+            text=raw_text,
+            score=1.0,
+            source="fts5",
+            doc_key="capture:77",
+            metadata={
+                "source_type": "capture",
+                "doc_key": "capture:77",
+                "url": "https://docs.corp.kuaishou.com/k/home/example?from=search",
+                "webpage_title": "潮汐调度说明",
+            },
+        )
+        pipeline = _make_pipeline(fts_chunks=[raw_document], top_k=3)
+
+        result = pipeline.query("潮汐特性", references_only=True)
+
+        assert len(result.contexts) == 1
+        assert result.contexts[0].metadata["source_type"] == "pending_document"
+        assert result.contexts[0].doc_key == "document_url:https://docs.corp.kuaishou.com/k/home/example"
+        assert deep_keyword in result.contexts[0].text[:800]
+
     def test_query_returns_rag_result(self):
         pipeline = _make_pipeline(
             fts_chunks=[_chunk(1, 0.8)],
@@ -407,6 +442,35 @@ class TestRagPipeline:
         pipeline = _make_pipeline(llm_response="记忆面包回答")
         result   = pipeline.query("任何问题")
         assert result.answer == "记忆面包回答"
+
+    def test_stream_callbacks_deliver_contexts_before_answer_delta(self):
+        pipeline = _make_pipeline(
+            knowledge_chunks=[
+                _chunk(
+                    1,
+                    0.9,
+                    source="knowledge",
+                    doc_key="knowledge:1",
+                    metadata={
+                        "source_type": "knowledge",
+                        "doc_key": "knowledge:1",
+                        "knowledge_id": 1,
+                    },
+                )
+            ],
+            llm_response="流式回答",
+        )
+        events: list[tuple[str, object]] = []
+
+        result = pipeline.query(
+            "工作内容",
+            on_contexts=lambda contexts: events.append(("contexts", len(contexts))),
+            on_delta=lambda text: events.append(("delta", text)),
+        )
+
+        assert events[0][0] == "contexts"
+        assert events[1] == ("delta", "流式回答")
+        assert result.answer == "流式回答"
 
     def test_contexts_included(self):
         knowledge = [
@@ -1123,6 +1187,111 @@ class TestVectorRetriever:
 
 
 class TestSqliteRetrievers:
+    def test_knowledge_fallback_limits_terms_and_backfills_primary_capture_link(self, tmp_path):
+        db_path = str(tmp_path / "knowledge-fallback.db")
+        _init_knowledge_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE captures (id INTEGER PRIMARY KEY, url TEXT, webpage_title TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO captures (id, url, webpage_title) VALUES (?, ?, ?)",
+            (100, "https://docs.example/fast-retrieval", "快速召回说明"),
+        )
+        conn.execute(
+            """
+            INSERT INTO knowledge_entries
+                (id, capture_id, summary, overview, details, start_time, end_time,
+                 duration_minutes, frag_app_name, frag_win_title, entities, category, user_verified)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                100,
+                "召回优化",
+                "知识库参考资料召回优化",
+                "避免相关子查询扫描截图表",
+                1_710_000_000_000,
+                1_710_000_060_000,
+                1,
+                "MemoryBread",
+                "咨询",
+                "[]",
+                "开发",
+                1,
+            ),
+        )
+        conn.execute("ALTER TABLE knowledge_entries RENAME TO timelines")
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+
+        retriever = KnowledgeFts5Retriever(db_path)
+        results = retriever._search_by_app_fields(
+            conn.cursor(),
+            query="知识库参考资料召回优化",
+            top_k=5,
+            start_ts=None,
+            end_ts=None,
+            entity_terms=None,
+            observed_start_ts=None,
+            observed_end_ts=None,
+            event_start_ts=None,
+            event_end_ts=None,
+            activity_types=None,
+            content_origins=None,
+            history_view=None,
+            is_self_generated=None,
+            evidence_strengths=None,
+            query_mode="lookup",
+            created_start_ts=None,
+            created_end_ts=None,
+        )
+        conn.close()
+
+        fallback_sql = next(sql for sql in statements if "FROM timelines k" in sql)
+        assert "group_concat" not in fallback_sql
+        assert "capture_ids" not in fallback_sql
+        assert len(_bounded_fallback_terms([f"term-{index}" for index in range(30)])) == 12
+        assert results[0].metadata["url"] == "https://docs.example/fast-retrieval"
+        assert results[0].metadata["webpage_title"] == "快速召回说明"
+
+    def test_fts5_searches_full_ax_body_after_500_characters(self, tmp_path):
+        db_path = str(tmp_path / "captures.db")
+        _init_captures_db(db_path)
+        ax_text = ("背景资料 " * 110) + "潮汐特性 可用于弹性调度"
+        assert ax_text.index("潮汐特性") > 500
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            INSERT INTO captures
+                (id, ts, app_name, win_title, url, webpage_title, ocr_text, ax_text, input_text, audio_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                1_710_000_000_000,
+                "Chrome",
+                "潮汐调度说明",
+                "https://docs.corp.kuaishou.com/k/home/example",
+                "潮汐调度说明",
+                "",
+                ax_text,
+                "",
+                "",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        results = Fts5Retriever(db_path).search("潮汐特性", top_k=5)
+
+        assert [chunk.capture_id for chunk in results] == [1]
+        assert "潮汐特性" in results[0].text
+
     def test_artifact_search_returns_document_and_knowledge_for_gpu_metric_doc_query(self, tmp_path):
         db_path = str(tmp_path / "artifacts.db")
         conn = sqlite3.connect(db_path)
@@ -1205,7 +1374,7 @@ class TestSqliteRetrievers:
         conn.close()
 
         doc_keys = [chunk.doc_key for chunk in results]
-        assert "document:80" in doc_keys
+        assert "document_url:https://docs.example/container-gpu" in doc_keys
         assert "bake_knowledge:229" in doc_keys
 
     def test_fts5_retriever_falls_back_to_app_name_match(self, tmp_path):

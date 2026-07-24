@@ -7,6 +7,18 @@ from types import SimpleNamespace
 from scheduled_task_executor import TaskExecutor
 
 
+class _EnergyPolicy:
+    def __init__(self, allow_diary: bool) -> None:
+        self.allow_diary = allow_diary
+
+    def current_profile(self):
+        return SimpleNamespace(
+            allow_diary=self.allow_diary,
+            mode="charging" if self.allow_diary else "battery",
+            battery_percent=58,
+        )
+
+
 def _create_common_tables(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -143,7 +155,7 @@ def test_daily_diary_task_writes_yesterday_diary(tmp_path):
     assert json.loads(row[3]) == [1]
 
 
-def test_daily_diary_task_catches_up_recent_completed_days(tmp_path, monkeypatch):
+def test_daily_diary_task_only_generates_latest_completed_day(tmp_path, monkeypatch):
     db_path = tmp_path / "memory-bread.db"
     conn = sqlite3.connect(db_path)
     _create_common_tables(conn)
@@ -168,8 +180,8 @@ def test_daily_diary_task_catches_up_recent_completed_days(tmp_path, monkeypatch
     rows = conn.execute(
         "SELECT diary_date, source_timeline_ids FROM diaries WHERE period_type = 'daily' ORDER BY diary_date"
     ).fetchall()
-    assert [row[0] for row in rows] == ["2026-07-08", "2026-07-09"]
-    assert [json.loads(row[1]) for row in rows] == [[1], [2]]
+    assert [row[0] for row in rows] == ["2026-07-09"]
+    assert [json.loads(row[1]) for row in rows] == [[2]]
 
 
 def test_daily_diary_catchup_does_not_overwrite_user_edited_diary(tmp_path, monkeypatch):
@@ -537,7 +549,7 @@ def test_llm_generate_rewrites_english_diary_once(monkeypatch):
     assert client.calls[1]["think"] is False
 
 
-def test_weekly_diary_uses_daily_diaries_as_sources(tmp_path):
+def test_weekly_diary_uses_timelines_as_sources(tmp_path):
     db_path = tmp_path / "memory-bread.db"
     conn = sqlite3.connect(db_path)
     _create_common_tables(conn)
@@ -549,25 +561,7 @@ def test_weekly_diary_uses_daily_diaries_as_sources(tmp_path):
     start_day = date.fromisoformat(start)
     for offset in range(2):
         day = (start_day + timedelta(days=offset)).isoformat()
-        conn.execute(
-            """
-            INSERT INTO diaries
-                (period_type, period_start, period_end, diary_date, content)
-            VALUES ('daily', ?, ?, ?, ?)
-            """,
-            (
-                day,
-                day,
-                day,
-                json.dumps(
-                    {
-                        "title": f"{day} 工作日记",
-                        "work_outputs": [f"完成了第 {offset + 1} 项产出"],
-                    },
-                    ensure_ascii=False,
-                ),
-            ),
-        )
+        _insert_timeline_for_day(conn, day, f"完成了第 {offset + 1} 项产出")
     conn.commit()
     conn.close()
 
@@ -577,13 +571,40 @@ def test_weekly_diary_uses_daily_diaries_as_sources(tmp_path):
     assert result["status"] == "success"
     conn = sqlite3.connect(db_path)
     row = conn.execute(
-        "SELECT period_type, diary_date, content, source_diary_ids FROM diaries WHERE period_type = 'weekly'"
+        "SELECT period_type, diary_date, content, source_timeline_ids, source_diary_ids "
+        "FROM diaries WHERE period_type = 'weekly'"
     ).fetchone()
     content = json.loads(row[2])
     assert row[0] == "weekly"
     assert row[1] == diary_date
-    assert content["source_dates"] == [
-        start_day.isoformat(),
-        (start_day + timedelta(days=1)).isoformat(),
-    ]
+    assert content["source_count"] == 2
     assert json.loads(row[3]) == [1, 2]
+    assert json.loads(row[4]) == []
+
+
+def test_diary_task_defers_on_battery_without_creating_execution(tmp_path):
+    db_path = tmp_path / "memory-bread.db"
+    conn = sqlite3.connect(db_path)
+    _create_common_tables(conn)
+    task_id = _insert_task(conn, "daily_journal", "生成昨日工作日记")
+    conn.close()
+
+    executor = TaskExecutor(
+        db_path=str(db_path),
+        energy_policy=_EnergyPolicy(False),
+    )
+    executor._llm_generate = _fake_llm
+
+    result = executor.execute_task(task_id)
+
+    assert result["status"] == "deferred"
+    assert result["reason"] == "waiting_for_external_power"
+    conn = sqlite3.connect(db_path)
+    execution_count = conn.execute("SELECT COUNT(*) FROM task_executions").fetchone()[0]
+    task_row = conn.execute(
+        "SELECT run_count, last_run_status FROM scheduled_tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    conn.close()
+    assert execution_count == 0
+    assert task_row == (0, None)

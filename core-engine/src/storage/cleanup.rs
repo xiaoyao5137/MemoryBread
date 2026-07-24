@@ -138,7 +138,7 @@ impl StorageManager {
     /// 清理过期截图文件。
     ///
     /// 步骤：
-    /// 1. 查找 `captures.screenshot_path IS NOT NULL AND ts < older_than_ms AND timeline_id IS NULL` 的记录
+    /// 1. 查找没有可提炼文本的孤立旧截图
     /// 2. 尝试删除对应的文件
     /// 3. 将 captures.screenshot_path 置为 NULL
     /// 4. 写入 data_cleanup_log
@@ -149,13 +149,20 @@ impl StorageManager {
         older_than_ms: i64,
         captures_dir: &Path,
     ) -> Result<(usize, u64), StorageError> {
-        // 只清理未被时间线使用的孤立截图；已提炼/已关联的 capture 需要保留截图路径作为证据链。
+        // 有可提炼文本且 timeline_id 仍为空的 capture 属于提炼 backlog，不能因节能限速
+        // 而提前删除截图。这里只清理没有任何可提炼文本的孤立旧截图。
         let rows = self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, screenshot_path FROM captures
                  WHERE screenshot_path IS NOT NULL
                    AND ts < ?1
-                   AND timeline_id IS NULL",
+                   AND timeline_id IS NULL
+                   AND COALESCE(ax_text, '') = ''
+                   AND COALESCE(ocr_text, '') = ''
+                   AND COALESCE(input_text, '') = ''
+                   AND COALESCE(audio_text, '') = ''
+                   AND COALESCE(url, '') = ''
+                   AND COALESCE(webpage_title, '') = ''",
             )?;
             let result = stmt
                 .query_map(params![older_than_ms], |row| {
@@ -180,7 +187,13 @@ impl StorageManager {
                      SET screenshot_path = NULL,
                          screenshot_source = NULL
                      WHERE id = ?1
-                       AND timeline_id IS NULL",
+                       AND timeline_id IS NULL
+                       AND COALESCE(ax_text, '') = ''
+                       AND COALESCE(ocr_text, '') = ''
+                       AND COALESCE(input_text, '') = ''
+                       AND COALESCE(audio_text, '') = ''
+                       AND COALESCE(url, '') = ''
+                       AND COALESCE(webpage_title, '') = ''",
                     params![id],
                 )?;
                 Ok(())
@@ -212,7 +225,9 @@ impl StorageManager {
 
     /// 清理过期采集记录。
     ///
-    /// 只删除原始 captures、其向量索引元数据和对应截图文件；时间线、知识、
+    /// 只删除已经完成时间线提炼，或没有任何可提炼内容的原始 captures、其向量
+    /// 索引元数据和对应截图文件；仍在提炼 backlog 中的有效 capture 永不因保留期
+    /// 清理而丢失。时间线、知识、
     /// 操作记录等提炼物不会被删除。快照恢复生成的 `snapshot_ref` 只是跨设备
     /// 重建引用占位，不包含原始采集内容，也不应被采集保留期清理掉。历史 schema
     /// 中 timelines.capture_id 是外键，因此这里临时关闭外键检查以允许“原始证据
@@ -228,7 +243,22 @@ impl StorageManager {
             let mut stmt = conn.prepare(
                 "SELECT id, screenshot_path FROM captures
                  WHERE ts < ?1
-                   AND (event_type IS NULL OR event_type <> 'snapshot_ref')",
+                   AND (event_type IS NULL OR event_type <> 'snapshot_ref')
+                   AND (
+                       timeline_id IS NOT NULL
+                       OR EXISTS (
+                           SELECT 1 FROM timelines t
+                           WHERE t.capture_id = captures.id
+                       )
+                       OR (
+                           COALESCE(ax_text, '') = ''
+                           AND COALESCE(ocr_text, '') = ''
+                           AND COALESCE(input_text, '') = ''
+                           AND COALESCE(audio_text, '') = ''
+                           AND COALESCE(url, '') = ''
+                           AND COALESCE(webpage_title, '') = ''
+                       )
+                   )",
             )?;
             let result = stmt
                 .query_map(params![older_than_ms], |row| {
@@ -260,6 +290,21 @@ impl StorageManager {
                     SELECT id FROM captures
                     WHERE ts < ?1
                       AND (event_type IS NULL OR event_type <> 'snapshot_ref')
+                      AND (
+                          timeline_id IS NOT NULL
+                          OR EXISTS (
+                              SELECT 1 FROM timelines t
+                              WHERE t.capture_id = captures.id
+                          )
+                          OR (
+                              COALESCE(ax_text, '') = ''
+                              AND COALESCE(ocr_text, '') = ''
+                              AND COALESCE(input_text, '') = ''
+                              AND COALESCE(audio_text, '') = ''
+                              AND COALESCE(url, '') = ''
+                              AND COALESCE(webpage_title, '') = ''
+                          )
+                      )
                  )",
                     params![older_than_ms],
                 )?;
@@ -268,7 +313,22 @@ impl StorageManager {
                 let delete_result = conn.execute(
                     "DELETE FROM captures
                  WHERE ts < ?1
-                   AND (event_type IS NULL OR event_type <> 'snapshot_ref')",
+                   AND (event_type IS NULL OR event_type <> 'snapshot_ref')
+                   AND (
+                       timeline_id IS NOT NULL
+                       OR EXISTS (
+                           SELECT 1 FROM timelines t
+                           WHERE t.capture_id = captures.id
+                       )
+                       OR (
+                           COALESCE(ax_text, '') = ''
+                           AND COALESCE(ocr_text, '') = ''
+                           AND COALESCE(input_text, '') = ''
+                           AND COALESCE(audio_text, '') = ''
+                           AND COALESCE(url, '') = ''
+                           AND COALESCE(webpage_title, '') = ''
+                       )
+                   )",
                     params![older_than_ms],
                 );
                 let restore_result = conn.execute_batch("PRAGMA foreign_keys = ON;");
@@ -475,6 +535,75 @@ mod tests {
     }
 
     #[test]
+    fn test_old_captures_cleanup_keeps_meaningful_pending_backlog() {
+        let mgr = make_mgr();
+        let dir = tempdir().unwrap();
+        let rel_path = "screenshots/pending-backlog.jpg";
+        let bytes = b"pending backlog screenshot";
+        write_screenshot(dir.path(), rel_path, bytes);
+
+        let old_ts = current_ts_ms() - 30 * 24 * 3600 * 1000;
+        let capture_id = mgr
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO captures (
+                        ts, event_type, ax_text, screenshot_path, is_sensitive, pii_scrubbed
+                     ) VALUES (?1, 'auto', '仍待时间线提炼的有效内容', ?2, 0, 0)",
+                    params![old_ts, rel_path],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .unwrap();
+
+        let cutoff = current_ts_ms() - 14 * 24 * 3600 * 1000;
+        let (deleted, deleted_screenshots, freed) =
+            mgr.run_old_captures_cleanup(cutoff, dir.path()).unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(deleted_screenshots, 0);
+        assert_eq!(freed, 0);
+        assert!(dir.path().join(rel_path).exists());
+        let remaining: i64 = mgr
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM captures WHERE id = ?1 AND timeline_id IS NULL",
+                    params![capture_id],
+                    |row| row.get(0),
+                )
+                .map_err(StorageError::Sqlite)
+            })
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[test]
+    fn test_screenshot_purge_keeps_meaningful_pending_backlog() {
+        let mgr = make_mgr();
+        let dir = tempdir().unwrap();
+        let rel_path = "screenshots/pending-evidence.jpg";
+        write_screenshot(dir.path(), rel_path, b"pending evidence");
+
+        let old_ts = current_ts_ms() - 120 * 24 * 3600 * 1000;
+        mgr.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO captures (
+                    ts, event_type, ocr_text, screenshot_path, is_sensitive, pii_scrubbed
+                 ) VALUES (?1, 'auto', '等待提炼的 OCR 文本', ?2, 0, 0)",
+                params![old_ts, rel_path],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cutoff = current_ts_ms() - 90 * 24 * 3600 * 1000;
+        let (deleted, freed) = mgr.run_screenshot_purge(cutoff, dir.path()).unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(freed, 0);
+        assert!(dir.path().join(rel_path).exists());
+    }
+
+    #[test]
     fn test_old_captures_cleanup_deletes_orphan_screenshot_files() {
         let mgr = make_mgr();
         let dir = tempdir().unwrap();
@@ -525,8 +654,8 @@ mod tests {
                 params![old_ts],
             )?;
             conn.execute(
-                "INSERT INTO captures (ts, event_type, ax_text)
-                 VALUES (?1, 'auto', 'raw')",
+                "INSERT INTO captures (ts, event_type)
+                 VALUES (?1, 'auto')",
                 params![old_ts],
             )?;
             Ok(())

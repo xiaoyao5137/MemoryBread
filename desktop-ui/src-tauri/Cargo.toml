@@ -5,6 +5,11 @@ description = "记忆面包 Desktop Application"
 authors = ["记忆面包 Team"]
 edition = "2021"
 
+[features]
+default = []
+# App Store 构建禁用透明 WebView 私有 API 与 LaunchAgent 开机启动。
+app-store = []
+
 [lib]
 name = "memory_bread_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -25,7 +30,8 @@ base64 = "0.22"
 
 [target."cfg(target_os = \"macos\")".dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSResponder", "NSTrackingArea", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSControl", "NSDockTile", "NSEvent", "NSImage", "NSImageView", "NSResponder", "NSRunningApplication", "NSTrackingArea", "NSView", "NSWindow", "NSWorkspace"] }
 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
+tauri-plugin-global-shortcut = "2"
 tauri-plugin-shell = "2"

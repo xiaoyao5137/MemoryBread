@@ -81,6 +81,28 @@ pub struct CaptureRecord {
     pub webpage_title: Option<String>,
 }
 
+/// 工作画像页使用的采集活动聚合结果。
+///
+/// 只暴露日期、应用名与时长统计，不携带窗口标题或采集正文。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureActivityAggregate {
+    pub day_index: i64,
+    pub app_name: String,
+    pub duration_ms: i64,
+    pub capture_count: i64,
+    pub first_ts: i64,
+    pub last_ts: i64,
+}
+
+/// 工作画像内部用于心情推断的用户 IM 输入。
+///
+/// 该结构只在本地聚合流程中使用，API 不返回原始输入文本。
+#[derive(Debug, Clone)]
+pub struct WorkImExpression {
+    pub app_name: String,
+    pub input_text: String,
+}
+
 impl CaptureRecord {
     /// 返回最佳文本（programmatic/ax_text 优先，fallback 到 ocr_text）
     pub fn best_text(&self) -> Option<&str> {

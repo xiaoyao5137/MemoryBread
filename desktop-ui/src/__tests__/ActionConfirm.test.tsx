@@ -98,6 +98,6 @@ describe('ActionConfirm 无 description 时', () => {
     const action: ActionCommand = { type: 'hotkey', keys: ['ctrl', 'c'] }
     useAppStore.getState().setPendingAction(action)
     render(<ActionConfirm autoCancel={0} />)
-    expect(screen.getByTestId('action-confirm-action')).toHaveTextContent('hotkey')
+    expect(screen.getByTestId('action-confirm-action')).toHaveTextContent('使用快捷键')
   })
 })

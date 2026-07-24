@@ -2,12 +2,6 @@ import React, { useState } from 'react'
 import type { SopCandidate } from '../../types'
 import { BakeButton, BakeCard, BakeMarkdown, BakePill, BakeSectionHeader } from './BakeShared'
 
-const confidenceLabel: Record<SopCandidate['confidence'], string> = {
-  low: '低',
-  medium: '中',
-  high: '高',
-}
-
 const formatCreatedTime = (item: Pick<SopCandidate, 'createdAt' | 'createdAtMs'>) => {
   if ((item.createdAtMs ?? 0) > 0) {
     return new Date(item.createdAtMs ?? 0).toLocaleString('zh-CN', {
@@ -161,7 +155,7 @@ const BakeSopTab: React.FC<{
                   className="bake-input"
                   value={draftQuery}
                   onChange={(event) => onDraftQueryChange(event.target.value)}
-                  placeholder="搜索问题、来源或关键词"
+                  placeholder="搜索问题或关键词"
                 />
               </label>
               <div className="bake-list-toolbar__repository-actions bake-list-toolbar__repository-actions--search">
@@ -216,13 +210,10 @@ const BakeSopTab: React.FC<{
             >
               <div className="bake-inline-meta">
                 <div style={{ minWidth: 0 }}>
-                  <div className="bake-list-item__title bake-line-clamp-2">{item.extractedProblem || item.sourceTitle || '未命名问题'}</div>
+                  <div className="bake-list-item__title bake-line-clamp-2">{item.extractedProblem || '未命名问题'}</div>
                   <div className="bake-muted bake-line-clamp-1">关键词：{item.triggerKeywords.join(' / ') || '暂无'}</div>
                   <div className="bake-muted bake-line-clamp-1">创建：{formatCreatedTime(item)}</div>
                 </div>
-              </div>
-              <div className="bake-inline-pills">
-                <BakePill text={`置信度 ${confidenceLabel[item.confidence]}`} />
               </div>
             </button>
           ))}
@@ -268,14 +259,9 @@ const BakeSopTab: React.FC<{
       <BakeCard className="bake-knowledge-detail-card">
         {selected ? (
           <div className="bake-kv bake-knowledge-detail">
-            <div className="bake-inline-meta">
-              <div>
-                <div className="bake-title" style={{ fontSize: 18 }}>{selected.extractedProblem || selected.sourceTitle || '未命名问题'}</div>
-                <div className="bake-muted" style={{ marginTop: 4 }}>来源：{selected.sourceTitle || '—'} · ID: {selected.id} · 创建：{formatCreatedTime(selected)}</div>
-              </div>
-              <div className="bake-inline-pills">
-                <BakePill text={`置信度 ${confidenceLabel[selected.confidence]}`} />
-              </div>
+            <div>
+              <div className="bake-title" style={{ fontSize: 18 }}>{selected.extractedProblem || '未命名问题'}</div>
+              <div className="bake-muted" style={{ marginTop: 4 }}>ID: {selected.id} · 创建：{formatCreatedTime(selected)}</div>
             </div>
             <div className="bake-knowledge-detail__section">
               <div className="bake-kv__title">触发关键词</div>
@@ -380,21 +366,6 @@ const BakeSopTab: React.FC<{
                 ))}
                 <BakeButton compact onClick={addKeyword}>+ 添加关键词</BakeButton>
               </div>
-              <label className="bake-form-field">
-                <span className="bake-form-label">置信度</span>
-                <select
-                  className="bake-input"
-                  value={newSop.confidence}
-                  onChange={(e) => {
-                    const value = e.target.value as 'low' | 'medium' | 'high'
-                    setNewSop({ ...newSop, confidence: value })
-                  }}
-                >
-                  <option value="low">低</option>
-                  <option value="medium">中</option>
-                  <option value="high">高</option>
-                </select>
-              </label>
             </div>
             <div className="bake-modal__footer">
               <BakeButton onClick={() => setShowCreateDialog(false)}>取消</BakeButton>

@@ -2,7 +2,7 @@
 模型管理 API - 提供模型列表、下载、配置等接口
 """
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
 from werkzeug.exceptions import BadGateway, ServiceUnavailable
 from dataclasses import dataclass
@@ -21,6 +21,7 @@ import concurrent.futures
 import sys
 import threading
 import re
+import queue
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -36,8 +37,9 @@ from inference_queue import (
     LANE_P2_BAKE,
     Priority,
     QueueEvictedError,
-    configure_global_queue,
+    current_task_preempt_requested,
     get_global_queue,
+    interactive_demand_active,
 )
 from monitor.llm_tracker import estimate_tokens, log_llm_usage
 from idle_compute.model_manager import _log_model_event
@@ -414,7 +416,7 @@ def _analyze_floating_assist_intent(raw_query: str, metadata: dict | None, llm) 
         )
         parsed = _parse_json_object(response.text)
         if not parsed:
-            logger.warning("悬浮球意图识别返回非 JSON，使用规则兜底: %s", response.text[:300])
+            logger.warning("悬浮球意图识别返回非 JSON，使用规则兜底")
             return _fallback_floating_assist_intent(raw_query, metadata)
 
         answer_requirements = parsed.get('answer_requirements')
@@ -715,6 +717,37 @@ def health():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
+@app.route('/api/inference/queue-status', methods=['GET'])
+def get_inference_queue_status():
+    """只读暴露实际执行 LLM 的队列状态，供跨进程节能调度判断空闲。
+
+    该接口不接受任何配置写入；并发度仍完全由供电状态自动控制。
+    """
+    try:
+        inference_queue = get_global_queue()
+        interactive_active = interactive_demand_active()
+        stats = inference_queue.stats()
+        retry_after_ms = int(stats.get('background_retry_after_ms') or 0)
+        return jsonify({
+            'status': 'ok',
+            # creation_service 在另一进程中执行 P0；只看本进程队列会误判为空闲，
+            # 进而让 Sidecar 反复启动注定被抢占的 P2 bake。
+            'idle': (
+                inference_queue.is_idle()
+                and not interactive_active
+                and retry_after_ms <= 0
+            ),
+            'stats': stats,
+        })
+    except Exception as exc:
+        logger.error("读取推理队列状态失败: %s", exc)
+        return jsonify({
+            'status': 'error',
+            'idle': False,
+            'message': str(exc),
+        }), 500
+
+
 def _check_task_resources() -> tuple[bool, str]:
     cpu = psutil.cpu_percent(interval=0.5)
     mem = psutil.virtual_memory().percent
@@ -741,6 +774,8 @@ def execute_scheduled_task():
 
     logger.info("收到任务执行请求: task_id=%s", task_id)
     result = _task_executor.execute_task(task_id)
+    if result.get("status") == "deferred":
+        return jsonify(result), 503
     if result.get("status") == "failed":
         return jsonify({"error": result.get("error", "执行失败")}), 500
     return jsonify(result)
@@ -962,48 +997,6 @@ def get_config():
     try:
         return jsonify({'status': 'ok', 'config': model_manager.config})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
-@app.route('/api/models/llm-concurrency', methods=['GET'])
-def get_llm_concurrency():
-    try:
-        configured = int(model_manager.config.get('llm_max_concurrency', 1) or 1)
-        configured = max(1, min(3, configured))
-        stats = get_global_queue().stats()
-        return jsonify({
-            'status': 'ok',
-            'max_concurrency': configured,
-            'max_allowed': 3,
-            'stats': stats,
-        })
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
-@app.route('/api/models/llm-concurrency', methods=['POST'])
-def update_llm_concurrency():
-    try:
-        data = request.get_json(silent=True) or {}
-        raw_value = data.get('max_concurrency')
-        try:
-            max_concurrency = int(raw_value)
-        except (TypeError, ValueError):
-            return jsonify({'status': 'error', 'message': 'max_concurrency 必须是 1 到 3 的整数'}), 400
-        if max_concurrency < 1 or max_concurrency > 3:
-            return jsonify({'status': 'error', 'message': 'max_concurrency 必须在 1 到 3 之间'}), 400
-
-        model_manager.config['llm_max_concurrency'] = max_concurrency
-        model_manager._save_config()
-        stats = configure_global_queue(max_concurrency)
-        return jsonify({
-            'status': 'ok',
-            'max_concurrency': max_concurrency,
-            'max_allowed': 3,
-            'stats': stats,
-        })
-    except Exception as e:
-        logger.error("更新 LLM 并发配置失败: %s", e, exc_info=True)
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
@@ -1294,6 +1287,291 @@ def model_chat(model_id: str):
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
+def _serialize_rag_contexts(chunks) -> list[dict]:
+    return [
+        {
+            'capture_id': chunk.capture_id,
+            'doc_key': chunk.doc_key,
+            'text': chunk.text,
+            'score': chunk.score,
+            'source': chunk.metadata.get('source_type') or chunk.source,
+            'source_type': chunk.metadata.get('source_type') or chunk.source,
+            'knowledge_id': chunk.metadata.get('knowledge_id'),
+            'artifact_id': chunk.metadata.get('artifact_id'),
+            'document_id': chunk.metadata.get('document_id'),
+            'app_name': chunk.metadata.get('app_name'),
+            'win_title': chunk.metadata.get('win_title'),
+            'url': chunk.metadata.get('url') or chunk.metadata.get('source_url'),
+            'source_url': chunk.metadata.get('source_url') or chunk.metadata.get('url'),
+            'title': chunk.metadata.get('title'),
+            'doc_type': chunk.metadata.get('doc_type'),
+            'time': chunk.metadata.get('time') or chunk.metadata.get('ts') or chunk.metadata.get('end_time') or chunk.metadata.get('start_time'),
+            'observed_at': chunk.metadata.get('observed_at'),
+            'event_time_start': chunk.metadata.get('event_time_start'),
+            'event_time_end': chunk.metadata.get('event_time_end'),
+            'start_time': chunk.metadata.get('start_time'),
+            'end_time': chunk.metadata.get('end_time'),
+            'summary': chunk.metadata.get('summary'),
+            'overview': chunk.metadata.get('overview'),
+            'category': chunk.metadata.get('category'),
+            'activity_type': chunk.metadata.get('activity_type'),
+            'content_origin': chunk.metadata.get('content_origin'),
+            'history_view': chunk.metadata.get('history_view'),
+            'evidence_strength': chunk.metadata.get('evidence_strength'),
+            'importance': chunk.metadata.get('importance'),
+            'source_timeline_ids': chunk.metadata.get('source_timeline_ids'),
+            'linked_knowledge_ids': chunk.metadata.get('linked_knowledge_ids'),
+        }
+        for chunk in chunks
+    ]
+
+
+def _rag_stream_event(event_type: str, **payload) -> str:
+    return f"data: {json.dumps({'type': event_type, **payload}, ensure_ascii=False)}\n\n"
+
+
+def _public_rag_stream_error(error_text: str) -> str:
+    lowered = error_text.lower()
+    if 'busy' in lowered or 'service unavailable' in lowered or '初始化失败' in error_text:
+        return 'AI 正在处理其他任务，请稍候再试'
+    if 'ollama' in lowered:
+        return '本地模型服务暂时不可用，请检查模型状态后重试'
+    if '云端模型' in error_text or 'tls' in lowered or 'connection' in lowered:
+        return '云端模型服务暂时不可用，请检查网络后重试'
+    return '咨询生成失败，请稍后重试'
+
+
+@app.route('/query/stream', methods=['POST'])
+def rag_query_stream():
+    """流式 RAG 查询：状态、参考资料、答案增量和最终耗时共用一条 SSE。"""
+    data = request.get_json()
+    if not data or 'query' not in data:
+        return jsonify({'error': '缺少 query 参数'}), 400
+
+    from model_registry_global import check_memory_pressure
+    if check_memory_pressure() == "critical":
+        return jsonify({
+            'error': 'MEMORY_PRESSURE',
+            'message': '系统内存不足，RAG 查询暂时不可用，请稍后再试',
+        }), 503
+    if _rag_pipeline is None:
+        return jsonify({
+            'error': 'MODEL_NOT_READY',
+            'message': '向量模型或推理模型未就绪，请前往「烤箱型号」界面检查模型状态',
+        }), 503
+
+    query_text = data['query']
+    top_k = _coerce_rag_top_k(data.get('top_k'))
+    metadata = _floating_assist_metadata(query_text, dict(data))
+    pipeline = _rag_pipeline
+    llm_override = _build_rag_llm_override(metadata)
+    intent_llm_override = _build_rag_llm_override(metadata, timeout=60, num_predict=384) or llm_override
+
+    @stream_with_context
+    def generate():
+        event_queue: queue.Queue = queue.Queue()
+        finished = object()
+        cancelled = threading.Event()
+        started_ms = int(time.time() * 1000)
+
+        def emit(event_type: str, **payload):
+            if not cancelled.is_set():
+                event_queue.put(_rag_stream_event(event_type, **payload))
+
+        def run_stream_query():
+            answer_started_ms = None
+            generation_started_ms = None
+            response_contexts: list[dict] = []
+            retrieval_started_ms = None
+            retrieval_finished_ms = None
+            final_query = _build_floating_assist_rag_query(query_text, metadata)
+            try:
+                emit('status', stage='queued', message='咨询任务已接收', progress=18)
+                if metadata.get('source') == 'floating_assist':
+                    emit('status', stage='understanding', message='正在理解当前问题', progress=28)
+                    intent = get_global_queue().submit_sync(
+                        Priority.P0,
+                        lambda: _analyze_floating_assist_intent(
+                            query_text,
+                            metadata,
+                            intent_llm_override,
+                        ),
+                        timeout=90.0,
+                        lane=LANE_P0_QUERY,
+                    )
+                    final_query = _build_floating_assist_rag_query_from_intent(query_text, intent)
+                    metadata['floating_intent'] = {
+                        'source': intent.source,
+                        'core_question': intent.core_question,
+                        'retrieval_query': intent.retrieval_query,
+                        'screen_context_summary': intent.screen_context_summary,
+                        'confidence': intent.confidence,
+                        'needs_rag': intent.needs_rag,
+                    }
+                metadata['rag_query_text'] = final_query
+                emit('status', stage='retrieving', message='正在召回相关资料', progress=42)
+                retrieval_started_ms = int(time.time() * 1000)
+                retrieval_result = pipeline.query(
+                    final_query,
+                    top_k=top_k,
+                    references_only=True,
+                )
+                retrieval_finished_ms = int(time.time() * 1000)
+                response_contexts = _serialize_rag_contexts(retrieval_result.contexts)
+                emit('references', contexts=response_contexts)
+                emit(
+                    'status',
+                    stage='waiting_generation',
+                    message='资料已就绪，正在等待生成',
+                    progress=54,
+                )
+
+                def on_generation_contexts(_chunks):
+                    nonlocal answer_started_ms
+                    answer_started_ms = int(time.time() * 1000)
+                    emit('status', stage='answering', message='正在生成答案', progress=62)
+
+                def run_generation():
+                    nonlocal generation_started_ms
+                    generation_started_ms = int(time.time() * 1000)
+                    return pipeline.query(
+                        final_query,
+                        top_k=top_k,
+                        llm=llm_override,
+                        on_contexts=on_generation_contexts,
+                        on_delta=on_delta,
+                    )
+
+                def on_delta(delta: str):
+                    if delta:
+                        emit('delta', text=delta)
+
+                result = get_global_queue().submit_sync(
+                    Priority.P0,
+                    run_generation,
+                    timeout=420.0,
+                    lane=LANE_P0_QUERY,
+                )
+
+                saved_contexts = _with_floating_assist_context(response_contexts, metadata)
+                prompt_used = pipeline._build_context(result.contexts)
+                elapsed_ms = int(time.time() * 1000) - started_ms
+                inference_elapsed_ms = (
+                    int(time.time() * 1000) - answer_started_ms
+                    if answer_started_ms is not None
+                    else elapsed_ms
+                )
+                retrieval_elapsed_ms = (
+                    retrieval_finished_ms - retrieval_started_ms
+                    if retrieval_started_ms is not None and retrieval_finished_ms is not None
+                    else 0
+                )
+                generation_queue_wait_ms = (
+                    generation_started_ms - retrieval_finished_ms
+                    if generation_started_ms is not None and retrieval_finished_ms is not None
+                    else 0
+                )
+                generation_prepare_ms = (
+                    answer_started_ms - generation_started_ms
+                    if answer_started_ms is not None and generation_started_ms is not None
+                    else 0
+                )
+                logger.info(
+                    "流式 RAG 阶段耗时 retrieval_ms=%s generation_queue_wait_ms=%s "
+                    "generation_prepare_ms=%s inference_ms=%s total_ms=%s",
+                    retrieval_elapsed_ms,
+                    generation_queue_wait_ms,
+                    generation_prepare_ms,
+                    inference_elapsed_ms,
+                    elapsed_ms,
+                )
+                session_id = _save_rag_session(
+                    final_query,
+                    prompt_used,
+                    result.answer,
+                    saved_contexts,
+                    elapsed_ms,
+                    metadata,
+                    result.model,
+                )
+                completion_tokens = result.tokens or estimate_tokens(result.answer)
+                prompt_tokens = estimate_tokens(f"工作记录上下文：\n{prompt_used}\n\n用户问题：{final_query}")
+                log_llm_usage(
+                    caller='rag',
+                    model_name=result.model or 'unknown',
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    latency_ms=elapsed_ms,
+                    caller_id=str(session_id) if session_id is not None else None,
+                    done_reason=result.done_reason,
+                )
+                emit(
+                    'done',
+                    answer=result.answer,
+                    contexts=response_contexts,
+                    model='mbcd-std-v1',
+                    done_reason=result.done_reason,
+                    output_truncated=bool(result.output_truncated),
+                    elapsed_ms=elapsed_ms,
+                    inference_elapsed_ms=inference_elapsed_ms,
+                )
+            except QueueEvictedError as exc:
+                logger.warning("流式 RAG 查询被队列淘汰: %s", exc)
+                emit('error', code='BUSY', message='系统繁忙，请稍候再试')
+            except concurrent.futures.TimeoutError:
+                logger.warning("流式 RAG 查询执行超时")
+                emit('error', code='TIMEOUT', message='本次咨询生成时间过长，请稍后重试或缩小查询范围')
+            except Exception as exc:
+                elapsed_ms = int(time.time() * 1000) - started_ms
+                error_text = str(exc)
+                try:
+                    from model_registry_global import get_active_ollama_model
+                    log_llm_usage(
+                        caller='rag',
+                        model_name=get_active_ollama_model(),
+                        prompt_tokens=estimate_tokens(query_text),
+                        completion_tokens=0,
+                        latency_ms=elapsed_ms,
+                        status='failed',
+                        error_msg=error_text,
+                    )
+                except Exception:
+                    pass
+                logger.error("流式 RAG 查询失败: %s", exc, exc_info=True)
+                emit(
+                    'error',
+                    code='RAG_STREAM_FAILED',
+                    message=_public_rag_stream_error(error_text),
+                )
+            finally:
+                event_queue.put(finished)
+
+        worker = threading.Thread(target=run_stream_query, name='rag-sse-query', daemon=True)
+        worker.start()
+        try:
+            while True:
+                try:
+                    item = event_queue.get(timeout=15)
+                except queue.Empty:
+                    yield ': keep-alive\n\n'
+                    continue
+                if item is finished:
+                    break
+                yield item
+        finally:
+            cancelled.set()
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache, no-transform',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        },
+    )
+
+
 @app.route('/query', methods=['POST'])
 def rag_query():
     """RAG 查询接口，与模型管理 API 共用 7071 端口。"""
@@ -1307,7 +1585,7 @@ def rag_query():
 
         query = data['query']
         top_k = _coerce_rag_top_k(data.get('top_k'))
-        logger.info(f"收到 RAG 查询: {query}")
+        logger.info("收到 RAG 查询: top_k=%s", top_k)
         data = _floating_assist_metadata(query, data)
         rag_query_text = _build_floating_assist_rag_query(query, data)
 
@@ -1366,42 +1644,7 @@ def rag_query():
                 'message': '本次咨询生成时间过长，请稍后重试或缩小查询范围'
             }), 504
 
-        contexts = [
-            {
-                'capture_id': chunk.capture_id,
-                'doc_key': chunk.doc_key,
-                'text': chunk.text,
-                'score': chunk.score,
-                'source': chunk.metadata.get('source_type') or chunk.source,
-                'source_type': chunk.metadata.get('source_type') or chunk.source,
-                'knowledge_id': chunk.metadata.get('knowledge_id'),
-                'artifact_id': chunk.metadata.get('artifact_id'),
-                'document_id': chunk.metadata.get('document_id'),
-                'app_name': chunk.metadata.get('app_name'),
-                'win_title': chunk.metadata.get('win_title'),
-                'url': chunk.metadata.get('url') or chunk.metadata.get('source_url'),
-                'source_url': chunk.metadata.get('source_url') or chunk.metadata.get('url'),
-                'title': chunk.metadata.get('title'),
-                'doc_type': chunk.metadata.get('doc_type'),
-                'time': chunk.metadata.get('time') or chunk.metadata.get('ts') or chunk.metadata.get('end_time') or chunk.metadata.get('start_time'),
-                'observed_at': chunk.metadata.get('observed_at'),
-                'event_time_start': chunk.metadata.get('event_time_start'),
-                'event_time_end': chunk.metadata.get('event_time_end'),
-                'start_time': chunk.metadata.get('start_time'),
-                'end_time': chunk.metadata.get('end_time'),
-                'summary': chunk.metadata.get('summary'),
-                'overview': chunk.metadata.get('overview'),
-                'category': chunk.metadata.get('category'),
-                'activity_type': chunk.metadata.get('activity_type'),
-                'content_origin': chunk.metadata.get('content_origin'),
-                'history_view': chunk.metadata.get('history_view'),
-                'evidence_strength': chunk.metadata.get('evidence_strength'),
-                'importance': chunk.metadata.get('importance'),
-                'source_timeline_ids': chunk.metadata.get('source_timeline_ids'),
-                'linked_knowledge_ids': chunk.metadata.get('linked_knowledge_ids'),
-            }
-            for chunk in result.contexts
-        ]
+        contexts = _serialize_rag_contexts(result.contexts)
 
         response_contexts = contexts
         saved_contexts = _with_floating_assist_context(contexts, data)
@@ -1468,7 +1711,7 @@ def rag_references():
 
         query = data['query']
         top_k = _coerce_rag_top_k(data.get('top_k'))
-        logger.info(f"收到 RAG 参考资料召回: {query}")
+        logger.info("收到 RAG 参考资料召回: top_k=%s", top_k)
 
         if _rag_pipeline is None:
             return jsonify({
@@ -1477,49 +1720,9 @@ def rag_references():
             }), 503
 
         pipeline = _rag_pipeline
-        result = get_global_queue().submit_sync(
-            Priority.P0,
-            lambda: pipeline.query(query, top_k=top_k, references_only=True),
-            timeout=90.0,
-            lane=LANE_P0_QUERY,
-        )
+        result = pipeline.query(query, top_k=top_k, references_only=True)
 
-        contexts = [
-            {
-                'capture_id': chunk.capture_id,
-                'doc_key': chunk.doc_key,
-                'text': chunk.text,
-                'score': chunk.score,
-                'source': chunk.metadata.get('source_type') or chunk.source,
-                'source_type': chunk.metadata.get('source_type') or chunk.source,
-                'knowledge_id': chunk.metadata.get('knowledge_id'),
-                'artifact_id': chunk.metadata.get('artifact_id'),
-                'document_id': chunk.metadata.get('document_id'),
-                'app_name': chunk.metadata.get('app_name'),
-                'win_title': chunk.metadata.get('win_title'),
-                'url': chunk.metadata.get('url') or chunk.metadata.get('source_url'),
-                'source_url': chunk.metadata.get('source_url') or chunk.metadata.get('url'),
-                'title': chunk.metadata.get('title'),
-                'doc_type': chunk.metadata.get('doc_type'),
-                'time': chunk.metadata.get('time') or chunk.metadata.get('ts') or chunk.metadata.get('end_time') or chunk.metadata.get('start_time'),
-                'observed_at': chunk.metadata.get('observed_at'),
-                'event_time_start': chunk.metadata.get('event_time_start'),
-                'event_time_end': chunk.metadata.get('event_time_end'),
-                'start_time': chunk.metadata.get('start_time'),
-                'end_time': chunk.metadata.get('end_time'),
-                'summary': chunk.metadata.get('summary'),
-                'overview': chunk.metadata.get('overview'),
-                'category': chunk.metadata.get('category'),
-                'activity_type': chunk.metadata.get('activity_type'),
-                'content_origin': chunk.metadata.get('content_origin'),
-                'history_view': chunk.metadata.get('history_view'),
-                'evidence_strength': chunk.metadata.get('evidence_strength'),
-                'importance': chunk.metadata.get('importance'),
-                'source_timeline_ids': chunk.metadata.get('source_timeline_ids'),
-                'linked_knowledge_ids': chunk.metadata.get('linked_knowledge_ids'),
-            }
-            for chunk in result.contexts
-        ]
+        contexts = _serialize_rag_contexts(result.contexts)
         return jsonify({'answer': '', 'contexts': contexts, 'model': 'references-only'})
     except QueueEvictedError as ee:
         logger.warning(f"RAG 参考资料召回被队列淘汰: {ee}")
@@ -1624,13 +1827,20 @@ def extract_bake():
         try:
             result = get_global_queue().submit_sync(
                 Priority.P2,
-                lambda: extractor.extract_bake_bundle(candidate, preempt_check=lambda: False),
+                lambda: extractor.extract_bake_bundle(
+                    candidate,
+                    preempt_check=current_task_preempt_requested,
+                ),
                 timeout=900.0,
                 lane=LANE_P2_BAKE,
             )
         except QueueEvictedError as ee:
             logger.warning(f"bake extract 被队列淘汰: {ee}")
-            return jsonify({'error': 'AI 正在处理其他任务，请稍候再试'}), 503
+            return jsonify({
+                'error': 'AI 正在处理其他任务，请稍候再试',
+                'code': 'INFERENCE_PREEMPTED',
+                'retryable': True,
+            }), 503
         except concurrent.futures.TimeoutError:
             logger.warning("bake extract 执行超时")
             return jsonify({'error': 'bake 提炼超时'}), 504
@@ -1681,7 +1891,23 @@ def merge_bake_document():
             timeout=600.0,
             lane=LANE_P2_BAKE,
         )
+        if isinstance(result, dict) and not result.get('title'):
+            result['title'] = existing_document.get('title') or ''
         return jsonify(result)
+    except QueueEvictedError as e:
+        logger.warning("bake merge_document 被队列淘汰: %s", e)
+        return jsonify({
+            'error': 'AI 正在处理其他任务，请稍候再试',
+            'code': 'INFERENCE_PREEMPTED',
+            'retryable': True,
+        }), 503
+    except concurrent.futures.TimeoutError:
+        logger.warning("bake merge_document 执行超时")
+        return jsonify({
+            'error': 'bake 文档合并超时',
+            'code': 'INFERENCE_TIMEOUT',
+            'retryable': True,
+        }), 504
     except Exception as e:
         logger.error("bake merge_document 失败: %s", e, exc_info=True)
         return jsonify({'error': str(e)}), 500

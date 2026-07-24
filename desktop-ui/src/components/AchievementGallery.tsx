@@ -43,6 +43,12 @@ const RARITY_LABELS: Record<AchievementBadge['rarity'], string> = {
   legendary: '传说',
 }
 
+const BADGE_WELLNESS_NOTES: Partial<Record<string, string>> = {
+  sleepless_warrior: '高强度纪念卡：请优先补充睡眠和休息。',
+  overnight_writer: '通宵纪念卡：完成赶稿后，请尽快补充睡眠。',
+  uninterrupted_four_hours: '长时间久坐会影响健康。记得起身、喝水和休息。',
+}
+
 const formatCredit = (value: string) => {
   const amount = Number(value)
   if (!Number.isFinite(amount)) return value
@@ -145,8 +151,8 @@ const AchievementGallery: React.FC<AchievementGalleryProps> = ({
                   <span>累计奖励 <strong>{formatCredit(item.total_credit_earned)}</strong> Credit</span>
                   <span>最近获得 {new Date(item.last_earned_at).toLocaleDateString('zh-CN')}</span>
                 </div>
-                {badge.badge_key === 'sleepless_warrior' && (
-                  <div className="achievement-gallery__rest-note">高强度纪念卡：请优先补充睡眠和休息。</div>
+                {BADGE_WELLNESS_NOTES[badge.badge_key] && (
+                  <div className="achievement-gallery__rest-note">{BADGE_WELLNESS_NOTES[badge.badge_key]}</div>
                 )}
                 <div className="achievement-gallery__actions">
                   <button

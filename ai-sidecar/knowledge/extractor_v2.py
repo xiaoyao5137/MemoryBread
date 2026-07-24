@@ -17,6 +17,10 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 BAKE_NUM_PREDICT = 65536
+BAKE_CAPTURE_AX_MAX_CHARS = 16_000
+BAKE_CAPTURE_CONTEXT_MAX_CHARS = 20_000
+BAKE_DOCUMENT_MERGE_EXISTING_CONTEXT_MAX_CHARS = 24_000
+BAKE_DOCUMENT_MERGE_CANDIDATE_CONTEXT_MAX_CHARS = 32_000
 BAKE_ERROR_LOG_PATH = Path.home() / ".memory-bread" / "logs" / "bake_extract_errors.log"
 
 # RAG 查询优先锁:model_api_server 在 RAG 调用期间持有此文件锁。
@@ -379,6 +383,50 @@ BAKE_RESPONSE_SCHEMA = {
     "additionalProperties": False,
 }
 
+BAKE_BUNDLE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "knowledge": BAKE_RESPONSE_SCHEMA,
+        "design": BAKE_RESPONSE_SCHEMA,
+        "sop": BAKE_RESPONSE_SCHEMA,
+    },
+    "required": ["knowledge", "design", "sop"],
+    "additionalProperties": False,
+}
+
+BAKE_MERGE_DOCUMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "no_change": {"type": "boolean"},
+        "title": {"type": "string"},
+        "summary": {"type": ["string", "null"]},
+        "content_patch": {"type": ["string", "null"]},
+        # 兼容旧模型/旧测试返回；新提示词只允许模型输出 content_patch，完整正文由
+        # sidecar 在本地确定性拼接，避免长文档被模型可见窗口截断后整体覆盖。
+        "full_content": {"type": ["string", "null"]},
+        "insert_mode": {
+            "type": ["string", "null"],
+            "enum": [
+                "append",
+                "insert_after_section",
+                "replace_section",
+                "no_change",
+                None,
+            ],
+        },
+        "target_section_index": {"type": ["integer", "null"]},
+        "evidence_summary": {"type": ["string", "null"]},
+        "new_info_summary": {"type": ["string", "null"]},
+        "match_score": {"type": ["number", "null"]},
+        "match_level": {
+            "type": ["string", "null"],
+            "enum": ["high", "medium", "low", None],
+        },
+    },
+    "required": ["no_change", "title"],
+    "additionalProperties": False,
+}
+
 
 BAKE_TEMPLATE_MARKERS = (
     "模板",
@@ -603,6 +651,30 @@ accepted=true 时，payload schema:
 - 没有明确步骤化流程就 reject
 - 如果只是经验总结或模板骨架，不要误判成 SOP"""
 
+BAKE_BUNDLE_PROMPT = f"""你在执行一次性 bake bundle 提炼。输入是一条时间线候选工作片段。
+
+你必须在同一次判断中，分别评估 knowledge、design、sop 三类稳定资产。三类互不互斥，
+但都必须保守，只基于候选证据；证据不足的类别必须 reject。
+
+必须拒绝把界面中渲染的历史操作记录、变更日志或动态消息流当成当前用户产出。
+
+最终只返回一个 JSON 对象，顶层固定为 knowledge、design、sop。每个子对象固定为：
+{{"accepted": true/false, "reason": "原因或 null", "payload": {{...}} 或 null}}
+
+不要输出解释、代码块或思考过程。Markdown 只能出现在类别 schema 明确允许的字符串字段中。
+
+以下是三个类别各自的判断规则和 payload schema：
+
+--- knowledge ---
+{BAKE_KNOWLEDGE_PROMPT}
+
+--- design ---
+{BAKE_DESIGN_PROMPT}
+
+--- sop ---
+{BAKE_SOP_PROMPT}
+"""
+
 MERGE_SYSTEM_PROMPT ="""你是一个工作片段提炼助手。以下是用户在一段连续时间内的屏幕采集记录（按时间顺序），它们属于同一个工作片段。
 
 **你的任务**:将这些连续采集提炼为一个完整的工作片段知识条目。
@@ -753,12 +825,19 @@ class KnowledgeExtractorV2:
             logger.info(f"✅ 用户身份已配置: {self.user_identity}")
 
     def _ollama_chat(self, messages, format=None, options=None):
-        """使用 requests 调用 Ollama chat API"""
+        """使用可中断流调用 Ollama；在线 P0 到达时立即关闭后台响应。"""
         import requests
+        from inference_queue import (
+            current_task_preempt_requested,
+            raise_if_preempted,
+            register_current_preempt_callback,
+        )
+
+        raise_if_preempted()
         payload = {
             "model": self.model,
             "messages": messages,
-            "stream": False,
+            "stream": True,
             "think": False,  # 禁用 thinking 模式，确保 content 有内容
             # keep_alive=10m：与 RAG 查询保持一致，避免 Ollama 在查询和提炼之间频繁 swap
             "keep_alive": "10m",
@@ -768,13 +847,43 @@ class KnowledgeExtractorV2:
         if options:
             payload["options"] = options
 
-        r = requests.post(
-            f"{self.ollama_base_url}/api/chat",
-            json=payload,
-            timeout=self.timeout
-        )
-        r.raise_for_status()
-        return r.json()
+        try:
+            with requests.post(
+                f"{self.ollama_base_url}/api/chat",
+                json=payload,
+                timeout=self.timeout,
+                stream=True,
+            ) as response:
+                unregister = register_current_preempt_callback(response.close)
+                try:
+                    response.raise_for_status()
+                    final: Dict[str, Any] = {}
+                    content_parts: list[str] = []
+                    thinking_parts: list[str] = []
+                    for raw_line in response.iter_lines():
+                        raise_if_preempted()
+                        if not raw_line:
+                            continue
+                        chunk = json.loads(raw_line.decode("utf-8", errors="replace"))
+                        final.update(chunk)
+                        message = chunk.get("message") or {}
+                        if message.get("content"):
+                            content_parts.append(str(message["content"]))
+                        if message.get("thinking"):
+                            thinking_parts.append(str(message["thinking"]))
+                    final["message"] = {
+                        **(final.get("message") or {}),
+                        "content": "".join(content_parts),
+                        "thinking": "".join(thinking_parts),
+                    }
+                finally:
+                    unregister()
+            raise_if_preempted()
+            return final
+        except Exception:
+            if current_task_preempt_requested():
+                raise_if_preempted()
+            raise
 
     def _build_merge_system_prompt(self) -> str:
         """构建带用户身份的 MERGE_SYSTEM_PROMPT"""
@@ -1009,14 +1118,17 @@ class KnowledgeExtractorV2:
         entities_text = "、".join(str(item) for item in entities if item)
         sanitized_details = self._sanitize_bake_details_text(candidate.get('details'))
         capture_parts = [
-            self._truncate_text(candidate.get('capture_ax_text'), 3000),
+            self._truncate_text(candidate.get('capture_ax_text'), BAKE_CAPTURE_AX_MAX_CHARS),
             self._truncate_text(candidate.get('capture_ocr_text'), 1000),
             self._truncate_text(candidate.get('capture_input_text'), 500),
             self._truncate_text(candidate.get('capture_audio_text'), 500),
         ]
         capture_text = "\n\n".join(part for part in capture_parts if part)
-        if len(capture_text) > 5000:
-            capture_text = capture_text[:5000].rstrip() + "\n...(已截断)"
+        if len(capture_text) > BAKE_CAPTURE_CONTEXT_MAX_CHARS:
+            capture_text = (
+                capture_text[:BAKE_CAPTURE_CONTEXT_MAX_CHARS].rstrip()
+                + "\n...(已截断)"
+            )
 
         url_aggregated_text = candidate.get('url_aggregated_text') or ''
         url_aggregated_count = candidate.get('url_aggregated_capture_count') or 0
@@ -1123,7 +1235,13 @@ class KnowledgeExtractorV2:
         adjusted['evidence_summary'] = f"{evidence} | mismatch_guard={reason}" if evidence else f"mismatch_guard={reason}"
         return adjusted
 
-    def _call_bake_llm(self, caller_id: str, system_prompt: str, user_prompt: str) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    def _call_bake_llm(
+        self,
+        caller_id: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: Dict[str, Any] = BAKE_RESPONSE_SCHEMA,
+    ) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         from monitor.llm_tracker import LLMCallTracker, estimate_tokens
 
         started_at = time.time()
@@ -1138,7 +1256,7 @@ class KnowledgeExtractorV2:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                format=BAKE_RESPONSE_SCHEMA,
+                format=response_schema,
                 options={"temperature": 0.0, "num_predict": BAKE_NUM_PREDICT},
             )
             raw_content = _extract_ollama_response_text(response)
@@ -1364,6 +1482,109 @@ class KnowledgeExtractorV2:
             'elapsed_ms': elapsed_ms,
         }
 
+    def _normalize_bake_artifact_result(
+        self,
+        candidate: Dict[str, Any],
+        artifact_type: str,
+        parsed: Optional[Dict[str, Any]],
+        meta: Dict[str, Any],
+        *,
+        caller_id: str,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """校验一次 bundle 调用中的单个类别结果，并复用原有 mismatch guard。"""
+        elapsed_ms = int(meta.get('elapsed_ms') or 0)
+        usage = meta.get('usage')
+        model = meta.get('model') or self.model
+
+        if not isinstance(parsed, dict):
+            return {
+                'accepted': False,
+                'reason': meta.get('parse_failure_reason') or 'missing_bundle_artifact',
+                'payload': None,
+            }, {
+                'usage': usage,
+                'model': model,
+                'degraded': True,
+                'elapsed_ms': elapsed_ms,
+            }
+
+        accepted = bool(parsed.get('accepted', False))
+        reason = parsed.get('reason')
+        payload = parsed.get('payload')
+        if accepted and payload is None:
+            return {
+                'accepted': False,
+                'reason': 'accepted_without_payload',
+                'payload': None,
+            }, {
+                'usage': usage,
+                'model': model,
+                'degraded': True,
+                'elapsed_ms': elapsed_ms,
+            }
+        if accepted and not isinstance(payload, dict):
+            return {
+                'accepted': False,
+                'reason': 'malformed_payload',
+                'payload': None,
+            }, {
+                'usage': usage,
+                'model': model,
+                'degraded': True,
+                'elapsed_ms': elapsed_ms,
+            }
+
+        if accepted:
+            mismatch_reason = self._resolve_bake_artifact_mismatch_reason(
+                artifact_type,
+                candidate,
+                payload,
+            )
+            if mismatch_reason and artifact_type == 'knowledge':
+                return {
+                    'accepted': False,
+                    'reason': mismatch_reason,
+                    'payload': None,
+                }, {
+                    'usage': usage,
+                    'model': model,
+                    'degraded': False,
+                    'elapsed_ms': elapsed_ms,
+                }
+            if mismatch_reason:
+                payload = self._downgrade_mismatch_payload(payload, mismatch_reason)
+                reason = reason or mismatch_reason
+
+        logger.info(
+            "bake bundle artifact normalized type=%s caller=%s accepted=%s reason=%s",
+            artifact_type,
+            caller_id,
+            accepted,
+            reason,
+        )
+        if not accepted:
+            return {
+                'accepted': False,
+                'reason': reason or 'rejected',
+                'payload': None,
+            }, {
+                'usage': usage,
+                'model': model,
+                'degraded': False,
+                'elapsed_ms': elapsed_ms,
+            }
+
+        return {
+            'accepted': True,
+            'reason': reason,
+            'payload': payload,
+        }, {
+            'usage': usage,
+            'model': model,
+            'degraded': False,
+            'elapsed_ms': elapsed_ms,
+        }
+
     def extract_bake_knowledge(self, candidate: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
         return self._extract_bake_artifact(candidate, 'knowledge', BAKE_KNOWLEDGE_PROMPT)
 
@@ -1418,7 +1639,7 @@ class KnowledgeExtractorV2:
         return self._merge_with_llm_once(existing_document, candidate, candidate_text)
 
     def _merge_with_llm_once(self, existing_document: Dict[str, Any], candidate: Dict[str, Any], candidate_text: str) -> Dict[str, Any]:
-        """一次LLM调用完成去重判断+合并+插入位置决策"""
+        """让 LLM 只返回增量补丁，再在本地拼接，保证已有正文不会丢失。"""
         existing_title = existing_document.get('title') or ''
         existing_content = existing_document.get('full_content') or ''
         existing_summary = existing_document.get('summary') or ''
@@ -1434,26 +1655,23 @@ class KnowledgeExtractorV2:
             for i, s in enumerate(sections)
         ) if sections else "（文档无章节结构）"
 
-        system_prompt = """你在执行 bake 文档智能合并。
+        system_prompt = """你在执行 bake 文档增量合并。
 
 **输入**：已有文档 + 新 capture 内容
 
 **任务**：
 1. 判断新内容是否已被文档完全覆盖（即新内容是已有内容的子集或同义复述）
-2. 如果有新信息，决定如何合并：
-   - 简单追加（新内容独立于现有章节）
-   - 插入到某章节后（新内容是某章节的补充）
-   - 替换某章节（新内容是某章节的更新版本）
-3. 输出合并后的完整文档
+2. 如果有新信息，只输出已有文档中尚不存在的 Markdown 增量片段
+3. 不要复述已有正文，不要输出合并后的完整文档；程序会在本地保留旧正文并追加增量
 
 **输出 JSON**：
 {
   "no_change": true/false,  // true=新内容已完全覆盖，无需更新
   "title": "文档标题",
   "summary": "一句话摘要",
-  "full_content": "合并后的完整正文（仅当no_change=false时必填）",
-  "insert_mode": "append|insert_after_section|replace_section|no_change",
-  "target_section_index": 章节索引（仅insert_after_section/replace_section时需要）,
+  "content_patch": "仅包含新增信息的 Markdown 片段（仅当no_change=false时必填）",
+  "insert_mode": "append|no_change",
+  "target_section_index": null,
   "evidence_summary": "本次更新说明",
   "new_info_summary": "新增信息点（一句话）",
   "match_score": 0.0-1.0,
@@ -1461,43 +1679,115 @@ class KnowledgeExtractorV2:
 }
 
 **规则**：
-- no_change=true 时可省略 full_content，其他字段填原值
-- 保留已有章节顺序，不要无故重组
-- 只修改有据可查的部分
+- no_change=true 时 content_patch 必须为 null
+- no_change=false 时 content_patch 只能包含新增且有据可查的内容
+- 即使新内容是在修正旧章节，也用带明确小标题的补充说明表达，不要复制或改写旧正文
+- 严禁输出 full_content；旧正文不在模型侧重写
 - 严禁重复：相同信息只保留一次
 """
+        existing_context = self._head_tail_context(
+            existing_content,
+            BAKE_DOCUMENT_MERGE_EXISTING_CONTEXT_MAX_CHARS,
+        )
+        candidate_context = self._head_tail_context(
+            candidate_text,
+            BAKE_DOCUMENT_MERGE_CANDIDATE_CONTEXT_MAX_CHARS,
+        )
         user_prompt = (
             f"已有文档:\ntitle: {existing_title}\nsummary: {existing_summary}\n"
             f"章节结构:\n{section_structure}\n\n"
-            f"full_content（前3000字）:\n{existing_content[:3000]}\n\n"
-            f"新 capture:\n{candidate_text[:2000]}"
+            f"existing_content_context（只用于查重，原文由程序完整保留）:\n{existing_context}\n\n"
+            f"new_capture_context:\n{candidate_context}"
         )
 
         parsed, _ = self._call_bake_llm(
             f"merge_doc:{candidate.get('source_timeline_id')}",
             system_prompt,
             user_prompt,
+            response_schema=BAKE_MERGE_DOCUMENT_SCHEMA,
         )
 
         if not parsed or not isinstance(parsed, dict):
             return {'title': existing_title, 'no_change': True}
 
-        return parsed
+        if bool(parsed.get('no_change')):
+            parsed.pop('content_patch', None)
+            parsed.pop('full_content', None)
+            parsed['title'] = parsed.get('title') or existing_title
+            return parsed
+
+        content_patch = str(parsed.pop('content_patch', '') or '').strip()
+        if content_patch:
+            merged_content = self._append_document_patch(existing_content, content_patch)
+            if merged_content == existing_content:
+                parsed['no_change'] = True
+                parsed['insert_mode'] = 'no_change'
+                parsed.pop('full_content', None)
+            else:
+                parsed['no_change'] = False
+                parsed['insert_mode'] = 'append'
+                parsed['full_content'] = merged_content
+            parsed['title'] = parsed.get('title') or existing_title
+            return parsed
+
+        # 向后兼容旧模型偶发返回 full_content，但只有它逐字包含全部旧正文时才接受。
+        # 任何“重写后变短”的结果都视为 no_change，防止再次发生 171 号文档式截断。
+        legacy_full_content = str(parsed.get('full_content') or '').strip()
+        if legacy_full_content and self._content_preserves_existing(
+            existing_content,
+            legacy_full_content,
+        ):
+            parsed['full_content'] = legacy_full_content
+            parsed['title'] = parsed.get('title') or existing_title
+            return parsed
+
+        if legacy_full_content:
+            logger.warning(
+                "拒绝会丢失旧正文的文档合并结果 source_timeline_id=%s existing_len=%s merged_len=%s",
+                candidate.get('source_timeline_id'),
+                len(existing_content),
+                len(legacy_full_content),
+            )
+        return {'title': existing_title, 'no_change': True}
+
+    @staticmethod
+    def _head_tail_context(value: Any, limit: int) -> str:
+        """长文本保留首尾用于模型查重；该窗口从不参与最终正文覆盖。"""
+        text = str(value or '').strip()
+        if len(text) <= limit:
+            return text
+        marker = "\n\n...(中间内容仅在查重上下文中省略，存储原文保持完整)...\n\n"
+        available = max(0, limit - len(marker))
+        head_chars = available * 2 // 3
+        tail_chars = available - head_chars
+        return text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
+
+    @staticmethod
+    def _content_preserves_existing(existing_content: str, merged_content: str) -> bool:
+        existing = str(existing_content or '').strip()
+        merged = str(merged_content or '').strip()
+        return not existing or existing in merged
+
+    @classmethod
+    def _append_document_patch(cls, existing_content: str, content_patch: str) -> str:
+        existing = str(existing_content or '').strip()
+        patch = str(content_patch or '').strip()
+        if not patch or patch in existing:
+            return existing
+        # 模型若无视“只返回增量”的要求、返回了包含完整旧正文的扩展版，也只在
+        # 能逐字证明旧正文未丢失时接受，避免把整篇文档重复追加一遍。
+        if cls._content_preserves_existing(existing, patch):
+            return patch
+        if not existing:
+            return patch
+        return f"{existing}\n\n{patch}"
 
     def extract_bake_bundle(
         self,
         candidate: Dict[str, Any],
         preempt_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
-        """提炼 bake bundle（知识/模板/SOP），支持抢占中断。
-
-        Args:
-            candidate: 候选知识条目
-            preempt_check: 抢占检查函数，返回 True 表示需要中断
-
-        Returns:
-            提炼结果字典，如果被抢占则 degraded=True
-        """
+        """用一次 LLM 调用同时提炼 knowledge/document/SOP。"""
         bundle_started_at = time.time()
         source_timeline_id = candidate.get('source_timeline_id')
         logger.info("bake bundle start source_timeline_id=%s", source_timeline_id)
@@ -1516,82 +1806,83 @@ class KnowledgeExtractorV2:
                 'total_elapsed_ms': int((time.time() - bundle_started_at) * 1000),
             }
 
-        knowledge, knowledge_meta = self.extract_bake_knowledge(candidate)
-
-        # 每个阶段后检查抢占
-        if preempt_check and preempt_check():
-            logger.info("bake bundle 在 knowledge 后收到抢占信号 source_timeline_id=%s", source_timeline_id)
+        candidate_text = self._build_bake_candidate_text(candidate)
+        user_prompt = f"候选输入如下:\n\n{candidate_text}"
+        caller_id = f"bundle:{source_timeline_id}"
+        try:
+            parsed, meta = self._call_bake_llm(
+                caller_id,
+                BAKE_BUNDLE_PROMPT,
+                user_prompt,
+                response_schema=BAKE_BUNDLE_RESPONSE_SCHEMA,
+            )
+        except Exception as exc:
+            elapsed_ms = int((time.time() - bundle_started_at) * 1000)
+            logger.error(
+                "bake bundle 提炼失败 caller=%s elapsed_ms=%s error=%s",
+                caller_id,
+                elapsed_ms,
+                exc,
+            )
+            rejected = {
+                'accepted': False,
+                'reason': f'llm_error: {exc}',
+                'payload': None,
+            }
             return {
-                'knowledge': knowledge,
-                'design': {'accepted': False, 'reason': 'preempted', 'payload': None},
-                'sop': {'accepted': False, 'reason': 'preempted', 'payload': None},
-                'usage': knowledge_meta.get('usage'),
-                'model': knowledge_meta.get('model') or self.model,
+                'knowledge': rejected,
+                'design': dict(rejected),
+                'sop': dict(rejected),
+                'usage': None,
+                'model': self.model,
                 'degraded': True,
-                'stage_elapsed_ms': {'knowledge': int(knowledge_meta.get('elapsed_ms') or 0)},
-                'total_elapsed_ms': int((time.time() - bundle_started_at) * 1000),
+                'stage_elapsed_ms': {'bundle': elapsed_ms},
+                'total_elapsed_ms': elapsed_ms,
             }
 
-        design, design_meta = self.extract_bake_design(candidate)
+        parse_failure_reason = None
+        if not isinstance(parsed, dict):
+            parse_failure_reason = 'empty_content' if meta.get('empty_content') else (
+                'truncated_json' if meta.get('done_reason') == 'length' else 'invalid_json'
+            )
+            meta = {**meta, 'parse_failure_reason': parse_failure_reason}
+            parsed = {}
 
-        if preempt_check and preempt_check():
-            logger.info("bake bundle 在 design 后收到抢占信号 source_timeline_id=%s", source_timeline_id)
-            usage_items = [meta.get('usage') for meta in (knowledge_meta, design_meta) if meta.get('usage')]
-            usage = None
-            if usage_items:
-                usage = {
-                    'prompt_tokens': sum(int(item.get('prompt_tokens') or 0) for item in usage_items),
-                    'completion_tokens': sum(int(item.get('completion_tokens') or 0) for item in usage_items),
-                }
-            return {
-                'knowledge': knowledge,
-                'design': design,
-                'sop': {'accepted': False, 'reason': 'preempted', 'payload': None},
-                'usage': usage,
-                'model': design_meta.get('model') or self.model,
-                'degraded': True,
-                'stage_elapsed_ms': {
-                    'knowledge': int(knowledge_meta.get('elapsed_ms') or 0),
-                    'design': int(design_meta.get('elapsed_ms') or 0),
-                },
-                'total_elapsed_ms': int((time.time() - bundle_started_at) * 1000),
-            }
+        results: Dict[str, Dict[str, Any]] = {}
+        result_meta: Dict[str, Dict[str, Any]] = {}
+        for artifact_type in ('knowledge', 'design', 'sop'):
+            artifact, artifact_meta = self._normalize_bake_artifact_result(
+                candidate,
+                artifact_type,
+                parsed.get(artifact_type),
+                meta,
+                caller_id=caller_id,
+            )
+            results[artifact_type] = artifact
+            result_meta[artifact_type] = artifact_meta
 
-        sop, sop_meta = self.extract_bake_sop(candidate)
-
-        usage_items = [meta.get('usage') for meta in (knowledge_meta, design_meta, sop_meta) if meta.get('usage')]
-        usage = None
-        if usage_items:
-            usage = {
-                'prompt_tokens': sum(int(item.get('prompt_tokens') or 0) for item in usage_items),
-                'completion_tokens': sum(int(item.get('completion_tokens') or 0) for item in usage_items),
-            }
-
-        models = [meta.get('model') for meta in (knowledge_meta, design_meta, sop_meta) if meta.get('model')]
-        degraded = any(bool(meta.get('degraded')) for meta in (knowledge_meta, design_meta, sop_meta))
+        degraded = bool(parse_failure_reason) or any(
+            bool(item.get('degraded')) for item in result_meta.values()
+        )
         total_elapsed_ms = int((time.time() - bundle_started_at) * 1000)
-        per_stage_ms = {
-            'knowledge': int(knowledge_meta.get('elapsed_ms') or 0),
-            'design': int(design_meta.get('elapsed_ms') or 0),
-            'sop': int(sop_meta.get('elapsed_ms') or 0),
-        }
+        per_stage_ms = {'bundle': int(meta.get('elapsed_ms') or total_elapsed_ms)}
         logger.info(
             "bake bundle done source_timeline_id=%s total_elapsed_ms=%s stage_elapsed_ms=%s degraded=%s accepted={knowledge:%s,design:%s,sop:%s}",
             source_timeline_id,
             total_elapsed_ms,
             per_stage_ms,
             degraded,
-            knowledge.get('accepted'),
-            design.get('accepted'),
-            sop.get('accepted'),
+            results['knowledge'].get('accepted'),
+            results['design'].get('accepted'),
+            results['sop'].get('accepted'),
         )
 
         return {
-            'knowledge': knowledge,
-            'design': design,
-            'sop': sop,
-            'usage': usage,
-            'model': models[0] if models else self.model,
+            'knowledge': results['knowledge'],
+            'design': results['design'],
+            'sop': results['sop'],
+            'usage': meta.get('usage'),
+            'model': meta.get('model') or self.model,
             'degraded': degraded,
             'stage_elapsed_ms': per_stage_ms,
             'total_elapsed_ms': total_elapsed_ms,

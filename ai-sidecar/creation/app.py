@@ -1,10 +1,16 @@
 """创作服务 FastAPI 应用"""
+import asyncio
+import queue
+import threading
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import logging
+
+from inference_queue import LANE_P0_CREATION, Priority, get_global_queue
 
 from .service import CreationOptions, CreationService
 
@@ -65,6 +71,12 @@ class ReferenceRequest(BaseModel):
     max_references: int = 6
 
 
+class AnalyzeCreationSkillRequest(BaseModel):
+    document_title: str
+    document_content: str
+    doc_type: str = ""
+
+
 @app.post("/creation/generate")
 async def generate_document(request: GenerateRequest):
     """流式生成文档"""
@@ -74,22 +86,52 @@ async def generate_document(request: GenerateRequest):
         async def event_stream():
             import json
             yield f"data: {json.dumps({'status': 'started'})}\n\n"
+            chunk_queue: queue.Queue = queue.Queue()
+            finished = object()
+            cancelled = threading.Event()
+
+            def run_creation() -> None:
+                async def produce() -> None:
+                    if cancelled.is_set():
+                        return
+                    async for chunk in creation_service.generate_document(
+                        user_prompt=request.user_prompt,
+                        design_templates=request.design_templates,
+                        timeline_context=request.timeline_context,
+                        capture_context=request.capture_context,
+                        options=options,
+                        creation_model=request.creation_model,
+                        creation_api_key=request.creation_api_key,
+                        creation_base_url=request.creation_base_url,
+                    ):
+                        if cancelled.is_set():
+                            break
+                        chunk_queue.put(chunk)
+
+                try:
+                    asyncio.run(produce())
+                finally:
+                    chunk_queue.put(finished)
+
+            future = get_global_queue().submit(
+                Priority.P0,
+                run_creation,
+                lane=LANE_P0_CREATION,
+            )
             try:
-                async for chunk in creation_service.generate_document(
-                    user_prompt=request.user_prompt,
-                    design_templates=request.design_templates,
-                    timeline_context=request.timeline_context,
-                    capture_context=request.capture_context,
-                    options=options,
-                    creation_model=request.creation_model,
-                    creation_api_key=request.creation_api_key,
-                    creation_base_url=request.creation_base_url,
-                ):
-                    yield f"data: {json.dumps({'content': chunk})}\n\n"
+                while True:
+                    item = await asyncio.to_thread(chunk_queue.get)
+                    if item is finished:
+                        break
+                    yield f"data: {json.dumps({'content': item})}\n\n"
+                await asyncio.to_thread(future.result)
                 yield f"data: {json.dumps({'done': True})}\n\n"
             except Exception as e:
                 logger.error(f"Streaming generation error: {e}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            finally:
+                cancelled.set()
+                future.cancel()
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
     except Exception as e:
@@ -133,6 +175,22 @@ async def preview_references(request: ReferenceRequest):
     except Exception as e:
         logger.error(f"Reference preview error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/creation/skills/analyze")
+async def analyze_creation_skill(request: AnalyzeCreationSkillRequest):
+    """在本地从既有文档提炼可编辑的创作 Skill。"""
+    try:
+        return await creation_service.analyze_creation_skill(
+            document_title=request.document_title,
+            document_content=request.document_content,
+            doc_type=request.doc_type,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Creation skill analysis error: %s", e)
+        raise HTTPException(status_code=500, detail="本地 Skill 分析失败")
 
 
 @app.get("/health")

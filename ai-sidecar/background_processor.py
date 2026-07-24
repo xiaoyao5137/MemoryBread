@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 from urllib import error as urllib_error, request as urllib_request
 
+from energy_policy import EnergyPolicy
 from idle_compute.model_manager import _log_model_event
 from knowledge.fragment_grouper import FragmentGrouper
 
@@ -27,10 +28,12 @@ logger = logging.getLogger(__name__)
 _RAG_LOCK_FILE = "/tmp/memory-bread-rag.lock"
 _PROCESS_LOCK_FILE = "/tmp/memory-bread-knowledge-extract.lock"
 _DEFAULT_CORE_ENGINE_URL = "http://127.0.0.1:7070"
+_DEFAULT_MODEL_API_URL = "http://127.0.0.1:7071"
 _BAKE_RUN_ENDPOINT = "/api/bake/run"
-
-# 周期性主动触发 bake 的间隔（秒）：即使没有新 capture 被处理，也要定期检查是否有历史积压的 pending timeline
-_PERIODIC_BAKE_INTERVAL_SECS = 5 * 60  # 5 分钟
+_INFERENCE_QUEUE_STATUS_ENDPOINT = "/api/inference/queue-status"
+_CHARGING_CATCHUP_MAX_BATCH_SIZE = 100
+_CHARGING_CATCHUP_SLEEP_SECS = 1
+_SUBSTANTIVE_DOCUMENT_MIN_CHARS = 200
 
 # 全局 embedding 信号量，限制并发数
 _embedding_semaphore = asyncio.Semaphore(2)
@@ -175,12 +178,15 @@ class BackgroundProcessor:
         db_path: str,
         interval: int = 30,  # 扫描间隔（秒）
         batch_size: int = 10,  # 每次处理的记录数
+        energy_policy: Optional[EnergyPolicy] = None,
     ):
         self.db_path = db_path
         self.interval = interval
         self.batch_size = batch_size
+        self.energy_policy = energy_policy or EnergyPolicy(db_path)
         self.running = False
         self._run_lock = asyncio.Lock()
+        self._last_energy_mode: Optional[str] = None
 
         # 懒加载 workers
         self._embed_worker = None
@@ -388,6 +394,45 @@ class BackgroundProcessor:
             for r in rows
         ]
 
+    def _count_unprocessed_captures(self) -> int:
+        """统计完整待提炼 backlog；限速只改变消费速度，不改变 capture 状态。"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                app_kws = tuple(k.lower() for k in _SELF_GENERATED_APP_KEYWORDS)
+                win_kws = tuple(k.lower() for k in _SELF_GENERATED_WINDOW_KEYWORDS)
+                app_not_like = " AND ".join(
+                    f"LOWER(COALESCE(c.app_name, '')) NOT LIKE '%{k}%'" for k in app_kws
+                )
+                win_not_like = " AND ".join(
+                    f"LOWER(COALESCE(c.win_title, '')) NOT LIKE '%{k}%'" for k in win_kws
+                )
+                row = conn.execute(f"""
+                    SELECT COUNT(*)
+                    FROM captures c
+                    WHERE ((c.ocr_text IS NOT NULL AND c.ocr_text != '')
+                       OR (c.ax_text IS NOT NULL AND c.ax_text != ''))
+                      AND c.timeline_id IS NULL
+                      AND c.is_sensitive = 0
+                      AND ({app_not_like})
+                      AND ({win_not_like})
+                """).fetchone()
+                return int(row[0] or 0) if row else 0
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("统计待提炼 capture backlog 失败: %s", exc)
+            return 0
+
+    @staticmethod
+    def _timeline_batch_limit(profile, pending_count: int) -> int:
+        base_limit = max(1, int(profile.timeline_batch_size))
+        if profile.mode not in {"charging", "unrestricted"}:
+            return base_limit
+        if pending_count <= base_limit:
+            return base_limit
+        return min(max(base_limit, int(pending_count)), _CHARGING_CATCHUP_MAX_BATCH_SIZE)
+
     # 跨批上下文回溯条数：用于判断新 batch 开头是否与前一批末尾属于同一件事
     _CROSS_BATCH_CONTEXT_N = 5
 
@@ -482,22 +527,65 @@ class BackgroundProcessor:
     def _get_core_engine_url() -> str:
         return os.getenv("CORE_ENGINE_URL") or os.getenv("MEMORY_BREAD_CORE_URL") or _DEFAULT_CORE_ENGINE_URL
 
-    async def _trigger_unified_bake_pipeline(self, processed_count: int, force: bool = False) -> dict:
+    @staticmethod
+    def _get_model_api_url() -> str:
+        return os.getenv("MODEL_API_URL") or _DEFAULT_MODEL_API_URL
+
+    def _all_inference_queues_idle(self) -> bool:
+        """同时确认本进程 P1 队列和 7071 实际模型队列均为空。
+
+        BackgroundProcessor 通常运行在 main.py，而 P0/P2 运行在独立的
+        model_api_server.py 进程。只检查进程内单例会把远端正在推理误判为空闲。
+        状态接口不可用时 fail-closed，留到下一轮再试。
+        """
+        from inference_queue import get_global_queue
+
+        if not get_global_queue().is_idle():
+            return False
+
+        url = (
+            f"{self._get_model_api_url().rstrip('/')}"
+            f"{_INFERENCE_QUEUE_STATUS_ENDPOINT}"
+        )
+        try:
+            request = urllib_request.Request(url, method="GET")
+            with urllib_request.urlopen(request, timeout=3) as response:
+                body = response.read().decode("utf-8") if response else ""
+                data = json.loads(body) if body else {}
+            return data.get("status") == "ok" and data.get("idle") is True
+        except Exception as exc:
+            logger.debug("读取跨进程推理队列状态失败，按忙碌处理: %s", exc)
+            return False
+
+    async def _trigger_unified_bake_pipeline(
+        self,
+        processed_count: int,
+        force: bool = False,
+        *,
+        limit_override: Optional[int] = None,
+        max_concurrency: int = 3,
+    ) -> dict:
         if processed_count <= 0 and not force:
             return {
                 "triggered": False,
                 "reason": "no_new_knowledge",
             }
+        if not await asyncio.to_thread(self._all_inference_queues_idle):
+            return {
+                "triggered": False,
+                "reason": "inference_busy",
+            }
 
         url = f"{self._get_core_engine_url().rstrip('/')}{_BAKE_RUN_ENDPOINT}"
+        limit = (
+            max(1, int(limit_override))
+            if limit_override is not None
+            else max(processed_count, 20)
+        )
         payload = json.dumps({
             "trigger_reason": "knowledge_background",
-            # core 端会在本次 run 中按 watermark 顺序消化候选；这里不再限制为
-            # `processed_count`，而是给一个较大的上限，让 timelines 表里历史积压
-            # 的 candidate 在每次触发中尽可能被一并处理。
-            # core 端 handler 自带 clamp(1, 100)，且整轮在后台 task 中跑，不会
-            # 被 sidecar 这边的 15s urlopen 超时影响。
-            "limit": max(processed_count, 20),
+            "limit": limit,
+            "max_concurrency": max(1, min(int(max_concurrency), 3)),
         }).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -509,13 +597,17 @@ class BackgroundProcessor:
                 with urllib_request.urlopen(request, timeout=15) as response:
                     body = response.read().decode("utf-8") if response else ""
                     data = json.loads(body) if body else {}
+                    status = data.get("status")
+                    run_id = data.get("id")
+                    accepted = status == "accepted" and run_id is not None
                     return {
-                        "triggered": True,
-                        "status": data.get("status"),
-                        "run_id": data.get("id"),
+                        "triggered": accepted,
+                        "status": status,
+                        "run_id": run_id,
                         "auto_created_count": data.get("auto_created_count"),
                         "candidate_count": data.get("candidate_count"),
                         "discarded_count": data.get("discarded_count"),
+                        "reason": None if accepted else (data.get("reason") or f"status={status}"),
                     }
             except urllib_error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
@@ -696,7 +788,15 @@ class BackgroundProcessor:
 
         return result_groups, merge_into
 
-    async def _run_batch(self, limit_override: Optional[int] = None, force_finalize_tail: bool = False) -> dict:
+    async def _run_batch(
+        self,
+        limit_override: Optional[int] = None,
+        force_finalize_tail: bool = False,
+        *,
+        trigger_bake: bool = True,
+        bake_limit: Optional[int] = None,
+        bake_concurrency: int = 3,
+    ) -> dict:
         batch = await asyncio.to_thread(self._process_batch_sync, limit_override, force_finalize_tail)
         groups_to_process = batch.get('groups_to_process')
         if not groups_to_process:
@@ -755,14 +855,37 @@ class BackgroundProcessor:
 
         fetched_count = int(batch.get('fetched_count', 0))
         logger.info("批处理完成: processed=%s fetched=%s", processed, fetched_count)
-        bake_result = await self._trigger_unified_bake_pipeline(processed)
         summary = self._build_batch_summary(fetched_count, processed)
-        summary['bake_trigger'] = bake_result
+        if trigger_bake:
+            summary['bake_trigger'] = await self._trigger_unified_bake_pipeline(
+                processed,
+                limit_override=bake_limit,
+                max_concurrency=bake_concurrency,
+            )
+        else:
+            summary['bake_trigger'] = {
+                "triggered": False,
+                "reason": "scheduled_separately",
+            }
         return summary
 
-    async def run_once(self, limit_override: Optional[int] = None, force_finalize_tail: bool = False) -> dict:
+    async def run_once(
+        self,
+        limit_override: Optional[int] = None,
+        force_finalize_tail: bool = False,
+        *,
+        trigger_bake: bool = True,
+        bake_limit: Optional[int] = None,
+        bake_concurrency: int = 3,
+    ) -> dict:
         async with self._run_lock:
-            return await self._run_batch(limit_override, force_finalize_tail)
+            return await self._run_batch(
+                limit_override,
+                force_finalize_tail,
+                trigger_bake=trigger_bake,
+                bake_limit=bake_limit,
+                bake_concurrency=bake_concurrency,
+            )
 
     def _save_knowledge(self, conn: sqlite3.Connection, knowledge: dict) -> int:
         """保存 knowledge 条目，返回新插入的 id"""
@@ -846,6 +969,35 @@ class BackgroundProcessor:
         conn.commit()
         return cursor.lastrowid
 
+    @staticmethod
+    def _apply_document_metadata_defaults(knowledge: dict, captures: list[dict]) -> bool:
+        """对“文档 URL + 实质正文”应用确定性元数据。
+
+        importance 仍保留模型对业务重要程度的判断；文档是否进入 bake 不再依赖
+        importance，也不依赖模型是否完整输出 activity/origin/evidence 三个字段。
+        """
+        from knowledge.fragment_grouper import _document_identity
+
+        substantive_chars = 0
+        has_document_url = False
+        for capture in captures:
+            if _document_identity(capture.get('url')):
+                has_document_url = True
+            visible_text = " ".join(
+                str(capture.get(key) or "")
+                for key in ("ax_text", "ocr_text", "input_text", "audio_text")
+            )
+            substantive_chars += len("".join(visible_text.split()))
+
+        if not has_document_url or substantive_chars < _SUBSTANTIVE_DOCUMENT_MIN_CHARS:
+            return False
+
+        knowledge['category'] = '文档'
+        knowledge['activity_type'] = 'reading'
+        knowledge['content_origin'] = 'document_reference'
+        knowledge['evidence_strength'] = 'medium'
+        return True
+
     def _mark_captures_processed(
         self, conn: sqlite3.Connection, capture_ids: list[int], timeline_id: int
     ):
@@ -897,24 +1049,41 @@ class BackgroundProcessor:
 
         return member_ids
 
-    def _document_identities_for_capture_ids(
+    def _document_state_for_capture_ids(
         self, conn: sqlite3.Connection, capture_ids: list[int]
-    ) -> Optional[set[str]]:
-        """读取一组 capture 的文档 URL identity；查不到 url 列时返回 None 表示无法判定。"""
+    ) -> Optional[tuple[set[str], bool]]:
+        """读取 capture 的文档 URL identity 与文档特征；查询失败时返回 None。"""
         if not capture_ids:
-            return set()
-        from knowledge.fragment_grouper import _document_identity
+            return set(), False
+        from knowledge.fragment_grouper import _document_identity, _looks_like_document_capture
 
         placeholders = ','.join('?' * len(capture_ids))
         try:
             rows = conn.execute(
-                f"SELECT url FROM captures WHERE id IN ({placeholders})",
+                f"""
+                SELECT url, win_title, webpage_title
+                FROM captures
+                WHERE id IN ({placeholders})
+                """,
                 capture_ids,
             ).fetchall()
         except sqlite3.OperationalError as e:
-            logger.warning("文档边界守卫查询 capture url 失败: %s，放行", e)
+            logger.warning("文档边界守卫查询 capture 来源失败: %s，拒绝合并", e)
             return None
-        return {doc for doc in (_document_identity(row[0]) for row in rows) if doc}
+
+        identities: set[str] = set()
+        has_document_hint = False
+        for url, win_title, webpage_title in rows:
+            identity = _document_identity(url)
+            if identity:
+                identities.add(identity)
+            if _looks_like_document_capture({
+                'url': url,
+                'win_title': win_title,
+                'webpage_title': webpage_title,
+            }):
+                has_document_hint = True
+        return identities, has_document_hint
 
     def _merge_group_into_existing_timeline(
         self,
@@ -983,37 +1152,64 @@ class BackgroundProcessor:
     def _doc_compatible_with_timeline(self, group: list[dict], timeline_id: int) -> bool:
         """文档边界守卫：判断 group 是否可跨批合并进 timeline_id。
 
-        规则与 FragmentGrouper 一致——"一份文档独占一个 timeline"：
-        - 目标 timeline 是文档型(成员含文档)：仅当 group 不含其它文档、且不引入非文档主体时可并。
-          简化为：group 的文档标识集合 ⊆ {目标文档} 即可（group 可继续浏览同一文档）。
-        - 目标 timeline 非文档型：group 不得含文档型 capture（文档要独立成 timeline）。
-        无法判定(查不到/无 url)时放行，保持原行为。
+        规则与 FragmentGrouper 一致：
+        - 文档 timeline 只接受每条 capture 都具有相同非空文档 URL identity 的 group；
+        - 不同 URL、混入普通 capture、URL 为空，一律拒绝合并；
+        - URL 为空但标题/类型呈现文档特征的 timeline 也不接受跨批合并；
+        - 普通非文档 timeline 仍按原语义规则合并。
+        数据库查询失败时也拒绝合并，避免在无法证明同 URL 时污染 timeline。
         """
-        from knowledge.fragment_grouper import _document_identity
+        from knowledge.fragment_grouper import _document_identity, _looks_like_document_capture
         try:
             conn = sqlite3.connect(self.db_path)
             try:
                 member_ids = self._timeline_member_capture_ids(conn, timeline_id)
                 if not member_ids:
-                    return True
-                tl_docs = self._document_identities_for_capture_ids(conn, member_ids)
-                if tl_docs is None:
-                    return True
+                    return False
+                timeline_state = self._document_state_for_capture_ids(conn, member_ids)
+                if timeline_state is None:
+                    return False
+                tl_docs, tl_has_document_hint = timeline_state
+                timeline_row = conn.execute(
+                    """
+                    SELECT category, content_origin, frag_win_title
+                    FROM timelines
+                    WHERE id = ?
+                    """,
+                    (timeline_id,),
+                ).fetchone()
+                if timeline_row:
+                    category, content_origin, frag_win_title = timeline_row
+                    tl_has_document_hint = tl_has_document_hint or (
+                        '文档' in str(category or '')
+                        or str(content_origin or '') == 'document_reference'
+                        or _looks_like_document_capture({
+                            'url': None,
+                            'win_title': frag_win_title,
+                        })
+                    )
             finally:
                 conn.close()
         except Exception as e:
-            logger.warning("文档边界守卫查询失败 timeline_id=%d: %s，放行", timeline_id, e)
-            return True
+            logger.warning("文档边界守卫查询失败 timeline_id=%d: %s，拒绝合并", timeline_id, e)
+            return False
 
-        grp_docs = {d for d in (_document_identity(c.get('url')) for c in group) if d}
+        group_identities = [_document_identity(c.get('url')) for c in group]
+        grp_has_document_hint = any(_looks_like_document_capture(c) for c in group)
 
         if tl_docs:
-            # 文档型 timeline：group 只能是同一份文档（或无文档的同主题续浏览由语义层把关，
-            # 但为保纯净，group 引入任何不同文档即拦截）
-            return grp_docs.issubset(tl_docs)
-        else:
-            # 非文档 timeline：group 不得带入文档型 capture
-            return len(grp_docs) == 0
+            # 历史上已经混入多个文档的 timeline 不再接受任何追加，避免继续污染。
+            if len(tl_docs) != 1 or not group:
+                return False
+            target_doc = next(iter(tl_docs))
+            return all(identity == target_doc for identity in group_identities)
+
+        # timeline 看起来是文档但自身 URL 为空，无法证明后续 capture 同源，禁止追加。
+        if tl_has_document_hint:
+            return False
+
+        # 普通 timeline 不接收已知文档或 URL 为空的文档型 capture。
+        return not grp_has_document_hint
 
     async def _append_captures_to_timeline(self, group: list[dict], timeline_id: int) -> bool:
         """跨批合并：把 group 里的新 captures 追加到已有 timeline（occurrence_count+1，更新 end_time）。
@@ -1103,14 +1299,20 @@ class BackgroundProcessor:
             )
             extractor = self._get_knowledge_extractor()
             logger.info("KnowledgeExtractor 已就绪，提交 InferenceQueue 执行 extract_merged")
-            from inference_queue import LANE_P1_CAPTURE, Priority, get_global_queue, QueueEvictedError
+            from inference_queue import (
+                LANE_P1_CAPTURE,
+                Priority,
+                QueueEvictedError,
+                current_task_preempt_requested,
+                get_global_queue,
+            )
             def _run_extract_merged():
                 group_id = self._mark_group_extracting(group)
                 succeeded = False
                 try:
                     knowledge_result = extractor.extract_merged(
                         captures=group,
-                        preempt_check=lambda: False,
+                        preempt_check=current_task_preempt_requested,
                     )
                     succeeded = bool(knowledge_result)
                     return knowledge_result
@@ -1131,6 +1333,12 @@ class BackgroundProcessor:
             if not knowledge:
                 logger.warning(f"片段提炼未产出 knowledge ({len(group)} 条 captures)")
                 return False
+
+            if self._apply_document_metadata_defaults(knowledge, group):
+                logger.info(
+                    "文档元数据确定性兜底已应用: captures=%s activity=reading origin=document_reference evidence=medium",
+                    capture_ids,
+                )
 
             conn = sqlite3.connect(self.db_path)
 
@@ -1196,30 +1404,65 @@ class BackgroundProcessor:
             return False
 
     async def _process_vectorization_batch(self, group: list[dict]):
-        """对一组 captures 批量向量化"""
-        texts = []
-        captures_with_text = []
+        """对一组 captures 批量向量化。
+
+        文档 URL 使用完整正文分块并写入 ``document`` 检索域；普通活动记录
+        继续保留短摘要向量，避免把聊天/应用 AX 树无限扩张进索引。
+        """
+        from embedding.document_chunks import build_document_snapshot
+        from embedding.vector_storage import get_vector_storage
+
+        storage = get_vector_storage()
+        document_snapshots: dict[str, object] = {}
+        regular_texts: list[str] = []
+        regular_captures: list[dict] = []
 
         for capture in group:
+            snapshot = build_document_snapshot(capture)
+            if snapshot is not None:
+                existing = document_snapshots.get(snapshot.doc_key)
+                if existing is None or len(snapshot.body) > len(existing.body):
+                    document_snapshots[snapshot.doc_key] = snapshot
+                continue
             text = self._build_capture_embedding_text(capture)
             if text:
-                texts.append(text)
-                captures_with_text.append(capture)
+                regular_texts.append(text)
+                regular_captures.append(capture)
 
+        pending_snapshots = [
+            snapshot
+            for snapshot in document_snapshots.values()
+            if not storage.document_version_exists(
+                snapshot.doc_key,
+                snapshot.content_hash,
+                len(snapshot.chunks),
+            )
+        ]
+        document_texts = [
+            chunk
+            for snapshot in pending_snapshots
+            for chunk in snapshot.chunks
+        ]
+        texts = [*regular_texts, *document_texts]
         if not texts:
             return
 
         async with _embedding_semaphore:
             try:
                 from model_registry_global import get_shared_embedding
-                from embedding.vector_storage import get_vector_storage
 
                 # 使用全局共享 EmbeddingModel，避免重复加载
                 model = get_shared_embedding()
-                vectors = await asyncio.to_thread(model.encode, texts)
-                storage = get_vector_storage()
+                vectors = []
+                for offset in range(0, len(texts), 32):
+                    batch_vectors = await asyncio.to_thread(
+                        model.encode,
+                        texts[offset : offset + 32],
+                    )
+                    vectors.extend(batch_vectors)
 
-                for capture, vec_obj in zip(captures_with_text, vectors):
+                regular_vectors = vectors[: len(regular_texts)]
+                for capture, vec_obj in zip(regular_captures, regular_vectors):
                     if vec_obj and vec_obj.vector:
                         try:
                             storage.store_vector(
@@ -1233,10 +1476,153 @@ class BackgroundProcessor:
                                     "app_name": capture.get('app_name'),
                                 }
                             )
-                        except Exception as e:
+                        except Exception:
                             logger.warning(f"⚠️ 向量存储失败，继续时间线提炼: capture_id={capture['id']}")
+
+                vector_offset = len(regular_texts)
+                for snapshot in pending_snapshots:
+                    chunk_count = len(snapshot.chunks)
+                    chunk_vectors = [
+                        item.vector
+                        for item in vectors[vector_offset : vector_offset + chunk_count]
+                    ]
+                    vector_offset += chunk_count
+                    if len(chunk_vectors) != chunk_count or any(not item for item in chunk_vectors):
+                        logger.warning(
+                            "文档分块向量结果不完整，跳过写入: doc_key=%s",
+                            snapshot.doc_key,
+                        )
+                        continue
+                    capture = next(
+                        (
+                            item
+                            for item in group
+                            if int(item.get("id") or 0) == snapshot.capture_id
+                        ),
+                        {},
+                    )
+                    storage.store_document_vectors(
+                        capture_id=snapshot.capture_id,
+                        chunks=snapshot.chunks,
+                        vectors=chunk_vectors,
+                        metadata={
+                            "doc_key": snapshot.doc_key,
+                            "source_type": "document",
+                            "content_hash": snapshot.content_hash,
+                            "url": snapshot.canonical_url,
+                            "title": snapshot.title,
+                            "ts": capture.get("ts"),
+                            "app_name": capture.get("app_name"),
+                            "win_title": capture.get("window_title"),
+                            "model_name": model.model_name,
+                        },
+                    )
             except Exception as e:
                 logger.error(f"批量向量化失败: {e}")
+
+    async def backfill_document_vectors(self, limit: int = 2000) -> dict:
+        """启动后补齐历史文档 capture 的分块向量。
+
+        每个 URL 只选择正文最完整的一次快照；稳定 point id 会让未变化文档
+        直接跳过，因此该任务可安全地在每次启动时执行。
+        """
+        try:
+            captures = await asyncio.to_thread(self._load_document_backfill_captures, limit)
+            if not captures:
+                return {"candidate_count": 0, "processed_count": 0}
+
+            from embedding.document_chunks import build_document_snapshot
+
+            best_by_url: dict[str, dict] = {}
+            best_lengths: dict[str, int] = {}
+            for capture in captures:
+                snapshot = build_document_snapshot(capture)
+                if snapshot is None:
+                    continue
+                body_length = len(snapshot.body)
+                if body_length > best_lengths.get(snapshot.doc_key, -1):
+                    best_by_url[snapshot.doc_key] = capture
+                    best_lengths[snapshot.doc_key] = body_length
+
+            selected = list(best_by_url.values())
+            processed = 0
+            for offset in range(0, len(selected), 8):
+                batch = selected[offset : offset + 8]
+                await self._process_vectorization_batch(batch)
+                processed += len(batch)
+                await asyncio.sleep(0)
+            logger.info(
+                "历史文档分块向量补齐完成: captures=%s urls=%s",
+                len(captures),
+                processed,
+            )
+            return {
+                "candidate_count": len(captures),
+                "processed_count": processed,
+            }
+        except Exception as exc:
+            logger.error("历史文档分块向量补齐失败: %s", exc, exc_info=True)
+            return {
+                "candidate_count": 0,
+                "processed_count": 0,
+                "error": str(exc),
+            }
+
+    def _load_document_backfill_captures(self, limit: int) -> list[dict]:
+        url_markers = (
+            "docs.corp",
+            "/docs/",
+            "docs.google",
+            "/document/",
+            "yuque.com",
+            "feishu.cn/docx",
+            "feishu.cn/wiki",
+            "notion.so",
+            "confluence",
+            "/wiki/",
+            "shimo.im",
+            "/d/home/",
+            "/s/home/",
+            "/k/home/",
+        )
+        marker_sql = " OR ".join(
+            "LOWER(COALESCE(c.url, '')) LIKE ?" for _ in url_markers
+        )
+        params = [f"%{marker}%" for marker in url_markers]
+        params.append(max(1, int(limit)))
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT c.id, c.ts, c.app_name, c.win_title, c.webpage_title,
+                       c.ocr_text, c.ax_text, c.url
+                FROM captures c
+                WHERE c.is_sensitive = 0
+                  AND ({marker_sql})
+                  AND LENGTH(
+                        REPLACE(
+                            REPLACE(COALESCE(c.ax_text, '') || COALESCE(c.ocr_text, ''), ' ', ''),
+                            char(10),
+                            ''
+                        )
+                      ) >= ?
+                ORDER BY c.ts DESC
+                LIMIT ?
+                """,
+                [*params[:-1], _SUBSTANTIVE_DOCUMENT_MIN_CHARS, params[-1]],
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "ts": row[1],
+                "app_name": row[2],
+                "window_title": row[3],
+                "webpage_title": row[4],
+                "ocr_text": row[5],
+                "ax_text": row[6],
+                "url": row[7],
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def _build_capture_embedding_text(capture: dict) -> str:
@@ -1426,6 +1812,7 @@ class BackgroundProcessor:
                 return False
 
             if knowledge:
+                self._apply_document_metadata_defaults(knowledge, [capture_data])
                 # 保存到数据库
                 cursor = conn.cursor()
 
@@ -1477,14 +1864,30 @@ class BackgroundProcessor:
             logger.error(f"❌ 时间线提炼异常: capture_id={capture_data['id']}, error={e}")
             return False
 
-    async def _process_batch(self):
+    async def _process_batch(
+        self,
+        *,
+        limit: int,
+        trigger_bake: bool,
+        bake_limit: int,
+        bake_concurrency: int,
+    ) -> dict:
         """处理一批未处理的记录（基于语义分组）"""
         try:
-            result = await self.run_once()
-            return int(result.get('processed_count', 0))
+            return await self.run_once(
+                limit_override=limit,
+                trigger_bake=trigger_bake,
+                bake_limit=bake_limit,
+                bake_concurrency=bake_concurrency,
+            )
         except Exception as e:
             logger.error(f"批处理异常: {e}")
-            return 0
+            return {
+                "fetched_count": 0,
+                "processed_count": 0,
+                "remaining_estimate": 0,
+                "reason": "batch_error",
+            }
 
     def _has_pending_bake_timelines(self) -> bool:
         """检查数据库中是否有满足 bake 候选条件的 pending timeline（本地 SQLite 快速查询）。"""
@@ -1501,6 +1904,33 @@ class BackgroundProcessor:
                       AND (
                           t.importance >= 4
                           OR t.user_verified = 1
+                          OR EXISTS (
+                              SELECT 1
+                              FROM captures c
+                              WHERE c.timeline_id = t.id
+                                AND (
+                                    LOWER(COALESCE(c.url, '')) LIKE '%docs.corp%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%/docs/%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%docs.google%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%/document/%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%yuque.com%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%feishu.cn/docx%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%feishu.cn/wiki%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%notion.so%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%confluence%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%/wiki/%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%shimo.im%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%/d/home/%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%/s/home/%'
+                                    OR LOWER(COALESCE(c.url, '')) LIKE '%/k/home/%'
+                                )
+                                AND LENGTH(
+                                    REPLACE(REPLACE(
+                                        COALESCE(c.ax_text, '') || COALESCE(c.ocr_text, ''),
+                                        ' ', ''
+                                    ), char(10), '')
+                                ) >= 200
+                          )
                           OR (
                               t.evidence_strength IN ('high', 'medium')
                               AND (t.history_view = 1
@@ -1528,12 +1958,22 @@ class BackgroundProcessor:
             logger.warning("检查 pending bake timelines 失败: %s", e)
             return False
 
-    async def _maybe_trigger_periodic_bake(self) -> None:
+    async def _maybe_trigger_periodic_bake(
+        self,
+        *,
+        limit: int,
+        max_concurrency: int,
+    ) -> dict:
         """周期性主动触发 bake，处理因没有新 capture 而积压的 pending timeline。"""
         if not self._has_pending_bake_timelines():
-            return
+            return {"triggered": False, "reason": "no_pending_bake_timeline"}
         logger.info("🔁 检测到积压的 pending timeline，主动触发 bake pipeline")
-        result = await self._trigger_unified_bake_pipeline(processed_count=50, force=True)
+        result = await self._trigger_unified_bake_pipeline(
+            processed_count=limit,
+            force=True,
+            limit_override=limit,
+            max_concurrency=max_concurrency,
+        )
         if result.get("triggered"):
             logger.info(
                 "周期性 bake 已触发: run_id=%s",
@@ -1541,6 +1981,7 @@ class BackgroundProcessor:
             )
         else:
             logger.warning("周期性 bake 触发失败: %s", result.get("reason"))
+        return result
 
     async def run(self):
         """运行后台处理循环"""
@@ -1550,6 +1991,7 @@ class BackgroundProcessor:
         _last_periodic_bake_ts: float = 0.0
 
         while self.running:
+            sleep_secs = self.interval
             try:
                 self._touch_status_file()
 
@@ -1558,25 +2000,81 @@ class BackgroundProcessor:
                     await asyncio.sleep(self.interval)
                     continue
 
-                processed = await self._process_batch()
+                profile = self.energy_policy.current_profile(
+                    base_timeline_interval_secs=self.interval,
+                    base_timeline_batch_size=self.batch_size,
+                )
+                sleep_secs = profile.timeline_interval_secs
+                if profile.mode != self._last_energy_mode:
+                    logger.info(
+                        "后台节能档位切换: mode=%s saving=%s plugged=%s battery=%s "
+                        "timeline_interval=%ss timeline_batch=%s bake_interval=%ss "
+                        "bake_limit=%s bake_concurrency=%s",
+                        profile.mode,
+                        profile.saving_enabled,
+                        profile.on_external_power,
+                        profile.battery_percent,
+                        profile.timeline_interval_secs,
+                        profile.timeline_batch_size,
+                        profile.bake_interval_secs,
+                        profile.bake_limit,
+                        profile.bake_concurrency,
+                    )
+                    self._last_energy_mode = profile.mode
+
+                if not profile.allow_background_extraction:
+                    logger.info(
+                        "低电量节能档位暂停后台时间线与 bake 提炼: battery=%s%%",
+                        profile.battery_percent,
+                    )
+                    await asyncio.sleep(sleep_secs)
+                    continue
+
+                maximum_throughput = profile.mode in {"charging", "unrestricted"}
+                pending_before = await asyncio.to_thread(self._count_unprocessed_captures)
+                timeline_batch_limit = self._timeline_batch_limit(profile, pending_before)
+                batch_result = await self._process_batch(
+                    limit=timeline_batch_limit,
+                    trigger_bake=maximum_throughput,
+                    bake_limit=profile.bake_limit,
+                    bake_concurrency=profile.bake_concurrency,
+                )
+                processed = int(batch_result.get('processed_count', 0))
                 self._touch_status_file()
 
                 if processed > 0:
                     logger.info(f"✅ 本轮处理完成: {processed} 条记录")
+                if (batch_result.get('bake_trigger') or {}).get('triggered'):
+                    _last_periodic_bake_ts = time.monotonic()
+                if maximum_throughput and pending_before > profile.timeline_batch_size:
+                    pending_after = await asyncio.to_thread(self._count_unprocessed_captures)
+                    if pending_after > profile.timeline_batch_size:
+                        sleep_secs = _CHARGING_CATCHUP_SLEEP_SECS
 
                 # 周期性检查：即使本轮没有新 capture，也要尝试消化积压的 pending timeline
                 now = time.monotonic()
-                if now - _last_periodic_bake_ts >= _PERIODIC_BAKE_INTERVAL_SECS:
-                    _last_periodic_bake_ts = now
-                    await self._maybe_trigger_periodic_bake()
+                periodic_due = now - _last_periodic_bake_ts >= profile.bake_interval_secs
+                battery_idle_due = False
+                if profile.mode == "battery":
+                    battery_idle_due = (
+                        await asyncio.to_thread(self._all_inference_queues_idle)
+                        and now - _last_periodic_bake_ts >= profile.timeline_interval_secs
+                    )
+                if periodic_due or battery_idle_due:
+                    bake_result = await self._maybe_trigger_periodic_bake(
+                        limit=profile.bake_limit,
+                        max_concurrency=profile.bake_concurrency,
+                    )
+                    if bake_result.get("triggered"):
+                        _last_periodic_bake_ts = now
 
                 # 等待下一轮
-                await asyncio.sleep(self.interval)
+                await asyncio.sleep(sleep_secs)
 
             except Exception as e:
                 logger.error(f"后台处理循环异常: {e}")
                 self._touch_status_file()
-                await asyncio.sleep(self.interval)
+                await asyncio.sleep(sleep_secs)
 
     def stop(self):
         """停止后台处理器"""

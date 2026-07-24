@@ -23,6 +23,22 @@ class _Executor:
         }
 
 
+class _EnergyPolicy:
+    def __init__(self, allow_diary: bool) -> None:
+        self.allow_diary = allow_diary
+
+    def current_profile(self):
+        return type(
+            "_Profile",
+            (),
+            {
+                "allow_diary": self.allow_diary,
+                "mode": "charging" if self.allow_diary else "battery",
+                "battery_percent": 66,
+            },
+        )()
+
+
 def test_idle_worker_does_not_run_when_queue_busy():
     queue = _Queue(idle=False)
     executor = _Executor()
@@ -34,6 +50,7 @@ def test_idle_worker_does_not_run_when_queue_busy():
         stable_idle_secs=0,
         cooldown_secs=0,
         lookback_days=7,
+        energy_policy=_EnergyPolicy(True),
     )
 
     assert worker.tick(now=100) == {"status": "busy"}
@@ -51,6 +68,7 @@ def test_idle_worker_runs_after_stable_idle_window():
         stable_idle_secs=10,
         cooldown_secs=0,
         lookback_days=7,
+        energy_policy=_EnergyPolicy(True),
     )
 
     assert worker.tick(now=100)["status"] == "warming_idle"
@@ -73,6 +91,7 @@ def test_idle_worker_respects_cooldown():
         enabled=True,
         stable_idle_secs=0,
         cooldown_secs=60,
+        energy_policy=_EnergyPolicy(True),
     )
 
     worker.tick(now=100)
@@ -80,3 +99,23 @@ def test_idle_worker_respects_cooldown():
     worker.tick(now=102)
     assert worker.tick(now=103)["status"] == "cooldown"
     assert executor.calls == 1
+
+
+def test_idle_worker_defers_until_external_power():
+    queue = _Queue(idle=True)
+    executor = _Executor()
+    worker = IdleDiaryBackfillWorker(
+        db_path=":memory:",
+        executor=executor,
+        queue_provider=lambda: queue,
+        enabled=True,
+        stable_idle_secs=0,
+        cooldown_secs=0,
+        energy_policy=_EnergyPolicy(False),
+    )
+
+    result = worker.tick(now=100)
+
+    assert result["status"] == "deferred"
+    assert result["reason"] == "waiting_for_external_power"
+    assert executor.calls == 0

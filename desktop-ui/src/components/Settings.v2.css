@@ -11,58 +11,71 @@
 
 /* 标题栏 */
 .settings-v2__header {
-  position: sticky;
-  top: 0;
-  z-index: 10;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 24px;
-  background: linear-gradient(135deg, #007AFF 0%, #0051D5 100%);
-  color: white;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  margin: 16px 16px 0;
+  padding: 16px;
+  background: #FFFFFF;
+  color: #111111;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04);
 }
 
 .settings-v2__title-group {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
 }
 
+.settings-v2__title-group > svg {
+  color: #A54F25;
+}
+
 .settings-v2__title {
-  font-size: 22px;
-  font-weight: 600;
+  font-size: 24px;
+  font-weight: 700;
   margin: 0;
 }
 
 .settings-v2__close-btn {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.2);
-  border: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: #F8F5F2;
+  border: 1px solid rgba(104, 64, 39, 0.12);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: white;
+  color: #6B4A38;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
 }
 
 .settings-v2__close-btn:hover {
-  background: rgba(255, 255, 255, 0.3);
-  transform: scale(1.1);
+  background: #FBE9DC;
+  border-color: rgba(165, 79, 37, 0.24);
+  color: #A54F25;
+  transform: translateY(-1px);
+}
+
+.settings-v2__close-btn:focus-visible {
+  outline: none;
+  border-color: #C46A32;
+  box-shadow: 0 0 0 3px rgba(196, 106, 50, 0.13);
 }
 
 .settings-v2__close-btn:active {
-  transform: scale(0.95);
+  transform: scale(0.98);
 }
 
 /* 内容区域 */
 .settings-v2__content {
-  padding: 24px;
+  width: 100%;
+  padding: 16px;
   max-width: 1080px;
   margin: 0 auto;
 }
@@ -238,6 +251,13 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+
+.settings-v2__toggle-row--standalone {
+  margin-top: 0;
+  padding: 14px 0;
+  border-top: 0;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
 }
 
 .settings-v2__toggle-row span {
@@ -517,20 +537,269 @@
   line-height: 1.5;
 }
 
+/* 快捷键与悬浮球 */
+.settings-v2__card--interactions {
+  border-color: rgba(191, 93, 38, 0.24);
+  background:
+    linear-gradient(135deg, rgba(255, 247, 237, 0.9), rgba(255, 255, 255, 0) 44%),
+    #FFFFFF;
+}
+
+.settings-v2__card-icon--bread {
+  color: #A54F25;
+  background: #FCE6D2;
+  box-shadow: inset 0 0 0 1px rgba(165, 79, 37, 0.09);
+}
+
+.settings-v2__interaction-heading {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-v2__reset-shortcuts {
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid rgba(125, 73, 42, 0.2);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.74);
+  color: #75452C;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-v2__reset-shortcuts:hover:not(:disabled) {
+  border-color: rgba(165, 79, 37, 0.42);
+  background: #FFF8F1;
+}
+
+.settings-v2__reset-shortcuts:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.settings-v2__interaction-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(290px, 0.85fr);
+  gap: 14px;
+}
+
+.settings-v2__interaction-group {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid rgba(104, 64, 39, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.settings-v2__interaction-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #482C1D;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.settings-v2__interaction-group-help {
+  margin: 5px 0 12px;
+  color: #846E60;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-v2__shortcut-list,
+.settings-v2__gesture-list {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-v2__shortcut-row,
+.settings-v2__gesture-row {
+  min-height: 60px;
+  padding: 10px 11px;
+  border: 1px solid rgba(104, 64, 39, 0.1);
+  border-radius: 9px;
+  background: #FFFCF8;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-v2__shortcut-copy,
+.settings-v2__gesture-row > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.settings-v2__shortcut-copy strong,
+.settings-v2__gesture-row strong {
+  color: #35231A;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.settings-v2__shortcut-copy small,
+.settings-v2__gesture-row small {
+  color: #8A7568;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.settings-v2__shortcut-controls {
+  min-width: 154px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.settings-v2__shortcut-recorder {
+  min-width: 118px;
+  min-height: 36px;
+  padding: 5px 8px;
+  border: 1px solid rgba(104, 64, 39, 0.18);
+  border-radius: 8px;
+  background: #FFFFFF;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.settings-v2__shortcut-recorder:hover:not(:disabled),
+.settings-v2__shortcut-recorder:focus-visible,
+.settings-v2__shortcut-recorder.is-recording {
+  outline: none;
+  border-color: #C46A32;
+  box-shadow: 0 0 0 3px rgba(196, 106, 50, 0.13);
+}
+
+.settings-v2__shortcut-recorder:disabled {
+  opacity: 0.62;
+  cursor: wait;
+}
+
+.settings-v2__keycaps {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.settings-v2__keycaps kbd {
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid #D8C5B7;
+  border-bottom-width: 2px;
+  border-radius: 6px;
+  background: linear-gradient(#FFFDFB, #F7EEE7);
+  color: #563725;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font: 650 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  box-shadow: 0 1px 0 rgba(84, 49, 28, 0.08);
+}
+
+.settings-v2__recording-label {
+  color: #A54F25;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.settings-v2__shortcut-empty {
+  color: #9B8B80;
+  font-size: 12px;
+}
+
+.settings-v2__shortcut-clear {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #9B8172;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.settings-v2__shortcut-clear:hover:not(:disabled),
+.settings-v2__shortcut-clear:focus-visible {
+  outline: none;
+  background: #FBE9DC;
+  color: #A54F25;
+}
+
+.settings-v2__gesture-row select {
+  width: min(210px, 52%);
+  min-height: 36px;
+  padding: 7px 30px 7px 10px;
+  border: 1px solid rgba(104, 64, 39, 0.2);
+  border-radius: 8px;
+  background-color: #FFFFFF;
+  color: #4D3325;
+  font: inherit;
+  font-size: 12px;
+}
+
+.settings-v2__gesture-row select:focus-visible {
+  outline: none;
+  border-color: #C46A32;
+  box-shadow: 0 0 0 3px rgba(196, 106, 50, 0.13);
+}
+
+.settings-v2__interaction-feedback {
+  margin-top: 12px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-v2__interaction-feedback--error {
+  background: #FFF0EE;
+  color: #B42318;
+}
+
+.settings-v2__interaction-feedback--success {
+  background: #EEF8F0;
+  color: #24753A;
+}
+
 @media (max-width: 960px) {
   .settings-v2__content {
-    padding: 20px;
+    padding: 16px;
   }
 
   .settings-v2__card {
     padding: 20px;
   }
+
+  .settings-v2__interaction-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 720px) {
   .settings-v2__header {
-    padding: 20px;
-    align-items: flex-start;
+    margin: 12px 12px 0;
+    padding: 14px;
   }
 
   .settings-v2__title-group {
@@ -538,7 +807,7 @@
   }
 
   .settings-v2__content {
-    padding: 16px;
+    padding: 12px;
   }
 
   .settings-v2__card {
@@ -551,6 +820,10 @@
 
   .settings-v2__input-group {
     flex-direction: column;
+  }
+
+  .settings-v2__input {
+    flex-basis: auto;
   }
 
   .settings-v2__btn {
@@ -570,12 +843,53 @@
   .settings-v2__check-actions {
     justify-content: flex-start;
   }
+
+  .settings-v2__interaction-heading,
+  .settings-v2__shortcut-row,
+  .settings-v2__gesture-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .settings-v2__reset-shortcuts {
+    align-self: flex-start;
+  }
+
+  .settings-v2__shortcut-controls,
+  .settings-v2__shortcut-recorder,
+  .settings-v2__gesture-row select {
+    width: 100%;
+    max-width: none;
+  }
 }
 
 /* 深色模式 */
 @media (prefers-color-scheme: dark) {
   .settings-v2 {
     background: #1C1C1E;
+  }
+
+  .settings-v2__header {
+    background: #2C2C2E;
+    color: #F3F4F6;
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  }
+
+  .settings-v2__title-group > svg {
+    color: #FFB17A;
+  }
+
+  .settings-v2__close-btn {
+    background: #3A3A3C;
+    border-color: rgba(255, 255, 255, 0.1);
+    color: #D1D1D6;
+  }
+
+  .settings-v2__close-btn:hover {
+    background: #4A352B;
+    border-color: rgba(255, 177, 122, 0.26);
+    color: #FFE9D8;
   }
 
   .settings-v2__card {
@@ -682,5 +996,45 @@
 
   .settings-v2__hint {
     color: #AEAEB2;
+  }
+
+  .settings-v2__card--interactions {
+    border-color: rgba(230, 143, 87, 0.28);
+    background:
+      linear-gradient(135deg, rgba(91, 50, 28, 0.46), rgba(44, 44, 46, 0) 46%),
+      #2C2C2E;
+  }
+
+  .settings-v2__interaction-group,
+  .settings-v2__shortcut-row,
+  .settings-v2__gesture-row {
+    border-color: rgba(255, 255, 255, 0.09);
+    background: rgba(28, 28, 30, 0.68);
+  }
+
+  .settings-v2__interaction-group-title,
+  .settings-v2__shortcut-copy strong,
+  .settings-v2__gesture-row strong {
+    color: #FFF4EA;
+  }
+
+  .settings-v2__interaction-group-help,
+  .settings-v2__shortcut-copy small,
+  .settings-v2__gesture-row small {
+    color: #C6B3A7;
+  }
+
+  .settings-v2__reset-shortcuts,
+  .settings-v2__shortcut-recorder,
+  .settings-v2__gesture-row select {
+    border-color: rgba(255, 255, 255, 0.14);
+    background: #3A302B;
+    color: #FFEFE3;
+  }
+
+  .settings-v2__keycaps kbd {
+    border-color: #725542;
+    background: linear-gradient(#534139, #40322C);
+    color: #FFE9D8;
   }
 }

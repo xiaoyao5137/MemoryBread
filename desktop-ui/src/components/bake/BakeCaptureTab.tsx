@@ -187,7 +187,6 @@ const BakeCaptureTab: React.FC<{
         <BakeCard className="bake-capture-list-card">
           <BakeSectionHeader
             title="采集记录"
-            subtitle="浏览原始采集记录与关联知识"
             right={canGoBack ? <BakeButton compact onClick={onGoBack}>返回上一步</BakeButton> : undefined}
           />
 

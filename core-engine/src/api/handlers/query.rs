@@ -10,12 +10,15 @@ use crate::storage::models::NewRagSession;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
+    convert::Infallible,
     sync::{atomic::Ordering, Arc},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Deserialize)]
@@ -519,6 +522,108 @@ pub async fn rag_query(
     let body = enrich_creation_model_from_preferences(&state, body);
     let rag_response = call_rag_service(&state.sidecar_url, body).await?;
     Ok(Json(rag_response))
+}
+
+/// 转发 ai-sidecar 的 RAG SSE，让客户端按阶段接收参考资料和答案增量。
+pub async fn rag_stream(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RagQueryRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    if body.query.trim().is_empty() {
+        return Err(ApiError::BadRequest("缺少 query 参数".to_string()));
+    }
+    let body = enrich_creation_model_from_preferences(&state, body);
+    let request_body = serde_json::json!({
+        "query": body.query,
+        "top_k": body.top_k,
+        "creation_model": body.creation_model,
+        "creation_api_key": body.creation_api_key,
+        "creation_base_url": body.creation_base_url,
+        "source": body.source,
+        "screenshot_path": body.screenshot_path,
+        "screenshot_width": body.screenshot_width,
+        "screenshot_height": body.screenshot_height,
+        "ocr_text": body.ocr_text,
+    });
+    let response = reqwest::Client::new()
+        .post(format!("{}/query/stream", state.sidecar_url))
+        .json(&request_body)
+        .timeout(Duration::from_secs(430))
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!("无法连接到 RAG 流式服务: {}", error);
+            ApiError::Upstream {
+                status: StatusCode::BAD_GATEWAY,
+                code: "BAD_GATEWAY",
+                message: "RAG 服务不可用，请确认 AI Sidecar 已正常启动".to_string(),
+            }
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .or_else(|| value.get("error"))
+                    .and_then(|item| item.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "RAG 流式服务暂时不可用".to_string());
+        let (mapped_status, code) = match status.as_u16() {
+            400 | 422 => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+            503 => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
+            504 => (StatusCode::GATEWAY_TIMEOUT, "GATEWAY_TIMEOUT"),
+            _ => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+        };
+        return Err(ApiError::Upstream {
+            status: mapped_status,
+            code,
+            message,
+        });
+    }
+
+    let stream = async_stream::stream! {
+        let mut bytes_stream = response.bytes_stream();
+        let mut buffer = String::new();
+        while let Some(chunk) = bytes_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(newline_index) = buffer.find('\n') {
+                        let line = buffer[..newline_index].trim_end_matches('\r').to_string();
+                        buffer.drain(..=newline_index);
+                        if let Some(data) = line.strip_prefix("data:") {
+                            yield Ok(Event::default().data(data.trim()));
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("RAG SSE 上游连接中断: {}", error);
+                    let payload = serde_json::json!({
+                        "type": "error",
+                        "code": "UPSTREAM_STREAM_ERROR",
+                        "message": "咨询流式连接中断，请重试"
+                    }).to_string();
+                    yield Ok(Event::default().data(payload));
+                    break;
+                }
+            }
+        }
+        let remaining = buffer.trim();
+        if let Some(data) = remaining.strip_prefix("data:") {
+            yield Ok(Event::default().data(data.trim()));
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 pub async fn rag_references(

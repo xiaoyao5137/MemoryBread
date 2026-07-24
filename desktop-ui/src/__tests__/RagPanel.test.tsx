@@ -8,6 +8,7 @@ import RagPanel from '../components/RagPanel'
 import { useAppStore } from '../store/useAppStore'
 
 vi.mock('../hooks/useApi', () => ({
+  RAG_REFERENCE_LIMIT: 5,
   useRagQuery: () => {
     return vi.fn().mockImplementation(async (_query: string) => {
       const result = {

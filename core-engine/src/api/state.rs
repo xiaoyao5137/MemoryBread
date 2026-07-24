@@ -109,12 +109,34 @@ impl AppState {
         sidecar_url: String,
         debug_log_specs: Vec<DebugLogSpec>,
     ) -> Arc<Self> {
+        match storage.fail_stale_running_bake_runs() {
+            Ok(count) if count > 0 => {
+                tracing::warn!("启动时已收敛 {} 个陈旧 running bake run", count);
+            }
+            Err(error) => {
+                tracing::warn!("启动时清理陈旧 bake run 失败: {}", error);
+            }
+            _ => {}
+        }
+        match storage.clear_recoverable_bake_retry_failures() {
+            Ok(count) if count > 0 => {
+                tracing::warn!(
+                    "启动时已恢复 {} 个由上游瞬态错误或旧文档响应兼容问题阻塞的 bake 候选",
+                    count
+                );
+            }
+            Err(error) => {
+                tracing::warn!("启动时恢复可重试 bake 候选失败: {}", error);
+            }
+            _ => {}
+        }
         let capture_enabled = storage
             .get_preference("runtime.capture_enabled")
             .ok()
             .flatten()
             .map(|preference| preference.value != "false")
-            .unwrap_or(true);
+            // 新安装必须由用户明确开启采集，不能在首次启动时默认录屏。
+            .unwrap_or(false);
         let capture_enabled = std::env::var("MEMORY_BREAD_CAPTURE_ENABLED")
             .ok()
             .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {

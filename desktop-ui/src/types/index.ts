@@ -66,6 +66,8 @@ export interface RagQueryResponse {
   model:    string
   done_reason?: string | null
   output_truncated?: boolean
+  elapsed_ms?: number
+  inference_elapsed_ms?: number
 }
 
 export interface RagContext {
@@ -172,10 +174,12 @@ export interface CloudUser {
   username?: string | null
   name?: string | null
   nickname?: string | null
+  company_name?: string | null
   email?: string | null
   phone?: string | null
   status: string
   roles: string[]
+  feature_flags?: string[]
   locale: string
   timezone: string
   created_at: string
@@ -198,6 +202,7 @@ export interface CloudBalance {
 }
 
 export type AchievementSurface = 'profile_avatar' | 'floating_avatar'
+export type AccountProfileSection = 'personal' | 'achievements' | 'investment' | 'mood'
 
 export interface AchievementBadge {
   id: string
@@ -224,6 +229,34 @@ export interface AchievementProfile {
     profile_avatar?: AchievementBadge | null
     floating_avatar?: AchievementBadge | null
   }
+}
+
+export interface RewardTask {
+  id: string
+  task_key: string
+  title: string
+  description: string
+  status: string
+  approval_status: string
+  period: 'weekly' | 'monthly' | 'lifetime'
+  metric_key: string
+  threshold: string
+  metric_unit: string
+  reward: {
+    badge: AchievementBadge
+    badge_quantity: number
+    credit: string
+  }
+}
+
+export interface TaskClaimResult {
+  task_id: string
+  period_key: string
+  observed_value: string
+  badge: AchievementBadge
+  badge_quantity: number
+  total_badge_quantity: number
+  credit_granted: string
 }
 
 export interface CloudSubscription {
@@ -372,7 +405,6 @@ export interface TimelineItem {
   summary?: string
   weight: number
   openCount: number
-  dwellSeconds: number
   hasEditAction: boolean
   knowledgeRefCount: number
   status: 'candidate' | 'confirmed' | 'ignored' | 'templated'
@@ -586,6 +618,12 @@ export interface MonitorOverview {
     today_count: number
     period_count: number
     pending_extraction_count: number
+    oldest_pending_extraction_at_ms: number | null
+    pending_bake_count: number
+    oldest_pending_bake_at_ms: number | null
+    bake_retry_exhausted_count: number
+    running_bake_count: number
+    stale_bake_run_count: number
     by_time: { ts: number; count: number }[]
     recent: { id: number; ts: number; summary: string; category: string; importance: number; app_name: string; win_title: string }[]
     extracting: { id: number; ts: number; app_name: string; win_title: string; group_started_at_ms: number }[]
@@ -624,8 +662,28 @@ export interface ExtractionLive {
   extracting:       { id: number; ts: number; app_name: string; win_title: string; group_started_at_ms: number }[]
   last_extraction_at_ms: number | null
   pending_extraction_count: number
+  oldest_pending_extraction_at_ms: number | null
+  pending_bake_count: number
+  oldest_pending_bake_at_ms: number | null
+  bake_retry_exhausted_count: number
+  running_bake_count: number
+  stale_bake_run_count: number
+  inference_queue: InferenceQueueMonitor
   recent:           { id: number; ts: number; summary: string; category: string; importance: number; app_name: string; win_title: string }[]
   server_now_ms:    number
+}
+
+export interface InferenceQueueMonitor {
+  available: boolean
+  idle: boolean
+  queued_total: number
+  queued_p0: number
+  queued_p1: number
+  queued_p2: number
+  running_total: number
+  oldest_wait_ms: number
+  max_concurrency: number
+  on_external_power: boolean | null
 }
 
 // ─── 提炼流水线 DAG ───────────────────────────────────────────────────────────
@@ -660,7 +718,7 @@ export interface PipelineDagResponse {
   running_bake_run:  { id: number; trigger_reason: string; started_at: number; candidate_count: number } | null
   /// 所有正在运行的 bake run 列表
   running_bake_runs: { id: number; trigger_reason: string; started_at: number; candidate_count: number }[]
-  /// bake watermark 距离最老一条排队候选的 ms 间隔；0 表示已追上
+  /// 兼容字段：最老待烘焙候选的实际等待时长；0 表示无库存
   bake_watermark_lag_ms: number
   stages:            DagStage[]
 }

@@ -5,7 +5,8 @@ LLM 后端抽象接口
 from __future__ import annotations
 
 from abc         import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Callable
 
 
 @dataclass
@@ -34,6 +35,23 @@ class LlmBackend(ABC):
             system: System prompt（可选）
             **kwargs: 模型参数（如 temperature, max_tokens）
         """
+
+    def complete_stream(
+        self,
+        prompt: str,
+        system: str = "",
+        on_delta: Callable[[str], None] | None = None,
+        **kwargs,
+    ) -> LlmResponse:
+        """流式完成推理。
+
+        未提供原生流能力的后端仍可复用非流式实现；调用方因此可以只维护一套
+        SSE 编排逻辑，同时让支持流式传输的后端尽快输出首段内容。
+        """
+        response = self.complete(prompt, system=system, **kwargs)
+        if on_delta and response.text:
+            on_delta(response.text)
+        return response
 
     @property
     @abstractmethod

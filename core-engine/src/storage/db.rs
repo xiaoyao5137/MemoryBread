@@ -192,6 +192,38 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "045_remove_daily_diary_future_plans",
         include_str!("migrations/045_remove_daily_diary_future_plans.sql"),
     ),
+    (
+        "046_seed_energy_saving_mode",
+        include_str!("migrations/046_seed_energy_saving_mode.sql"),
+    ),
+    (
+        "047_update_diary_timeline_sources",
+        include_str!("migrations/047_update_diary_timeline_sources.sql"),
+    ),
+    (
+        "048_preserve_existing_capture_runtime",
+        include_str!("migrations/048_preserve_existing_capture_runtime.sql"),
+    ),
+    (
+        "049_create_creation_skills",
+        include_str!("migrations/049_create_creation_skills.sql"),
+    ),
+    (
+        "050_add_creation_skill_lifecycle",
+        include_str!("migrations/050_add_creation_skill_lifecycle.sql"),
+    ),
+    (
+        "051_expand_creation_skill_examples",
+        include_str!("migrations/051_expand_creation_skill_examples.sql"),
+    ),
+    (
+        "052_add_creation_skill_market_source",
+        include_str!("migrations/052_add_creation_skill_market_source.sql"),
+    ),
+    (
+        "053_backfill_document_timeline_metadata",
+        include_str!("migrations/053_backfill_document_timeline_metadata.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -697,6 +729,48 @@ mod tests {
     }
 
     #[test]
+    fn capture_runtime_migration_preserves_existing_users_only() {
+        fn preference_after_migration(has_capture: bool) -> Option<String> {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE user_preferences (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key TEXT NOT NULL UNIQUE,
+                    value TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'learned',
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    updated_at INTEGER NOT NULL,
+                    sample_count INTEGER NOT NULL DEFAULT 1
+                 );
+                 CREATE TABLE captures (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+            if has_capture {
+                conn.execute("INSERT INTO captures (id) VALUES (1)", [])
+                    .unwrap();
+            }
+
+            conn.execute_batch(include_str!(
+                "migrations/048_preserve_existing_capture_runtime.sql"
+            ))
+            .unwrap();
+            conn.query_row(
+                "SELECT value FROM user_preferences WHERE key = 'runtime.capture_enabled'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+        }
+
+        assert_eq!(preference_after_migration(true).as_deref(), Some("true"));
+        assert_eq!(preference_after_migration(false), None);
+    }
+
+    #[test]
     fn normalization_migration_clears_stuck_due_time() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -752,10 +826,8 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_batch(include_str!(
-            "migrations/044_correct_weekday_semantics.sql"
-        ))
-        .unwrap();
+        conn.execute_batch(include_str!("migrations/044_correct_weekday_semantics.sql"))
+            .unwrap();
 
         let (cron, next_run): (String, Option<i64>) = conn
             .query_row(
@@ -766,5 +838,96 @@ mod tests {
             .unwrap();
         assert_eq!(cron, "0 0 9 * * 2");
         assert!(next_run.is_none());
+    }
+
+    #[test]
+    fn document_metadata_migration_backfills_and_requeues_only_substantive_docs() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+             );
+             CREATE TABLE timelines (
+                id INTEGER PRIMARY KEY,
+                category TEXT,
+                activity_type TEXT,
+                content_origin TEXT,
+                evidence_strength TEXT,
+                updated_at TEXT,
+                updated_at_ms INTEGER
+             );
+             CREATE TABLE captures (
+                id INTEGER PRIMARY KEY,
+                timeline_id INTEGER,
+                url TEXT,
+                ax_text TEXT,
+                ocr_text TEXT
+             );
+             CREATE TABLE bake_retry_state (
+                timeline_id INTEGER PRIMARY KEY,
+                failure_count INTEGER NOT NULL,
+                last_error TEXT,
+                last_failed_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO timelines VALUES
+                (1, '其他', NULL, NULL, NULL, NULL, 1),
+                (2, '其他', NULL, NULL, NULL, NULL, 1);
+             INSERT INTO captures VALUES
+                (10, 1, 'https://docs.corp.kuaishou.com/k/home/space/doc-id', replace(hex(zeroblob(300)), '00', '文'), NULL),
+                (20, 2, 'https://docs.corp.kuaishou.com/k/home/space/short-id', '只有标题', NULL);
+             INSERT INTO bake_retry_state VALUES
+                (1, 3, '旧错误', 1),
+                (2, 3, '旧错误', 1);",
+        )
+        .unwrap();
+
+        conn.execute_batch(include_str!(
+            "migrations/053_backfill_document_timeline_metadata.sql"
+        ))
+        .unwrap();
+
+        let metadata: (String, String, String, String, i64) = conn
+            .query_row(
+                "SELECT category, activity_type, content_origin, evidence_strength, updated_at_ms
+                 FROM timelines WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (&metadata.0, &metadata.1, &metadata.2, &metadata.3),
+            (
+                &"文档".to_string(),
+                &"reading".to_string(),
+                &"document_reference".to_string(),
+                &"medium".to_string(),
+            )
+        );
+        assert!(metadata.4 > 1);
+        let short_activity: Option<String> = conn
+            .query_row(
+                "SELECT activity_type FROM timelines WHERE id = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(short_activity.is_none());
+        let retry_ids: Vec<i64> = conn
+            .prepare("SELECT timeline_id FROM bake_retry_state ORDER BY timeline_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(retry_ids, vec![2]);
     }
 }

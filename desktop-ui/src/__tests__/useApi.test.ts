@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { renderHook } from '@testing-library/react'
 import {
+  runGatewayRagQuery,
+  runGatewayRagQueryStream,
+  runRagQueryStream,
   useFetchBakeCaptures,
   useFetchBakeKnowledge,
   useFetchBakeKnowledgeDetail,
@@ -16,6 +19,158 @@ import { useAppStore } from '../store/useAppStore'
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
   status,
   headers: { 'Content-Type': 'application/json' },
+})
+
+describe('runRagQueryStream', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('按 SSE 顺序交付状态、参考资料、答案增量和耗时', async () => {
+    const encoder = new TextEncoder()
+    const chunks = [
+      'data: {"type":"status","stage":"retrieving","message":"正在召回相关资料","progress":42}\n\n',
+      'data: {"type":"references","contexts":[{"capture_id":1,"text":"资料","score":0.9,"source":"document"}]}\n\n',
+      'data: {"type":"delta","text":"部分"}\n\ndata: {"type":"delta","text":"答案"}\n\n',
+      'data: {"type":"done","answer":"部分答案","contexts":[{"capture_id":1,"text":"资料","score":0.9,"source":"document"}],"model":"local","elapsed_ms":1800,"inference_elapsed_ms":1200}\n\n',
+    ]
+    const body = new ReadableStream({
+      start(controller) {
+        chunks.forEach(chunk => controller.enqueue(encoder.encode(chunk)))
+        controller.close()
+      },
+    })
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const events: string[] = []
+
+    const result = await runRagQueryStream(
+      'http://localhost:7070',
+      [],
+      '流式测试',
+      5,
+      {},
+      false,
+      undefined,
+      {
+        onStatus: status => events.push(`status:${status.stage}`),
+        onReferences: contexts => events.push(`references:${contexts.length}`),
+        onDelta: (_delta, accumulated) => events.push(`answer:${accumulated}`),
+      },
+    )
+
+    expect(events).toEqual([
+      'status:retrieving',
+      'references:1',
+      'answer:部分',
+      'answer:部分答案',
+    ])
+    expect(result).toMatchObject({
+      answer: '部分答案',
+      elapsed_ms: 1800,
+      inference_elapsed_ms: 1200,
+    })
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:7070/api/rag/stream',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      }),
+    )
+  })
+})
+
+describe('runGatewayRagQuery environment binding', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('只在云网关请求中携带当前服务环境', async () => {
+    useAppStore.getState().reset()
+    useAppStore.getState().setDebugModeEnabled(true)
+    useAppStore.getState().setServiceEnvironment('staging')
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ contexts: [] }))
+      .mockResolvedValueOnce(jsonResponse({ content: '云端回答' }))
+      .mockResolvedValueOnce(jsonResponse({}))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await runGatewayRagQuery(
+      'http://127.0.0.1:7070',
+      'http://127.0.0.1:18090',
+      '环境绑定测试',
+      'user-1',
+    )
+
+    expect(fetchMock.mock.calls[0][1]?.headers).toEqual({ 'Content-Type': 'application/json' })
+    expect(fetchMock.mock.calls[1][1]?.headers).toEqual({
+      'X-MemoryBread-Environment': 'staging',
+      'Content-Type': 'application/json',
+    })
+  })
+
+  it('云端流式咨询先交付本地参考资料，再消费网关答案增量', async () => {
+    useAppStore.getState().reset()
+    useAppStore.getState().setDebugModeEnabled(true)
+    useAppStore.getState().setServiceEnvironment('staging')
+    const encoder = new TextEncoder()
+    const gatewayBody = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"delta","text":"云端"}\n\n'))
+        controller.enqueue(encoder.encode(
+          'data: {"type":"done","answer":"云端回答","model":"mbcd-plus-v1","elapsed_ms":900,"inference_elapsed_ms":700}\n\n',
+        ))
+        controller.close()
+      },
+    })
+    const reference = {
+      capture_id: 1,
+      text: '本地参考',
+      score: 0.9,
+      source: 'document',
+    }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ contexts: [reference] }))
+      .mockResolvedValueOnce(new Response(gatewayBody, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      }))
+      .mockResolvedValueOnce(jsonResponse({}))
+    vi.stubGlobal('fetch', fetchMock)
+    const events: string[] = []
+
+    const result = await runGatewayRagQueryStream(
+      'http://127.0.0.1:7070',
+      'http://127.0.0.1:18090',
+      '云端流式测试',
+      '00000000-0000-0000-0000-000000000001',
+      undefined,
+      { source: 'floating_assist' },
+      {
+        onReferences: contexts => events.push(`references:${contexts.length}`),
+        onDelta: (_delta, accumulated) => events.push(`answer:${accumulated}`),
+      },
+    )
+
+    expect(events).toEqual(['references:1', 'answer:云端'])
+    expect(result).toMatchObject({
+      answer: '云端回答',
+      contexts: [reference],
+      model: 'mbcd-plus-v1',
+      inference_elapsed_ms: 700,
+    })
+    expect(fetchMock.mock.calls[1][1]?.headers).toEqual({
+      'X-MemoryBread-Environment': 'staging',
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    })
+    expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string).stream).toBe(true)
+  })
 })
 
 describe('useFetchRagHistory', () => {

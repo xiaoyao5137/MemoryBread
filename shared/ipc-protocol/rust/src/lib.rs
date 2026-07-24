@@ -28,13 +28,8 @@ pub mod transport;
 
 pub use error::IpcError;
 pub use message::{
-    AsrRequest, AsrResult,
-    EmbedRequest, EmbedResult,
-    IpcRequest, IpcResponse,
-    OcrRequest, OcrResult,
-    PiiScrubRequest, PiiScrubResult,
-    ProfileAnalysisRequest, ProfileAnalysisResult,
-    ResultPayload, TaskRequest,
-    VlmRequest, VlmResult,
+    AsrRequest, AsrResult, EmbedRequest, EmbedResult, IpcRequest, IpcResponse, OcrRequest,
+    OcrResult, PiiScrubRequest, PiiScrubResult, ProfileAnalysisRequest, ProfileAnalysisResult,
+    ResultPayload, TaskRequest, VlmRequest, VlmResult,
 };
 pub use transport::IpcClient;

@@ -3,11 +3,16 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { useAppStore } from '../store/useAppStore'
+import { serviceEnvironmentHeaders, useAppStore } from '../store/useAppStore'
 import type { ActionCommand } from '../types'
 
 beforeEach(() => {
   useAppStore.getState().reset()
+  useAppStore.setState({
+    debugModeEnabled: false,
+    localDebugModeEnabled: false,
+    serviceEnvironment: 'production',
+  })
 })
 
 describe('windowMode', () => {
@@ -136,5 +141,63 @@ describe('配置状态', () => {
   it('setSidecarVersion 更新版本', () => {
     useAppStore.getState().setSidecarVersion('0.2.0')
     expect(useAppStore.getState().sidecarVersion).toBe('0.2.0')
+  })
+})
+
+describe('服务环境绑定', () => {
+  it('非调试模式拒绝切换测试环境', () => {
+    useAppStore.getState().setServiceEnvironment('staging')
+
+    expect(useAppStore.getState().serviceEnvironment).toBe('production')
+    expect(serviceEnvironmentHeaders()).toEqual({
+      'X-MemoryBread-Environment': 'production',
+    })
+  })
+
+  it('调试模式允许切换环境并让请求头同步变化', () => {
+    useAppStore.getState().setDebugModeEnabled(true)
+    useAppStore.getState().setServiceEnvironment('staging')
+
+    expect(useAppStore.getState().serviceEnvironment).toBe('staging')
+    expect(useAppStore.getState().adminApiBaseUrl).toBe('http://127.0.0.1:18080')
+    expect(useAppStore.getState().gatewayApiBaseUrl).toBe('http://127.0.0.1:18090')
+    expect(serviceEnvironmentHeaders()).toEqual({
+      'X-MemoryBread-Environment': 'staging',
+    })
+  })
+
+  it('关闭调试模式会恢复正式环境和正式服务地址', () => {
+    useAppStore.getState().setDebugModeEnabled(true)
+    useAppStore.getState().setServiceEnvironment('staging')
+    useAppStore.getState().setAdminApiBaseUrl('http://127.0.0.1:18080')
+    useAppStore.getState().setGatewayApiBaseUrl('http://127.0.0.1:18090')
+
+    useAppStore.getState().setDebugModeEnabled(false)
+
+    const state = useAppStore.getState()
+    expect(state.serviceEnvironment).toBe('production')
+    expect(state.localDebugModeEnabled).toBe(false)
+    expect(state.adminApiBaseUrl).toBe('http://127.0.0.1:8080')
+    expect(state.gatewayApiBaseUrl).toBe('http://127.0.0.1:8090')
+  })
+
+  it('切换环境不会沿用当前环境的账户会话', () => {
+    useAppStore.getState().setDebugModeEnabled(true)
+    useAppStore.getState().setServiceEnvironment('staging')
+    useAppStore.getState().setAuthSession({
+      access_token: 'staging-token',
+      expires_at: new Date(Date.now() + 86_400_000).toISOString(),
+      user: {
+        id: '01900000-0000-7000-8000-000000000099',
+        status: 'active',
+        roles: ['user'],
+        locale: 'zh-CN',
+        timezone: 'Asia/Shanghai',
+        created_at: new Date().toISOString(),
+      },
+    })
+
+    useAppStore.getState().setServiceEnvironment('production')
+    expect(useAppStore.getState().authToken).toBeNull()
   })
 })

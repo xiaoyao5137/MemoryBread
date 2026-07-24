@@ -12,6 +12,7 @@ import {
   useFetchCaptures,
 } from '../hooks/useApi'
 import { useAppStore, type BakeNavigationTarget } from '../store/useAppStore'
+import { toUserFacingError } from '../utils/userFacingError'
 import type {
   ArticleTemplate,
   BakeCaptureItem,
@@ -132,7 +133,7 @@ const RepositoryPanel: React.FC = () => {
         if (requestSeq !== memoryRequestSeqRef.current) return
         setMemories([])
         setMemoryTotal(0)
-        setStatusMessage(error instanceof Error ? error.message : `未找到时间线 #${repositoryMemoryFocusId}`)
+        setStatusMessage(toUserFacingError(error, '未找到这条时间线'))
       })
       return
     }
@@ -150,7 +151,7 @@ const RepositoryPanel: React.FC = () => {
       setMemoryTotal(data.total)
     }).catch((error) => {
       if (requestSeq !== memoryRequestSeqRef.current) return
-      setStatusMessage(error instanceof Error ? error.message : '时间线加载失败')
+      setStatusMessage(toUserFacingError(error, '时间线加载失败'))
     })
   }, [
     bakeMemoryOffset,
@@ -182,7 +183,7 @@ const RepositoryPanel: React.FC = () => {
       setCaptureTotal(data.total)
     }).catch((error) => {
       if (requestSeq !== captureRequestSeqRef.current) return
-      setStatusMessage(error instanceof Error ? error.message : '采集记录加载失败')
+      setStatusMessage(toUserFacingError(error, '采集记录加载失败'))
     })
   }, [
     bakeCaptureOffset,
@@ -201,7 +202,7 @@ const RepositoryPanel: React.FC = () => {
       return
     }
     void fetchCaptureDetail(selectedCaptureId).then(setCaptureDetail).catch((error) => {
-      setStatusMessage(error instanceof Error ? error.message : '采集记录详情加载失败')
+      setStatusMessage(toUserFacingError(error, '采集记录详情加载失败'))
     })
   }, [fetchCaptureDetail, repositoryTab, selectedCaptureId])
 
@@ -293,11 +294,10 @@ const RepositoryPanel: React.FC = () => {
   const memoryTotalPages = Math.max(1, Math.ceil(memoryTotal / repositoryMemoryLimit))
   const memoryFilterPills = useMemo(() => {
     const pills: string[] = []
-    if (repositoryMemoryFocusId) pills.push(`仅看时间线 #${repositoryMemoryFocusId}`)
     if (repositoryMemoryFrom) pills.push(`开始：${repositoryMemoryFrom}`)
     if (repositoryMemoryTo) pills.push(`结束：${repositoryMemoryTo}`)
     return pills
-  }, [repositoryMemoryFocusId, repositoryMemoryFrom, repositoryMemoryTo])
+  }, [repositoryMemoryFrom, repositoryMemoryTo])
 
   const handleSearchMemories = () => {
     clearBakeNavigationStack()
@@ -496,7 +496,6 @@ const RepositoryPanel: React.FC = () => {
       <BakeHeader title="采集" subtitle="" />
       {bakeNavigationStack.length > 0 && (
         <div className="bake-backbar">
-          <span>可以返回上一步页面</span>
           <BakeButton compact onClick={handleCaptureGoBack}>返回上一步</BakeButton>
         </div>
       )}
@@ -561,7 +560,7 @@ const RepositoryPanel: React.FC = () => {
             </div>
           </form>
 
-          {memoryFilterPills.length > 0 && (
+          {(memoryFilterPills.length > 0 || repositoryMemoryFocusId) && (
             <div className="bake-filter-summary">
               {memoryFilterPills.map(item => <BakePill key={item} text={item} />)}
               {repositoryMemoryFocusId && <BakeButton compact onClick={handleClearMemoryFilters}>查看全部</BakeButton>}
@@ -594,10 +593,7 @@ const RepositoryPanel: React.FC = () => {
                         <div className="bake-list-item__title bake-line-clamp-1">{item.title}</div>
                         <div className="bake-muted bake-line-clamp-2">{item.summary || '暂无摘要'}</div>
                         <div className="bake-memory-list-item__meta">
-                          <span>创建于 {formatMemoryTime(item)}</span>
-                          <span>权重 {item.weight}</span>
-                          <span>打开 {item.openCount} 次</span>
-                          <span>停留 {item.dwellSeconds}s</span>
+                          <span>ID #{item.id} · 创建于 {formatMemoryTime(item)}</span>
                         </div>
                       </button>
                     ))}
@@ -664,15 +660,10 @@ const RepositoryPanel: React.FC = () => {
                     <div className="bake-inline-meta">
                       <div style={{ minWidth: 0 }}>
                         <div className="bake-title" style={{ fontSize: 20, lineHeight: 1.4 }}>{selectedMemory.title}</div>
-                        <div className="bake-muted bake-line-clamp-1" style={{ marginTop: 6 }}>{selectedMemory.url || `时间线 #${selectedMemory.id || '暂无编号'}`}</div>
+                        <div className="bake-muted bake-line-clamp-1" style={{ marginTop: 6 }}>
+                          ID #{selectedMemory.id || '暂无编号'} · 创建于 {formatMemoryTime(selectedMemory)}
+                        </div>
                       </div>
-                    </div>
-                    <div className="bake-memory-detail__stats">
-                      <span className="bake-stat-chip">创建于 {formatMemoryTime(selectedMemory)}</span>
-                      <span className="bake-stat-chip">权重 {selectedMemory.weight}</span>
-                      <span className="bake-stat-chip">打开 {selectedMemory.openCount} 次</span>
-                      <span className="bake-stat-chip">停留 {selectedMemory.dwellSeconds}s</span>
-                      <span className="bake-stat-chip">重复观察 {selectedMemory.knowledgeRefCount} 次</span>
                     </div>
                   </div>
 

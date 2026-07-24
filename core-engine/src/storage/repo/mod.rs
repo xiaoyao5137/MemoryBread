@@ -5,6 +5,7 @@ pub mod bake_document;
 pub mod bake_run;
 pub mod capture;
 pub mod creation_history;
+pub mod creation_skill;
 pub mod diary;
 pub mod knowledge;
 pub mod preferences;

@@ -1,0 +1,2 @@
+# 仅发布构建使用；最终用户不需要安装 Python 或 PyInstaller。
+pyinstaller==6.21.0

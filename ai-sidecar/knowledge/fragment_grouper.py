@@ -20,6 +20,11 @@ _DOC_URL_MARKERS = (
     '/wiki/', 'shimo.im', '/d/home/', '/s/home/',
 )
 
+_DOC_TITLE_MARKERS = (
+    '云文档', '在线文档', 'google docs', '腾讯文档', '飞书文档',
+    '语雀', 'notion', 'confluence', '石墨文档', 'docs - google chrome',
+)
+
 
 def _is_document_url(url: Optional[str]) -> bool:
     """URL 是否指向一份文档。"""
@@ -52,6 +57,19 @@ def _document_identity(url: Optional[str]) -> Optional[str]:
         return f"{parsed.netloc.lower()}::{last_segment}"
     return f"{parsed.netloc.lower()}::{path.lower()}"
 
+
+def _looks_like_document_capture(capture: dict) -> bool:
+    """capture 是否呈现出文档特征；URL 为空时仅用于阻止未经证明的合并。"""
+    if _document_identity(capture.get('url')):
+        return True
+    title = (
+        capture.get('webpage_title')
+        or capture.get('window_title')
+        or capture.get('win_title')
+        or ''
+    )
+    lowered = str(title).strip().lower()
+    return bool(lowered) and any(marker in lowered for marker in _DOC_TITLE_MARKERS)
 
 
 _HISTORY_APP_KEYWORDS = (
@@ -197,33 +215,32 @@ class FragmentGrouper:
                 return ident
         return None
 
+    @staticmethod
+    def _group_has_unknown_document(group: list[dict]) -> bool:
+        """组内存在看起来是文档、但 URL 为空或无法识别的 capture。"""
+        return any(
+            _looks_like_document_capture(cap) and _document_identity(cap.get('url')) is None
+            for cap in group
+        )
+
     def _document_boundary_split(self, current_group: list[dict], curr: dict) -> bool:
         """判断是否因文档边界而强制切片。
 
-        规则（"一份文档独占一个片段，且片段聚焦同一份文档"）：
-        - 组已有主文档 A（文档组）：严格排他，只接纳 A 自己的后续浏览。
-            * curr 是文档 A → 不切（继续浏览同一文档）
-            * curr 是其它文档 B → 切（B 另起一组）
-            * curr 非文档型 → 切（IM/编码等杂项不并入文档组，避免污染）
-        - 组无主文档（操作/IM/编码组）：
-            * curr 是文档型 → 切（让文档干净地独占新组）
-            * curr 非文档型 → 不切（留给语义判断）
+        文档 capture 只有在双方都具有非空 URL、且文档 identity 完全相同时才能合并。
+        不同 URL、普通 capture、以及看起来像文档但 URL 为空的 capture 都必须切开。
         """
         curr_doc = _document_identity(curr.get('url'))
         primary_doc = self._group_primary_document(current_group)
 
         if primary_doc is not None:
-            if curr_doc == primary_doc:
-                return False
-            if curr_doc is not None and curr_doc != primary_doc:
-                return True
-            # curr 非文档型：文档组一旦确立即严格排他，
-            # 不让 IM/编码等杂项靠应用回归吸附进来污染文档 timeline。
+            return curr_doc != primary_doc
+
+        # URL 为空的文档型 capture 无法证明属于同一文档，保持单条隔离。
+        if self._group_has_unknown_document(current_group):
             return True
-        else:
-            if curr_doc is not None:
-                return True
-            return False
+
+        # 普通组遇到已知文档或 URL 为空的文档型 capture，都先切出独立片段。
+        return curr_doc is not None or _looks_like_document_capture(curr)
 
     def _batch_encode(self, captures: list[dict]) -> Optional[list]:
         """批量向量化所有 captures"""

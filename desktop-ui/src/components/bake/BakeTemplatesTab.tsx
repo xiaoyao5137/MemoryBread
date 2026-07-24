@@ -1,14 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import type { ArticleTemplate } from '../../types'
+import type { LocalCreationSkill } from '../../utils/creationSkills'
 import { BakeButton, BakeCard, BakeMarkdown, BakePill, BakeSectionHeader } from './BakeShared'
-
-const formatTemplateStatus = (status: ArticleTemplate['status']) => {
-  if (status === 'enabled') return '已启用'
-  if (status === 'pending_review') return '草稿'
-  if (status === 'disabled') return '已停用'
-  if (status === 'auto_generated') return '自动生成'
-  return '草稿'
-}
 
 const BakeTemplatesTab: React.FC<{
   templates: ArticleTemplate[]
@@ -27,6 +20,9 @@ const BakeTemplatesTab: React.FC<{
   onUpdateTemplate: (templateId: string, updater: (template: ArticleTemplate) => ArticleTemplate) => void
   onToggleTemplateStatus: (templateId: string) => void
   onDeleteTemplate: (templateId: string) => void
+  onSettleSkill?: (template: ArticleTemplate) => void
+  relatedSkills?: LocalCreationSkill[]
+  onOpenSkill?: (skill: LocalCreationSkill) => void
   onViewSourceMemory: (memoryId?: string) => void
   memoryTitleById?: Map<string, string>
   onPageChange: (offset: number) => void
@@ -54,6 +50,9 @@ const BakeTemplatesTab: React.FC<{
   onUpdateTemplate,
   onToggleTemplateStatus,
   onDeleteTemplate,
+  onSettleSkill,
+  relatedSkills = [],
+  onOpenSkill,
   onViewSourceMemory,
   memoryTitleById = new Map(),
   onPageChange,
@@ -132,7 +131,6 @@ const BakeTemplatesTab: React.FC<{
       <BakeCard>
         <BakeSectionHeader
           title="文档"
-          subtitle="管理可复用的文档模板"
           right={<BakeButton primary onClick={onCreateTemplate}>新建模板</BakeButton>}
         />
         <form
@@ -205,17 +203,8 @@ const BakeTemplatesTab: React.FC<{
                 onClick={() => onSelectTemplate(item.id)}
                 className={`bake-list-item bake-knowledge-list-item ${active ? 'bake-list-item--active' : ''}`.trim()}
               >
-                <div className="bake-inline-meta">
-                  <div style={{ minWidth: 0 }}>
-                    <div className="bake-list-item__title bake-line-clamp-2">{item.title}</div>
-                    <div className="bake-muted bake-line-clamp-1">{item.docType} · 使用 {item.usageCount} 次</div>
-                  </div>
-                  <BakePill text={formatTemplateStatus(item.status)} />
-                </div>
-                <div className="bake-inline-pills">
-                  {item.matchLevel && <BakePill text={item.matchLevel} />}
-                  {item.matchScore != null && <BakePill text={`匹配分 ${item.matchScore.toFixed(2)}`} />}
-                </div>
+                <div className="bake-list-item__title bake-line-clamp-2">{item.title}</div>
+                <div className="bake-muted bake-line-clamp-1">{item.docType}</div>
               </button>
             )
           })}
@@ -262,23 +251,9 @@ const BakeTemplatesTab: React.FC<{
       <BakeCard className="bake-knowledge-detail-card">
         {selected ? (
           <div className="bake-kv bake-knowledge-detail">
-            <div className="bake-inline-meta">
-              <div>
-                <div className="bake-title" style={{ fontSize: 18 }}>{selected.title}</div>
-                <div className="bake-muted" style={{ marginTop: 4 }}>{selected.docType} · ID: {selected.id} · 最近更新 {selected.updatedAt || '—'}</div>
-              </div>
-              <div className="bake-inline-pills">
-                <BakePill text={formatTemplateStatus(selected.status)} />
-              </div>
-            </div>
-
-            <div className="bake-knowledge-detail__section">
-              <div className="bake-kv__title">提炼状态</div>
-              <div className="bake-memory-detail__stats">
-                {selected.matchScore != null && <span className="bake-stat-chip">匹配分：{selected.matchScore.toFixed(2)}</span>}
-                {selected.matchLevel && <span className="bake-stat-chip">匹配等级：{selected.matchLevel}</span>}
-                <span className="bake-stat-chip">来源记忆：{selected.sourceMemoryIds.length}</span>
-              </div>
+            <div>
+              <div className="bake-title" style={{ fontSize: 18 }}>{selected.title}</div>
+              <div className="bake-muted" style={{ marginTop: 4 }}>{selected.docType} · ID: {selected.id} · 最近更新 {selected.updatedAt || '—'}</div>
             </div>
 
             {selected.sourceUrl && (
@@ -352,6 +327,22 @@ const BakeTemplatesTab: React.FC<{
               </>
             )}
 
+            <div className="bake-knowledge-detail__section bake-related-skills">
+              <div className="bake-kv__title">关联创作 Skill</div>
+              {relatedSkills.length ? (
+                <div className="bake-related-skills__list">
+                  {relatedSkills.map(skill => (
+                    <button type="button" key={skill.id} onClick={() => onOpenSkill?.(skill)}>
+                      <span><strong>{skill.title}</strong><small>{skill.summary}</small></span>
+                      <em>{skill.status === 'draft' ? '草稿' : skill.installed ? '已安装' : '已保存'}</em>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="bake-muted">这份文档还没有关联 Skill，可点击下方「沉淀 Skill」创建。</div>
+              )}
+            </div>
+
             <div className="bake-actions--primary">
               {isEditing ? (
                 <>
@@ -361,6 +352,9 @@ const BakeTemplatesTab: React.FC<{
               ) : (
                 <>
                   <BakeButton primary onClick={() => setIsEditing(true)}>编辑模板</BakeButton>
+                  {onSettleSkill ? (
+                    <BakeButton onClick={() => onSettleSkill(selected)}>沉淀 Skill</BakeButton>
+                  ) : null}
                   <BakeButton onClick={() => onToggleTemplateStatus(selected.id)}>{selected.status === 'enabled' ? '停用' : '启用'}</BakeButton>
                   <BakeButton onClick={() => onDeleteTemplate(selected.id)}>删除模板</BakeButton>
                   <BakeButton compact onClick={() => onViewSourceMemory(selected.sourceMemoryIds[0])}>查看来源时间线</BakeButton>

@@ -203,7 +203,7 @@ describe('显式搜索交互', () => {
     expect(useAppStore.getState().bakeKnowledgeFocusId).toBeNull()
   })
 
-  it('RepositoryPanel 展示采集标题以及情节记忆创建时间', async () => {
+  it('RepositoryPanel 以普通元信息展示 ID 和创建时间，不展示不可靠指标', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('/api/knowledge')) {
@@ -236,7 +236,11 @@ describe('显式搜索交互', () => {
     })
 
     expect(screen.getByText('采集')).toBeInTheDocument()
-    expect(screen.getAllByText('创建于 2026-04-11 09:30').length).toBeGreaterThan(1)
+    expect(screen.getAllByText('ID #1 · 创建于 2026-04-11 09:30').length).toBeGreaterThan(1)
+    expect(screen.queryByText(/停留/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/打开 \d+ 次/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/重复观察 \d+ 次/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/权重 \d+/)).not.toBeInTheDocument()
   })
 
   it('RepositoryPanel 情节记忆搜索只有点击搜索后才发起带筛选请求', async () => {
@@ -362,7 +366,7 @@ describe('显式搜索交互', () => {
       expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/knowledge/7')
     })
     expect(screen.getAllByText('目标时间线').length).toBeGreaterThan(0)
-    expect(screen.getByText('仅看时间线 #7')).toBeInTheDocument()
+    expect(screen.queryByText('仅看时间线 #7')).not.toBeInTheDocument()
     expect(screen.queryByText('普通时间线')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '查看全部' }))

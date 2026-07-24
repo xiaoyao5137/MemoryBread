@@ -1,12 +1,12 @@
 /* ========================================
-   FloatingBuddy v2 - 左侧菜单栏样式
+   FloatingBuddy v2 - 主窗口左侧导航样式
    ======================================== */
 
 .floating-buddy-v2 {
-  width: clamp(184px, 18vw, 212px);
-  min-width: 184px;
+  width: clamp(220px, 19vw, 244px);
+  min-width: 220px;
   height: 100%;
-  padding: 22px 12px;
+  padding: 22px 12px 0;
   display: flex;
   flex-direction: column;
   gap: 20px;
@@ -66,6 +66,7 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
+  overflow-x: hidden;
   overflow-y: auto;
   flex: 1;
 }
@@ -80,86 +81,95 @@
   gap: 10px;
 }
 
-.buddy-account-pill {
+.buddy-sidebar-footer {
+  flex: 0 0 auto;
+  margin: 0 -12px;
+  padding: 9px 10px 11px;
+  border-top: 1px solid rgba(78, 48, 27, 0.1);
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.buddy-account-entry {
   width: 100%;
-  min-height: 42px;
-  padding: 5px 8px 5px 6px;
-  border: 1px solid rgba(154, 106, 49, 0.2);
-  border-radius: 999px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(255, 248, 235, 0.9));
-  display: inline-flex;
-  justify-content: flex-start;
-  gap: 9px;
+  min-height: 58px;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  display: flex;
+  gap: 10px;
   align-items: center;
   text-align: left;
   cursor: pointer;
   color: #4b3524;
-  box-shadow: 0 10px 26px rgba(84, 48, 20, 0.08);
-  transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+  transition: background-color 0.18s ease, color 0.18s ease, transform 0.12s ease;
 }
 
-.buddy-account-pill__icon {
-  width: 30px;
-  height: 30px;
+.buddy-account-entry__avatar {
+  width: 36px;
+  height: 36px;
   border-radius: 999px;
-  background: #9f4522;
+  background: #a66a32;
   color: #fffaf4;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24);
 }
 
-.buddy-account-pill__text {
+.buddy-account-entry__identity {
   min-width: 0;
-  display: grid;
-  gap: 1px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
   flex: 1;
 }
 
-.buddy-account-pill__text span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.buddy-account-entry__identity span {
   color: #7a6b5e;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.1;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
 }
 
-.buddy-account-pill__text strong {
+.buddy-account-entry__identity strong {
   min-width: 0;
   color: #3a2414;
-  font-size: 12px;
-  line-height: 1.2;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
 }
 
-.buddy-account-pill__chevron {
+.buddy-account-entry__chevron {
   color: #9a6a31;
-  opacity: 0.86;
+  opacity: 0.72;
   flex: 0 0 auto;
+  transition: transform 0.18s ease, opacity 0.18s ease;
 }
 
-.buddy-account-pill:hover,
-.buddy-account-pill--active {
-  border-color: rgba(154, 106, 49, 0.34);
-  box-shadow: 0 12px 30px rgba(84, 48, 20, 0.12);
-  transform: translateY(-1px);
+.buddy-account-entry:hover,
+.buddy-account-entry--active {
+  background: rgba(180, 111, 42, 0.1);
 }
 
-.buddy-account-pill:active {
-  transform: translateY(0);
+.buddy-account-entry:hover .buddy-account-entry__chevron,
+.buddy-account-entry--active .buddy-account-entry__chevron {
+  opacity: 1;
+  transform: translateX(2px);
 }
 
-.buddy-account-pill:focus-visible {
-  outline: 3px solid rgba(198, 95, 47, 0.22);
-  outline-offset: 2px;
+.buddy-account-entry:active {
+  transform: scale(0.985);
+}
+
+.buddy-account-entry:focus-visible {
+  outline: 2px solid rgba(198, 95, 47, 0.34);
+  outline-offset: -2px;
 }
 
 .admin-env-switch__eyebrow {
@@ -251,7 +261,7 @@
 }
 
 .buddy-action-btn:active {
-  transform: translateX(1px);
+  transform: scale(0.985);
 }
 
 .buddy-action-btn--active {
@@ -371,31 +381,34 @@
     border-color: #D98C38;
   }
 
-  .buddy-account-pill {
-    border-color: rgba(245, 158, 11, 0.2);
-    background: linear-gradient(180deg, rgba(65, 45, 24, 0.78), rgba(37, 37, 38, 0.9));
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.24);
+  .buddy-sidebar-footer {
+    border-top-color: rgba(255, 255, 255, 0.08);
+    background: rgba(20, 20, 21, 0.42);
   }
 
-  .buddy-account-pill__icon {
-    background: #D98C38;
+  .buddy-account-entry {
+    color: #F6D6A8;
+  }
+
+  .buddy-account-entry__avatar {
+    background: #C07A35;
     color: #1F1308;
   }
 
-  .buddy-account-pill__text span {
+  .buddy-account-entry__identity span {
     color: #F4C177;
   }
 
-  .buddy-account-pill__text strong {
+  .buddy-account-entry__identity strong {
     color: #FFF7E8;
   }
 
-  .buddy-account-pill__chevron {
+  .buddy-account-entry__chevron {
     color: #F4C177;
   }
 
-  .buddy-account-pill:hover,
-  .buddy-account-pill--active {
-    background: linear-gradient(180deg, rgba(79, 54, 27, 0.9), rgba(45, 37, 31, 0.94));
+  .buddy-account-entry:hover,
+  .buddy-account-entry--active {
+    background: rgba(244, 193, 119, 0.11);
   }
 }

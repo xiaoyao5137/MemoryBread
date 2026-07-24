@@ -1,25 +1,32 @@
 import React, { FormEvent, useEffect, useState } from 'react'
-import { ArrowRight, Award, CheckCircle2, KeyRound, LogOut, LockKeyhole, Mail, Server, Smartphone, UserRound, WalletCards } from 'lucide-react'
+import { ArrowRight, Building2, KeyRound, LockKeyhole, Mail, Server, Smartphone, UserRound } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
-import type { AchievementProfile } from '../types'
-import { authenticateWithPassword, authenticateWithPhoneCode, fetchAchievementProfile, fetchConsoleSummary, logoutSession, sendPhoneVerificationCode } from '../utils/authApi'
+import type { AccountProfileSection } from '../types'
+import { authenticateWithPassword, authenticateWithPhoneCode, fetchConsoleSummary, logoutSession, sendPhoneVerificationCode } from '../utils/authApi'
 import { getRunModeLabel, getUserDisplayName } from '../utils/accountDisplay'
-import AchievementGallery from './AchievementGallery'
+import { toUserFacingError } from '../utils/userFacingError'
+import AccountProfile from './AccountProfile'
 import './AuthPanel.css'
 
 type AuthMode = 'login' | 'register'
 type LoginMethod = 'email' | 'phone'
 
-const accountStatusLabel: Record<string, string> = {
-  active: '正常',
-  suspended: '已暂停',
-  deleted: '已注销',
+interface AuthPanelProps {
+  initialProfileSection?: AccountProfileSection
+  highlightedAchievementKeys?: string[]
+  onInitialProfileSectionHandled?: () => void
 }
 
-const AuthPanel: React.FC = () => {
+const AuthPanel: React.FC<AuthPanelProps> = ({
+  initialProfileSection,
+  highlightedAchievementKeys,
+  onInitialProfileSectionHandled,
+}) => {
   const {
+    apiBaseUrl,
     adminApiBaseUrl,
     authToken,
+    authExpiresAt,
     currentUser,
     cloudBalance,
     cloudSubscription,
@@ -33,6 +40,8 @@ const AuthPanel: React.FC = () => {
   const [mode, setMode] = useState<AuthMode>('login')
   const [loginMethod, setLoginMethod] = useState<LoginMethod>('email')
   const [username, setUsername] = useState('')
+  const [nickname, setNickname] = useState('')
+  const [companyName, setCompanyName] = useState('')
   const [email, setEmail] = useState('')
   const [phone, setPhone] = useState('')
   const [phoneCode, setPhoneCode] = useState('')
@@ -41,11 +50,6 @@ const AuthPanel: React.FC = () => {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [balanceError, setBalanceError] = useState<string | null>(null)
-  const [activeProfileTab, setActiveProfileTab] = useState<'personal' | 'achievements'>('personal')
-  const [achievementProfile, setAchievementProfile] = useState<AchievementProfile | null>(null)
-  const [achievementError, setAchievementError] = useState<string | null>(null)
-  const [achievementLoading, setAchievementLoading] = useState(false)
-  const [achievementRetryKey, setAchievementRetryKey] = useState(0)
 
   const refreshBalance = async () => {
     if (!authToken || !currentUser) return
@@ -57,38 +61,13 @@ const AuthPanel: React.FC = () => {
     } catch (err) {
       setCloudBalance(null)
       setCloudSubscription(null)
-      setBalanceError(err instanceof Error ? err.message : '钱包信息读取失败')
+      setBalanceError(toUserFacingError(err, '账户余额读取失败'))
     }
   }
 
   useEffect(() => {
     void refreshBalance()
   }, [authToken, currentUser?.id, adminApiBaseUrl, setCloudBalance, setCloudSubscription])
-
-  useEffect(() => {
-    if (!authToken || !currentUser) {
-      setAchievementProfile(null)
-      setAchievementError(null)
-      setAchievementLoading(false)
-      return undefined
-    }
-    let cancelled = false
-    setAchievementLoading(true)
-    setAchievementError(null)
-    fetchAchievementProfile(adminApiBaseUrl, authToken)
-      .then((profile) => {
-        if (!cancelled) setAchievementProfile(profile)
-      })
-      .catch((achievementFetchError) => {
-        if (!cancelled) {
-          setAchievementError(achievementFetchError instanceof Error ? achievementFetchError.message : '标签卡片读取失败')
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setAchievementLoading(false)
-      })
-    return () => { cancelled = true }
-  }, [adminApiBaseUrl, authToken, currentUser?.id, achievementRetryKey])
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
@@ -101,14 +80,24 @@ const AuthPanel: React.FC = () => {
           phone,
           phoneCode,
           mode === 'register' ? username : undefined,
+          mode === 'register' ? nickname : undefined,
+          mode === 'register' ? companyName : undefined,
         )
         setAuthSession(session)
         return
       }
-      const session = await authenticateWithPassword(adminApiBaseUrl, mode, email, password, username)
+      const session = await authenticateWithPassword(
+        adminApiBaseUrl,
+        mode,
+        email,
+        password,
+        username,
+        nickname,
+        companyName,
+      )
       setAuthSession(session)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '登录失败，请检查网络或账户信息')
+      setError(toUserFacingError(err, '登录失败，请检查网络或账户信息'))
     } finally {
       setLoading(false)
     }
@@ -126,7 +115,7 @@ const AuthPanel: React.FC = () => {
       await sendPhoneVerificationCode(adminApiBaseUrl, phone)
       setCodeSent(true)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '验证码发送失败')
+      setError(toUserFacingError(err, '验证码发送失败'))
     } finally {
       setLoading(false)
     }
@@ -136,97 +125,25 @@ const AuthPanel: React.FC = () => {
     const accountLabel = getUserDisplayName(currentUser)
     const runModeLabel = getRunModeLabel(currentUser, cloudSubscription)
     return (
-      <main className="auth-panel auth-panel--signed-in" data-testid="auth-panel">
-        <section className="auth-panel__form" aria-label="个人中心">
-          <div className="auth-panel__form-head">
-            <span className="auth-panel__form-icon" aria-hidden="true"><CheckCircle2 size={18} /></span>
-            <div>
-              <strong>个人中心</strong>
-              <span>管理账户资料与标签卡片</span>
-            </div>
-          </div>
-          <div className="auth-panel__avatar-row">
-            <span className="auth-panel__avatar" aria-hidden="true">
-              {accountLabel.slice(0, 1).toUpperCase()}
-              {achievementProfile?.equipped.profile_avatar && (
-                <span
-                  className={`auth-panel__avatar-badge auth-panel__avatar-badge--${achievementProfile.equipped.profile_avatar.palette_key}`}
-                  title={`已佩戴 ${achievementProfile.equipped.profile_avatar.name}`}
-                >
-                  {Array.from(achievementProfile.equipped.profile_avatar.name)[0]}
-                </span>
-              )}
-            </span>
-            <div>
-              <strong>{accountLabel}</strong>
-              <span>{runModeLabel} · ID {currentUser.id}</span>
-            </div>
-          </div>
-
-          <nav className="auth-panel__profile-tabs" role="tablist" aria-label="个人中心页面导航">
-            <button
-              aria-selected={activeProfileTab === 'personal'}
-              className={activeProfileTab === 'personal' ? 'auth-panel__profile-tab auth-panel__profile-tab--active' : 'auth-panel__profile-tab'}
-              onClick={() => setActiveProfileTab('personal')}
-              role="tab"
-              type="button"
-            >
-              <UserRound size={16} aria-hidden />个人信息
-            </button>
-            <button
-              aria-selected={activeProfileTab === 'achievements'}
-              className={activeProfileTab === 'achievements' ? 'auth-panel__profile-tab auth-panel__profile-tab--active' : 'auth-panel__profile-tab'}
-              onClick={() => setActiveProfileTab('achievements')}
-              role="tab"
-              type="button"
-            >
-              <Award size={16} aria-hidden />标签卡片
-            </button>
-          </nav>
-
-          {activeProfileTab === 'personal' && (
-            <div className="auth-panel__profile-content" role="tabpanel">
-              <div className="auth-panel__profile">
-                <span>运行模式</span>
-                <strong>{runModeLabel}</strong>
-              </div>
-              <div className="auth-panel__profile-grid">
-                <div><span>状态</span><strong>{accountStatusLabel[currentUser.status] ?? '正常'}</strong></div>
-                <div><span>区域</span><strong>{currentUser.locale}</strong></div>
-                <div><span>时区</span><strong>{currentUser.timezone}</strong></div>
-                <div><span>创建时间</span><strong>{new Date(currentUser.created_at).toLocaleString('zh-CN')}</strong></div>
-                <div><span>登录方式</span><strong>{currentUser.email ? '邮箱账号' : '手机号账号'}</strong></div>
-              </div>
-              <div className="auth-panel__wallet">
-                <div className="auth-panel__wallet-head">
-                  <span><WalletCards size={16} aria-hidden /> 钱包信息</span>
-                </div>
-                <div className="auth-panel__wallet-grid">
-                  <div><span>可用 Credit</span><strong>{cloudBalance?.available ?? '-'}</strong></div>
-                </div>
-                {balanceError && <div className="auth-panel__wallet-error">{balanceError}</div>}
-              </div>
-              <button className="auth-panel__submit auth-panel__submit--secondary" type="button" onClick={handleLogout}>
-                退出登录 <LogOut size={16} aria-hidden />
-              </button>
-            </div>
-          )}
-
-          {activeProfileTab === 'achievements' && (
-            <div className="auth-panel__profile-content" role="tabpanel">
-              <AchievementGallery
-                adminApiBaseUrl={adminApiBaseUrl}
-                authToken={authToken ?? ''}
-                error={achievementError}
-                loading={achievementLoading}
-                onChange={setAchievementProfile}
-                onRetry={() => setAchievementRetryKey((value) => value + 1)}
-                profile={achievementProfile}
-              />
-            </div>
-          )}
-        </section>
-      </main>
+      <AccountProfile
+        accountLabel={accountLabel}
+        adminApiBaseUrl={adminApiBaseUrl}
+        apiBaseUrl={apiBaseUrl}
+        authToken={authToken!}
+        balanceError={balanceError}
+        cloudBalance={cloudBalance}
+        highlightedAchievementKeys={highlightedAchievementKeys}
+        initialSection={initialProfileSection}
+        onInitialSectionHandled={onInitialProfileSectionHandled}
+        onUserChange={(user) => setAuthSession({
+          access_token: authToken!,
+          expires_at: authExpiresAt || new Date(Date.now() + 30 * 86400_000).toISOString(),
+          user,
+        })}
+        onLogout={handleLogout}
+        runModeLabel={runModeLabel}
+        user={currentUser}
+      />
     )
   }
 
@@ -303,20 +220,58 @@ const AuthPanel: React.FC = () => {
 
         {mode === 'register' && (
           <label>
-            <span>用户名</span>
+            <span>账户名</span>
+            <div className="auth-panel__input-with-icon">
+              <UserRound size={16} aria-hidden />
+              <input
+                autoComplete="username"
+                maxLength={30}
+                minLength={2}
+                onChange={(event) => setUsername(event.target.value)}
+                placeholder="用于识别账户，注册后保留展示"
+                required
+                value={username}
+              />
+            </div>
+          </label>
+        )}
+
+        {mode === 'register' && (
+          <label>
+            <span>昵称</span>
             <div className="auth-panel__input-with-icon">
               <UserRound size={16} aria-hidden />
               <input
                 autoComplete="nickname"
                 maxLength={30}
                 minLength={2}
-                onChange={(event) => setUsername(event.target.value)}
-                placeholder="注册后显示在用户卡片"
+                onChange={(event) => setNickname(event.target.value)}
+                placeholder="用于头像和左下角用户卡片"
                 required
-                value={username}
+                value={nickname}
               />
             </div>
           </label>
+        )}
+
+        {mode === 'register' && (
+          <label>
+            <span>公司名称（可选）</span>
+            <div className="auth-panel__input-with-icon">
+              <Building2 size={16} aria-hidden />
+              <input
+                autoComplete="organization"
+                maxLength={100}
+                onChange={(event) => setCompanyName(event.target.value)}
+                placeholder="例如：记忆面包科技"
+                value={companyName}
+              />
+            </div>
+          </label>
+        )}
+
+        {mode === 'register' && (
+          <p className="auth-panel__profile-note">昵称和公司名称注册后仍可修改，每项每个自然月最多 3 次。</p>
         )}
 
         {loginMethod === 'email' && (

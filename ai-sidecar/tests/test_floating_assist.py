@@ -1,3 +1,6 @@
+import json
+
+import model_api_server
 from model_api_server import (
     _analyze_floating_assist_intent,
     _build_floating_assist_rag_query,
@@ -5,6 +8,8 @@ from model_api_server import (
     _extract_floating_assist_question,
 )
 from rag.pipeline import _extract_core_retrieval_query
+from rag.pipeline import RagResult
+from rag.retriever import RetrievedChunk
 
 
 class FakeIntentLlm:
@@ -72,3 +77,75 @@ def test_floating_assist_model_intent_understands_ocr_before_rag_query():
     assert "检索问题：Loop Engineering Top5 任务 自动化闭环 Token 预算" in rag_query
     assert "屏幕理解：屏幕展示的是关于从人 Prompt Agent 升级到自动化 Loop 的执行建议。" in rag_query
     assert _extract_core_retrieval_query(rag_query) == "Loop Engineering Top5 任务 自动化闭环 Token 预算"
+
+
+def test_rag_stream_sends_references_before_answer_and_finishes_with_elapsed(monkeypatch):
+    chunk = RetrievedChunk(
+        capture_id=1,
+        doc_key="document:1",
+        text="提前召回资料",
+        score=0.9,
+        source="document",
+        metadata={"source_type": "document", "title": "资料一"},
+    )
+
+    calls: list[str] = []
+
+    class FakePipeline:
+        def query(
+            self,
+            query,
+            top_k=None,
+            llm=None,
+            references_only=False,
+            on_contexts=None,
+            on_delta=None,
+        ):
+            if references_only:
+                calls.append("retrieve")
+                return RagResult(answer="", contexts=[chunk], model="references-only")
+            calls.append("generate")
+            on_contexts([chunk])
+            on_delta("部分")
+            on_delta("答案")
+            return RagResult(answer="部分答案", contexts=[chunk], model="internal-model")
+
+        def _build_context(self, contexts):
+            return "context"
+
+    class InlineQueue:
+        def submit_sync(self, priority, func, timeout=None, lane=None):
+            calls.append("queue")
+            assert calls == ["retrieve", "queue"]
+            return func()
+
+    monkeypatch.setattr(model_api_server, "_rag_pipeline", FakePipeline())
+    monkeypatch.setattr(model_api_server, "get_global_queue", lambda: InlineQueue())
+    monkeypatch.setattr(model_api_server, "_build_rag_llm_override", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_api_server, "_save_rag_session", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(model_api_server, "log_llm_usage", lambda *args, **kwargs: None)
+    monkeypatch.setattr("model_registry_global.check_memory_pressure", lambda: "normal")
+
+    response = model_api_server.app.test_client().post(
+        "/query/stream",
+        json={"query": "测试问题", "top_k": 5, "source": "monitor"},
+        buffered=True,
+    )
+    events = [
+        json.loads(line[6:])
+        for line in response.get_data(as_text=True).splitlines()
+        if line.startswith("data: ")
+    ]
+    types = [event["type"] for event in events]
+
+    assert response.status_code == 200
+    assert types.index("references") < types.index("delta")
+    statuses = [event["stage"] for event in events if event["type"] == "status"]
+    assert statuses == ["queued", "retrieving", "waiting_generation", "answering"]
+    assert calls == ["retrieve", "queue", "generate"]
+    assert [event["text"] for event in events if event["type"] == "delta"] == ["部分", "答案"]
+    done = next(event for event in events if event["type"] == "done")
+    assert done["answer"] == "部分答案"
+    assert done["model"] == "mbcd-std-v1"
+    assert done["elapsed_ms"] >= 0
+    assert done["inference_elapsed_ms"] >= 0

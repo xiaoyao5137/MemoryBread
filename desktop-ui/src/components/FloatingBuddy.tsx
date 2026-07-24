@@ -1,15 +1,16 @@
 /**
- * FloatingBuddy v2 — 悬浮搭子窗口（优化版）
+ * FloatingBuddy v2 - 主窗口左侧导航
  *
- * 改进：
+ * 设计约束：
  * 1. 使用 SVG 图标替代 Emoji
  * 2. 修复 hover 时所有图标放大的问题
  * 3. 遵循设计规范
  * 4. 多级分组菜单：吃面包 / 烤面包 / 面包机
+ * 5. 账号入口固定在侧栏底部，不使用悬浮卡片
  */
 
 import React from 'react'
-import { ChevronRight, CircleUserRound, LogIn } from 'lucide-react'
+import { ChevronRight, LogIn } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { type WindowMode } from '../types'
 import { getRunModeLabel, getUserDisplayName } from '../utils/accountDisplay'
@@ -35,7 +36,7 @@ interface MenuGroup {
 
 const MENU_GROUPS: MenuGroup[] = [
   {
-    groupLabel: '吃面包',
+    groupLabel: '工作',
     items: [
       {
         mode: 'rag',
@@ -58,7 +59,7 @@ const MENU_GROUPS: MenuGroup[] = [
     ]
   },
   {
-    groupLabel: '烤面包',
+    groupLabel: '知识库',
     items: [
       {
         mode: 'bake',
@@ -81,7 +82,7 @@ const MENU_GROUPS: MenuGroup[] = [
     ]
   },
   {
-    groupLabel: '面包机',
+    groupLabel: '系统',
     items: [
       {
         mode: 'models',
@@ -103,7 +104,7 @@ const MENU_GROUPS: MenuGroup[] = [
       },
       {
         mode: 'settings',
-        label: '配置',
+        label: '设置',
         testId: 'settings-btn',
         icon: 'settings'
       },
@@ -111,10 +112,30 @@ const MENU_GROUPS: MenuGroup[] = [
   }
 ]
 
+const getAccountInitials = (label: string): string => {
+  const normalized = label.trim()
+  if (!normalized) return '记'
+
+  const firstCharacter = Array.from(normalized)[0]
+  if (/\p{Script=Han}/u.test(firstCharacter)) return firstCharacter
+
+  const words = normalized.split(/\s+/).filter(Boolean)
+  if (words.length > 1) {
+    return words
+      .slice(0, 2)
+      .map((word) => Array.from(word)[0])
+      .join('')
+      .toUpperCase()
+  }
+
+  return Array.from(normalized).slice(0, 2).join('').toUpperCase()
+}
+
 const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
   const { windowMode, setWindowMode, clearBakeNavigationStack, currentUser, cloudSubscription } = useAppStore()
   const accountLabel = getUserDisplayName(currentUser)
   const runModeLabel = getRunModeLabel(currentUser, cloudSubscription)
+  const accountInitials = getAccountInitials(accountLabel)
   const handleNavigate = (mode: WindowMode) => {
     clearBakeNavigationStack()
     setWindowMode(mode)
@@ -131,7 +152,7 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
         </div>
         <div className="buddy-sidebar-title-group">
           <h1 className="buddy-sidebar-title">记忆面包</h1>
-          <p className="buddy-sidebar-subtitle">品尝新知识</p>
+          <p className="buddy-sidebar-subtitle">让工作持续积累</p>
         </div>
       </div>
 
@@ -164,21 +185,25 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
         ))}
       </nav>
 
-      <button
-        className={`buddy-account-pill ${windowMode === 'account' ? 'buddy-account-pill--active' : ''}`}
-        type="button"
-        aria-label={currentUser ? '打开用户账户' : '未登录，打开登录'}
-        onClick={() => handleNavigate('account')}
-      >
-        <span className="buddy-account-pill__icon" aria-hidden="true">
-          {currentUser ? <CircleUserRound size={17} /> : <LogIn size={17} />}
-        </span>
-        <span className="buddy-account-pill__text">
-          <strong>{accountLabel}</strong>
-          <span>{runModeLabel}</span>
-        </span>
-        <ChevronRight className="buddy-account-pill__chevron" size={15} aria-hidden="true" />
-      </button>
+      <footer className="buddy-sidebar-footer">
+        <button
+          className={`buddy-account-entry ${windowMode === 'account' ? 'buddy-account-entry--active' : ''}`}
+          data-testid="account-entry"
+          type="button"
+          aria-current={windowMode === 'account' ? 'page' : undefined}
+          aria-label={currentUser ? `打开${accountLabel}的用户账户` : '未登录，打开登录'}
+          onClick={() => handleNavigate('account')}
+        >
+          <span className="buddy-account-entry__avatar" data-testid="account-avatar" aria-hidden="true">
+            {currentUser ? accountInitials : <LogIn size={17} />}
+          </span>
+          <span className="buddy-account-entry__identity">
+            <strong>{accountLabel}</strong>
+            <span>{runModeLabel}</span>
+          </span>
+          <ChevronRight className="buddy-account-entry__chevron" size={16} aria-hidden="true" />
+        </button>
+      </footer>
     </aside>
   )
 }

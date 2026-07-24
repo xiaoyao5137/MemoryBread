@@ -19,6 +19,8 @@ from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Optional
 
+from energy_policy import EnergyPolicy
+
 logger = logging.getLogger(__name__)
 
 # 内置场景模板（UI 展示用，执行时直接用 user_instruction）
@@ -44,7 +46,7 @@ BUILTIN_TEMPLATES = [
         "cron": "0 9 * * 1",
         "category": "工作总结",
         "user_instruction": (
-            "请根据上周每日工作日记，生成一份工作周记。要求：\n"
+            "请根据上周时间线记录，生成一份工作周记。要求：\n"
             "1. 【本周核心产出】按重要性排列，每条说明：做了什么（结果）、为什么重要（价值/影响），有量化数据的必须写出。\n"
             "2. 【项目进展】当前各项目的阶段状态，用「已完成 / 进行中 / 待启动」标注。\n"
             "3. 【下周计划】每条是具体可交付目标，不写「继续推进」「调研」等模糊描述。\n"
@@ -58,7 +60,7 @@ BUILTIN_TEMPLATES = [
         "cron": "0 9 1 * *",
         "category": "工作总结",
         "user_instruction": (
-            "请根据上月每日工作日记，生成工作月记。要求：\n"
+            "请根据上月时间线记录，生成工作月记。要求：\n"
             "1. 【主要成果】列出上月最重要的 3-5 项交付物，每项说明其业务价值或影响，有数据的写数据。\n"
             "2. 【时间分配】按项目/类别分析时间投入占比，指出是否与优先级匹配。\n"
             "3. 【效率亮点与问题】各一条，基于事实而非感受。\n"
@@ -186,8 +188,8 @@ AVG_TOKENS_PER_KNOWLEDGE = 300
 FULL_CONTEXT_TOKEN_LIMIT = 24000
 # 只用 overview 的 token 上限
 OVERVIEW_ONLY_TOKEN_LIMIT = 60000
-# 每次 daily_journal 执行时补偿/刷新最近几个已完成自然日，覆盖关机、休眠、提炼延迟等断档场景
-DAILY_DIARY_CATCHUP_DAYS = int(os.getenv("DAILY_DIARY_CATCHUP_DAYS", "7"))
+# 定时 daily_journal 每次只生成昨天，历史断档交给充电空闲时的一天一补 worker。
+DAILY_DIARY_CATCHUP_DAYS = 1
 # 推理队列空闲时，自动从最近历史日期中补齐缺失的 daily 日记。一次只处理一天，避免后台长时间占用 LLM。
 IDLE_DIARY_BACKFILL_LOOKBACK_DAYS = int(os.getenv("DIARY_BACKFILL_LOOKBACK_DAYS", "30"))
 DAILY_DIARY_CONTEXT_MAX_ITEMS = int(os.getenv("DAILY_DIARY_CONTEXT_MAX_ITEMS", "24"))
@@ -204,8 +206,14 @@ DIARY_LANGUAGE_LABELS = {
 class TaskExecutor:
     """定时任务执行器"""
 
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        energy_policy: Optional[EnergyPolicy] = None,
+    ):
         self.db_path = db_path
+        self.energy_policy = energy_policy or EnergyPolicy(db_path)
         self._llm_client = None
 
     def _get_llm_client(self):
@@ -234,11 +242,28 @@ class TaskExecutor:
             conn.close()
             return {"status": "failed", "error": f"任务 {task_id} 不存在"}
 
+        diary_period = self._detect_diary_period(task)
+        if diary_period:
+            profile = self.energy_policy.current_profile()
+            if not profile.allow_diary:
+                conn.close()
+                logger.info(
+                    "日记任务延迟到充电模式: task_id=%s mode=%s battery=%s",
+                    task_id,
+                    profile.mode,
+                    profile.battery_percent,
+                )
+                return {
+                    "status": "deferred",
+                    "reason": "waiting_for_external_power",
+                    "energy_mode": profile.mode,
+                    "battery_percent": profile.battery_percent,
+                }
+
         # 2. 创建执行记录（running 状态）
         exec_id = self._create_execution(conn, task_id, started_at)
 
         try:
-            diary_period = self._detect_diary_period(task)
             if diary_period:
                 diary_result = self._execute_diary_task(conn, task, diary_period)
                 knowledge_count = diary_result["source_count"]
@@ -326,12 +351,15 @@ class TaskExecutor:
 
         output_language = self._resolve_diary_output_language(task.get("user_instruction") or "")
         period_start, period_end, diary_date = self._resolve_diary_period(period_type)
-        source_diaries = self._query_daily_diaries(conn, period_start, period_end)
-        context_text = self._build_diary_rollup_context(source_diaries)
-        token_estimate = max(1, len(context_text) // 4)
-        source_items = source_diaries
-        source_timeline_ids = []
-        source_diary_ids = [int(item["id"]) for item in source_diaries if item.get("id") is not None]
+        source_items = self._query_timelines_for_period(conn, period_start, period_end)
+        context_text, token_estimate = self._build_daily_diary_context(
+            source_items,
+            output_language=output_language,
+        )
+        source_timeline_ids = [
+            int(item["id"]) for item in source_items if item.get("id") is not None
+        ]
+        source_diary_ids: list[int] = []
 
         result_text = self._llm_generate(
             user_instruction=self._diary_instruction(
@@ -374,7 +402,7 @@ class TaskExecutor:
         }
 
     def _execute_daily_diary_catchup(self, conn: sqlite3.Connection, task: dict) -> dict:
-        target_dates = self._resolve_recent_daily_dates(days=DAILY_DIARY_CATCHUP_DAYS)
+        target_dates = self._resolve_recent_daily_dates(days=DAILY_DIARY_CATCHUP_DAYS)[-1:]
         newest_target = target_dates[-1] if target_dates else None
         result_blocks: list[str] = []
         skipped_dates: list[str] = []
@@ -487,6 +515,15 @@ class TaskExecutor:
         today: Optional[date] = None,
     ) -> dict:
         """推理队列空闲时调用：补齐一个缺失的历史 daily 日记。"""
+        profile = self.energy_policy.current_profile()
+        if not profile.allow_diary:
+            return {
+                "status": "deferred",
+                "reason": "waiting_for_external_power",
+                "energy_mode": profile.mode,
+                "battery_percent": profile.battery_percent,
+            }
+
         started_at = int(time.time() * 1000)
         conn = sqlite3.connect(self.db_path)
         self._ensure_diaries_table(conn)
@@ -726,6 +763,24 @@ class TaskExecutor:
 
     def _query_timelines_for_date(self, conn: sqlite3.Connection, diary_date: str) -> list[dict]:
         start_ms, end_ms = self._date_range_ms(diary_date)
+        return self._query_timelines_between_ms(conn, start_ms, end_ms)
+
+    def _query_timelines_for_period(
+        self,
+        conn: sqlite3.Connection,
+        period_start: str,
+        period_end: str,
+    ) -> list[dict]:
+        start_ms, _ = self._date_range_ms(period_start)
+        _, end_ms = self._date_range_ms(period_end)
+        return self._query_timelines_between_ms(conn, start_ms, end_ms)
+
+    def _query_timelines_between_ms(
+        self,
+        conn: sqlite3.Connection,
+        start_ms: int,
+        end_ms: int,
+    ) -> list[dict]:
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -740,7 +795,7 @@ class TaskExecutor:
               AND COALESCE(start_time, event_time_start, observed_at, created_at_ms, 0) < ?
               AND COALESCE(is_self_generated, 0) = 0
             ORDER BY COALESCE(start_time, event_time_start, observed_at, created_at_ms, 0) ASC, id ASC
-            LIMIT 500
+            LIMIT 1000
             """,
             (start_ms, end_ms),
         )
@@ -825,14 +880,14 @@ class TaskExecutor:
             return self._daily_diary_instruction(None, output_language=output_language)
         if period_type == "weekly":
             return (
-                "请仅基于 daily 工作日记汇总周记，不要引入日记之外的事实。\n"
+                "请仅基于输入的时间线记录汇总周记，不要引入时间线之外的事实。\n"
                 f"必须使用{language_label}输出，即使来源中包含大量英文。\n"
                 "输出 Markdown，包含：## 本周核心产出、## 项目进展、## 下周计划、## 风险/阻塞。\n"
                 "每个章节最多 5 条，每条只写一个结论，不复述每日过程。"
             )
         if period_type == "monthly":
             return (
-                "请仅基于 daily 工作日记汇总月记，不要引入日记之外的事实。\n"
+                "请仅基于输入的时间线记录汇总月记，不要引入时间线之外的事实。\n"
                 f"必须使用{language_label}输出，即使来源中包含大量英文。\n"
                 "输出 Markdown，包含：## 主要成果、## 时间分配、## 效率亮点与问题、## 下月目标。\n"
                 "每个章节最多 5 条，合并重复事项，不逐日复述。"
@@ -1611,20 +1666,78 @@ class TaskExecutor:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ]
-            response = client.chat(
-                model=model,
-                messages=messages,
-                # Qwen 等模型会把内部推理放在 thinking 字段。日记只需要最终正文，
-                # 显式关闭思考输出，避免英文推理过程被误当成日记保存。
-                think=False,
-                options={"temperature": 0.2 if concise else 0.5, "num_predict": 768 if concise else 2048},
+            import inference_queue as inference_queue_module
+
+            current_task_preempt_requested = getattr(
+                inference_queue_module,
+                "current_task_preempt_requested",
+                lambda: False,
+            )
+            raise_if_preempted = getattr(
+                inference_queue_module,
+                "raise_if_preempted",
+                lambda: None,
+            )
+            register_current_preempt_callback = getattr(
+                inference_queue_module,
+                "register_current_preempt_callback",
+                lambda _callback: (lambda: None),
+            )
+
+            def preemptible_chat(chat_messages: list[dict], options: dict) -> dict:
+                raise_if_preempted()
+                stream = client.chat(
+                    model=model,
+                    messages=chat_messages,
+                    stream=True,
+                    # Qwen 等模型会把内部推理放在 thinking 字段。日记只需要最终正文，
+                    # 显式关闭思考输出，避免英文推理过程被误当成日记保存。
+                    think=False,
+                    options=options,
+                )
+                chunks = [stream] if isinstance(stream, dict) else stream
+                close_stream = getattr(chunks, "close", lambda: None)
+                unregister = register_current_preempt_callback(close_stream)
+                content_parts: list[str] = []
+                thinking_parts: list[str] = []
+                final: dict = {}
+                try:
+                    for raw_chunk in chunks:
+                        raise_if_preempted()
+                        chunk = (
+                            raw_chunk.model_dump()
+                            if hasattr(raw_chunk, "model_dump")
+                            else dict(raw_chunk)
+                        )
+                        final.update(chunk)
+                        message = chunk.get("message") or {}
+                        if message.get("content"):
+                            content_parts.append(str(message["content"]))
+                        if message.get("thinking"):
+                            thinking_parts.append(str(message["thinking"]))
+                except Exception:
+                    if current_task_preempt_requested():
+                        raise_if_preempted()
+                    raise
+                finally:
+                    unregister()
+                raise_if_preempted()
+                final["message"] = {
+                    **(final.get("message") or {}),
+                    "content": "".join(content_parts),
+                    "thinking": "".join(thinking_parts),
+                }
+                return final
+
+            response = preemptible_chat(
+                messages,
+                {"temperature": 0.2 if concise else 0.5, "num_predict": 768 if concise else 2048},
             )
             content = self._llm_message_content(response)
             if self._requires_chinese_output(output_language) and not self._is_chinese_diary_output(content):
                 logger.warning("日记首次生成未遵守中文输出要求，正在执行一次纠偏重写")
-                response = client.chat(
-                    model=model,
-                    messages=messages + [
+                response = preemptible_chat(
+                    messages + [
                         {"role": "assistant", "content": content},
                         {
                             "role": "user",
@@ -1634,8 +1747,7 @@ class TaskExecutor:
                             ),
                         },
                     ],
-                    think=False,
-                    options={"temperature": 0.1, "num_predict": 768 if concise else 2048},
+                    {"temperature": 0.1, "num_predict": 768 if concise else 2048},
                 )
                 content = self._llm_message_content(response)
                 if not self._is_chinese_diary_output(content):

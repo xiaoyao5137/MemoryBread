@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import {
@@ -22,14 +22,27 @@ import BakePanel              from './components/BakePanel'
 import DiaryPanel             from './components/DiaryPanel'
 import OnboardingWizard       from './components/OnboardingWizard'
 import AuthPanel              from './components/AuthPanel'
+import AchievementCelebration from './components/AchievementCelebration'
 import SystemFloatingAssist   from './components/SystemFloatingAssist'
 import { fetchConsoleSummary, fetchCurrentUser } from './utils/authApi'
+import { syncEligibleAchievementTasks } from './utils/achievementTasks'
 import {
   FLOATING_ASSIST_ENABLED_KEY,
   readFloatingAssistAutoTaskConfig,
   type FloatingAssistAutoTaskConfig,
   writeFloatingAssistAutoTaskConfig,
 } from './utils/floatingAssistAutoTask'
+import { startGlobalShortcutRuntime } from './utils/interactionSettings'
+import { synchronizeWorkProfile } from './utils/workProfileCloud'
+import type { AccountProfileSection, AchievementBadge } from './types'
+
+const WORK_PROFILE_SYNC_INTERVAL_MS = 5 * 60 * 1000
+const ACHIEVEMENT_SYNC_INTERVAL_MS = 5 * 60 * 1000
+
+interface AccountNavigationRequest {
+  section: AccountProfileSection
+  highlightedAchievementKeys: string[]
+}
 
 const hasConfiguredCreationModel = (configs: Array<{ enabled?: boolean; apiKey?: string }>) =>
   configs.some(config => Boolean(config.enabled || config.apiKey))
@@ -75,6 +88,8 @@ const App: React.FC = () => {
     apiBaseUrl,
     adminApiBaseUrl,
     authToken,
+    currentUser,
+    serviceEnvironment,
     setCreationModelConfigs,
     setAuthSession,
     setCloudBalance,
@@ -82,7 +97,43 @@ const App: React.FC = () => {
     clearAuthSession,
   } = useAppStore()
 
+  const [achievementCelebrations, setAchievementCelebrations] = useState<AchievementBadge[][]>([])
+  const [accountNavigation, setAccountNavigation] = useState<AccountNavigationRequest | null>(null)
+
   const showOnboarding = !hasCompletedSetup && !setupSkipped
+  const activeAchievementCelebration = achievementCelebrations[0] ?? null
+
+  const dismissAchievementCelebration = useCallback(() => {
+    setAchievementCelebrations((queue) => queue.slice(1))
+  }, [])
+
+  const viewCelebratedAchievements = useCallback(() => {
+    if (activeAchievementCelebration) {
+      setAccountNavigation({
+        section: 'achievements',
+        highlightedAchievementKeys: activeAchievementCelebration.map((badge) => badge.badge_key),
+      })
+    }
+    setAchievementCelebrations((queue) => queue.slice(1))
+    setWindowMode('account')
+  }, [activeAchievementCelebration, setWindowMode])
+
+  const handleAccountNavigationConsumed = useCallback(() => {
+    setAccountNavigation(null)
+  }, [])
+
+  useEffect(() => {
+    if (showOnboarding) return undefined
+    return startGlobalShortcutRuntime(async action => {
+      if (action === 'recognize_screen_task') {
+        await invoke('trigger_floating_assist_action', { action })
+        return
+      }
+
+      setWindowMode(action === 'open_creation' ? 'creation' : 'rag')
+      await invoke('show_main_panel_from_floating_assist').catch(() => {})
+    })
+  }, [setWindowMode, showOnboarding])
 
   useEffect(() => {
     let cancelled = false
@@ -98,7 +149,7 @@ const App: React.FC = () => {
         }
         return true
       } catch {
-        // 浏览器预览或 Core Engine 尚未启动时保持菜单默认开启。
+        // 浏览器预览或 Core Engine 尚未启动时保持菜单默认关闭。
         return false
       }
     }
@@ -239,6 +290,82 @@ const App: React.FC = () => {
     void validateSession()
     return () => { cancelled = true }
   }, [adminApiBaseUrl, authToken, clearAuthSession, setAuthSession, setCloudBalance, setCloudSubscription])
+
+  useEffect(() => {
+    if (!authToken || !currentUser) return undefined
+    let cancelled = false
+
+    const sync = async () => {
+      if (cancelled) return
+      await synchronizeWorkProfile({
+        apiBaseUrl,
+        adminApiBaseUrl,
+        authToken,
+        userId: currentUser.id,
+      }).catch(() => {
+        // 本地画像始终可用；网络恢复或下个周期会自动重试云端同步。
+      })
+    }
+    const syncWhenVisible = () => {
+      if (document.visibilityState === 'visible') void sync()
+    }
+
+    void sync()
+    const interval = window.setInterval(() => void sync(), WORK_PROFILE_SYNC_INTERVAL_MS)
+    window.addEventListener('online', sync)
+    document.addEventListener('visibilitychange', syncWhenVisible)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+      window.removeEventListener('online', sync)
+      document.removeEventListener('visibilitychange', syncWhenVisible)
+    }
+  }, [adminApiBaseUrl, apiBaseUrl, authToken, currentUser?.id, serviceEnvironment])
+
+  useEffect(() => {
+    setAchievementCelebrations([])
+    setAccountNavigation(null)
+  }, [authToken, serviceEnvironment])
+
+  useEffect(() => {
+    if (!authToken || !currentUser || showOnboarding) return undefined
+    const controller = new AbortController()
+    let syncInFlight = false
+
+    const syncAchievements = async () => {
+      if (controller.signal.aborted || syncInFlight) return
+      syncInFlight = true
+      try {
+        const claimedBadges = await syncEligibleAchievementTasks({
+          adminApiBaseUrl,
+          apiBaseUrl,
+          authToken,
+          signal: controller.signal,
+        })
+        if (!controller.signal.aborted && claimedBadges.length > 0) {
+          setAchievementCelebrations((queue) => [...queue, claimedBadges])
+        }
+      } catch {
+        // 领取检测属于后台增强；本地或账户服务恢复后会自动重试。
+      } finally {
+        syncInFlight = false
+      }
+    }
+    const syncWhenVisible = () => {
+      if (document.visibilityState === 'visible') void syncAchievements()
+    }
+
+    void syncAchievements()
+    const interval = window.setInterval(() => void syncAchievements(), ACHIEVEMENT_SYNC_INTERVAL_MS)
+    window.addEventListener('online', syncAchievements)
+    document.addEventListener('visibilitychange', syncWhenVisible)
+    return () => {
+      controller.abort()
+      window.clearInterval(interval)
+      window.removeEventListener('online', syncAchievements)
+      document.removeEventListener('visibilitychange', syncWhenVisible)
+    }
+  }, [adminApiBaseUrl, apiBaseUrl, authToken, currentUser?.id, serviceEnvironment, showOnboarding])
 
   // 监听查看采集记录事件
   useEffect(() => {
@@ -384,9 +511,22 @@ const App: React.FC = () => {
         {windowMode === 'monitor'   && <MonitorPanel />}
         {windowMode === 'bake'      && <BakePanel />}
         {windowMode === 'diary'     && <DiaryPanel />}
-        {windowMode === 'account'   && <AuthPanel />}
+        {windowMode === 'account'   && (
+          <AuthPanel
+            highlightedAchievementKeys={accountNavigation?.highlightedAchievementKeys}
+            initialProfileSection={accountNavigation?.section}
+            onInitialProfileSectionHandled={handleAccountNavigationConsumed}
+          />
+        )}
       </main>
 
+      {activeAchievementCelebration && (
+        <AchievementCelebration
+          badges={activeAchievementCelebration}
+          onDismiss={dismissAchievementCelebration}
+          onViewCards={viewCelebratedAchievements}
+        />
+      )}
       <ActionConfirm />
     </div>
   )

@@ -4,8 +4,11 @@ import { CREATION_MODEL_PREFERENCE_KEY, useAppStore } from '../store/useAppStore
 import type { CreationModelConfig } from '../store/useAppStore'
 import { fetchBillingBalance } from '../utils/authApi'
 import { REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel } from '../utils/modelSelection'
+import { toUserFacingError } from '../utils/userFacingError'
+import { openExternalUrl } from '../utils/openExternalUrl'
 
 const SIDECAR = 'http://localhost:7071'
+const OLLAMA_MACOS_DOWNLOAD_URL = 'https://ollama.com/download/mac'
 
 type OllamaSetupDetail = {
   message?: string
@@ -16,25 +19,19 @@ type OllamaSetupDetail = {
   ollama_running?: boolean
   ollama_version?: string
   brew_available?: boolean
+  can_auto_install?: boolean
+  version_compatible?: boolean
+  minimum_macos_major?: number
+  official_download_url?: string
   recommended_install_method?: string
 }
 
-type LlmConcurrencyConfig = {
-  max_concurrency: number
-  max_allowed: number
-  stats?: {
-    running_total?: number
-    queue_lengths?: Record<string, number>
-    running_by_lane?: Record<string, number>
-  }
-}
-
 const PROVIDER_LABEL: Record<string, string> = {
-  ollama: '分析模型', huggingface: 'HuggingFace',
-  openai: 'OpenAI', anthropic: 'Anthropic',
+  ollama: '本地运行', huggingface: '本地向量',
+  openai: '云端能力', anthropic: '云端能力',
   gateway: '云端创作',
-  tongyi: '通义千问', doubao: '豆包', deepseek: 'DeepSeek', kimi: 'Kimi',
-  google: 'Google', kling: '可灵',
+  tongyi: '云端能力', doubao: '云端能力', deepseek: '云端能力', kimi: '云端能力',
+  google: '云端能力', kling: '云端能力',
 }
 const PROVIDER_COLOR: Record<string, string> = {
   ollama: '#007AFF', huggingface: '#FF9500',
@@ -63,11 +60,6 @@ const ANALYSIS_MODEL_ALIASES = new Set([
 
 const VECTOR_MODEL_ALIASES = new Set([
   'bge-small-zh',
-])
-
-const IMAGE_MODEL_ALLOWLIST = new Set([
-  'gpt-image-2',
-  'gemini-nano-banana',
 ])
 
 function normalizeVisibleModels(items: ModelEntry[]): ModelEntry[] {
@@ -102,11 +94,8 @@ function normalizeVisibleModels(items: ModelEntry[]): ModelEntry[] {
       continue
     }
 
-    if (model.category === 'image') {
-      if (!IMAGE_MODEL_ALLOWLIST.has(model.id)) continue
-      normalized.push(model)
-      continue
-    }
+    // 云端创作只通过 MemoryBread 品牌模型配置，不显示供应商模型或密钥入口。
+    if (model.category === 'image' || model.requires_api_key) continue
 
     if (model.category === 'inference_engine') {
       normalized.push(model)
@@ -141,7 +130,7 @@ const ApiKeyDialog: React.FC<{
       const d = await r.json()
       if (d.status !== 'ok') throw new Error(d.message)
       onSaved(); onClose()
-    } catch (e: any) { setError(e.message) } finally { setSaving(false) }
+    } catch (e: unknown) { setError(toUserFacingError(e, '保存失败，请稍后重试')) } finally { setSaving(false) }
   }
 
   const handleValidate = async () => {
@@ -154,8 +143,8 @@ const ApiKeyDialog: React.FC<{
       const r = await fetch(`${SIDECAR}/api/models/${model.id}/validate`, { method: 'POST' })
       const d = await r.json()
       if (d.valid) setValidMsg('✓ ' + d.message)
-      else setError(d.message)
-    } catch (e: any) { setError(e.message) } finally { setValidating(false) }
+      else setError(toUserFacingError(d.message, '配置保存失败，请稍后重试'))
+    } catch (e: unknown) { setError(toUserFacingError(e, '验证失败，请稍后重试')) } finally { setValidating(false) }
   }
 
   return (
@@ -238,7 +227,7 @@ const ModelChatDialog: React.FC<{
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({ message: `HTTP ${response.status}` }))
-        setChatError(errData.message || `请求失败 (${response.status})`)
+        setChatError(toUserFacingError(errData.message, '模型响应失败，请稍后重试'))
         setChatLoading(false)
         return
       }
@@ -275,7 +264,7 @@ const ModelChatDialog: React.FC<{
               })
             }
             if (evt.error) {
-              setChatError(evt.error)
+              setChatError(toUserFacingError(evt.error, '模型响应失败，请稍后重试'))
             }
             if (evt.done) {
               // 流式结束
@@ -283,8 +272,8 @@ const ModelChatDialog: React.FC<{
           } catch { /* ignore parse errors */ }
         }
       }
-    } catch (e: any) {
-      setChatError(e.message || '连接失败')
+    } catch (e: unknown) {
+      setChatError(toUserFacingError(e, '连接失败，请稍后重试'))
     } finally {
       setChatLoading(false)
     }
@@ -331,7 +320,6 @@ const ModelChatDialog: React.FC<{
         }}>
           {messages.length === 0 && !chatLoading && (
             <div style={{ textAlign: 'center', color: '#AEAEB2', fontSize: 13, padding: 60 }}>
-              <div style={{ fontSize: 40, marginBottom: 8 }}>💬</div>
               <div>和 {model.name} 开始对话</div>
               <div style={{ fontSize: 11, marginTop: 4 }}>输入任何问题来体验这个模型的能力</div>
             </div>
@@ -435,7 +423,7 @@ const ModelCard: React.FC<{
               fontSize: 10, padding: '1px 6px', borderRadius: 4,
               background: `${PROVIDER_COLOR[model.provider]}18`,
               color: PROVIDER_COLOR[model.provider],
-            }}>{PROVIDER_LABEL[model.provider] || model.provider}</span>
+            }}>{PROVIDER_LABEL[model.provider] || '本地能力'}</span>
             {model.recommended && (
               <span style={{
                 fontSize: 10, padding: '1px 6px', borderRadius: 4,
@@ -470,7 +458,7 @@ const ModelCard: React.FC<{
           )}
           {model.error && (
             <div style={{ marginTop: 8, fontSize: 11, color: '#FF3B30', background: '#FF3B3010', padding: '4px 8px', borderRadius: 4 }}>
-              ⚠️ {model.error}
+              {toUserFacingError(model.error, '模型暂时不可用，请重试')}
             </div>
           )}
         </div>
@@ -484,7 +472,7 @@ const ModelCard: React.FC<{
           <div style={{ display: 'flex', gap: 5 }}>
             {isApi && (
               <button onClick={onConfigure} style={btn('#F2F2F7', '#333', 11)}>
-                {isInstalled ? '重新配置' : '配置 Key'}
+                {isInstalled ? '重新配置' : '配置云端能力'}
               </button>
             )}
             {isInferenceEngine && isInstalled && onUpgrade && (model as any).can_upgrade && (
@@ -501,7 +489,7 @@ const ModelCard: React.FC<{
             )}
             {/* 体验入口：LLM 模型已可用时显示 */}
             {(isActive || (isApi && isInstalled)) && !isInferenceEngine && onChat && (
-              <button onClick={onChat} style={btn('#AF52DE18', '#AF52DE', 11)}>💬 体验</button>
+              <button onClick={onChat} style={btn('#AF52DE18', '#AF52DE', 11)}>体验</button>
             )}
             {isLoading && (
               <span style={{ fontSize: 11, color: '#FF9500', fontWeight: 600 }}>加载中</span>
@@ -523,6 +511,7 @@ const ModelManager: React.FC = () => {
   const [tab, setTab] = useState<TabType>('llm')
   const [models, setModels] = useState<ModelEntry[]>([])
   const [loading, setLoading] = useState(false)
+  const [modelLoadError, setModelLoadError] = useState('')
   const [configuringModel, setConfiguringModel] = useState<ModelEntry | null>(null)
   const [chattingModel, setChattingModel] = useState<ModelEntry | null>(null)
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set())
@@ -532,9 +521,6 @@ const ModelManager: React.FC = () => {
   const [ollamaInstalling, setOllamaInstalling] = useState(false)
   const [ollamaUpgrading, setOllamaUpgrading] = useState(false)
   const [ollamaError, setOllamaError] = useState('')
-  const [llmConcurrency, setLlmConcurrency] = useState<LlmConcurrencyConfig | null>(null)
-  const [llmConcurrencySaving, setLlmConcurrencySaving] = useState(false)
-  const [llmConcurrencyError, setLlmConcurrencyError] = useState('')
   const [configuringCreationId, setConfiguringCreationId] = useState<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const { apiBaseUrl, adminApiBaseUrl, authToken, currentUser, cloudBalance, setCloudBalance, creationModelConfigs, setCreationModelConfig } = useAppStore(s => ({
@@ -566,11 +552,16 @@ const ModelManager: React.FC = () => {
 
   const loadModels = async () => {
     setLoading(true)
+    setModelLoadError('')
     try {
       const r = await fetch(`${SIDECAR}/api/models`)
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
       const d = await r.json()
       if (d.status === 'ok') setModels(normalizeVisibleModels(d.models || []))
-    } catch { } finally { setLoading(false) }
+      else throw new Error(d.message || '模型列表读取失败')
+    } catch (error) {
+      setModelLoadError(toUserFacingError(error, 'AI 能力暂时无法读取，请稍后重试'))
+    } finally { setLoading(false) }
   }
 
   const refreshOllamaSetup = async () => {
@@ -583,70 +574,25 @@ const ModelManager: React.FC = () => {
       else setOllamaSetup(null)
     } catch {
       setOllamaSetup(null)
-      setOllamaError('无法获取 Ollama 状态')
+      setOllamaError('本地运行环境状态暂时无法读取')
     } finally {
       setOllamaChecking(false)
     }
   }
 
-  const refreshLlmConcurrency = async () => {
-    setLlmConcurrencyError('')
-    try {
-      const r = await fetch(`${SIDECAR}/api/models/llm-concurrency`)
-      if (r.status === 404) {
-        setLlmConcurrency({ max_concurrency: 1, max_allowed: 3 })
-        return
-      }
-      const d = await r.json()
-      if (d.status === 'ok') {
-        setLlmConcurrency({
-          max_concurrency: d.max_concurrency,
-          max_allowed: d.max_allowed || 3,
-          stats: d.stats,
-        })
-      } else {
-        setLlmConcurrencyError(d.message || '无法获取采集分析并发配置')
-      }
-    } catch {
-      setLlmConcurrencyError('无法获取采集分析并发配置')
-    }
-  }
-
-  const updateLlmConcurrency = async (value: number) => {
-    setLlmConcurrencySaving(true)
-    setLlmConcurrencyError('')
-    try {
-      const r = await fetch(`${SIDECAR}/api/models/llm-concurrency`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ max_concurrency: value }),
-      })
-      if (r.status === 404) {
-        setLlmConcurrencyError('AI Sidecar 需要重启后才能配置采集分析并发')
-        return
-      }
-      const d = await r.json()
-      if (d.status !== 'ok') throw new Error(d.message || '保存失败')
-      setLlmConcurrency({
-        max_concurrency: d.max_concurrency,
-        max_allowed: d.max_allowed || 3,
-        stats: d.stats,
-      })
-    } catch (e: any) {
-      setLlmConcurrencyError(e.message || '保存失败')
-    } finally {
-      setLlmConcurrencySaving(false)
-    }
-  }
-
   const handleInstallOllama = async () => {
+    if (ollamaSetup && !ollamaSetup.ollama_installed && !ollamaSetup.can_auto_install) {
+      await openExternalUrl(ollamaSetup.official_download_url || OLLAMA_MACOS_DOWNLOAD_URL)
+      return
+    }
+
     setOllamaInstalling(true)
     setOllamaError('')
     try {
       const installResp = await fetch(`${SIDECAR}/api/ollama/install`, { method: 'POST' })
       const installData = await installResp.json()
       if (installData.status !== 'ok') {
-        setOllamaError(installData.message || 'Ollama 安装失败')
+        setOllamaError(toUserFacingError(installData.message, '本地运行环境安装失败，请稍后重试'))
         await refreshOllamaSetup()
         return
       }
@@ -654,13 +600,13 @@ const ModelManager: React.FC = () => {
       const startResp = await fetch(`${SIDECAR}/api/ollama/start`, { method: 'POST' })
       const startData = await startResp.json()
       if (startData.status !== 'ok') {
-        setOllamaError(startData.message || 'Ollama 启动失败，请手动执行 ollama serve')
+        setOllamaError(toUserFacingError(startData.message, '本地运行环境启动失败，请重新打开应用'))
       }
 
       await refreshOllamaSetup()
       await loadModels()
-    } catch {
-      setOllamaError('无法连接到 AI 服务，请确保 ai-sidecar 已启动')
+    } catch (error) {
+      setOllamaError(toUserFacingError(error, '本地 AI 服务暂时不可用，请重新打开应用'))
     } finally {
       setOllamaInstalling(false)
     }
@@ -669,7 +615,6 @@ const ModelManager: React.FC = () => {
   useEffect(() => {
     loadModels()
     refreshOllamaSetup()
-    refreshLlmConcurrency()
   }, [])
 
   useEffect(() => {
@@ -701,8 +646,13 @@ const ModelManager: React.FC = () => {
         try {
           const r = await fetch(`${SIDECAR}/api/models/${id}/status`)
           const d = await r.json()
-          updates[id] = { status: d.status, download_progress: d.download_progress }
-          if (d.status === 'installed' || d.status === 'active') anyDone = true
+          updates[id] = { status: d.status, download_progress: d.download_progress, error: d.error }
+          if (d.status === 'installed' || d.status === 'active' || d.status === 'error' || d.error) {
+            anyDone = true
+            if (d.status === 'error' || d.error) {
+              setOllamaError(toUserFacingError(d.error || d.message, '下载失败，请稍后重试'))
+            }
+          }
         } catch { }
       }
       setModels(prev => prev.map(m => updates[m.id] ? { ...m, ...updates[m.id] } : m))
@@ -710,7 +660,7 @@ const ModelManager: React.FC = () => {
         setDownloadingIds(prev => {
           const next = new Set(prev)
           for (const [id, u] of Object.entries(updates)) {
-            if (u.status === 'installed' || u.status === 'active') next.delete(id)
+            if (u.status === 'installed' || u.status === 'active' || u.status === 'error' || u.error) next.delete(id)
           }
           return next
         })
@@ -721,16 +671,20 @@ const ModelManager: React.FC = () => {
 
   const handleDownload = async (model: ModelEntry) => {
     if (model.provider === 'ollama' && !ollamaSetup?.ollama_running) {
-      setOllamaError('请先安装并启动 Ollama，再下载分析模型')
+      setOllamaError('请先安装本地运行环境，再下载分析模型')
       return
     }
 
     try {
-      await fetch(`${SIDECAR}/api/models/${model.id}/download`, { method: 'POST' })
+      const response = await fetch(`${SIDECAR}/api/models/${model.id}/download`, { method: 'POST' })
+      const data = await response.json()
+      if (!response.ok || data.status !== 'ok') {
+        throw new Error(data.message || `HTTP ${response.status}`)
+      }
       setDownloadingIds(prev => new Set(prev).add(model.id))
       setModels(prev => prev.map(m => m.id === model.id ? { ...m, status: 'downloading', download_progress: 0 } : m))
-    } catch {
-      setOllamaError('下载请求失败，请稍后重试')
+    } catch (error) {
+      setOllamaError(toUserFacingError(error, '下载请求失败，请稍后重试'))
     }
   }
 
@@ -748,6 +702,7 @@ const ModelManager: React.FC = () => {
   }
 
   const handleDelete = async (model: ModelEntry) => {
+    if (!window.confirm(`确认删除“${model.name}”？删除后需要重新下载才能继续使用。`)) return
     try {
       await fetch(`${SIDECAR}/api/models/${model.id}/delete`, { method: 'DELETE' })
       await loadModels()
@@ -764,11 +719,11 @@ const ModelManager: React.FC = () => {
         // 启动轮询
         pollUpgradeStatus()
       } else if (data.status === 'error') {
-        setOllamaError(data.message || '升级失败')
+        setOllamaError(toUserFacingError(data.message, '更新失败，请稍后重试'))
         setOllamaUpgrading(false)
       }
     } catch (e) {
-      setOllamaError('升级失败')
+      setOllamaError(toUserFacingError(e, '更新失败，请稍后重试'))
       setOllamaUpgrading(false)
     }
   }
@@ -780,7 +735,7 @@ const ModelManager: React.FC = () => {
         const data = await res.json()
 
         if (data.status === 'upgrading') {
-          setOllamaError(data.message || '升级中...')
+          setOllamaError('正在更新本地运行环境...')
           setTimeout(poll, 2000)
         } else if (data.status === 'success') {
           setOllamaError('')
@@ -788,13 +743,13 @@ const ModelManager: React.FC = () => {
           await refreshOllamaSetup()
           await loadModels()
         } else if (data.status === 'error') {
-          setOllamaError(data.message || '升级失败')
+          setOllamaError(toUserFacingError(data.message, '更新失败，请稍后重试'))
           setOllamaUpgrading(false)
         } else {
           setTimeout(poll, 2000)
         }
       } catch {
-        setOllamaError('获取升级状态失败')
+        setOllamaError('更新状态暂时无法读取，请稍后重试')
         setOllamaUpgrading(false)
       }
     }
@@ -862,56 +817,6 @@ const ModelManager: React.FC = () => {
         }}>刷新</button>
       </div>
 
-      {tab === 'llm' && (
-        <div style={{ padding: '10px 14px 0' }}>
-          <div style={{
-            background: 'white',
-            borderRadius: 10,
-            padding: '10px 12px',
-            border: '1px solid rgba(0,0,0,0.07)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 12,
-          }}>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: '#1D1D1F' }}>采集分析并发</div>
-              <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 2 }}>
-                运行中 {llmConcurrency?.stats?.running_total ?? 0} · P0 快速通道保留
-              </div>
-              {llmConcurrencyError && (
-                <div style={{ fontSize: 11, color: '#FF3B30', marginTop: 4 }}>{llmConcurrencyError}</div>
-              )}
-            </div>
-            <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-              {[1, 2, 3].map(value => {
-                const active = llmConcurrency?.max_concurrency === value
-                return (
-                  <button
-                    key={value}
-                    onClick={() => updateLlmConcurrency(value)}
-                    disabled={llmConcurrencySaving}
-                    style={{
-                      width: 32,
-                      height: 28,
-                      borderRadius: 8,
-                      border: active ? 'none' : '1px solid rgba(0,0,0,0.1)',
-                      background: active ? '#007AFF' : '#F2F2F7',
-                      color: active ? 'white' : '#333',
-                      fontSize: 12,
-                      fontWeight: active ? 700 : 500,
-                      cursor: llmConcurrencySaving ? 'default' : 'pointer',
-                    }}
-                  >
-                    {value}
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* 内容区 */}
       <div style={{ flex: 1, overflow: 'auto', padding: '10px 14px 14px' }}>
         {tab === 'creation' ? (
@@ -945,6 +850,12 @@ const ModelManager: React.FC = () => {
           <div style={{ textAlign: 'center', color: '#AEAEB2', fontSize: 13, padding: 40 }}>加载中...</div>
         )}
 
+        {modelLoadError && (
+          <div role="alert" style={{ color: '#C52828', fontSize: 12, padding: '12px 14px', marginBottom: 10, borderRadius: 10, background: 'rgba(255,59,48,0.08)' }}>
+            {modelLoadError}
+          </div>
+        )}
+
         {Object.entries(displayGroups).map(([category, items]) => (
           <div key={category} style={{ marginBottom: 16 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
@@ -954,7 +865,7 @@ const ModelManager: React.FC = () => {
               </span>
             </div>
 
-            {/* Ollama 运行环境信息 */}
+            {/* 本地运行环境信息 */}
             {category === 'inference_engine' && tab === 'llm' && (
               <div style={{ background: 'white', borderRadius: 10, padding: 12, border: '1px solid rgba(0,0,0,0.07)', marginBottom: 8 }}>
                 {ollamaChecking ? (
@@ -962,36 +873,35 @@ const ModelManager: React.FC = () => {
                 ) : (
                   <>
                     <div style={{ fontSize: 12, color: ollamaSetup?.ollama_running ? '#34C759' : '#6E6E73', marginBottom: 4 }}>
-                      {ollamaSetup?.message || '无法获取 Ollama 状态'}
+                      {ollamaSetup?.ollama_running
+                        ? '本地运行环境正常'
+                        : ollamaSetup?.version_compatible === false
+                          ? `当前系统版本不兼容，需要 macOS ${ollamaSetup.minimum_macos_major || 14} 或更高版本`
+                          : '本地运行环境尚未就绪'}
                     </div>
-                    {(ollamaSetup?.system_version || ollamaSetup?.arch || ollamaSetup?.ollama_version) && (
-                      <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 8 }}>
-                        macOS {ollamaSetup?.system_version || 'unknown'} · {ollamaSetup?.arch || 'unknown'}
-                        {ollamaSetup?.ollama_version && ` · Ollama v${ollamaSetup.ollama_version}`}
-                      </div>
-                    )}
                     <div style={{ display: 'flex', gap: 6 }}>
                       <button onClick={refreshOllamaSetup} style={btn('#F2F2F7', '#333', 11)}>重新检测</button>
                       {ollamaSetup?.ollama_installed && ollamaSetup?.brew_available && (
                         <button onClick={handleUpgrade} disabled={ollamaUpgrading} style={btn('#007AFF', 'white', 11)}>
-                          {ollamaUpgrading ? '升级中...' : '更新 Ollama'}
+                          {ollamaUpgrading ? '更新中...' : '更新本地运行环境'}
                         </button>
                       )}
-                      {!ollamaSetup?.ollama_running && (
+                      {!ollamaSetup?.ollama_running && ollamaSetup?.version_compatible !== false && (
                         <button
                           onClick={handleInstallOllama}
                           disabled={ollamaInstalling}
                           style={btn('#007AFF', 'white', 11)}
                         >
-                          {ollamaInstalling ? '安装中...' : '检测并安装 Ollama'}
+                          {ollamaInstalling
+                            ? '安装中...'
+                            : ollamaSetup && !ollamaSetup.ollama_installed && !ollamaSetup.can_auto_install
+                              ? '打开官方下载页'
+                              : ollamaSetup?.ollama_installed
+                                ? '启动本地运行环境'
+                                : '自动安装并启动'}
                         </button>
                       )}
                     </div>
-                    {ollamaSetup?.recommended_install_method && !ollamaSetup?.ollama_running && (
-                      <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 6 }}>
-                        推荐命令：{ollamaSetup.recommended_install_method}
-                      </div>
-                    )}
                     {ollamaError && <div style={{ fontSize: 11, color: '#FF3B30', marginTop: 6 }}>{ollamaError}</div>}
                   </>
                 )}
@@ -1014,7 +924,7 @@ const ModelManager: React.FC = () => {
           </div>
         ))}
 
-        {!loading && filtered.length === 0 && (
+        {!loading && !modelLoadError && filtered.length === 0 && (
           <div style={{ textAlign: 'center', color: '#AEAEB2', fontSize: 13, padding: 40 }}>
             暂无模型
           </div>
@@ -1126,7 +1036,7 @@ const CreationModelChatDialog: React.FC<{ entry: CreationChatEntry; onClose: () 
       })
       if (!resp.ok) {
         const d = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }))
-        setChatError(d.detail || '请求失败')
+        setChatError(toUserFacingError(d.detail, '模型响应失败，请稍后重试'))
         setLoading(false)
         return
       }
@@ -1143,12 +1053,12 @@ const CreationModelChatDialog: React.FC<{ entry: CreationChatEntry; onClose: () 
           try {
             const evt = JSON.parse(line.slice(6))
             if (evt.content) { content += evt.content; setMessages(prev => { const u = [...prev]; u[u.length - 1] = { role: 'assistant', content }; return u }) }
-            if (evt.error) setChatError(evt.error)
+            if (evt.error) setChatError(toUserFacingError(evt.error, '模型响应失败，请稍后重试'))
           } catch { /* ignore */ }
         }
       }
-    } catch (e: any) {
-      setChatError(e.message || '连接失败')
+    } catch (e: unknown) {
+      setChatError(toUserFacingError(e, '连接失败，请稍后重试'))
     } finally {
       setLoading(false)
     }
@@ -1224,8 +1134,8 @@ const CreationModelPanel: React.FC<{
       const data = await r.json()
       if (!r.ok) throw new Error(data.detail || '请求失败')
       setTestState(s => ({ ...s, [def.id]: { loading: false, result: data.message } }))
-    } catch (e: any) {
-      setTestState(s => ({ ...s, [def.id]: { loading: false, error: e.message } }))
+    } catch (e: unknown) {
+      setTestState(s => ({ ...s, [def.id]: { loading: false, error: toUserFacingError(e, '验证失败，请稍后重试') } }))
     }
   }
 
@@ -1263,7 +1173,7 @@ const CreationModelPanel: React.FC<{
                 </button>
               )}
               {!isLocalModel && !isGatewayModel && cfg.apiKey && (
-                <button onClick={() => setChattingModel({ def, cfg })} style={btn('#AF52DE18', '#AF52DE', 11)}>💬 体验</button>
+                <button onClick={() => setChattingModel({ def, cfg })} style={btn('#AF52DE18', '#AF52DE', 11)}>试用</button>
               )}
               <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: disabled ? 'not-allowed' : 'pointer' }}>
                 <input type="checkbox" checked={cfg.enabled && !disabled} disabled={disabled} onChange={() => onChange(def.id, { enabled: !cfg.enabled })} />

@@ -367,9 +367,6 @@ const ScheduledTasksPanel: React.FC = () => {
                       color: autoTaskConfig.enabled ? '#248A3D' : '#6E6E73',
                     }}>{autoTaskConfig.enabled ? '运行中' : '已关闭'}</span>
                   </div>
-                  <p style={{ fontSize: 12, color: '#6E6E73', margin: 0, lineHeight: 1.5 }}>
-                    只在配置的软件窗口里扫描疑似任务片段，命中关键词或待办语气后再交给记忆面包咨询。
-                  </p>
                 </div>
               </div>
 

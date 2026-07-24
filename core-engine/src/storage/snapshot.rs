@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::storage::{db::current_ts_ms, error::StorageError, StorageManager};
 
 pub const ASSET_SNAPSHOT_FORMAT_VERSION: i32 = 1;
-pub const ASSET_SNAPSHOT_SCHEMA_VERSION: i32 = 1;
+pub const ASSET_SNAPSHOT_SCHEMA_VERSION: i32 = 2;
 
 const EXCLUDED_RAW_CAPTURE_COLUMNS: &[&str] = &[
     "ax_text",
@@ -97,6 +97,10 @@ const ASSET_TABLES: &[AssetTableSpec] = &[
     AssetTableSpec {
         name: "bake_sops",
         identity_columns: &["id"],
+    },
+    AssetTableSpec {
+        name: "creation_skills",
+        identity_columns: &["client_skill_key"],
     },
 ];
 
@@ -333,6 +337,7 @@ impl StorageManager {
                     "app_filters" => upsert_app_filters(&tx, table)?,
                     "app_blacklist" => upsert_app_blacklist(&tx, table)?,
                     "privacy_filters" => upsert_privacy_filters(&tx, table)?,
+                    "creation_skills" => upsert_creation_skills(&tx, table)?,
                     _ => insert_or_ignore_table(&tx, table)?,
                 };
                 report.tables.push(table_report);
@@ -639,6 +644,57 @@ fn upsert_privacy_filters(
     )
 }
 
+fn upsert_creation_skills(
+    conn: &Connection,
+    table: &TableSnapshot,
+) -> Result<TableImportReport, StorageError> {
+    upsert_by_unique(
+        conn,
+        table,
+        "client_skill_key",
+        &[
+            "client_skill_key",
+            "cloud_skill_id",
+            "source_kind",
+            "source_id",
+            "title",
+            "summary",
+            "category_id",
+            "common_titles",
+            "title_style",
+            "text_style",
+            "diagram_style",
+            "structure_pattern",
+            "writing_guidelines",
+            "status",
+            "installed",
+            "published",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ],
+        &[
+            "cloud_skill_id",
+            "source_kind",
+            "source_id",
+            "title",
+            "summary",
+            "category_id",
+            "common_titles",
+            "title_style",
+            "text_style",
+            "diagram_style",
+            "structure_pattern",
+            "writing_guidelines",
+            "status",
+            "installed",
+            "published",
+            "updated_at",
+            "deleted_at",
+        ],
+    )
+}
+
 fn upsert_by_unique(
     conn: &Connection,
     table: &TableSnapshot,
@@ -649,7 +705,10 @@ fn upsert_by_unique(
     let existing_columns = table_columns(conn, &table.name)?;
     let insert_columns = wanted_columns
         .iter()
-        .filter(|column| existing_columns.iter().any(|existing| existing == **column))
+        .filter(|column| {
+            existing_columns.iter().any(|existing| existing == **column)
+                && table.columns.iter().any(|incoming| incoming == **column)
+        })
         .map(|column| column.to_string())
         .collect::<Vec<_>>();
 
@@ -845,6 +904,19 @@ mod tests {
                      )",
                     [],
                 )?;
+                conn.execute(
+                    "INSERT INTO creation_skills (
+                        client_skill_key, source_kind, source_id, title, summary,
+                        common_titles, title_style, text_style, diagram_style,
+                        structure_pattern, writing_guidelines, published, created_at, updated_at
+                     ) VALUES (
+                        'snapshot-skill-1', 'bake_document', '11', '架构文档写作法',
+                        '用于验证本地 Skill 快照恢复。', '[\"总体架构设计\"]', '结论先行。',
+                        '正式、克制。', '标注系统边界。', '[\"背景\",\"方案\"]',
+                        '[\"写明技术取舍\"]', 0, 1700000000000, 1700000000000
+                     )",
+                    [],
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -873,6 +945,7 @@ mod tests {
                 | "bake_documents"
                 | "bake_document_sections"
                 | "bake_sops"
+                | "creation_skills"
         )));
         assert_eq!(snapshot.capture_refs.len(), 1);
         assert!(snapshot.capture_refs[0].get("ax_text").is_none());
@@ -912,9 +985,16 @@ mod tests {
             })
             .unwrap()
             .flatten();
+        let restored_skill = target
+            .list_creation_skills()
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.client_skill_key == "snapshot-skill-1")
+            .expect("creation skill restored from snapshot");
 
         assert_eq!(timeline_count, 1);
         assert_eq!(knowledge_count, 1);
+        assert_eq!(restored_skill.title, "架构文档写作法");
         assert!(capture_text.is_none());
         assert!(first.capture_refs.inserted >= 1);
         assert_eq!(second.capture_refs.skipped, 1);

@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import json
 import types
 
-from knowledge.extractor_v2 import BAKE_RESPONSE_SCHEMA, KnowledgeExtractorV2, _extract_json_object, _extract_ollama_response_text
+from knowledge.extractor_v2 import (
+    BAKE_BUNDLE_RESPONSE_SCHEMA,
+    BAKE_NUM_PREDICT,
+    BAKE_RESPONSE_SCHEMA,
+    KnowledgeExtractorV2,
+    _extract_json_object,
+    _extract_ollama_response_text,
+)
 
 
 class MessageLike:
@@ -134,7 +142,7 @@ def test_extract_ollama_response_text_reads_object_message_content_before_thinki
 
 def test_call_bake_llm_uses_structured_json_schema():
     extractor = make_extractor()
-    extractor.client = DummyClient(
+    client = DummyClient(
         {
             "model": "mock-model",
             "message": {"content": '{"accepted": false, "reason": "rejected", "payload": null}'},
@@ -142,13 +150,16 @@ def test_call_bake_llm_uses_structured_json_schema():
             "eval_count": 8,
         }
     )
+    extractor._ollama_chat = client.chat
 
     parsed, meta = extractor._call_bake_llm("knowledge:1", "system", "user")
 
     assert parsed == {"accepted": False, "reason": "rejected", "payload": None}
-    assert extractor.client.calls[0]["think"] is False
-    assert extractor.client.calls[0]["format"] == BAKE_RESPONSE_SCHEMA
-    assert extractor.client.calls[0]["options"] == {"temperature": 0.0, "num_predict": 1024}
+    assert client.calls[0]["format"] == BAKE_RESPONSE_SCHEMA
+    assert client.calls[0]["options"] == {
+        "temperature": 0.0,
+        "num_predict": BAKE_NUM_PREDICT,
+    }
     assert meta["empty_content"] is False
 
 
@@ -209,35 +220,45 @@ def test_extract_bake_artifact_marks_missing_payload_as_degraded():
 
 
 
-def test_extract_bake_bundle_returns_stage_timing_metadata():
+def test_extract_bake_bundle_uses_one_llm_call_for_three_artifacts():
     extractor = make_extractor()
-    extractor.extract_bake_knowledge = types.MethodType(
-        lambda self, candidate: (
-            {"accepted": False, "reason": "not_a_knowledge", "payload": None},
-            {"usage": {"prompt_tokens": 1, "completion_tokens": 2}, "model": "mock-model", "degraded": False, "elapsed_ms": 11},
-        ),
-        extractor,
+    response_payload = {
+        "knowledge": {
+            "accepted": False,
+            "reason": "not_a_knowledge",
+            "payload": None,
+        },
+        "design": {
+            "accepted": True,
+            "reason": None,
+            "payload": {"name": "周报模板"},
+        },
+        "sop": {
+            "accepted": False,
+            "reason": "not_a_sop",
+            "payload": None,
+        },
+    }
+    client = DummyClient(
+        {
+            "model": "mock-model",
+            "message": {"content": json.dumps(response_payload, ensure_ascii=False)},
+            "prompt_eval_count": 7,
+            "eval_count": 8,
+        }
     )
-    extractor.extract_bake_design = types.MethodType(
-        lambda self, candidate: (
-            {"accepted": True, "reason": None, "payload": {"name": "周报模板"}},
-            {"usage": {"prompt_tokens": 3, "completion_tokens": 4}, "model": "mock-model", "degraded": False, "elapsed_ms": 22},
-        ),
-        extractor,
-    )
-    extractor.extract_bake_sop = types.MethodType(
-        lambda self, candidate: (
-            {"accepted": False, "reason": "not_a_sop", "payload": None},
-            {"usage": {"prompt_tokens": 5, "completion_tokens": 6}, "model": "mock-model", "degraded": True, "elapsed_ms": 33},
-        ),
-        extractor,
-    )
+    extractor._ollama_chat = client.chat
 
     result = extractor.extract_bake_bundle(SAMPLE_CANDIDATE)
 
-    assert result["usage"] == {"prompt_tokens": 9, "completion_tokens": 12}
-    assert result["degraded"] is True
-    assert result["stage_elapsed_ms"] == {"knowledge": 11, "design": 22, "sop": 33}
+    assert len(client.calls) == 1
+    assert client.calls[0]["format"] == BAKE_BUNDLE_RESPONSE_SCHEMA
+    assert result["knowledge"]["reason"] == "not_a_knowledge"
+    assert result["design"]["payload"]["name"] == "周报模板"
+    assert result["sop"]["reason"] == "not_a_sop"
+    assert result["usage"] == {"prompt_tokens": 7, "completion_tokens": 8}
+    assert result["degraded"] is False
+    assert set(result["stage_elapsed_ms"]) == {"bundle"}
     assert isinstance(result["total_elapsed_ms"], int)
     assert result["total_elapsed_ms"] >= 0
 
@@ -464,6 +485,114 @@ def test_build_bake_candidate_text_strips_score_metadata_from_details():
     assert "需要保留" in text
 
 
+def test_build_bake_candidate_text_keeps_long_document_capture_beyond_3000_chars():
+    extractor = make_raw_extractor()
+    long_tail = "长文档尾部关键信息"
+    candidate = {
+        **SAMPLE_CANDIDATE,
+        "capture_ax_text": "正文" * 3500 + long_tail,
+        "capture_ocr_text": "",
+    }
+
+    text = extractor._build_bake_candidate_text(candidate)
+
+    assert long_tail in text
+
+
+def test_merge_document_appends_patch_without_rewriting_existing_long_content():
+    extractor = make_raw_extractor()
+    existing_content = "# 原文\n" + "已有正文。" * 1800
+    captured_call = {}
+
+    def call_bake_llm(self, caller_id, system_prompt, user_prompt, response_schema):
+        captured_call.update({
+            "caller_id": caller_id,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "response_schema": response_schema,
+        })
+        return {
+            "no_change": False,
+            "title": "长文档",
+            "summary": "补充了新章节",
+            "content_patch": "## 新章节\n这是新增内容。",
+            "insert_mode": "append",
+            "target_section_index": None,
+        }, {}
+
+    extractor._call_bake_llm = types.MethodType(call_bake_llm, extractor)
+
+    result = extractor._merge_with_llm_once(
+        {
+            "title": "长文档",
+            "summary": "旧摘要",
+            "full_content": existing_content,
+            "sections_json": "[]",
+        },
+        SAMPLE_CANDIDATE,
+        "新 capture 的完整证据",
+    )
+
+    assert result["no_change"] is False
+    assert result["full_content"].startswith(existing_content)
+    assert result["full_content"].endswith("## 新章节\n这是新增内容。")
+    assert len(result["full_content"]) > len(existing_content)
+    assert "content_patch" in captured_call["response_schema"]["properties"]
+    assert "前3000字" not in captured_call["user_prompt"]
+    assert "旧正文不在模型侧重写" in captured_call["system_prompt"]
+
+
+def test_merge_document_rejects_legacy_full_content_that_drops_existing_tail():
+    extractor = make_raw_extractor()
+    existing_content = "A" * 3000 + "不可丢失的旧正文尾部"
+    extractor._call_bake_llm = types.MethodType(
+        lambda self, caller_id, system_prompt, user_prompt, response_schema: (
+            {
+                "no_change": False,
+                "title": "长文档",
+                "full_content": existing_content[:3000],
+            },
+            {},
+        ),
+        extractor,
+    )
+
+    result = extractor._merge_with_llm_once(
+        {
+            "title": "长文档",
+            "full_content": existing_content,
+            "sections_json": "[]",
+        },
+        SAMPLE_CANDIDATE,
+        "新 capture",
+    )
+
+    assert result == {"title": "长文档", "no_change": True}
+
+
+def test_merge_document_no_change_keeps_existing_title_when_model_omits_it():
+    extractor = make_raw_extractor()
+    extractor._call_bake_llm = types.MethodType(
+        lambda self, caller_id, system_prompt, user_prompt, response_schema: (
+            {"no_change": True},
+            {},
+        ),
+        extractor,
+    )
+
+    result = extractor._merge_with_llm_once(
+        {
+            "title": "已有文档标题",
+            "full_content": "已有正文",
+            "sections_json": "[]",
+        },
+        SAMPLE_CANDIDATE,
+        "重复的新 capture",
+    )
+
+    assert result == {"no_change": True, "title": "已有文档标题"}
+
+
 
 def test_extract_bake_design_downgrades_sop_like_high_score_payload():
     extractor = make_extractor()
@@ -475,7 +604,7 @@ def test_extract_bake_design_downgrades_sop_like_high_score_payload():
         "entities": ["步骤", "排查", "触发条件"],
     }
     payload = {
-        "name": "启动排查模板",
+        "name": "启动故障排查记录",
         "category": "analysis",
         "status": "active",
         "tags": ["排查"],
@@ -512,7 +641,7 @@ def test_extract_bake_design_downgrades_sop_like_high_score_payload():
 
     assert artifact["accepted"] is True
     assert artifact["payload"]["match_level"] == "low"
-    assert artifact["payload"]["review_status"] == "candidate"
+    assert artifact["payload"]["review_status"] == "auto_created"
     assert artifact["payload"]["match_score"] <= 0.49
 
 
@@ -559,6 +688,5 @@ def test_extract_bake_sop_downgrades_template_like_high_score_payload():
 
     assert artifact["accepted"] is True
     assert artifact["payload"]["match_level"] == "low"
-    assert artifact["payload"]["review_status"] == "candidate"
+    assert artifact["payload"]["review_status"] == "auto_created"
     assert artifact["payload"]["match_score"] <= 0.49
-

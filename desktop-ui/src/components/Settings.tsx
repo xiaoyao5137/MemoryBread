@@ -19,16 +19,25 @@ import {
   useUpdatePreference,
 } from '../hooks/useApi'
 import type { ConfigCheckItem, ConfigCheckStatus, PreferenceRecord } from '../types'
+import { toUserFacingError } from '../utils/userFacingError'
+import InteractionSettings from './InteractionSettings'
 import './Settings.v2.css'
 
 interface SettingsProps {
   className?: string
 }
 
+const USER_VISIBLE_PREFERENCE_KEYS = new Set<string>([
+  'privacy.capture_interval_sec',
+  'privacy.screenshot_keep_days',
+  'privacy.capture_retention_days',
+])
+
 const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const CAPTURE_INTERVAL_KEY = 'privacy.capture_interval_sec'
   const SCREENSHOT_KEEP_DAYS_KEY = 'privacy.screenshot_keep_days'
   const CAPTURE_RETENTION_DAYS_KEY = 'privacy.capture_retention_days'
+  const ENERGY_SAVING_MODE_KEY = 'performance.energy_saving_mode'
   const USER_IDENTITY_KEY = 'user.identity_keywords'
   const DEFAULT_API_BASE = 'http://localhost:7070'
 
@@ -39,10 +48,16 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
     sidecarVersion,
     debugModeEnabled,
     localDebugModeEnabled,
+    serviceEnvironment,
+    currentUser,
     setApiBaseUrl,
+    setDebugModeEnabled,
     setLocalDebugModeEnabled,
     setWindowMode,
   } = useAppStore()
+
+  const canConfigureLocalService =
+    currentUser?.feature_flags?.includes('local_service_settings') ?? false
 
   const [preferences, setPreferences] = useState<PreferenceRecord[]>([])
   const [loading, setLoading] = useState(false)
@@ -65,16 +80,28 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const runCaptureCleanup = useRunCaptureCleanup()
 
   const sortedPreferences = useMemo(() => {
-    return [...preferences].sort((a, b) => {
-      if (a.key === CAPTURE_INTERVAL_KEY) return -1
-      if (b.key === CAPTURE_INTERVAL_KEY) return 1
-      if (a.key === SCREENSHOT_KEEP_DAYS_KEY) return -1
-      if (b.key === SCREENSHOT_KEEP_DAYS_KEY) return 1
-      if (a.key === CAPTURE_RETENTION_DAYS_KEY) return -1
-      if (b.key === CAPTURE_RETENTION_DAYS_KEY) return 1
-      return a.key.localeCompare(b.key)
-    })
-  }, [preferences, CAPTURE_INTERVAL_KEY, SCREENSHOT_KEEP_DAYS_KEY, CAPTURE_RETENTION_DAYS_KEY])
+    return preferences
+      .filter((pref) => USER_VISIBLE_PREFERENCE_KEYS.has(pref.key))
+      .sort((a, b) => {
+        if (a.key === CAPTURE_INTERVAL_KEY) return -1
+        if (b.key === CAPTURE_INTERVAL_KEY) return 1
+        if (a.key === SCREENSHOT_KEEP_DAYS_KEY) return -1
+        if (b.key === SCREENSHOT_KEEP_DAYS_KEY) return 1
+        if (a.key === CAPTURE_RETENTION_DAYS_KEY) return -1
+        if (b.key === CAPTURE_RETENTION_DAYS_KEY) return 1
+        return a.key.localeCompare(b.key)
+      })
+  }, [
+    preferences,
+    CAPTURE_INTERVAL_KEY,
+    SCREENSHOT_KEEP_DAYS_KEY,
+    CAPTURE_RETENTION_DAYS_KEY,
+  ])
+
+  const energySavingEnabled = useMemo(() => {
+    const pref = preferences.find((item) => item.key === ENERGY_SAVING_MODE_KEY)
+    return !pref || pref.value.trim().toLowerCase() !== 'false'
+  }, [preferences, ENERGY_SAVING_MODE_KEY])
 
   useEffect(() => {
     setLoading(true)
@@ -84,7 +111,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
         const identityPref = prefs.find((p) => p.key === USER_IDENTITY_KEY)
         if (identityPref) setIdentityInput(identityPref.value)
       })
-      .catch((e: Error) => setError(e.message))
+      .catch((cause) => setError(toUserFacingError(cause, '设置读取失败')))
       .finally(() => setLoading(false))
   }, [fetchPrefs])
 
@@ -95,7 +122,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
       const items = await fetchConfigChecks()
       setConfigChecks(items)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(toUserFacingError(e, '运行状态读取失败'))
     } finally {
       setConfigChecksLoading(false)
     }
@@ -136,11 +163,26 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
     async (key: string, value: string) => {
       try {
         const updated = await updatePref(key, value)
-        setPreferences((prev) =>
-          prev.map((p) => (p.key === key ? { ...p, value: updated.value } : p))
-        )
+        setPreferences((prev) => {
+          if (prev.some((item) => item.key === key)) {
+            return prev.map((item) =>
+              item.key === key ? { ...item, value: updated.value } : item
+            )
+          }
+          return [
+            ...prev,
+            {
+              id: updated.id ?? 0,
+              key,
+              value: updated.value,
+              source: updated.source ?? 'user',
+              confidence: updated.confidence ?? 1,
+              updated_at: updated.updated_at,
+            },
+          ]
+        })
         if (key === CAPTURE_INTERVAL_KEY) {
-          setSaveMsg('OCR / 截图频率已保存，需重启应用后生效')
+          setSaveMsg('文字识别与截图频率已保存，需重启应用后生效')
           setTimeout(() => setSaveMsg(null), 3000)
         } else if (key === SCREENSHOT_KEEP_DAYS_KEY) {
           setSaveMsg('图片过期时间已保存，将在下一次后台清理时生效')
@@ -148,12 +190,21 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
         } else if (key === CAPTURE_RETENTION_DAYS_KEY) {
           setSaveMsg('采集记录过期时间已保存，将在下一次后台清理时生效')
           setTimeout(() => setSaveMsg(null), 3000)
+        } else if (key === ENERGY_SAVING_MODE_KEY) {
+          setSaveMsg(value === 'true' ? '节能模式已开启' : '节能模式已关闭')
+          setTimeout(() => setSaveMsg(null), 3000)
         }
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
+        setError(toUserFacingError(e, '设置保存失败'))
       }
     },
-    [CAPTURE_INTERVAL_KEY, SCREENSHOT_KEEP_DAYS_KEY, CAPTURE_RETENTION_DAYS_KEY, updatePref]
+    [
+      CAPTURE_INTERVAL_KEY,
+      SCREENSHOT_KEEP_DAYS_KEY,
+      CAPTURE_RETENTION_DAYS_KEY,
+      ENERGY_SAVING_MODE_KEY,
+      updatePref,
+    ]
   )
 
   const handleRunScreenshotCleanup = useCallback(async () => {
@@ -167,7 +218,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
       const prefs = await fetchPrefs()
       setPreferences(prefs)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(toUserFacingError(e, '截图清理失败'))
     } finally {
       setCleanupRunning(false)
     }
@@ -184,7 +235,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
       const prefs = await fetchPrefs()
       setPreferences(prefs)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(toUserFacingError(e, '采集记录清理失败'))
     } finally {
       setCaptureCleanupRunning(false)
     }
@@ -199,11 +250,11 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
     setError(null)
     try {
       const result = await runConfigCheckAction(id, action)
-      setSaveMsg(result.message)
+      setSaveMsg(toUserFacingError(result.message, '操作已完成'))
       setTimeout(() => setSaveMsg(null), 5000)
       await refreshConfigChecks()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(toUserFacingError(e, '操作失败，请稍后重试'))
     } finally {
       setConfigActionRunning(null)
     }
@@ -219,7 +270,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
       setIdentitySaved(true)
       setTimeout(() => setIdentitySaved(false), 2000)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(toUserFacingError(e, '身份信息保存失败'))
     }
   }, [identityInput, updatePref, USER_IDENTITY_KEY])
 
@@ -345,6 +396,8 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
           </div>
         </section>
 
+        <InteractionSettings />
+
         {/* 配置检测 */}
         <section className="settings-v2__card" data-testid="settings-config-checks-section">
           <div className="settings-v2__card-header">
@@ -434,7 +487,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
         </section>
 
         {/* API 服务配置 */}
-        {debugModeEnabled && (
+        {canConfigureLocalService && debugModeEnabled && (
           <section className="settings-v2__card" data-testid="settings-api-section">
             <div className="settings-v2__card-header">
               <div className="settings-v2__card-icon settings-v2__card-icon--blue">
@@ -532,6 +585,31 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
           )}
 
           <div className="settings-v2__pref-list">
+            <label
+              className="settings-v2__toggle-row settings-v2__toggle-row--standalone"
+              htmlFor="energy-saving-mode-toggle"
+            >
+              <span>
+                <strong>节能模式</strong>
+                <small>
+                  充电时保持最大提炼吞吐；使用电池时降低频率和并发；电量不高于 20%
+                  时暂停后台时间线与 bake 提炼。事件与定时 capture 采集始终继续，积压会在充电后自动追赶。
+                </small>
+              </span>
+              <input
+                id="energy-saving-mode-toggle"
+                data-testid="energy-saving-mode-toggle"
+                type="checkbox"
+                checked={energySavingEnabled}
+                onChange={(event) => {
+                  void handlePrefChange(
+                    ENERGY_SAVING_MODE_KEY,
+                    event.target.checked ? 'true' : 'false'
+                  )
+                }}
+              />
+            </label>
+
             {sortedPreferences.map((pref) => {
               const isCaptureInterval = pref.key === CAPTURE_INTERVAL_KEY
               const isScreenshotKeepDays = pref.key === SCREENSHOT_KEEP_DAYS_KEY
@@ -611,41 +689,13 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
         </section>
 
         {/* 开发者工具 */}
-        {debugModeEnabled && (
-          <section className="settings-v2__card" data-testid="settings-debug-section">
-            <div className="settings-v2__card-header">
-              <div className="settings-v2__card-icon settings-v2__card-icon--orange">
-                {/* wrench 图标 */}
-                <svg
-                  width="20"
-                  height="20"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
-                </svg>
-              </div>
-              <div>
-                <h2 className="settings-v2__card-title">开发者工具</h2>
-                <p className="settings-v2__card-desc">
-                  查看实时采集记录、处理状态和系统性能指标
-                </p>
-              </div>
-            </div>
-
-            <button
-              data-testid="open-debug-btn"
-              onClick={() => setWindowMode('debug')}
-              type="button"
-              className="settings-v2__btn settings-v2__btn--secondary"
-            >
+        <section className="settings-v2__card" data-testid="settings-debug-section">
+          <div className="settings-v2__card-header">
+            <div className="settings-v2__card-icon settings-v2__card-icon--orange">
+              {/* wrench 图标 */}
               <svg
-                width="16"
-                height="16"
+                width="20"
+                height="20"
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
@@ -655,30 +705,75 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
               >
                 <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
               </svg>
-              打开调试面板
-            </button>
+            </div>
+            <div>
+              <h2 className="settings-v2__card-title">开发者工具</h2>
+              <p className="settings-v2__card-desc">
+                查看实时采集记录、处理状态和系统性能指标
+              </p>
+            </div>
+          </div>
 
-            <label className="settings-v2__toggle-row" htmlFor="local-debug-mode-toggle">
-              <span>
-                <strong>本地调试模式</strong>
-                <small>开启后使用本机开发服务验证账户登录和云端创作流程。</small>
-              </span>
-              <input
-                id="local-debug-mode-toggle"
-                type="checkbox"
-                checked={localDebugModeEnabled}
-                onChange={(event) => setLocalDebugModeEnabled(event.target.checked)}
-              />
-            </label>
-            {localDebugModeEnabled && (
-              <div className="settings-v2__debug-routes" aria-label="本地调试服务地址">
+          <button
+            data-testid="open-debug-btn"
+            onClick={() => setWindowMode('debug')}
+            type="button"
+            className="settings-v2__btn settings-v2__btn--secondary"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+            </svg>
+            打开调试面板
+          </button>
+
+          <label className="settings-v2__toggle-row" htmlFor="debug-mode-toggle">
+            <span>
+              <strong>调试模式</strong>
+              <small>开启后允许选择测试环境和覆盖服务地址；关闭时强制恢复正式环境。</small>
+            </span>
+            <input
+              id="debug-mode-toggle"
+              data-testid="debug-mode-toggle"
+              type="checkbox"
+              checked={debugModeEnabled}
+              onChange={(event) => setDebugModeEnabled(event.target.checked)}
+            />
+          </label>
+
+          {debugModeEnabled && (
+            <>
+              <label className="settings-v2__toggle-row" htmlFor="local-debug-mode-toggle">
+                <span>
+                  <strong>本地调试模式</strong>
+                  <small>使用本机端口；请求会携带所选环境，服务环境不一致时会被拒绝。</small>
+                </span>
+                <input
+                  id="local-debug-mode-toggle"
+                  data-testid="local-debug-mode-toggle"
+                  type="checkbox"
+                  checked={localDebugModeEnabled}
+                  onChange={(event) => setLocalDebugModeEnabled(event.target.checked)}
+                />
+              </label>
+              <div className="settings-v2__debug-routes" aria-label="调试服务环境绑定">
+                <span>Environment <strong>{serviceEnvironment}</strong></span>
+                <span>Mode <strong>{localDebugModeEnabled ? 'local' : 'configured'}</strong></span>
                 <span>Core <strong>{apiBaseUrl}</strong></span>
                 <span>Account <strong>{adminApiBaseUrl}</strong></span>
                 <span>Cloud Creation <strong>{gatewayApiBaseUrl}</strong></span>
               </div>
-            )}
-          </section>
-        )}
+            </>
+          )}
+        </section>
 
         {/* 版本信息 */}
         <section className="settings-v2__card" data-testid="settings-version-section">
@@ -707,11 +802,11 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
 
           <div className="settings-v2__version-list">
             <div className="settings-v2__version-item" data-testid="sidecar-version">
-              <span className="settings-v2__version-label">AI Sidecar</span>
+              <span className="settings-v2__version-label">AI 能力</span>
               <span className="settings-v2__version-value">{sidecarVersion}</span>
             </div>
             <div className="settings-v2__version-item" data-testid="app-version">
-              <span className="settings-v2__version-label">Desktop UI</span>
+              <span className="settings-v2__version-label">桌面应用</span>
               <span className="settings-v2__version-value">0.1.0</span>
             </div>
           </div>

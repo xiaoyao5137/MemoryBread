@@ -1,0 +1,278 @@
+.achievement-celebration {
+  position: fixed;
+  inset: 0;
+  z-index: 1900;
+  padding: 24px;
+  background: rgb(48 36 29 / 52%);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.achievement-celebration__dialog {
+  position: relative;
+  width: min(450px, 100%);
+  padding: 28px;
+  border: 1px solid rgb(128 83 48 / 24%);
+  border-radius: 22px;
+  background: #fcfaf7;
+  color: #3c322d;
+  box-shadow: 0 28px 80px rgb(44 28 18 / 30%);
+}
+
+.achievement-celebration__intro {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #8c4a26;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.achievement-celebration__spark {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: #f7e4d7;
+  display: grid;
+  place-items: center;
+}
+
+.achievement-celebration__card {
+  --celebration-accent: #a54c26;
+  --celebration-ink: #71351f;
+  --celebration-wash: #f7dfd0;
+  position: relative;
+  width: min(294px, 88%);
+  min-height: 214px;
+  margin: 22px auto 0;
+  padding: 25px 24px 22px;
+  border: 1px solid color-mix(in srgb, var(--celebration-accent) 34%, #ddd6cf);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at 88% 8%, color-mix(in srgb, var(--celebration-accent) 20%, transparent), transparent 34%),
+    linear-gradient(145deg, var(--celebration-wash), #fffdfa 72%);
+  color: var(--celebration-ink);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  overflow: hidden;
+  box-shadow: 0 18px 38px color-mix(in srgb, var(--celebration-accent) 18%, transparent);
+}
+
+.achievement-celebration__card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 22px;
+  left: 22px;
+  height: 5px;
+  border-radius: 0 0 5px 5px;
+  background: var(--celebration-accent);
+}
+
+.achievement-celebration__card--cobalt { --celebration-accent: #31649f; --celebration-ink: #294b72; --celebration-wash: #e1ebf7; }
+.achievement-celebration__card--midnight { --celebration-accent: #494c78; --celebration-ink: #343653; --celebration-wash: #e6e7f1; }
+.achievement-celebration__card--forest { --celebration-accent: #3c7656; --celebration-ink: #2f5941; --celebration-wash: #e0eee5; }
+.achievement-celebration__card--honey { --celebration-accent: #a76d26; --celebration-ink: #744b1c; --celebration-wash: #f7ead1; }
+.achievement-celebration__card--rose { --celebration-accent: #a84e58; --celebration-ink: #743a40; --celebration-wash: #f4e1e3; }
+
+.achievement-celebration__icon {
+  width: 62px;
+  height: 62px;
+  border: 1px solid color-mix(in srgb, var(--celebration-accent) 28%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--celebration-accent) 10%, #fffdfa);
+  display: grid;
+  place-items: center;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 72%);
+}
+
+.achievement-celebration__card-status {
+  position: absolute;
+  top: 25px;
+  right: 22px;
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--celebration-accent) 24%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--celebration-accent) 7%, #fffdfa);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9px;
+  font-weight: 760;
+}
+
+.achievement-celebration__card > strong {
+  margin-top: 24px;
+  font-size: 26px;
+  font-weight: 820;
+  letter-spacing: -0.035em;
+  line-height: 1.1;
+}
+
+.achievement-celebration__card > span:not(.achievement-celebration__icon):not(.achievement-celebration__card-status) {
+  margin-top: 7px;
+  color: var(--celebration-accent);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.achievement-celebration__card > small {
+  margin-top: 12px;
+  color: color-mix(in srgb, var(--celebration-ink) 72%, #766d66);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.achievement-celebration__copy {
+  margin-top: 24px;
+  text-align: center;
+}
+
+.achievement-celebration__copy h2 {
+  margin: 0;
+  color: #332a25;
+  font-size: 22px;
+  font-weight: 780;
+  letter-spacing: -0.025em;
+}
+
+.achievement-celebration__copy p {
+  max-width: 42ch;
+  margin: 10px auto 0;
+  color: #756a62;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.achievement-celebration__actions {
+  margin-top: 24px;
+  display: grid;
+  grid-template-columns: 1fr 1.25fr;
+  gap: 10px;
+}
+
+.achievement-celebration__actions button {
+  min-height: 44px;
+  padding: 0 16px;
+  border-radius: 11px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 740;
+  white-space: nowrap;
+  transition: transform 120ms ease, background-color 160ms ease, border-color 160ms ease;
+}
+
+.achievement-celebration__actions button:first-child {
+  border: 1px solid #d8d0ca;
+  background: #f7f4f0;
+  color: #5f544c;
+}
+
+.achievement-celebration__actions button:last-child {
+  border: 1px solid #9f4522;
+  background: #9f4522;
+  color: #fff8f3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+.achievement-celebration__actions button:hover:first-child { background: #eee8e2; }
+.achievement-celebration__actions button:hover:last-child { background: #84391e; }
+.achievement-celebration__actions button:active { transform: scale(0.98); }
+
+.achievement-celebration__actions button:focus-visible {
+  outline: 3px solid rgb(184 87 47 / 28%);
+  outline-offset: 2px;
+}
+
+.achievement-celebration__crumbs {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.achievement-celebration__crumbs span {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  background: #d9904a;
+  opacity: 0;
+}
+
+.achievement-celebration__crumbs span:nth-child(2n) { width: 7px; height: 12px; background: #f2c071; }
+.achievement-celebration__crumbs span:nth-child(3n) { border-radius: 999px; background: #9f4522; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .achievement-celebration { animation: achievement-celebration-fade 220ms ease-out both; }
+  .achievement-celebration__dialog { animation: achievement-celebration-rise 560ms cubic-bezier(.16, 1, .3, 1) both; }
+  .achievement-celebration__card { animation: achievement-celebration-card 760ms cubic-bezier(.18, 1.25, .34, 1) 90ms both; }
+  .achievement-celebration__actions { animation: achievement-celebration-actions 360ms ease-out 520ms both; }
+  .achievement-celebration__crumbs span { animation: achievement-celebration-crumb 780ms cubic-bezier(.18, .78, .3, 1) both; }
+  .achievement-celebration__crumbs span:nth-child(1) { --crumb-x: -205px; --crumb-y: -190px; animation-delay: 70ms; }
+  .achievement-celebration__crumbs span:nth-child(2) { --crumb-x: -140px; --crumb-y: -235px; animation-delay: 130ms; }
+  .achievement-celebration__crumbs span:nth-child(3) { --crumb-x: -72px; --crumb-y: -215px; animation-delay: 20ms; }
+  .achievement-celebration__crumbs span:nth-child(4) { --crumb-x: 35px; --crumb-y: -230px; animation-delay: 120ms; }
+  .achievement-celebration__crumbs span:nth-child(5) { --crumb-x: 125px; --crumb-y: -205px; animation-delay: 50ms; }
+  .achievement-celebration__crumbs span:nth-child(6) { --crumb-x: 205px; --crumb-y: -145px; animation-delay: 150ms; }
+  .achievement-celebration__crumbs span:nth-child(7) { --crumb-x: 220px; --crumb-y: 45px; animation-delay: 30ms; }
+  .achievement-celebration__crumbs span:nth-child(8) { --crumb-x: 158px; --crumb-y: 176px; animation-delay: 110ms; }
+  .achievement-celebration__crumbs span:nth-child(9) { --crumb-x: 52px; --crumb-y: 212px; animation-delay: 65ms; }
+  .achievement-celebration__crumbs span:nth-child(10) { --crumb-x: -68px; --crumb-y: 202px; animation-delay: 145ms; }
+  .achievement-celebration__crumbs span:nth-child(11) { --crumb-x: -180px; --crumb-y: 150px; animation-delay: 25ms; }
+  .achievement-celebration__crumbs span:nth-child(12) { --crumb-x: -225px; --crumb-y: 8px; animation-delay: 100ms; }
+}
+
+@keyframes achievement-celebration-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes achievement-celebration-rise {
+  from { opacity: 0; transform: translateY(18px) scale(.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes achievement-celebration-card {
+  from { opacity: 0; transform: translateY(24px) rotate(-2deg) scale(.9); }
+  62% { opacity: 1; transform: translateY(-3px) rotate(.7deg) scale(1.018); }
+  to { opacity: 1; transform: translateY(0) rotate(0) scale(1); }
+}
+
+@keyframes achievement-celebration-actions {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes achievement-celebration-crumb {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(.4) rotate(0); }
+  18% { opacity: 1; }
+  100% { opacity: 0; transform: translate(calc(-50% + var(--crumb-x)), calc(-50% + var(--crumb-y))) scale(1) rotate(180deg); }
+}
+
+@media (max-width: 620px) {
+  .achievement-celebration { padding: 14px; }
+  .achievement-celebration__dialog { padding: 22px 18px; border-radius: 18px; }
+  .achievement-celebration__card { width: 100%; min-height: 198px; }
+  .achievement-celebration__actions { grid-template-columns: 1fr; }
+  .achievement-celebration__actions button:last-child { grid-row: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .achievement-celebration,
+  .achievement-celebration__dialog,
+  .achievement-celebration__card,
+  .achievement-celebration__actions,
+  .achievement-celebration__crumbs span {
+    animation: none;
+  }
+  .achievement-celebration__crumbs { display: none; }
+}

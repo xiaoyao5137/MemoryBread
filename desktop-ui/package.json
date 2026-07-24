@@ -11,11 +11,15 @@
     "test:watch": "vitest",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "macos:build:dmg": "../scripts/build-macos.sh dmg",
+    "macos:build:appstore": "../scripts/build-macos.sh appstore",
+    "macos:verify": "../scripts/verify-macos-bundle.sh"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-global-shortcut": "^2.3.2",
     "@types/dompurify": "^3.0.5",
     "dompurify": "^3.3.3",
     "lucide-react": "^1.14.0",

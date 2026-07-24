@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react'
 import type { ExtractionLive, MonitorOverview, SystemResources } from '../types'
 import { useAppStore } from '../store/useAppStore'
+import { toUserFacingError } from '../utils/userFacingError'
 import PipelineDagPanel from './PipelineDagPanel'
+import './MonitorPanel.css'
 
 const API = 'http://localhost:7070'
 
@@ -70,6 +72,12 @@ const EMPTY_OVERVIEW: MonitorOverview = {
     today_count: 0,
     period_count: 0,
     pending_extraction_count: 0,
+    oldest_pending_extraction_at_ms: null,
+    pending_bake_count: 0,
+    oldest_pending_bake_at_ms: null,
+    bake_retry_exhausted_count: 0,
+    running_bake_count: 0,
+    stale_bake_run_count: 0,
     by_time: [],
     recent: [],
     extracting: [],
@@ -92,7 +100,7 @@ const EMPTY_OVERVIEW: MonitorOverview = {
 }
 
 const CALLER_LABELS: Record<string, string> = {
-  rag: 'RAG 问答', task: '定时任务', knowledge: '知识提炼', creation: '内容创作',
+  rag: '记忆问答', task: '定时任务', knowledge: '知识提炼', creation: '内容创作',
 }
 const CALLER_COLORS: Record<string, string> = {
   rag: '#007AFF', task: '#34C759', knowledge: '#AF52DE', creation: '#FF9500',
@@ -109,11 +117,12 @@ const EVENT_LABEL: Record<string, string> = {
 
 function formatLlmModelName(model?: string | null): string {
   const name = (model || '').trim()
-  if (!name) return '模型未记录'
-  if (name === 'unavailable') return '模型不可用/未记录'
-  if (name === 'qwen3.5:4b' || name === 'mbem-v1-local') return 'MBEM v1.0 / MBCD Std v1.0'
+  if (!name || name === 'unavailable') return '模型状态待确认'
+  if (/embed|bge|vector/i.test(name)) return '本地语义索引'
+  if (name === 'qwen3.5:4b' || name === 'mbem-v1-local') return 'MBEM v1.0'
   if (name === 'mbcd-plus-v1') return 'MBCD Plus v1.0'
-  return name
+  if (/^(?:MBEM|MBCD|MBVD|MBID)[\s-]/i.test(name)) return name
+  return '本地分析模型'
 }
 
 function fmt(n: number): string {
@@ -587,13 +596,13 @@ const ChartLegend: React.FC<{
 const StatCard: React.FC<{
   label: string; value: string; sub?: string; color: string
 }> = ({ label, value, sub, color }) => (
-  <div style={{
-    background: `${color}10`, borderRadius: 10, padding: '10px 12px',
-    border: `1px solid ${color}20`, flex: 1, minWidth: 0,
-  }}>
-    <div style={{ fontSize: 11, color: '#6E6E73', marginBottom: 4 }}>{label}</div>
-    <div style={fontSize_20_weight_700(color)}>{value}</div>
-    {sub && <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 3 }}>{sub}</div>}
+  <div
+    className="monitor-stat-card"
+    style={{ background: `${color}10`, borderColor: `${color}20` }}
+  >
+    <div className="monitor-stat-card__label" title={label}>{label}</div>
+    <div className="monitor-stat-card__value" style={fontSize_20_weight_700(color)}>{value}</div>
+    {sub && <div className="monitor-stat-card__sub" title={sub}>{sub}</div>}
   </div>
 )
 
@@ -623,15 +632,36 @@ function fmtRelativeTs(ms: number | null | undefined): string {
   return `${Math.floor(h / 24)} 天前`
 }
 
+function fmtDurationMs(ms: number): string {
+  const value = Math.max(0, ms)
+  if (value < 60_000) return `${Math.floor(value / 1000)} 秒`
+  if (value < 3_600_000) return `${Math.floor(value / 60_000)} 分钟`
+  if (value < 86_400_000) {
+    const hours = Math.floor(value / 3_600_000)
+    const minutes = Math.floor((value % 3_600_000) / 60_000)
+    return `${hours} 小时${minutes > 0 ? ` ${minutes} 分钟` : ''}`
+  }
+  const days = Math.floor(value / 86_400_000)
+  const hours = Math.floor((value % 86_400_000) / 3_600_000)
+  return `${days} 天${hours > 0 ? ` ${hours} 小时` : ''}`
+}
+
+function oldestQueueAge(oldestAtMs: number | null | undefined): number {
+  return oldestAtMs ? Math.max(0, Date.now() - oldestAtMs) : 0
+}
+
 const ExtractionQueueCard: React.FC<{
   pending: number
   status: ExtractorStatus
   extractingCount: number
   lastExtractionAtMs: number | null | undefined
-}> = ({ pending, status, extractingCount, lastExtractionAtMs }) => {
+  oldestPendingAtMs: number | null | undefined
+}> = ({ pending, status, extractingCount, lastExtractionAtMs, oldestPendingAtMs }) => {
   const meta = EXTRACTOR_STATUS_META[status] ?? EXTRACTOR_STATUS_META.idle
-  // 主色：等待队列卡片仍以橙色为基底（呼应原设计），但用状态点指示真实健康度
-  const baseColor = pending > 0 ? '#FF9500' : '#8E8E93'
+  const oldestAge = oldestQueueAge(oldestPendingAtMs)
+  const baseColor = oldestAge >= 86_400_000
+    ? '#FF3B30'
+    : pending > 0 ? '#FF9500' : '#8E8E93'
 
   let sub: string
   if (status === 'running') {
@@ -643,24 +673,23 @@ const ExtractionQueueCard: React.FC<{
   } else if (status === 'stalled') {
     sub = '后台提炼未启动，请检查本机服务'
   } else {
-    sub = pending > 0 ? `${pending} 条待评估` : '当前无待提炼内容'
+    sub = pending > 0
+      ? `最老已等待 ${fmtDurationMs(oldestAge)}`
+      : '当前无待提炼内容'
   }
 
   return (
     <div
-      title="数字代表已采集但尚未整理成知识的内容。系统会分批提炼，因此该数字会持续累计、阶段性下降，并不代表卡住。"
-      style={{
-        background: `${baseColor}10`, borderRadius: 10, padding: '10px 12px',
-        border: `1px solid ${baseColor}20`, flex: 1, minWidth: 0,
-      }}
+      className="monitor-stat-card"
+      title="全量库存：已采集但尚未整理成时间线的内容，不受页面趋势时间范围影响。"
+      style={{ background: `${baseColor}10`, borderColor: `${baseColor}20` }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, marginBottom: 4 }}>
-        <span style={{ fontSize: 11, color: '#6E6E73' }}>提炼等待队列</span>
-        <span style={{
-          display: 'inline-flex', alignItems: 'center', gap: 4,
-          fontSize: 10, padding: '1px 6px', borderRadius: 4,
-          background: `${meta.color}18`, color: meta.color, fontWeight: 600,
-        }}>
+      <div className="monitor-stat-card__header">
+        <span className="monitor-stat-card__label" title="时间线等待队列">时间线等待队列</span>
+        <span
+          className="monitor-stat-card__status"
+          style={{ background: `${meta.color}18`, color: meta.color }}
+        >
           <span style={{
             width: 6, height: 6, borderRadius: '50%', background: meta.dot,
             animation: status === 'running' ? 'pulse 1.4s ease-in-out infinite' : undefined,
@@ -668,8 +697,111 @@ const ExtractionQueueCard: React.FC<{
           {meta.label}
         </span>
       </div>
-      <div style={fontSize_20_weight_700(baseColor)}>{fmt(pending)}</div>
-      <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 3, lineHeight: 1.35 }}>{sub}</div>
+      <div className="monitor-stat-card__value" style={fontSize_20_weight_700(baseColor)}>{fmt(pending)}</div>
+      <div className="monitor-stat-card__sub" title={sub}>{sub}</div>
+    </div>
+  )
+}
+
+const BakeQueueCard: React.FC<{
+  pending: number
+  oldestPendingAtMs: number | null | undefined
+  runningCount: number
+  staleRunCount: number
+  retryExhaustedCount: number
+}> = ({ pending, oldestPendingAtMs, runningCount, staleRunCount, retryExhaustedCount }) => {
+  const oldestAge = oldestQueueAge(oldestPendingAtMs)
+  const color = staleRunCount > 0 || oldestAge >= 86_400_000
+    ? '#FF3B30'
+    : pending > 0 ? '#FF9500' : '#8E8E93'
+  const sub = pending > 0
+    ? `最老已等待 ${fmtDurationMs(oldestAge)} · 运行 ${runningCount}`
+    : `当前无待烘焙内容 · 运行 ${runningCount}`
+  const detail = retryExhaustedCount > 0
+    ? `${sub} · 重试耗尽 ${retryExhaustedCount}`
+    : sub
+  return (
+    <div
+      className="monitor-stat-card"
+      title="当前库存：位于烘焙水位之后、尚未生成知识、文档或操作手册的高价值候选；实质文档不依赖 importance 才能进入统计。"
+      style={{ background: `${color}10`, borderColor: `${color}20` }}
+    >
+      <div className="monitor-stat-card__label">烘焙等待队列</div>
+      <div className="monitor-stat-card__value" style={fontSize_20_weight_700(color)}>{fmt(pending)}</div>
+      <div className="monitor-stat-card__sub" title={detail}>{detail}</div>
+    </div>
+  )
+}
+
+const InferenceQueueCard: React.FC<{
+  queue: ExtractionLive['inference_queue'] | undefined
+}> = ({ queue }) => {
+  if (!queue?.available) {
+    return <StatCard label="模型推理队列" value="—" sub="队列状态接口不可用" color="#8E8E93" />
+  }
+  const color = queue.oldest_wait_ms >= 600_000
+    ? '#FF3B30'
+    : queue.queued_total > 0 ? '#FF9500' : '#34C759'
+  const sub = `运行 ${queue.running_total}/${queue.max_concurrency} · P0 ${queue.queued_p0} / P1 ${queue.queued_p1} / P2 ${queue.queued_p2}`
+  return (
+    <StatCard
+      label="模型推理队列"
+      value={fmt(queue.queued_total)}
+      sub={queue.oldest_wait_ms > 0 ? `${sub} · 最老 ${fmtDurationMs(queue.oldest_wait_ms)}` : sub}
+      color={color}
+    />
+  )
+}
+
+const PipelineBacklogAlert: React.FC<{
+  capturePending: number
+  captureOldestAtMs: number | null | undefined
+  bakePending: number
+  bakeOldestAtMs: number | null | undefined
+  staleBakeRuns: number
+  retryExhausted: number
+  inferenceQueue: ExtractionLive['inference_queue'] | undefined
+}> = ({
+  capturePending,
+  captureOldestAtMs,
+  bakePending,
+  bakeOldestAtMs,
+  staleBakeRuns,
+  retryExhausted,
+  inferenceQueue,
+}) => {
+  const issues: string[] = []
+  const captureAge = oldestQueueAge(captureOldestAtMs)
+  const bakeAge = oldestQueueAge(bakeOldestAtMs)
+  if (capturePending > 0 && captureAge >= 7_200_000) {
+    issues.push(`时间线队列 ${capturePending} 条，最老等待 ${fmtDurationMs(captureAge)}`)
+  }
+  if (bakePending > 0 && bakeAge >= 7_200_000) {
+    issues.push(`烘焙队列 ${bakePending} 条，最老等待 ${fmtDurationMs(bakeAge)}`)
+  }
+  if (staleBakeRuns > 0) issues.push(`${staleBakeRuns} 个烘焙批次运行超过 35 分钟`)
+  if (retryExhausted > 0) issues.push(`${retryExhausted} 条候选已重试耗尽`)
+  if (inferenceQueue?.available && inferenceQueue.oldest_wait_ms >= 600_000) {
+    issues.push(`模型推理队列最老等待 ${fmtDurationMs(inferenceQueue.oldest_wait_ms)}`)
+  }
+  if (issues.length === 0) return null
+  const critical = captureAge >= 86_400_000
+    || bakeAge >= 86_400_000
+    || staleBakeRuns > 0
+    || (inferenceQueue?.oldest_wait_ms ?? 0) >= 1_800_000
+  const color = critical ? '#FF3B30' : '#FF9500'
+  return (
+    <div style={{
+      marginBottom: 10,
+      padding: '10px 12px',
+      borderRadius: 10,
+      background: `${color}10`,
+      border: `1px solid ${color}30`,
+      color,
+      fontSize: 12,
+      fontWeight: 600,
+    }}>
+      流水线积压告警：{issues.join('；')}
     </div>
   )
 }
@@ -693,8 +825,8 @@ const OcrBackfillCard: React.FC<{
     <div style={cardStyle}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'flex-start', marginBottom: 10 }}>
         <div>
-          <div style={{ ...sectionTitle, marginBottom: 3 }}>后台 OCR 补写</div>
-          <div style={{ fontSize: 11, color: '#6E6E73' }}>{rangeLabel} · 仅 AX 正文为空时截图，OCR 后台单并发补全文本</div>
+          <div style={{ ...sectionTitle, marginBottom: 3 }}>后台文字识别</div>
+          <div style={{ fontSize: 11, color: '#6E6E73' }}>{rangeLabel} · 仅在无法读取正文时使用截图识别，并在后台逐条补全文本</div>
         </div>
         <div style={{
           fontSize: 11, color: statusColor, background: `${statusColor}14`,
@@ -745,7 +877,7 @@ const OcrBackfillCard: React.FC<{
 
       {metrics.recent.length > 0 && (
         <div>
-          <div style={{ fontSize: 11, color: '#6E6E73', marginBottom: 5 }}>最近 OCR 补写</div>
+          <div style={{ fontSize: 11, color: '#6E6E73', marginBottom: 5 }}>最近文字识别</div>
           {metrics.recent.map((item, index) => {
             const meta = OCR_STATUS_META[item.status] ?? { label: item.status, color: '#6E6E73' }
             return (
@@ -858,6 +990,24 @@ const OverviewContent: React.FC<{
     pending_extraction_count: liveData?.pending_extraction_count
       ?? data?.knowledge_flow?.pending_extraction_count
       ?? 0,
+    oldest_pending_extraction_at_ms: liveData?.oldest_pending_extraction_at_ms
+      ?? data?.knowledge_flow?.oldest_pending_extraction_at_ms
+      ?? null,
+    pending_bake_count: liveData?.pending_bake_count
+      ?? data?.knowledge_flow?.pending_bake_count
+      ?? 0,
+    oldest_pending_bake_at_ms: liveData?.oldest_pending_bake_at_ms
+      ?? data?.knowledge_flow?.oldest_pending_bake_at_ms
+      ?? null,
+    bake_retry_exhausted_count: liveData?.bake_retry_exhausted_count
+      ?? data?.knowledge_flow?.bake_retry_exhausted_count
+      ?? 0,
+    running_bake_count: liveData?.running_bake_count
+      ?? data?.knowledge_flow?.running_bake_count
+      ?? 0,
+    stale_bake_run_count: liveData?.stale_bake_run_count
+      ?? data?.knowledge_flow?.stale_bake_run_count
+      ?? 0,
   }
   const task_executions = {
     ...EMPTY_OVERVIEW.task_executions,
@@ -886,7 +1036,16 @@ const OverviewContent: React.FC<{
   return (
     <>
       <ServiceHealthBanner health={serviceHealth} />
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+      <PipelineBacklogAlert
+        capturePending={knowledge_flow.pending_extraction_count}
+        captureOldestAtMs={knowledge_flow.oldest_pending_extraction_at_ms}
+        bakePending={knowledge_flow.pending_bake_count}
+        bakeOldestAtMs={knowledge_flow.oldest_pending_bake_at_ms}
+        staleBakeRuns={knowledge_flow.stale_bake_run_count}
+        retryExhausted={knowledge_flow.bake_retry_exhausted_count}
+        inferenceQueue={liveData?.inference_queue}
+      />
+      <div className="monitor-metric-grid">
         <StatCard label="Token 用量" value={fmt(token_usage.total_period)}
           sub={`今日 ${fmt(token_usage.total_today)}`} color="#007AFF" />
         <StatCard label="采集记录" value={fmt(capture_flow.period_count)}
@@ -900,17 +1059,26 @@ const OverviewContent: React.FC<{
           status={knowledge_flow.extractor_status}
           extractingCount={knowledge_flow.extracting.length}
           lastExtractionAtMs={knowledge_flow.last_extraction_at_ms}
+          oldestPendingAtMs={knowledge_flow.oldest_pending_extraction_at_ms}
         />
-        <StatCard label="OCR 积压" value={fmt(ocr_backfill.backlog_count)}
+        <BakeQueueCard
+          pending={knowledge_flow.pending_bake_count}
+          oldestPendingAtMs={knowledge_flow.oldest_pending_bake_at_ms}
+          runningCount={knowledge_flow.running_bake_count}
+          staleRunCount={knowledge_flow.stale_bake_run_count}
+          retryExhaustedCount={knowledge_flow.bake_retry_exhausted_count}
+        />
+        <InferenceQueueCard queue={liveData?.inference_queue} />
+        <StatCard label="待识别截图" value={fmt(ocr_backfill.backlog_count)}
           sub={`队列 ${fmt(ocr_backfill.queued_count)} · 执行中 ${fmt(ocr_backfill.in_progress_count)}`} color="#FF9500" />
-        <StatCard label="OCR 成功率" value={`${ocr_backfill.period_success_rate.toFixed(0)}%`}
+        <StatCard label="文字识别成功率" value={`${ocr_backfill.period_success_rate.toFixed(0)}%`}
           sub={`吞吐 ${fmtRatePerMin(ocr_backfill.period_throughput_per_min)} · 超时 ${fmt(ocr_backfill.period_timed_out)}`} color="#007AFF" />
         <StatCard label="向量化率" value={`${(capture_flow.vectorization_rate * 100).toFixed(0)}%`}
           sub={`已入索引 ${fmt(capture_flow.vectorized_count)}/${fmt(capture_flow.eligible_count)}`} color="#5E5CE6" />
         <StatCard label="知识化率" value={`${(capture_flow.knowledge_generation_rate * 100).toFixed(0)}%`}
-          sub={`已生成 knowledge ${fmt(capture_flow.knowledge_generated_count)}`} color="#AF52DE" />
+          sub={`已生成知识 ${fmt(capture_flow.knowledge_generated_count)}`} color="#AF52DE" />
         <StatCard label="知识挂载率" value={`${(capture_flow.knowledge_rate * 100).toFixed(0)}%`}
-          sub={`已关联 capture ${fmt(capture_flow.knowledge_linked_count)}`} color="#FF9500" />
+          sub={`已关联采集内容 ${fmt(capture_flow.knowledge_linked_count)}`} color="#FF9500" />
       </div>
 
       <div style={cardStyle}>
@@ -949,7 +1117,6 @@ const OverviewContent: React.FC<{
           <>
             <ChartLegend items={[
               { label: '已提炼', color: '#BF5AF2' },
-              { label: '等待队列', color: '#FF9500' },
             ]} />
             <SparkLine
               series={[
@@ -958,12 +1125,6 @@ const OverviewContent: React.FC<{
                   color: '#BF5AF2',
                   data: knowledge_flow.by_time.map((t) => ({ ts: t.ts, value: t.count })),
                   valueFormatter: (value) => `${value} 条`,
-                },
-                {
-                  label: '等待队列',
-                  color: '#FF9500',
-                  data: knowledge_flow.by_time.map((t) => ({ ts: t.ts, value: knowledge_flow.pending_extraction_count })),
-                  valueFormatter: (value) => `${value} 待提炼`,
                 },
               ]}
               height={50}
@@ -976,6 +1137,9 @@ const OverviewContent: React.FC<{
             {knowledge_flow.by_time.length === 1 && (
               <div style={{ color: '#AEAEB2', fontSize: 11, marginTop: 6 }}>当前时间范围内仅 1 个统计点。</div>
             )}
+            <div style={{ color: '#8E8E93', fontSize: 11, marginTop: 6 }}>
+              当前库存：时间线 {fmt(knowledge_flow.pending_extraction_count)} 条 · 烘焙 {fmt(knowledge_flow.pending_bake_count)} 条
+            </div>
           </>
         ) : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无知识趋势数据</div>}
       </div>
@@ -1133,7 +1297,7 @@ const OverviewContent: React.FC<{
             }} />
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 12, color: '#333', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {c.win_title || c.app_name || `capture #${c.id}`}
+                {c.win_title || c.app_name || '采集内容'}
               </div>
               <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 2 }}>{fmtTs(c.ts)}</div>
             </div>
@@ -1201,17 +1365,17 @@ const SERVICE_HEALTH_META: Record<string, { title: string; color: string; bg: st
 
 const formatServiceMode = (mode?: string) => {
   if (mode === 'full') return '完整能力'
-  if (mode === 'basic_ipc') return '基础 IPC'
+  if (mode === 'basic_ipc') return '基础能力'
   if (mode === 'limited') return '受限模式'
-  if (mode === 'dry_run') return 'dry-run'
+  if (mode === 'dry_run') return '演练模式'
   if (mode === 'starting') return '启动中'
-  return mode || '未知模式'
+  return '状态待确认'
 }
 
 const ServiceHealthBanner: React.FC<{ health: MonitorOverview['service_health'] }> = ({ health }) => {
   const meta = SERVICE_HEALTH_META[health.status] ?? SERVICE_HEALTH_META.down
   if (health.status === 'ok') return null
-  const issues = health.issues?.length ? health.issues : ['Sidecar 完整后台能力未确认，时间线提炼和 bake 可能不会运行']
+  const issues = health.issues?.length ? health.issues : ['后台整理能力暂未就绪，部分内容可能稍后才能完成提炼']
   return (
     <div style={{
       ...cardStyle,
@@ -1226,14 +1390,14 @@ const ServiceHealthBanner: React.FC<{ health: MonitorOverview['service_health'] 
       </div>
       <div style={{ fontSize: 12, color: '#3A3A3C', lineHeight: 1.6 }}>
         {issues.slice(0, 3).map((issue, idx) => (
-          <div key={idx}>{issue}</div>
+          <div key={idx}>{toUserFacingError(issue, '后台能力暂未就绪，请稍后重试')}</div>
         ))}
       </div>
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
-        <HealthChip ok={health.critical_checks_passed} label="Ollama/LLM" />
-        <HealthChip ok={health.embedding_ok} label="Embedding" />
-        <HealthChip ok={health.full_dispatch_ready} label="完整分发器" />
-        <HealthChip ok={health.background_processor_running} label="后台提炼" />
+        <HealthChip ok={health.critical_checks_passed} label="本地分析" />
+        <HealthChip ok={health.embedding_ok} label="语义索引" />
+        <HealthChip ok={health.full_dispatch_ready} label="任务分发" />
+        <HealthChip ok={health.background_processor_running} label="后台整理" />
       </div>
     </div>
   )
@@ -1254,28 +1418,28 @@ const HealthChip: React.FC<{ ok: boolean; label: string }> = ({ ok, label }) => 
 
 // ── 系统资源内容 ──────────────────────────────────────────────────────────────
 const formatCoverageText = (note?: string | null, status?: string | null) => {
-  if (note && note.trim()) return note
   if (status === 'exact') return '覆盖完整'
   if (status === 'partial') return '部分识别'
   if (status === 'unavailable') return '未识别到进程'
+  if (note) return '覆盖状态待确认'
   return '状态未知'
 }
 
 const formatProcessNames = (names?: string[] | null) => {
   if (!names || names.length === 0) return null
-  return names.join(' · ')
+  return `${names.length} 个本地进程`
 }
 
 const MODEL_TYPE_META: Record<string, { label: string; color: string; bg: string; border: string }> = {
-  llm: { label: 'LLM', color: '#007AFF', bg: 'rgba(0,122,255,0.12)', border: 'rgba(0,122,255,0.18)' },
-  embedding: { label: 'Embedding', color: '#AF52DE', bg: 'rgba(175,82,222,0.12)', border: 'rgba(175,82,222,0.18)' },
-  ocr: { label: 'OCR', color: '#34C759', bg: 'rgba(52,199,89,0.12)', border: 'rgba(52,199,89,0.18)' },
-  asr: { label: 'ASR', color: '#FF9500', bg: 'rgba(255,149,0,0.12)', border: 'rgba(255,149,0,0.18)' },
-  vlm: { label: 'VLM', color: '#FF2D55', bg: 'rgba(255,45,85,0.12)', border: 'rgba(255,45,85,0.18)' },
+  llm: { label: '内容分析', color: '#007AFF', bg: 'rgba(0,122,255,0.12)', border: 'rgba(0,122,255,0.18)' },
+  embedding: { label: '语义索引', color: '#AF52DE', bg: 'rgba(175,82,222,0.12)', border: 'rgba(175,82,222,0.18)' },
+  ocr: { label: '文字识别', color: '#34C759', bg: 'rgba(52,199,89,0.12)', border: 'rgba(52,199,89,0.18)' },
+  asr: { label: '语音识别', color: '#FF9500', bg: 'rgba(255,149,0,0.12)', border: 'rgba(255,149,0,0.18)' },
+  vlm: { label: '图像理解', color: '#FF2D55', bg: 'rgba(255,45,85,0.12)', border: 'rgba(255,45,85,0.18)' },
 }
 
 const getModelTypeMeta = (type?: string | null) => MODEL_TYPE_META[type || ''] || {
-  label: type || '模型',
+  label: '模型',
   color: '#FF2D55',
   bg: 'rgba(255,45,85,0.12)',
   border: 'rgba(255,45,85,0.18)',
@@ -1717,7 +1881,7 @@ const ErrorNotice: React.FC<{ message: string }> = ({ message }) => (
     fontSize: 12,
     lineHeight: 1.5,
   }}>
-    监控数据加载失败：{message}
+    运行数据加载失败：{toUserFacingError(message, '暂时无法读取运行数据')}
   </div>
 )
 
@@ -1730,50 +1894,40 @@ const OverviewRangeControl: React.FC<{
     onChange({ ...value, amount: parsed })
   }
   return (
-    <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-      <span style={{ fontSize: 11, color: '#6E6E73' }}>最近</span>
-      <input
-        type="number"
-        min={1}
-        max={90}
-        value={value.amount}
-        onChange={(event) => updateAmount(event.target.value)}
-        style={{
-          width: 54,
-          fontSize: 11,
-          padding: '3px 6px',
-          borderRadius: 6,
-          border: '1px solid rgba(0,0,0,0.12)',
-          background: 'white',
-          color: '#1D1D1F',
-        }}
-      />
-      <select
-        value={value.unit}
-        onChange={(event) => onChange({ ...value, unit: event.target.value as TimeUnit })}
-        style={{
-          fontSize: 11,
-          padding: '3px 6px',
-          borderRadius: 6,
-          border: '1px solid rgba(0,0,0,0.12)',
-          background: 'white',
-          color: '#1D1D1F',
-        }}
-      >
-        <option value="minute">分钟</option>
-        <option value="hour">小时</option>
-        <option value="day">天</option>
-      </select>
-      {OVERVIEW_QUICK_RANGES.map(({ label, range }) => {
-        const active = isSameOverviewRange(value, range)
-        return (
-          <button key={label} onClick={() => onChange(range)} style={{
-            fontSize: 11, padding: '3px 8px', borderRadius: 6, border: 'none', cursor: 'pointer',
-            background: active ? '#007AFF' : 'white',
-            color: active ? 'white' : '#6E6E73',
-          }}>{label}</button>
-        )
-      })}
+    <div className="monitor-range-control">
+      <div className="monitor-range-control__custom">
+        <span className="monitor-range-control__label">最近</span>
+        <input
+          aria-label="时间范围数值"
+          type="number"
+          min={1}
+          max={90}
+          value={value.amount}
+          onChange={(event) => updateAmount(event.target.value)}
+          className="monitor-range-control__amount"
+        />
+        <select
+          aria-label="时间范围单位"
+          value={value.unit}
+          onChange={(event) => onChange({ ...value, unit: event.target.value as TimeUnit })}
+          className="monitor-range-control__unit"
+        >
+          <option value="minute">分钟</option>
+          <option value="hour">小时</option>
+          <option value="day">天</option>
+        </select>
+      </div>
+      <div className="monitor-range-control__presets" role="group" aria-label="快捷时间范围">
+        {OVERVIEW_QUICK_RANGES.map(({ label, range }) => {
+          const active = isSameOverviewRange(value, range)
+          return (
+            <button key={label} onClick={() => onChange(range)} style={{
+              background: active ? '#007AFF' : 'white',
+              color: active ? 'white' : '#6E6E73',
+            }}>{label}</button>
+          )
+        })}
+      </div>
     </div>
   )
 }
@@ -1916,11 +2070,11 @@ const MonitorPanel: React.FC = () => {
   )
 
   return (
-    <div style={{ height: '100%', overflow: 'auto', background: '#F5F5F7', padding: '16px 20px' }}>
+    <div className="monitor-panel">
 
       {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 10 }}>
-        <div style={{ display: 'flex', gap: 4 }}>
+      <div className="monitor-toolbar">
+        <div className="monitor-toolbar__tabs">
           {(['overview', 'system', 'dag'] as const).map(t => (
             <button key={t} onClick={() => setTab(t)} style={{
               fontSize: 12, padding: '4px 10px', borderRadius: 7, border: 'none', cursor: 'pointer',
@@ -1930,7 +2084,7 @@ const MonitorPanel: React.FC = () => {
             }}>{t === 'overview' ? '总览' : t === 'system' ? '系统资源' : '提炼流程'}</button>
           ))}
         </div>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+        <div className="monitor-toolbar__actions">
           {tab === 'overview' && <OverviewRangeControl value={range} onChange={setRange} />}
           {tab === 'system' && ([
             { value: '1h', label: '1h' },
@@ -1959,7 +2113,7 @@ const MonitorPanel: React.FC = () => {
         <OverviewContent data={data} range={range} liveData={liveData} nowMs={nowMs} />
       )}
       {tab === 'overview' && !data && !overviewError && !loadingOverview && (
-        <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '24px 0' }}>暂无监控数据</div>
+        <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '24px 0' }}>暂无运行数据</div>
       )}
       {tab === 'system' && <SystemContent data={sysData} range={sysRange} />}
       {tab === 'dag' && <PipelineDagPanel base={base} isVisible={isVisible} />}

@@ -10,6 +10,7 @@ import {
 import { useAppStore } from '../store/useAppStore'
 import type { CloudSnapshot, MemoryPackageImportReport } from '../types'
 import { fetchCloudSnapshots, upsertCloudDevice } from '../utils/authApi'
+import { toUserFacingError } from '../utils/userFacingError'
 import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './bake/BakeShared'
 
 const CLOUD_DEVICE_ID_KEY = 'memory-bread_cloud_device_id'
@@ -323,6 +324,7 @@ const randomBase64 = () => {
 const MemoryBackupSection: React.FC = () => {
   const {
     adminApiBaseUrl,
+    serviceEnvironment,
     authToken,
     currentUser,
     accountType,
@@ -405,7 +407,7 @@ const MemoryBackupSection: React.FC = () => {
         result.path,
       )
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '记忆包导出失败')
+      setStatusMessage(toUserFacingError(error, '记忆包导出失败'))
     } finally {
       setMemoryPackageBusy(null)
     }
@@ -422,7 +424,7 @@ const MemoryBackupSection: React.FC = () => {
       setStatusMessage(`记忆包导入完成：${summarizeImportReport(report)}`)
       setBakeMemoryOffset(0)
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '记忆包导入失败')
+      setStatusMessage(toUserFacingError(error, '记忆包导入失败'))
     } finally {
       setMemoryPackageBusy(null)
       if (importFileInputRef.current) importFileInputRef.current.value = ''
@@ -434,7 +436,7 @@ const MemoryBackupSection: React.FC = () => {
     try {
       await invoke('open_export_folder', { path: statusNotice.exportPath })
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : String(error || '无法打开备份所在文件夹'))
+      setStatusMessage(toUserFacingError(error, '无法打开备份所在文件夹'))
     }
   }
 
@@ -455,7 +457,7 @@ const MemoryBackupSection: React.FC = () => {
       }
     } catch (error) {
       if (requestSeq !== cloudSnapshotsRequestSeqRef.current) return
-      const message = error instanceof Error ? error.message : '云端备份列表读取失败'
+      const message = toUserFacingError(error, '云端备份列表读取失败')
       setCloudSnapshotsStatus('error')
       setCloudSnapshotsError(message)
       if (announceResult) setStatusMessage(message)
@@ -494,6 +496,7 @@ const MemoryBackupSection: React.FC = () => {
       const deviceId = await ensureCloudDevice()
       const result = await backupMemoryPackageToCloud({
         admin_base_url: adminApiBaseUrl,
+        service_environment: serviceEnvironment,
         access_token: authToken,
         device_id: deviceId,
         recovery_key_base64: recoveryKey.trim() || undefined,
@@ -508,7 +511,7 @@ const MemoryBackupSection: React.FC = () => {
       setCloudSnapshotsError(null)
       setStatusMessage(`云端备份完成：${formatBytes(result.encrypted_size)}，校验值 ${result.checksum_sha256.slice(0, 12)}...`)
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '云端上传失败')
+      setStatusMessage(toUserFacingError(error, '云端上传失败'))
     } finally {
       setMemoryPackageBusy(null)
     }
@@ -532,6 +535,7 @@ const MemoryBackupSection: React.FC = () => {
     try {
       const result = await restoreMemoryPackageFromCloud({
         admin_base_url: adminApiBaseUrl,
+        service_environment: serviceEnvironment,
         access_token: authToken,
         snapshot_id: selectedCloudSnapshotId,
         recovery_key_base64: recoveryKey.trim(),
@@ -544,7 +548,7 @@ const MemoryBackupSection: React.FC = () => {
         : '云端记忆包已下载')
       setBakeMemoryOffset(0)
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '云端下载失败')
+      setStatusMessage(toUserFacingError(error, '云端下载失败'))
     } finally {
       setMemoryPackageBusy(null)
     }

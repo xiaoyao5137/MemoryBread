@@ -19,6 +19,8 @@ import {
 } from '../hooks/useApi'
 import type { BakeOverviewResponse } from '../hooks/useApi'
 import { useAppStore, type BakeNavigationTarget } from '../store/useAppStore'
+import { toUserFacingError } from '../utils/userFacingError'
+import { listLocalCreationSkills, type CreationSkillSource, type LocalCreationSkill } from '../utils/creationSkills'
 import type {
   ArticleTemplate,
   BakeKnowledgeItem,
@@ -37,6 +39,7 @@ import BakeTabs from './bake/BakeTabs'
 import { BakeButton } from './bake/BakeShared'
 import { parseDateInputToMs } from './bake/BakeCaptureTab'
 import MemoryBackupSection from './MemoryBackupSection'
+import CreationSkillEditor from './CreationSkillEditor'
 import './bake/BakePanel.css'
 
 const PAGE_SIZE = 20
@@ -196,6 +199,7 @@ const buildLocalInventoryTrend = (sources: {
 }
 
 const BakePanel: React.FC = () => {
+  const apiBaseUrl = useAppStore(state => state.apiBaseUrl)
   const {
     bakeTab,
     selectedMemoryId,
@@ -282,13 +286,15 @@ const BakePanel: React.FC = () => {
   const [draftSopQuery, setDraftSopQuery] = useState(bakeSopQuery)
   const [draftSopFrom, setDraftSopFrom] = useState(bakeSopFrom)
   const [draftSopTo, setDraftSopTo] = useState(bakeSopTo)
+  const [creationSkillEditor, setCreationSkillEditor] = useState<{ source?: CreationSkillSource; initialSkill?: LocalCreationSkill } | null>(null)
+  const [relatedTemplateSkills, setRelatedTemplateSkills] = useState<LocalCreationSkill[]>([])
   const knowledgeRequestSeqRef = useRef(0)
 
   useEffect(() => {
     void fetchOverview().then((data) => {
       setOverview(mapBakeOverview(data))
     }).catch((error) => {
-      setStatusMessage(error instanceof Error ? error.message : '记忆数据加载失败')
+      setStatusMessage(toUserFacingError(error, '记忆数据加载失败'))
     })
   }, [fetchOverview])
 
@@ -355,7 +361,7 @@ const BakePanel: React.FC = () => {
         if (requestSeq !== knowledgeRequestSeqRef.current) return
         setKnowledgeItems([])
         setKnowledgeTotal(0)
-        setStatusMessage(error instanceof Error ? error.message : `未找到知识 #${bakeKnowledgeFocusId}`)
+        setStatusMessage(toUserFacingError(error, '未找到这条知识'))
       })
       return
     }
@@ -373,7 +379,7 @@ const BakePanel: React.FC = () => {
       setKnowledgeTotal(data.total)
     }).catch((error) => {
       if (requestSeq !== knowledgeRequestSeqRef.current) return
-      setStatusMessage(error instanceof Error ? error.message : '知识加载失败')
+      setStatusMessage(toUserFacingError(error, '知识加载失败'))
     })
   }, [bakeKnowledgeFocusId, bakeKnowledgeFrom, bakeKnowledgeLimit, bakeKnowledgeOffset, bakeKnowledgeQuery, bakeKnowledgeTo, bakeTab, fetchKnowledge, fetchKnowledgeDetail, setSelectedKnowledgeId])
 
@@ -387,7 +393,7 @@ const BakePanel: React.FC = () => {
       }).catch((error) => {
         setTemplates([])
         setTemplateTotal(0)
-        setStatusMessage(error instanceof Error ? error.message : `未找到文档 #${bakeTemplateFocusId}`)
+        setStatusMessage(toUserFacingError(error, '未找到这份文档'))
       })
       return
     }
@@ -401,7 +407,7 @@ const BakePanel: React.FC = () => {
       setTemplates(data.items)
       setTemplateTotal(data.total)
     }).catch((error) => {
-      setStatusMessage(error instanceof Error ? error.message : '模板加载失败')
+      setStatusMessage(toUserFacingError(error, '文档加载失败'))
     })
   }, [bakeTab, bakeTemplateFocusId, bakeTemplateFrom, bakeTemplateLimit, bakeTemplateOffset, bakeTemplateQuery, bakeTemplateTo, fetchTemplate, fetchTemplates, setSelectedTemplateId])
 
@@ -425,7 +431,7 @@ const BakePanel: React.FC = () => {
       }).catch((error) => {
         setSopCandidates([])
         setSopTotal(0)
-        setStatusMessage(error instanceof Error ? error.message : `未找到操作 #${bakeSopFocusId}`)
+        setStatusMessage(toUserFacingError(error, '未找到这份操作手册'))
       })
       return
     }
@@ -439,7 +445,7 @@ const BakePanel: React.FC = () => {
       setSopCandidates(data.items)
       setSopTotal(data.total)
     }).catch((error) => {
-      setStatusMessage(error instanceof Error ? error.message : '操作手册加载失败')
+      setStatusMessage(toUserFacingError(error, '操作手册加载失败'))
     })
   }, [bakeSopFocusId, bakeSopFrom, bakeSopLimit, bakeSopOffset, bakeSopQuery, bakeSopTo, bakeTab, fetchSop, fetchSops, setSelectedSopId])
 
@@ -491,6 +497,22 @@ const BakePanel: React.FC = () => {
   const resolvedKnowledgeItem = knowledgeItems.find(item => item.id === resolvedKnowledgeId)
   const resolvedSopItem = sopCandidates.find(item => item.id === resolvedSopId)
   const memoryTitleById = useMemo(() => new Map(memoryItems.map(item => [item.id, item.title])), [memoryItems])
+
+  useEffect(() => {
+    if (!resolvedTemplateId) {
+      setRelatedTemplateSkills([])
+      return
+    }
+    let cancelled = false
+    listLocalCreationSkills(apiBaseUrl, { sourceKind: 'bake_document', sourceId: resolvedTemplateId })
+      .then(items => {
+        if (!cancelled) setRelatedTemplateSkills(items)
+      })
+      .catch(() => {
+        if (!cancelled) setRelatedTemplateSkills([])
+      })
+    return () => { cancelled = true }
+  }, [apiBaseUrl, resolvedTemplateId])
 
   const refreshOverview = async () => {
     const data = await fetchOverview()
@@ -676,7 +698,7 @@ const BakePanel: React.FC = () => {
       setStatusMessage(`已新建模板「${created.title}」`)
       await refreshOverview()
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '新建模板失败')
+      setStatusMessage(toUserFacingError(error, '新建文档失败'))
     }
   }
 
@@ -707,7 +729,7 @@ const BakePanel: React.FC = () => {
       setStatusMessage(`已更新模板「${updated.title}」`)
       await refreshOverview()
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '更新模板失败')
+      setStatusMessage(toUserFacingError(error, '更新文档失败'))
     }
   }
 
@@ -718,7 +740,7 @@ const BakePanel: React.FC = () => {
       setStatusMessage(`模板状态已切换为「${updated.status}」`)
       await refreshOverview()
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '切换模板状态失败')
+      setStatusMessage(toUserFacingError(error, '更新文档状态失败'))
     }
   }
 
@@ -737,7 +759,7 @@ const BakePanel: React.FC = () => {
       setStatusMessage('已删除模板')
       await refreshOverview()
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '删除模板失败')
+      setStatusMessage(toUserFacingError(error, '删除文档失败'))
     }
   }
 
@@ -798,7 +820,7 @@ const BakePanel: React.FC = () => {
       setStatusMessage('已删除知识条目')
       await refreshOverview()
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '删除知识失败')
+      setStatusMessage(toUserFacingError(error, '删除知识失败'))
     }
   }
 
@@ -817,7 +839,7 @@ const BakePanel: React.FC = () => {
       setStatusMessage('已删除操作手册')
       await refreshOverview()
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : '删除操作手册失败')
+      setStatusMessage(toUserFacingError(error, '删除操作手册失败'))
     }
   }
 
@@ -864,7 +886,6 @@ const BakePanel: React.FC = () => {
       <BakeHeader />
       {bakeNavigationStack.length > 0 && (
         <div className="bake-backbar">
-          <span>可以返回上一步页面</span>
           <BakeButton compact onClick={handleGoBack}>
             <ArrowLeft size={14} />
             返回上一步
@@ -884,14 +905,14 @@ const BakePanel: React.FC = () => {
           fontSize: 13,
           color: '#856404',
         }}>
-          <div style={{ fontWeight: 600, marginBottom: 4 }}>⚠️ 模型未就绪</div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>AI 能力尚未就绪</div>
           <div style={{ marginBottom: 8 }}>
-            {!modelStatus.ollama && '• Ollama 推理引擎未运行'}
-            {!modelStatus.llm && '• LLM 推理模型未加载'}
-            {!modelStatus.embedding && '• 向量模型未加载'}
+            {!modelStatus.ollama && '本地运行环境未启动。'}
+            {!modelStatus.llm && '分析模型尚未加载。'}
+            {!modelStatus.embedding && '语义索引尚未加载。'}
           </div>
           <div style={{ fontSize: 12 }}>
-            请前往「模型」界面检查模型状态，提炼功能需要所有模型就绪
+            请前往「AI 能力」检查状态，全部就绪后即可继续提炼。
           </div>
         </div>
       )}
@@ -964,6 +985,20 @@ const BakePanel: React.FC = () => {
             onUpdateTemplate={handleUpdateTemplate}
             onToggleTemplateStatus={handleToggleTemplateStatus}
             onDeleteTemplate={handleDeleteTemplate}
+            onSettleSkill={(template) => setCreationSkillEditor({ source: {
+              kind: 'bake_document',
+              id: template.id,
+              title: template.title,
+              docType: template.docType,
+              content: template.fullContent || [
+                `# ${template.title}`,
+                template.summary || '',
+                ...template.sections.map(section => `## ${section.title}\n${section.notes || ''}`),
+                template.promptHint || '',
+              ].filter(Boolean).join('\n\n'),
+            } })}
+            relatedSkills={relatedTemplateSkills}
+            onOpenSkill={(skill) => setCreationSkillEditor({ initialSkill: skill })}
             onViewSourceMemory={handleViewSourceMemory}
             memoryTitleById={memoryTitleById}
             onPageChange={setBakeTemplateOffset}
@@ -1001,6 +1036,19 @@ const BakePanel: React.FC = () => {
             onSearch={handleSearchSop}
             onClearFilters={handleClearSopFilters}
             focusId={bakeSopFocusId}
+          />
+        )}
+        {creationSkillEditor && (
+          <CreationSkillEditor
+            source={creationSkillEditor.source}
+            initialSkill={creationSkillEditor.initialSkill}
+            onClose={() => setCreationSkillEditor(null)}
+            onSaved={(skill) => {
+              setStatusMessage(skill.status === 'draft' ? '创作 Skill 草稿已自动保存' : '创作 Skill 已保存')
+              if (skill.sourceKind === 'bake_document' && skill.sourceId === resolvedTemplateId) {
+                setRelatedTemplateSkills(prev => [skill, ...prev.filter(item => item.id !== skill.id)])
+              }
+            }}
           />
         )}
       </div>

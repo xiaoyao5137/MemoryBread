@@ -1,0 +1,15 @@
+{
+  "bundle": {
+    "category": "Productivity",
+    "targets": ["app", "dmg"],
+    "externalBin": [
+      "binaries/memory-bread-core"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "files": {
+        "Helpers/memory-bread-ai.app": "binaries/memory-bread-ai.app"
+      }
+    }
+  }
+}

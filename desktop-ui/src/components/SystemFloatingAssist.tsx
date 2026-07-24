@@ -3,7 +3,13 @@ import { invoke } from '@tauri-apps/api/core'
 import ReactMarkdown from 'react-markdown'
 import { ChevronDown, ChevronUp, EyeOff, Home, Loader2, MessageSquare, Sparkles, X } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
-import { RAG_REFERENCE_LIMIT, runGatewayRagQuery, runRagQueryJob } from '../hooks/useApi'
+import {
+  RAG_REFERENCE_LIMIT,
+  runGatewayRagQueryStream,
+  runRagQueryStream,
+  type RagStreamCallbacks,
+  type RagStreamStatus,
+} from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
 import type { AchievementBadge, RagContext } from '../types'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
@@ -18,6 +24,15 @@ import {
   type FloatingAssistTaskDetection,
 } from '../utils/floatingAssistAutoTask'
 import { REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId } from '../utils/modelSelection'
+import {
+  INTERACTION_SETTINGS_CHANGED_EVENT,
+  INTERACTION_SETTINGS_KEY,
+  normalizeInteractionSettings,
+  readInteractionSettings,
+  type FloatingBallAction,
+  type InteractionSettings,
+} from '../utils/interactionSettings'
+import { toUserFacingError } from '../utils/userFacingError'
 import { BreadToolIcon } from './icons/BreadIcons'
 import breadRollAsset from '../assets/floating-assist/bread-roll.png'
 import './SystemFloatingAssist.css'
@@ -38,6 +53,13 @@ const AUTO_TASK_DEDUP_CACHE_LIMIT = 64
 const FLOATING_ASSIST_DRAG_TICK_MS = 33
 const FLOATING_ASSIST_AMBIENT_ACTIVE_MS = 2_200
 const FLOATING_ASSIST_AMBIENT_PERIOD_MS = 8_000
+const STREAM_STAGE_PROGRESS: Record<string, { target: number; durationMs: number }> = {
+  queued: { target: 27, durationMs: 12_000 },
+  understanding: { target: 41, durationMs: 30_000 },
+  retrieving: { target: 57, durationMs: 30_000 },
+  waiting_generation: { target: 61, durationMs: 60_000 },
+  answering: { target: 94, durationMs: 120_000 },
+}
 
 const isAssistPhase = (value: string | null): value is AssistPhase =>
   value === 'idle' || value === 'receiving' || value === 'capturing' || value === 'answering' || value === 'done' || value === 'error'
@@ -241,6 +263,8 @@ const SystemFloatingAssist: React.FC = () => {
   const [references, setReferences] = useState<RagContext[]>([])
   const [referencesExpanded, setReferencesExpanded] = useState(false)
   const [outputTruncated, setOutputTruncated] = useState(false)
+  const [inferenceElapsedMs, setInferenceElapsedMs] = useState<number | null>(null)
+  const [streamStatus, setStreamStatus] = useState('')
   const [previewOpen, setPreviewOpen] = useState(false)
   const [canvasOpen, setCanvasOpen] = useState(false)
   const [contextMenuOpen, setContextMenuOpen] = useState(false)
@@ -252,6 +276,7 @@ const SystemFloatingAssist: React.FC = () => {
   const [floatingBadge, setFloatingBadge] = useState<AchievementBadge | null>(null)
   const [progress, setProgress] = useState(0)
   const [autoTaskConfig, setAutoTaskConfig] = useState(readFloatingAssistAutoTaskConfig)
+  const [interactionSettings, setInteractionSettings] = useState(readInteractionSettings)
   const [pendingAutoTask, setPendingAutoTask] = useState<PendingFloatingAssistTask | null>(null)
   const revealTimerRef = useRef<number | null>(null)
   const clickTimerRef = useRef<number | null>(null)
@@ -263,7 +288,10 @@ const SystemFloatingAssist: React.FC = () => {
   const seenAutoTasksRef = useRef<Map<string, number>>(new Map())
   const activeAssistTaskRef = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
+  const runAssistRef = useRef<() => Promise<void>>(async () => {})
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const followStreamingAnswerRef = useRef(true)
   const dragRef = useRef({
     active: false,
     dragging: false,
@@ -279,7 +307,7 @@ const SystemFloatingAssist: React.FC = () => {
   const statusText = useMemo(() => {
     if (phase === 'receiving') return '接住新任务'
     if (phase === 'capturing') return `正在识别屏幕 ${progress}%`
-    if (phase === 'answering') return `正在整理答案 ${progress}%`
+    if (phase === 'answering') return `${streamStatus || '正在整理答案'} ${progress}%`
     if (revealing) return '正在生成'
     if (phase === 'done') return '已生成'
     if (phase === 'error') return '需要处理'
@@ -287,7 +315,7 @@ const SystemFloatingAssist: React.FC = () => {
     if (pendingAutoTask) return '发现可能任务'
     if (autoTaskConfig.enabled) return '自动识别中'
     return '待咨询'
-  }, [answer, autoTaskConfig.enabled, pendingAutoTask, phase, progress, revealing])
+  }, [answer, autoTaskConfig.enabled, pendingAutoTask, phase, progress, revealing, streamStatus])
 
   const clearDoneIdleTimer = useCallback(() => {
     if (doneIdleTimerRef.current != null) {
@@ -316,8 +344,17 @@ const SystemFloatingAssist: React.FC = () => {
       const elapsed = Date.now() - startedAt
       const ratio = Math.min(1, elapsed / durationMs)
       const eased = 1 - Math.pow(1 - ratio, 2)
-      setProgress(Math.min(to, Math.round(from + (to - from) * eased)))
+      const nextProgress = Math.min(to, Math.round(from + (to - from) * eased))
+      setProgress(current => Math.max(current, nextProgress))
     }, 220)
+  }
+
+  const continueStreamProgress = (status: RagStreamStatus) => {
+    const plan = STREAM_STAGE_PROGRESS[status.stage] ?? {
+      target: Math.min(94, status.progress + 10),
+      durationMs: 30_000,
+    }
+    startProgress(status.progress, Math.max(status.progress, plan.target), plan.durationMs)
   }
 
   const waitForPaint = () => new Promise<void>((resolve) => {
@@ -347,6 +384,7 @@ const SystemFloatingAssist: React.FC = () => {
   const hasCanvas = canvasOpen
   const busy = phase === 'receiving' || phase === 'capturing' || phase === 'answering'
   const hasGeneratedAnswer = answer.trim().length > 0
+  const hasStreamingAnswer = phase === 'answering' && hasGeneratedAnswer
   const remoteModelAllowed = canUseRemoteCreationModel(currentUser, cloudBalance)
   const activeModelId = getEffectiveCreationModelId(creationModelConfigs, remoteModelAllowed)
   const collapseExpandedSurface = () => {
@@ -354,8 +392,14 @@ const SystemFloatingAssist: React.FC = () => {
     setContextMenuOpen(false)
     setPreviewOpen(false)
   }
-  const canvasHeight = phase === 'done' || (phase === 'idle' && hasGeneratedAnswer)
-    ? Math.min(560, Math.max(420, 330 + Math.ceil(answer.length / 2.4) + Math.min(references.length, 3) * 42))
+  const canvasHeight = phase === 'answering' || phase === 'done' || (phase === 'idle' && hasGeneratedAnswer)
+    ? Math.min(
+      560,
+      Math.max(
+        phase === 'answering' ? 500 : 420,
+        330 + Math.ceil(answer.length / 2.4) + Math.min(references.length, 3) * 42,
+      ),
+    )
     : phase === 'error'
       ? 370
       : phase === 'idle'
@@ -413,13 +457,9 @@ const SystemFloatingAssist: React.FC = () => {
       lastUserInteractionAtRef.current = Date.now()
     }
     const stopGlobalDrag = () => stopDrag()
-    const handleWindowBlur = () => {
-      stopDrag()
-      collapseExpandedSurface()
-    }
     window.addEventListener('pointerup', stopGlobalDrag)
     window.addEventListener('mouseup', stopGlobalDrag)
-    window.addEventListener('blur', handleWindowBlur)
+    window.addEventListener('blur', stopGlobalDrag)
     const closeContextMenu = () => setContextMenuOpen(false)
     const handleKeyDown = (event: KeyboardEvent) => {
       markUserInteraction()
@@ -429,6 +469,23 @@ const SystemFloatingAssist: React.FC = () => {
     window.addEventListener('wheel', markUserInteraction, { passive: true })
     window.addEventListener('click', closeContextMenu)
     window.addEventListener('keydown', handleKeyDown)
+    const syncInteractionSettings = () => setInteractionSettings(readInteractionSettings())
+    const handleInteractionSettingsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<InteractionSettings>).detail
+      setInteractionSettings(detail ? normalizeInteractionSettings(detail) : readInteractionSettings())
+    }
+    const handleInteractionStorage = (event: StorageEvent) => {
+      if (event.key === INTERACTION_SETTINGS_KEY || event.key === null) {
+        syncInteractionSettings()
+      }
+    }
+    window.addEventListener(INTERACTION_SETTINGS_CHANGED_EVENT, handleInteractionSettingsChanged)
+    window.addEventListener('storage', handleInteractionStorage)
+    void listen<InteractionSettings>(INTERACTION_SETTINGS_CHANGED_EVENT, event => {
+      setInteractionSettings(normalizeInteractionSettings(event.payload))
+    }).then(dispose => {
+      tauriCleanups.push(dispose)
+    }).catch(() => {})
     void listen('floating-assist-reset', () => {
       if (revealTimerRef.current != null) {
         window.clearInterval(revealTimerRef.current)
@@ -499,9 +556,11 @@ const SystemFloatingAssist: React.FC = () => {
       window.removeEventListener('wheel', markUserInteraction)
       window.removeEventListener('pointerup', stopGlobalDrag)
       window.removeEventListener('mouseup', stopGlobalDrag)
-      window.removeEventListener('blur', handleWindowBlur)
+      window.removeEventListener('blur', stopGlobalDrag)
       window.removeEventListener('click', closeContextMenu)
       window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener(INTERACTION_SETTINGS_CHANGED_EVENT, handleInteractionSettingsChanged)
+      window.removeEventListener('storage', handleInteractionStorage)
       tauriCleanups.forEach(cleanup => cleanup())
     }
   }, [])
@@ -577,6 +636,15 @@ const SystemFloatingAssist: React.FC = () => {
     invoke('set_floating_assist_size', { width, height }).catch(() => {})
   }, [canvasHeight, contextMenuOpen, hasCanvas, previewOpen])
 
+  useEffect(() => {
+    if (phase !== 'answering' || !answer || !followStreamingAnswerRef.current) return
+    const frameId = window.requestAnimationFrame(() => {
+      const body = bodyRef.current
+      if (body) body.scrollTop = body.scrollHeight
+    })
+    return () => window.cancelAnimationFrame(frameId)
+  }, [answer, phase])
+
   const revealAnswer = (content: string) => {
     if (revealTimerRef.current != null) {
       window.clearInterval(revealTimerRef.current)
@@ -621,11 +689,14 @@ const SystemFloatingAssist: React.FC = () => {
     setScreenshotSrc('')
     setReferences([])
     setOutputTruncated(false)
+    setInferenceElapsedMs(null)
+    setStreamStatus('')
     setPreviewOpen(false)
     setManualInstruction('')
     setAttachments([])
     setAttachmentError(null)
     setPendingAutoTask(null)
+    followStreamingAnswerRef.current = true
   }
 
   const stopAssist = () => {
@@ -644,7 +715,7 @@ const SystemFloatingAssist: React.FC = () => {
       const next = await filesToAttachments(files, attachments.length)
       setAttachments(prev => [...prev, ...next])
     } catch (err) {
-      setAttachmentError(err instanceof Error ? err.message : '附件读取失败')
+      setAttachmentError(toUserFacingError(err, '附件读取失败'))
     }
   }
 
@@ -668,14 +739,16 @@ const SystemFloatingAssist: React.FC = () => {
     setScreenshotSrc('')
     setReferences([])
     setOutputTruncated(false)
+    setInferenceElapsedMs(null)
+    setStreamStatus('')
     setPreviewOpen(false)
+    followStreamingAnswerRef.current = true
     const controller = new AbortController()
     abortRef.current = controller
     try {
       setPhase('receiving')
       startProgress(4, 12, 900)
       await waitForPaint()
-      await new Promise(resolve => window.setTimeout(resolve, 900))
       setPhase('capturing')
       startProgress(12, 34, 9000)
       await waitForPaint()
@@ -721,24 +794,50 @@ const SystemFloatingAssist: React.FC = () => {
           : undefined,
         attachments: buildAttachmentMetadata(attachments),
       }
+      const streamCallbacks: RagStreamCallbacks = {
+        onStatus: status => {
+          setStreamStatus(status.message)
+          continueStreamProgress(status)
+        },
+        onReferences: contexts => {
+          setReferences(contexts)
+        },
+        onDelta: (_delta, accumulated) => {
+          setPhase('answering')
+          setRevealing(true)
+          setAnswer(accumulated)
+          setProgress(current => Math.min(94, Math.max(58, current + 1)))
+        },
+      }
       const result = activeModelId === REMOTE_CREATION_MODEL_ID && currentUser?.id
-        ? await runGatewayRagQuery(apiBaseUrl, gatewayApiBaseUrl, queryWithAttachments, currentUser.id, controller.signal, {
+        ? await runGatewayRagQueryStream(apiBaseUrl, gatewayApiBaseUrl, queryWithAttachments, currentUser.id, controller.signal, {
           source: 'floating_assist',
           metadata,
-        })
-        : await runRagQueryJob(apiBaseUrl, creationModelConfigs, queryWithAttachments, RAG_REFERENCE_LIMIT, metadata, remoteModelAllowed, controller.signal)
+        }, streamCallbacks)
+        : await runRagQueryStream(
+          apiBaseUrl,
+          creationModelConfigs,
+          queryWithAttachments,
+          RAG_REFERENCE_LIMIT,
+          metadata,
+          remoteModelAllowed,
+          controller.signal,
+          streamCallbacks,
+        )
       setReferences(result.contexts ?? [])
       setOutputTruncated(Boolean(result.output_truncated))
+      setInferenceElapsedMs(result.inference_elapsed_ms ?? result.elapsed_ms ?? null)
       stopProgress()
       setProgress(100)
       setPhase('done')
-      revealAnswer(result.answer?.trim() || '本次没有生成咨询输出，请重试。')
+      setRevealing(false)
+      setAnswer(result.answer?.trim() || '本次没有生成咨询输出，请重试。')
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return true
       stopProgress()
       setRevealing(false)
       setPhase('error')
-      setError(err instanceof Error ? err.message : String(err))
+      setError(toUserFacingError(err, '暂时无法完成请求，请稍后重试'))
     } finally {
       if (abortRef.current === controller) abortRef.current = null
       activeAssistTaskRef.current = false
@@ -749,6 +848,35 @@ const SystemFloatingAssist: React.FC = () => {
   const runAssist = async () => {
     await runAssistWithOcr()
   }
+  runAssistRef.current = runAssist
+
+  useEffect(() => {
+    let dispose: (() => void) | null = null
+    let cancelled = false
+    const consumePendingAction = async () => {
+      try {
+        const action = await invoke<string | null>('take_pending_floating_assist_action')
+        if (!cancelled && action === 'recognize_screen_task') {
+          await runAssistRef.current()
+        }
+      } catch {
+        // 浏览器预览环境没有原生悬浮球动作队列。
+      }
+    }
+
+    void consumePendingAction()
+    void listen('floating-assist-action-triggered', () => {
+      void consumePendingAction()
+    }).then(cleanup => {
+      if (cancelled) cleanup()
+      else dispose = cleanup
+    }).catch(() => {})
+
+    return () => {
+      cancelled = true
+      dispose?.()
+    }
+  }, [])
 
   const showPendingAutoTask = async (ocr: FloatingAssistOcrResult, detection: FloatingAssistTaskDetection) => {
     clearDoneIdleTimer()
@@ -761,6 +889,8 @@ const SystemFloatingAssist: React.FC = () => {
     setAnswer('')
     setReferences([])
     setOutputTruncated(false)
+    setInferenceElapsedMs(null)
+    setStreamStatus('')
     setScreenshot(ocr)
     setPendingAutoTask({ ocr, detection })
     try {
@@ -896,14 +1026,16 @@ const SystemFloatingAssist: React.FC = () => {
     setError(null)
     setReferences([])
     setOutputTruncated(false)
+    setInferenceElapsedMs(null)
+    setStreamStatus('')
     setPreviewOpen(false)
+    followStreamingAnswerRef.current = true
     const controller = new AbortController()
     abortRef.current = controller
     try {
       setPhase('receiving')
       startProgress(8, 18, 900)
       await waitForPaint()
-      await new Promise(resolve => window.setTimeout(resolve, 900))
       setPhase('answering')
       startProgress(18, 92, 60000)
       await waitForPaint()
@@ -923,12 +1055,27 @@ const SystemFloatingAssist: React.FC = () => {
         manual_instruction: instruction,
         attachments: buildAttachmentMetadata(attachments),
       }
+      const streamCallbacks: RagStreamCallbacks = {
+        onStatus: status => {
+          setStreamStatus(status.message)
+          continueStreamProgress(status)
+        },
+        onReferences: contexts => {
+          setReferences(contexts)
+        },
+        onDelta: (_delta, accumulated) => {
+          setPhase('answering')
+          setRevealing(true)
+          setAnswer(accumulated)
+          setProgress(current => Math.min(94, Math.max(58, current + 1)))
+        },
+      }
       const result = activeModelId === REMOTE_CREATION_MODEL_ID && currentUser?.id
-        ? await runGatewayRagQuery(apiBaseUrl, gatewayApiBaseUrl, queryWithAttachments, currentUser.id, controller.signal, {
+        ? await runGatewayRagQueryStream(apiBaseUrl, gatewayApiBaseUrl, queryWithAttachments, currentUser.id, controller.signal, {
           source: 'floating_assist',
           metadata,
-        })
-        : await runRagQueryJob(
+        }, streamCallbacks)
+        : await runRagQueryStream(
           apiBaseUrl,
           creationModelConfigs,
           queryWithAttachments,
@@ -936,20 +1083,23 @@ const SystemFloatingAssist: React.FC = () => {
           metadata,
           remoteModelAllowed,
           controller.signal,
+          streamCallbacks,
         )
       setReferences(result.contexts ?? [])
       setOutputTruncated(Boolean(result.output_truncated))
+      setInferenceElapsedMs(result.inference_elapsed_ms ?? result.elapsed_ms ?? null)
       stopProgress()
       setProgress(100)
       setPhase('done')
       setManualInstruction('')
-      revealAnswer(result.answer?.trim() || '本次没有生成咨询输出，请重试。')
+      setRevealing(false)
+      setAnswer(result.answer?.trim() || '本次没有生成咨询输出，请重试。')
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return
       stopProgress()
       setRevealing(false)
       setPhase('error')
-      setError(err instanceof Error ? err.message : String(err))
+      setError(toUserFacingError(err, '暂时无法完成请求，请稍后重试'))
     } finally {
       if (abortRef.current === controller) abortRef.current = null
       activeAssistTaskRef.current = false
@@ -975,24 +1125,6 @@ const SystemFloatingAssist: React.FC = () => {
     setContextMenuOpen(false)
   }
 
-  const handleOutsidePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (event.target === event.currentTarget) {
-      collapseExpandedSurface()
-    }
-  }
-
-  const handleBallClick = () => {
-    if (suppressClickRef.current) return
-    setContextMenuOpen(false)
-    if (clickTimerRef.current != null) {
-      window.clearTimeout(clickTimerRef.current)
-    }
-    clickTimerRef.current = window.setTimeout(() => {
-      clickTimerRef.current = null
-      toggleCanvas()
-    }, 220)
-  }
-
   const handleBallContextMenu = (event: React.MouseEvent) => {
     event.preventDefault()
     event.stopPropagation()
@@ -1014,6 +1146,31 @@ const SystemFloatingAssist: React.FC = () => {
       .finally(() => {
         invoke('show_main_panel_from_floating_assist').catch(() => {})
       })
+  }
+
+  const runFloatingBallAction = (action: FloatingBallAction) => {
+    if (action === 'none') return
+    if (action === 'open_floating_consult') {
+      toggleCanvas()
+      return
+    }
+    if (action === 'open_main_panel') {
+      openMainPanel()
+      return
+    }
+    void runAssist()
+  }
+
+  const handleBallClick = () => {
+    if (suppressClickRef.current) return
+    setContextMenuOpen(false)
+    if (clickTimerRef.current != null) {
+      window.clearTimeout(clickTimerRef.current)
+    }
+    clickTimerRef.current = window.setTimeout(() => {
+      clickTimerRef.current = null
+      runFloatingBallAction(interactionSettings.floatingBall.singleClick)
+    }, 220)
   }
 
   const handleManualWheel = useCallback((event: React.WheelEvent<HTMLTextAreaElement>) => {
@@ -1042,7 +1199,7 @@ const SystemFloatingAssist: React.FC = () => {
       window.clearTimeout(clickTimerRef.current)
       clickTimerRef.current = null
     }
-    void runAssist()
+    runFloatingBallAction(interactionSettings.floatingBall.doubleClick)
   }
 
   const startDrag = (event: React.PointerEvent<HTMLElement>) => {
@@ -1151,13 +1308,15 @@ const SystemFloatingAssist: React.FC = () => {
     : visibleReferences.slice(0, DEFAULT_VISIBLE_REFERENCE_COUNT)
   const hiddenReferenceCount = visibleReferences.length - DEFAULT_VISIBLE_REFERENCE_COUNT
   const floatingAnswer = useMemo(() => splitFloatingAssistAnswer(answer), [answer])
-  const displayedAnswer = floatingAnswer.responseContent || (floatingAnswer.userQuestionUnderstanding ? '' : answer)
-  const showAnswer = Boolean(displayedAnswer) && (phase === 'done' || phase === 'idle')
+  const displayedAnswer = floatingAnswer.responseContent
+    || (!screenshotSrc ? floatingAnswer.userQuestionUnderstanding : '')
+    || (floatingAnswer.userQuestionUnderstanding ? '' : answer)
+  const showAnswer = phase === 'answering'
+    || (Boolean(displayedAnswer) && (phase === 'done' || phase === 'idle'))
 
   return (
     <div
       className={`system-floating-assist ${debugBackground ? 'system-floating-assist--debug-bg' : ''} ${hasCanvas ? 'system-floating-assist--open' : ''} ${hasCanvas || contextMenuOpen ? 'system-floating-assist--dismissable' : ''}`}
-      onPointerDown={handleOutsidePointerDown}
     >
       <div className="system-floating-assist__dock">
         <button
@@ -1286,7 +1445,16 @@ const SystemFloatingAssist: React.FC = () => {
             </div>
           </header>
 
-          <div className="system-floating-assist__body">
+          <div
+            ref={bodyRef}
+            className="system-floating-assist__body"
+            onScroll={(event) => {
+              if (phase !== 'answering') return
+              const body = event.currentTarget
+              followStreamingAnswerRef.current =
+                body.scrollHeight - body.scrollTop - body.clientHeight <= 48
+            }}
+          >
             {screenshotSrc && (
               <div className="system-floating-assist__consult-screen">
                 <div className="system-floating-assist__consult-title">用户咨询：</div>
@@ -1324,7 +1492,7 @@ const SystemFloatingAssist: React.FC = () => {
             )}
 
             {(phase === 'receiving' || phase === 'capturing' || phase === 'answering') && (
-              <div className="system-floating-assist__thinking">
+              <div className={`system-floating-assist__thinking${hasStreamingAnswer ? ' system-floating-assist__thinking--streaming' : ''}`}>
                 <div className="system-floating-assist__thinking-row">
                   <Loader2 size={18} className="system-floating-assist__spin" />
                   <span>{statusText}</span>
@@ -1364,8 +1532,13 @@ const SystemFloatingAssist: React.FC = () => {
             )}
 
             {showAnswer && (
-              <div className="system-floating-assist__answer">
-                <div className="system-floating-assist__output-title">咨询输出</div>
+              <div className={`system-floating-assist__answer${phase === 'answering' ? ' system-floating-assist__answer--streaming' : ''}`}>
+                <div className="system-floating-assist__output-title">
+                  <span>咨询输出{phase === 'answering' ? ' · 正在生成' : ''}</span>
+                  {phase === 'done' && inferenceElapsedMs != null && (
+                    <small>推理耗时 {formatElapsed(inferenceElapsedMs)}</small>
+                  )}
+                </div>
                 {outputTruncated && (
                   <div className="system-floating-assist__answer-notice">
                     本次回答触达输出长度上限，已返回可用部分。请点击重试生成更完整版本。
@@ -1395,7 +1568,7 @@ const SystemFloatingAssist: React.FC = () => {
                 rows={2}
                 disabled={busy}
                 onKeyDown={(event) => {
-                  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                     void runManualAssist(event)
                   }
                 }}
@@ -1453,20 +1626,26 @@ const SystemFloatingAssist: React.FC = () => {
             </button>
           </form>
 
-          {showAnswer && visibleReferences.length > 0 && (
+          {visibleReferences.length > 0 && (
             <div className="system-floating-assist__refs">
               <div className="system-floating-assist__refs-title">参考资料</div>
-              {displayedReferences.map((item, index) => (
-                <button
-                  className="system-floating-assist__ref"
-                  type="button"
-                  onClick={() => openReference(item)}
-                  key={`${item.doc_key || item.capture_id}-${index}`}
-                >
-                  <span>R{index + 1}</span>
-                  <strong>{referenceTitle(item)}</strong>
-                </button>
-              ))}
+              {displayedReferences.map((item, index) => {
+                const referenceType = referenceTypeMeta(item)
+                return (
+                  <button
+                    className="system-floating-assist__ref"
+                    type="button"
+                    onClick={() => openReference(item)}
+                    key={`${item.doc_key || item.capture_id}-${index}`}
+                  >
+                    <span className={`system-floating-assist__ref-type system-floating-assist__ref-type--${referenceType.kind}`}>
+                      {referenceType.label}
+                    </span>
+                    <span className="system-floating-assist__ref-index">R{index + 1}</span>
+                    <strong>{referenceTitle(item)}</strong>
+                  </button>
+                )
+              })}
               {hiddenReferenceCount > 0 && (
                 <button
                   className="system-floating-assist__refs-toggle"
@@ -1474,7 +1653,7 @@ const SystemFloatingAssist: React.FC = () => {
                   aria-expanded={referencesExpanded}
                   onClick={() => setReferencesExpanded(expanded => !expanded)}
                 >
-                  {referencesExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                  {referencesExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
                   {referencesExpanded ? '收起' : `展开更多（${hiddenReferenceCount}）`}
                 </button>
               )}
@@ -1495,6 +1674,21 @@ const SystemFloatingAssist: React.FC = () => {
 
 const referenceTitle = (item: RagContext) =>
   item.title || item.overview || item.summary || item.win_title || item.app_name || item.text?.slice(0, 48) || '参考资料'
+
+const formatElapsed = (elapsedMs: number) => {
+  if (elapsedMs < 1000) return `${Math.max(1, Math.round(elapsedMs))} ms`
+  return `${(elapsedMs / 1000).toFixed(elapsedMs < 10_000 ? 1 : 0)} 秒`
+}
+
+type FloatingReferenceType = 'knowledge' | 'document' | 'operation' | 'timeline'
+
+const referenceTypeMeta = (item: RagContext): { kind: FloatingReferenceType; label: string } => {
+  const sourceType = item.source_type || item.source
+  if (sourceType === 'bake_knowledge') return { kind: 'knowledge', label: '知识' }
+  if (sourceType === 'document') return { kind: 'document', label: '文档' }
+  if (sourceType === 'operation' || sourceType === 'action') return { kind: 'operation', label: '操作' }
+  return { kind: 'timeline', label: '时间线' }
+}
 
 const MarkdownContent = ({ content }: { content: string }) => {
   const inlineComponents = {

@@ -14,6 +14,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+from energy_policy import EnergyPolicy
 from scheduled_task_executor import (
     IDLE_DIARY_BACKFILL_LOOKBACK_DAYS,
     TaskExecutor,
@@ -41,9 +42,11 @@ class IdleDiaryBackfillWorker:
         stable_idle_secs: Optional[float] = None,
         cooldown_secs: Optional[float] = None,
         lookback_days: Optional[int] = None,
+        energy_policy: Optional[EnergyPolicy] = None,
     ) -> None:
         self.db_path = db_path
         self.executor = executor or TaskExecutor(db_path=db_path)
+        self.energy_policy = energy_policy or EnergyPolicy(db_path)
         self.queue_provider = queue_provider or self._default_queue_provider
         self.enabled = _env_bool("DIARY_IDLE_BACKFILL_ENABLED", True) if enabled is None else enabled
         self.interval_secs = interval_secs if interval_secs is not None else float(
@@ -90,6 +93,16 @@ class IdleDiaryBackfillWorker:
         """Run one polling tick. Exposed for tests."""
         if not self.enabled:
             return {"status": "disabled"}
+
+        profile = self.energy_policy.current_profile()
+        if not profile.allow_diary:
+            self._idle_since = None
+            return {
+                "status": "deferred",
+                "reason": "waiting_for_external_power",
+                "energy_mode": profile.mode,
+                "battery_percent": profile.battery_percent,
+            }
 
         now = now if now is not None else time.monotonic()
         if not self._queue_is_idle():

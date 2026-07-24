@@ -67,7 +67,12 @@ fn extract_document_identity(url: &str) -> String {
         .unwrap_or(url);
 
     if let Some((host, rest)) = without_protocol.split_once('/') {
-        let path = rest.split('?').next().unwrap_or(rest).trim_end_matches('/');
+        let path_without_query = rest.split('?').next().unwrap_or(rest);
+        let path = path_without_query
+            .split('#')
+            .next()
+            .unwrap_or(path_without_query)
+            .trim_end_matches('/');
 
         if path.is_empty() {
             return host.to_lowercase();
@@ -83,6 +88,154 @@ fn extract_document_identity(url: &str) -> String {
     } else {
         without_protocol.to_lowercase()
     }
+}
+
+#[derive(Debug)]
+struct TimelineUrlGroup {
+    identity: String,
+    representative_url: String,
+    title_affinity: u8,
+    occurrence_count: usize,
+    last_seen_ts: i64,
+    is_document: bool,
+}
+
+fn normalized_source_title(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn source_title_affinity(candidate: Option<&str>, preferred_titles: &[&str]) -> u8 {
+    let Some(candidate) = candidate
+        .map(normalized_source_title)
+        .filter(|value| !value.is_empty())
+    else {
+        return 0;
+    };
+
+    preferred_titles
+        .iter()
+        .map(|preferred| normalized_source_title(preferred))
+        .filter(|preferred| !preferred.is_empty())
+        .map(|preferred| {
+            if candidate == preferred {
+                3
+            } else if candidate.chars().count().min(preferred.chars().count()) >= 6
+                && (candidate.contains(&preferred) || preferred.contains(&candidate))
+            {
+                2
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn prefer_representative_url(current: &str, candidate: &str) -> bool {
+    let current_has_fragment = current.contains('#');
+    let candidate_has_fragment = candidate.contains('#');
+    (current_has_fragment && !candidate_has_fragment)
+        || (current_has_fragment == candidate_has_fragment && candidate.len() < current.len())
+}
+
+fn is_generic_document_landing_url(url: &str) -> bool {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let without_protocol = without_query
+        .strip_prefix("https://")
+        .or_else(|| without_query.strip_prefix("http://"))
+        .unwrap_or(without_query);
+    let path = without_protocol
+        .split_once('/')
+        .map(|(_, path)| path.trim_matches('/'))
+        .unwrap_or("");
+    path.is_empty() || matches!(path.to_lowercase().as_str(), "home" | "docs" | "wiki")
+}
+
+fn find_timeline_fallback_source_url(
+    conn: &Connection,
+    timeline_id: i64,
+    preferred_titles: &[&str],
+) -> Result<Option<String>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT url, win_title, webpage_title, ts
+         FROM captures
+         WHERE timeline_id = ?1
+           AND url IS NOT NULL
+           AND TRIM(url) <> ''
+         ORDER BY ts ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![timeline_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    let mut groups: Vec<TimelineUrlGroup> = Vec::new();
+    for row in rows {
+        let (url, win_title, webpage_title, ts) = row?;
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            continue;
+        }
+        let identity = extract_document_identity(&url);
+        let affinity = source_title_affinity(win_title.as_deref(), preferred_titles).max(
+            source_title_affinity(webpage_title.as_deref(), preferred_titles),
+        );
+        let is_document = is_document_url(&url);
+
+        if let Some(group) = groups.iter_mut().find(|group| group.identity == identity) {
+            group.title_affinity = group.title_affinity.max(affinity);
+            group.occurrence_count += 1;
+            group.last_seen_ts = group.last_seen_ts.max(ts);
+            group.is_document |= is_document;
+            if prefer_representative_url(&group.representative_url, &url) {
+                group.representative_url = url;
+            }
+        } else {
+            groups.push(TimelineUrlGroup {
+                identity,
+                representative_url: url,
+                title_affinity: affinity,
+                occurrence_count: 1,
+                last_seen_ts: ts,
+                is_document,
+            });
+        }
+    }
+
+    if let Some(group) = groups
+        .iter()
+        .filter(|group| group.title_affinity > 0)
+        .max_by_key(|group| {
+            (
+                group.title_affinity,
+                group.is_document,
+                group.occurrence_count,
+                group.last_seen_ts,
+            )
+        })
+    {
+        return Ok(Some(group.representative_url.clone()));
+    }
+
+    let document_groups = groups
+        .iter()
+        .filter(|group| {
+            group.is_document && !is_generic_document_landing_url(&group.representative_url)
+        })
+        .collect::<Vec<_>>();
+    if document_groups.len() == 1 {
+        return Ok(Some(document_groups[0].representative_url.clone()));
+    }
+
+    Ok(None)
 }
 
 impl StorageManager {
@@ -865,6 +1018,22 @@ impl StorageManager {
                     record.timeline.capture_ids = Some(to_json_array_string(&full_member_ids));
                 }
 
+                if record.capture_url.is_none() {
+                    let preferred_titles = [
+                        record.capture_webpage_title.as_deref(),
+                        record.capture_win_title.as_deref(),
+                        record.timeline.frag_win_title.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                    record.capture_url = find_timeline_fallback_source_url(
+                        conn,
+                        record.timeline.id,
+                        &preferred_titles,
+                    )?;
+                }
+
                 // 优先聚合 timeline 全部成员 capture 的内容（含文档型成员的正文），
                 // 因为主 capture 常是 IM，代表不了 timeline 里浏览/编辑的文档。
                 let member_ids = parse_capture_ids(record.timeline.capture_ids.as_deref());
@@ -1141,23 +1310,24 @@ impl StorageManager {
 
 const URL_AGGREGATION_LOOKBACK_MS: i64 = 30 * 24 * 3600 * 1000;
 const URL_AGGREGATION_MAX_CAPTURES: i64 = 30;
-const URL_AGGREGATION_TOTAL_BUDGET_CHARS: usize = 12000;
-const URL_AGGREGATION_PER_CAPTURE_CAP_CHARS: usize = 4000;
+const URL_AGGREGATION_TOTAL_BUDGET_CHARS: usize = 32_000;
+const URL_AGGREGATION_PER_CAPTURE_CAP_CHARS: usize = 16_000;
 const URL_AGGREGATION_DEDUP_HEAD_CHARS: usize = 200;
 
 // 成员聚合：把一条 timeline 的 capture_ids 数组里所有成员的可见文本拼起来，
 // 用于补充主 capture 之外的内容（尤其文档型成员，主 capture 常是 IM 无法代表）。
 const MEMBER_AGGREGATION_MAX_CAPTURES: usize = 40;
-const MEMBER_AGGREGATION_TOTAL_BUDGET_CHARS: usize = 12000;
-const MEMBER_AGGREGATION_PER_CAPTURE_CAP_CHARS: usize = 2000;
+const MEMBER_AGGREGATION_TOTAL_BUDGET_CHARS: usize = 32_000;
+const MEMBER_AGGREGATION_PER_CAPTURE_CAP_CHARS: usize = 16_000;
 const MEMBER_AGGREGATION_DEDUP_HEAD_CHARS: usize = 200;
 
 /// 聚合一条 timeline 全部成员 capture 的可见文本。
 ///
 /// 设计要点：
 /// - 文档型成员（URL 含文档域名）优先靠前，保证有限预算下文档正文不被 IM/编码噪声挤掉；
-/// - 同一份文档的多次 capture 按 head 去重，避免重复抄录；
-/// - 返回 (聚合文本, 纳入的成员数)。成员数 <= 1 时返回 None（无聚合价值，回退到主 capture）。
+/// - 同一份文档的多次 capture 按 head 去重，保留正文最长（同长时最新）的一帧；
+/// - 返回 (聚合文本, 纳入的成员数)。即使去重后只剩一帧，也保留这帧，因为它可能
+///   比 timeline 主 capture 更完整。
 fn aggregate_member_capture_text(
     conn: &Connection,
     capture_ids: &[i64],
@@ -1226,22 +1396,34 @@ fn aggregate_member_capture_text(
         return Ok(None);
     }
 
-    // 文档型优先（稳定排序：先 is_doc 降序，再时间升序），保证预算先喂文档正文。
-    members.sort_by(|a, b| b.is_doc.cmp(&a.is_doc).then(a.ts.cmp(&b.ts)));
-
-    let mut buf = String::new();
-    let mut seen_heads: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut budget = MEMBER_AGGREGATION_TOTAL_BUDGET_CHARS;
-    let mut included = 0_i64;
-    for m in &members {
-        let head: String = m
+    // 相同开头通常是同一页面的周期性快照。旧逻辑先到先得，会把更晚、更完整的长
+    // 快照误删，只留下最早的短文本；改为每个 head 保留最长（同长时最新）的版本。
+    let mut best_by_head: std::collections::HashMap<String, Member> =
+        std::collections::HashMap::new();
+    for member in members {
+        let head: String = member
             .text
             .chars()
             .take(MEMBER_AGGREGATION_DEDUP_HEAD_CHARS)
             .collect();
-        if !seen_heads.insert(head) {
-            continue; // 同一份内容已收录，跳过重复
+        let should_replace = best_by_head.get(&head).map_or(true, |existing| {
+            let member_len = member.text.chars().count();
+            let existing_len = existing.text.chars().count();
+            member_len > existing_len || (member_len == existing_len && member.ts > existing.ts)
+        });
+        if should_replace {
+            best_by_head.insert(head, member);
         }
+    }
+    let mut members: Vec<Member> = best_by_head.into_values().collect();
+
+    // 文档型优先（稳定排序：先 is_doc 降序，再时间升序），保证预算先喂文档正文。
+    members.sort_by(|a, b| b.is_doc.cmp(&a.is_doc).then(a.ts.cmp(&b.ts)));
+
+    let mut buf = String::new();
+    let mut budget = MEMBER_AGGREGATION_TOTAL_BUDGET_CHARS;
+    let mut included = 0_i64;
+    for m in &members {
         let allowed = budget.min(MEMBER_AGGREGATION_PER_CAPTURE_CAP_CHARS);
         if allowed == 0 {
             break;
@@ -1267,7 +1449,7 @@ fn aggregate_member_capture_text(
         }
     }
 
-    if included <= 1 {
+    if included == 0 {
         return Ok(None);
     }
     Ok(Some((buf, included)))
@@ -1371,35 +1553,53 @@ fn aggregate_url_capture_text(
         },
     )?;
 
-    let mut buf = String::new();
-    let mut last_head = String::new();
-    let mut budget = URL_AGGREGATION_TOTAL_BUDGET_CHARS;
-    let mut included = 0_i64;
+    struct UrlCapture {
+        cap_id: i64,
+        ts: i64,
+        text: String,
+    }
+    let mut best_by_head: std::collections::HashMap<String, UrlCapture> =
+        std::collections::HashMap::new();
     for row in rows {
         let (cap_id, ts, ax_text, ocr_text, input_text) = row.map_err(StorageError::Sqlite)?;
-        let combined = combine_capture_text_for_url(
+        let text = combine_capture_text_for_url(
             ax_text.as_deref(),
             ocr_text.as_deref(),
             input_text.as_deref(),
         );
-        if combined.is_empty() {
+        if text.is_empty() {
             continue;
         }
-        let head: String = combined
+        let head: String = text
             .chars()
             .take(URL_AGGREGATION_DEDUP_HEAD_CHARS)
             .collect();
-        if !last_head.is_empty() && head == last_head {
-            continue;
+        let should_replace = best_by_head.get(&head).map_or(true, |existing| {
+            let text_len = text.chars().count();
+            let existing_len = existing.text.chars().count();
+            text_len > existing_len || (text_len == existing_len && ts > existing.ts)
+        });
+        if should_replace {
+            best_by_head.insert(head, UrlCapture { cap_id, ts, text });
         }
-        last_head = head;
+    }
+    let mut captures: Vec<UrlCapture> = best_by_head.into_values().collect();
+    captures.sort_by_key(|capture| capture.ts);
+
+    let mut buf = String::new();
+    let mut budget = URL_AGGREGATION_TOTAL_BUDGET_CHARS;
+    let mut included = 0_i64;
+    for capture in captures {
         let allowed = budget.min(URL_AGGREGATION_PER_CAPTURE_CAP_CHARS);
         if allowed == 0 {
             break;
         }
-        let truncated: String = combined.chars().take(allowed).collect();
+        let truncated: String = capture.text.chars().take(allowed).collect();
         let used = truncated.chars().count();
-        buf.push_str(&format!("--- capture#{} ts={} ---\n", cap_id, ts));
+        buf.push_str(&format!(
+            "--- capture#{} ts={} ---\n",
+            capture.cap_id, capture.ts
+        ));
         buf.push_str(&truncated);
         buf.push_str("\n\n");
         budget = budget.saturating_sub(used);
@@ -1408,7 +1608,7 @@ fn aggregate_url_capture_text(
             break;
         }
     }
-    if included <= 1 {
+    if included == 0 {
         return Ok(None);
     }
     Ok(Some((buf, included)))
@@ -2196,6 +2396,28 @@ mod tests {
         .expect("插入 capture 失败")
     }
 
+    fn seed_document_capture(mgr: &StorageManager, ts: i64, text: String, url: &str) -> i64 {
+        mgr.insert_capture(&NewCapture {
+            ts,
+            app_name: Some("Chrome".to_string()),
+            app_bundle_id: Some("com.google.Chrome".to_string()),
+            win_title: Some("长文档 - 云文档".to_string()),
+            event_type: EventType::Manual,
+            ax_text: Some(text),
+            ax_focused_role: None,
+            ax_focused_id: None,
+            ocr_text: None,
+            screenshot_path: None,
+            screenshot_source: None,
+            input_text: None,
+            is_sensitive: false,
+            pii_scrubbed: false,
+            url: Some(url.to_string()),
+            webpage_title: Some("长文档".to_string()),
+        })
+        .expect("插入文档 capture 失败")
+    }
+
     fn sample_entry(mgr: &StorageManager, category: &str) -> NewTimeline {
         NewTimeline {
             capture_id: seed_capture(mgr),
@@ -2273,6 +2495,127 @@ mod tests {
         let candidates = mgr.list_bake_memory_init_candidates(0, 10).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].timeline.category, "meeting");
+    }
+
+    #[test]
+    fn test_extract_document_identity_ignores_fragment() {
+        assert_eq!(
+            extract_document_identity(
+                "https://docs.corp.kuaishou.com/d/home/fcAAmNeDmIOF15Y6K80NVq0Wq#section=a"
+            ),
+            extract_document_identity(
+                "https://docs.corp.kuaishou.com/d/home/fcAAmNeDmIOF15Y6K80NVq0Wq#section=b"
+            )
+        );
+    }
+
+    #[test]
+    fn test_list_bake_candidates_recovers_url_from_matching_timeline_capture() {
+        let mgr = make_mgr();
+        let primary_capture_id = seed_capture(&mgr);
+        mgr.with_conn(|conn| {
+            conn.execute(
+                "UPDATE captures
+                 SET app_name = 'ChatGPT Atlas',
+                     win_title = '容器云 GPU 指标采集项目 - 云文档'
+                 WHERE id = ?1",
+                params![primary_capture_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let mut timeline = sample_entry(&mgr, "document");
+        timeline.capture_id = primary_capture_id;
+        timeline.frag_win_title = Some("容器云 GPU 指标采集项目 - 云文档".to_string());
+        let timeline_id = mgr.insert_timeline_entry(&timeline).unwrap();
+
+        let source_capture_id = mgr
+            .insert_capture(&NewCapture {
+                ts: 1_700_000_010_000,
+                app_name: Some("Google Chrome".to_string()),
+                app_bundle_id: Some("com.google.Chrome".to_string()),
+                win_title: Some("容器云 GPU 指标采集项目 - 云文档 - Google Chrome".to_string()),
+                event_type: EventType::Manual,
+                ax_text: Some("GPU 指标定义".to_string()),
+                ax_focused_role: None,
+                ax_focused_id: None,
+                ocr_text: None,
+                screenshot_path: None,
+                screenshot_source: None,
+                input_text: None,
+                is_sensitive: false,
+                pii_scrubbed: false,
+                url: Some(
+                    "https://docs.corp.kuaishou.com/d/home/fcAAmNeDmIOF15Y6K80NVq0Wq".to_string(),
+                ),
+                webpage_title: Some("容器云 GPU 指标采集项目 - 云文档".to_string()),
+            })
+            .unwrap();
+        mgr.with_conn(|conn| {
+            conn.execute(
+                "UPDATE captures SET timeline_id = ?1 WHERE id IN (?2, ?3)",
+                params![timeline_id, primary_capture_id, source_capture_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let candidates = mgr.list_bake_memory_init_candidates(0, 10).unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.timeline.id == timeline_id)
+            .unwrap();
+        assert_eq!(
+            candidate.capture_url.as_deref(),
+            Some("https://docs.corp.kuaishou.com/d/home/fcAAmNeDmIOF15Y6K80NVq0Wq")
+        );
+    }
+
+    #[test]
+    fn test_url_aggregation_keeps_longest_snapshot_when_document_head_repeats() {
+        let mgr = make_mgr();
+        let url = "https://docs.corp.kuaishou.com/d/home/long-document";
+        let shared_head = "共同文档开头".repeat(60);
+        let short_text = format!("{shared_head}\n短版本");
+        let long_tail = "长版本尾部关键信息".repeat(500);
+        let long_text = format!("{shared_head}\n{long_tail}");
+        seed_document_capture(&mgr, 1_700_000_000_000, short_text, url);
+        seed_document_capture(&mgr, 1_700_000_010_000, long_text.clone(), url);
+
+        let (aggregated, count) = mgr
+            .with_conn(|conn| aggregate_url_capture_text(conn, url, 1_700_000_010_000))
+            .unwrap()
+            .expect("应返回去重后的最长文档快照");
+
+        assert_eq!(count, 1);
+        assert!(aggregated.contains(&long_tail));
+        assert!(aggregated.chars().count() >= long_text.chars().count());
+    }
+
+    #[test]
+    fn test_member_aggregation_keeps_longest_snapshot_even_if_only_one_remains() {
+        let mgr = make_mgr();
+        let url = "https://docs.corp.kuaishou.com/d/home/member-long-document";
+        let shared_head = "同一页面固定开头".repeat(60);
+        let short_id = seed_document_capture(
+            &mgr,
+            1_700_000_000_000,
+            format!("{shared_head}\n短版本"),
+            url,
+        );
+        let long_tail = "必须保留的文档末尾".repeat(500);
+        let long_text = format!("{shared_head}\n{long_tail}");
+        let long_id = seed_document_capture(&mgr, 1_700_000_010_000, long_text.clone(), url);
+
+        let (aggregated, count) = mgr
+            .with_conn(|conn| aggregate_member_capture_text(conn, &[short_id, long_id], short_id))
+            .unwrap()
+            .expect("应保留比主 capture 更完整的单一快照");
+
+        assert_eq!(count, 1);
+        assert!(aggregated.contains(&long_tail));
+        assert!(aggregated.chars().count() >= long_text.chars().count());
     }
 
     #[test]

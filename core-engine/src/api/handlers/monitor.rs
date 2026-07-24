@@ -3,8 +3,9 @@
 //! GET /api/monitor/overview?range_ms=21600000
 //! 聚合返回：token 用量、采集流水、问答记录、定时任务执行
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
@@ -39,6 +40,224 @@ fn build_not_like_clause(column: &str, keywords: &[&str]) -> String {
         .map(|keyword| format!("LOWER({column}) NOT LIKE '%{}%'", keyword.to_lowercase()))
         .collect::<Vec<_>>()
         .join(" AND ")
+}
+
+fn load_pipeline_backlog_metrics(
+    conn: &rusqlite::Connection,
+    now_ms: i64,
+) -> Result<PipelineBacklogMetrics, rusqlite::Error> {
+    let app_not_like = build_not_like_clause("c.app_name", &SELF_GENERATED_APP_KEYWORDS);
+    let win_not_like = build_not_like_clause("c.win_title", &SELF_GENERATED_WINDOW_KEYWORDS);
+    let pending_capture_sql = format!(
+        "SELECT COUNT(*), MIN(c.ts)
+         FROM captures c
+         WHERE (
+               COALESCE(c.ocr_text, '') != ''
+            OR COALESCE(c.ax_text, '') != ''
+            OR COALESCE(c.input_text, '') != ''
+            OR COALESCE(c.audio_text, '') != ''
+         )
+           AND c.timeline_id IS NULL
+           AND c.is_sensitive = 0
+           AND ({app_not_like})
+           AND ({win_not_like})"
+    );
+    let (pending_extraction_count, oldest_pending_extraction_at_ms) =
+        conn.query_row(&pending_capture_sql, [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+
+    // This predicate mirrors BakeService::is_high_value_candidate and its
+    // candidate timestamp (timeline update or latest member capture).  The
+    // watermark excludes candidates already visited and intentionally
+    // discarded; substantive document captures are included even when their
+    // importance/evidence metadata is still weak.
+    let pending_bake_sql = r#"
+        WITH pending AS (
+            SELECT
+                t.id,
+                MAX(
+                    COALESCE(t.updated_at_ms, 0),
+                    COALESCE(
+                        (SELECT MAX(c2.ts) FROM captures c2 WHERE c2.timeline_id = t.id),
+                        0
+                    )
+                ) AS candidate_ts
+            FROM timelines t
+            LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
+            WHERE t.category NOT IN (
+                    'bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate'
+                  )
+              AND t.is_self_generated = 0
+              AND COALESCE(r.failure_count, 0) < 3
+              AND (
+                    t.importance >= 4
+                 OR t.user_verified = 1
+                 OR t.history_view = 1
+                 OR (
+                        t.evidence_strength IN ('high', 'medium')
+                    AND (
+                           t.activity_type IN (
+                               'coding', 'reading', 'reviewing_history', 'document_reference'
+                           )
+                        OR t.content_origin IN ('historical_content', 'live_interaction')
+                    )
+                 )
+                 OR EXISTS (
+                    SELECT 1
+                    FROM captures dc
+                    WHERE dc.timeline_id = t.id
+                      AND (
+                           LOWER(COALESCE(dc.url, '')) LIKE '%docs.corp%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%/docs/%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%docs.google%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%/document/%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%yuque.com%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%feishu.cn/docx%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%feishu.cn/wiki%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%notion.so%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%confluence%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%/wiki/%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%shimo.im%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%/d/home/%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%/s/home/%'
+                        OR LOWER(COALESCE(dc.url, '')) LIKE '%/k/home/%'
+                      )
+                      AND LENGTH(
+                            REPLACE(
+                                REPLACE(
+                                    COALESCE(dc.ax_text, '') || COALESCE(dc.ocr_text, ''),
+                                    ' ',
+                                    ''
+                                ),
+                                char(10),
+                                ''
+                            )
+                          ) >= 200
+                 )
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM bake_knowledge bk WHERE bk.timeline_id = t.id
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM bake_sops bs WHERE bs.timeline_id = t.id
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM bake_documents bd
+                    WHERE bd.deleted_at IS NULL
+                      AND (
+                           (
+                               json_valid(COALESCE(bd.source_memory_ids, '[]'))
+                               AND EXISTS (
+                                   SELECT 1 FROM json_each(bd.source_memory_ids)
+                                   WHERE CAST(json_each.value AS TEXT) = CAST(t.id AS TEXT)
+                               )
+                           )
+                        OR (
+                               json_valid(COALESCE(bd.source_episode_ids, '[]'))
+                               AND EXISTS (
+                                   SELECT 1 FROM json_each(bd.source_episode_ids)
+                                   WHERE CAST(json_each.value AS TEXT) = CAST(t.id AS TEXT)
+                               )
+                           )
+                      )
+              )
+              AND MAX(
+                    COALESCE(t.updated_at_ms, 0),
+                    COALESCE(
+                        (SELECT MAX(c4.ts) FROM captures c4 WHERE c4.timeline_id = t.id),
+                        0
+                    )
+                  ) > COALESCE(
+                        (
+                            SELECT MAX(last_processed_ts)
+                            FROM bake_watermarks
+                            WHERE pipeline_name = 'unified'
+                        ),
+                        0
+                      )
+        )
+        SELECT COUNT(*), MIN(candidate_ts) FROM pending
+    "#;
+    let (pending_bake_count, oldest_pending_bake_at_ms) =
+        conn.query_row(pending_bake_sql, [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+
+    let bake_retry_exhausted_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bake_retry_state WHERE failure_count >= 3",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let running_bake_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bake_runs
+             WHERE status = 'running' AND started_at >= ?1",
+            rusqlite::params![now_ms - DAG_RUNNING_BAKE_STALE_MS],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let stale_bake_run_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bake_runs
+             WHERE status = 'running' AND started_at < ?1",
+            rusqlite::params![now_ms - DAG_RUNNING_BAKE_STALE_MS],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    Ok(PipelineBacklogMetrics {
+        pending_extraction_count,
+        oldest_pending_extraction_at_ms,
+        pending_bake_count,
+        oldest_pending_bake_at_ms,
+        bake_retry_exhausted_count,
+        running_bake_count,
+        stale_bake_run_count,
+    })
+}
+
+async fn read_inference_queue_monitor(sidecar_url: &str) -> InferenceQueueMonitor {
+    let url = format!(
+        "{}/api/inference/queue-status",
+        sidecar_url.trim_end_matches('/')
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return InferenceQueueMonitor::default(),
+    };
+    let response = match client.get(url).send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => return InferenceQueueMonitor::default(),
+    };
+    let body = match response.json::<UpstreamInferenceQueueResponse>().await {
+        Ok(body) if body.status == "ok" => body,
+        _ => return InferenceQueueMonitor::default(),
+    };
+    let Some(stats) = body.stats else {
+        return InferenceQueueMonitor::default();
+    };
+    let queued_p0 = stats.queue_lengths.get("P0").copied().unwrap_or(0);
+    let queued_p1 = stats.queue_lengths.get("P1").copied().unwrap_or(0);
+    let queued_p2 = stats.queue_lengths.get("P2").copied().unwrap_or(0);
+    InferenceQueueMonitor {
+        available: true,
+        idle: body.idle,
+        queued_total: queued_p0 + queued_p1 + queued_p2,
+        queued_p0,
+        queued_p1,
+        queued_p2,
+        running_total: stats.running_total,
+        oldest_wait_ms: stats.oldest_wait_ms,
+        max_concurrency: stats.max_concurrency,
+        on_external_power: stats.on_external_power,
+    }
 }
 
 // ── 请求参数 ─────────────────────────────────────────────────────────────────
@@ -266,7 +485,15 @@ pub struct AppCount {
 pub struct KnowledgeFlow {
     pub today_count: i64,
     pub period_count: i64,
+    /// 全量库存：尚未归入 timeline 的可提炼 capture，不受趋势时间范围影响。
     pub pending_extraction_count: i64,
+    pub oldest_pending_extraction_at_ms: Option<i64>,
+    /// 全量库存：已有 timeline、尚未生成任一 bake 产物的高价值候选。
+    pub pending_bake_count: i64,
+    pub oldest_pending_bake_at_ms: Option<i64>,
+    pub bake_retry_exhausted_count: i64,
+    pub running_bake_count: i64,
+    pub stale_bake_run_count: i64,
     pub by_time: Vec<KnowledgeTimePoint>,
     pub recent: Vec<KnowledgeItem>,
     /// 当前正在被提炼的 captures（来自 sidecar 实时状态）
@@ -275,6 +502,68 @@ pub struct KnowledgeFlow {
     pub last_extraction_at_ms: Option<i64>,
     /// 提炼器状态：running / waiting / idle / stalled
     pub extractor_status: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PipelineBacklogMetrics {
+    pending_extraction_count: i64,
+    oldest_pending_extraction_at_ms: Option<i64>,
+    pending_bake_count: i64,
+    oldest_pending_bake_at_ms: Option<i64>,
+    bake_retry_exhausted_count: i64,
+    running_bake_count: i64,
+    stale_bake_run_count: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct InferenceQueueMonitor {
+    pub available: bool,
+    pub idle: bool,
+    pub queued_total: i64,
+    pub queued_p0: i64,
+    pub queued_p1: i64,
+    pub queued_p2: i64,
+    pub running_total: i64,
+    pub oldest_wait_ms: i64,
+    pub max_concurrency: i64,
+    pub on_external_power: Option<bool>,
+}
+
+impl Default for InferenceQueueMonitor {
+    fn default() -> Self {
+        Self {
+            available: false,
+            idle: false,
+            queued_total: 0,
+            queued_p0: 0,
+            queued_p1: 0,
+            queued_p2: 0,
+            running_total: 0,
+            oldest_wait_ms: 0,
+            max_concurrency: 0,
+            on_external_power: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpstreamInferenceQueueResponse {
+    status: String,
+    idle: bool,
+    stats: Option<UpstreamInferenceQueueStats>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpstreamInferenceQueueStats {
+    #[serde(default)]
+    queue_lengths: HashMap<String, i64>,
+    #[serde(default)]
+    running_total: i64,
+    #[serde(default)]
+    oldest_wait_ms: i64,
+    #[serde(default)]
+    max_concurrency: i64,
+    on_external_power: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -532,9 +821,6 @@ pub async fn monitor_overview(
             .filter_map(|r| r.ok())
             .collect();
 
-        let app_not_like = build_not_like_clause("c.app_name", &SELF_GENERATED_APP_KEYWORDS);
-        let win_not_like = build_not_like_clause("c.win_title", &SELF_GENERATED_WINDOW_KEYWORDS);
-
         let knowledge_today_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM timelines WHERE created_at >= datetime(?1/1000, 'unixepoch') AND summary NOT LIKE ?2",
             rusqlite::params![today_start, fallback_noise_pattern.as_str()],
@@ -545,21 +831,7 @@ pub async fn monitor_overview(
             rusqlite::params![from_ms, fallback_noise_pattern.as_str()],
             |r| r.get(0),
         ).unwrap_or(0);
-        let pending_extraction_count_sql = format!(
-            "SELECT COUNT(*) FROM captures c
-             WHERE ((c.ocr_text IS NOT NULL AND c.ocr_text != '')
-                OR (c.ax_text IS NOT NULL AND c.ax_text != ''))
-               AND c.timeline_id IS NULL
-               AND c.is_sensitive = 0
-               AND c.ts >= ?1
-               AND ({app_not_like})
-               AND ({win_not_like})"
-        );
-        let pending_extraction_count: i64 = conn.query_row(
-            &pending_extraction_count_sql,
-            rusqlite::params![from_ms],
-            |r| r.get(0),
-        ).unwrap_or(0);
+        let backlog = load_pipeline_backlog_metrics(conn, now_ms).unwrap_or_default();
 
         let mut knowledge_by_time_stmt = conn.prepare(
             "SELECT (CAST(strftime('%s', created_at) AS INTEGER) * 1000 / ?1) * ?1 + ?1/2 as bucket, COUNT(*)
@@ -703,7 +975,13 @@ pub async fn monitor_overview(
             knowledge_flow: KnowledgeFlow {
                 today_count: knowledge_today_count,
                 period_count: knowledge_period_count,
-                pending_extraction_count,
+                pending_extraction_count: backlog.pending_extraction_count,
+                oldest_pending_extraction_at_ms: backlog.oldest_pending_extraction_at_ms,
+                pending_bake_count: backlog.pending_bake_count,
+                oldest_pending_bake_at_ms: backlog.oldest_pending_bake_at_ms,
+                bake_retry_exhausted_count: backlog.bake_retry_exhausted_count,
+                running_bake_count: backlog.running_bake_count,
+                stale_bake_run_count: backlog.stale_bake_run_count,
                 by_time: knowledge_by_time,
                 recent: knowledge_recent,
                 extracting: Vec::new(),
@@ -978,6 +1256,13 @@ pub struct ExtractionLiveResponse {
     pub extracting: Vec<ExtractingCapture>,
     pub last_extraction_at_ms: Option<i64>,
     pub pending_extraction_count: i64,
+    pub oldest_pending_extraction_at_ms: Option<i64>,
+    pub pending_bake_count: i64,
+    pub oldest_pending_bake_at_ms: Option<i64>,
+    pub bake_retry_exhausted_count: i64,
+    pub running_bake_count: i64,
+    pub stale_bake_run_count: i64,
+    pub inference_queue: InferenceQueueMonitor,
     pub recent: Vec<KnowledgeItem>,
     pub server_now_ms: i64,
 }
@@ -989,27 +1274,10 @@ pub async fn monitor_extraction_live(
     let now_ms = Utc::now().timestamp_millis();
     let from_ms = now_ms - query_range_ms(&params);
     let fallback_noise_pattern = format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX);
-    let app_not_like = build_not_like_clause("app_name", &SELF_GENERATED_APP_KEYWORDS);
-    let win_not_like = build_not_like_clause("win_title", &SELF_GENERATED_WINDOW_KEYWORDS);
-
-    let (pending_extraction_count, recent) = state
+    let (backlog, recent) = state
         .storage
         .with_conn_async(move |conn| {
-            let pending_sql = format!(
-                "SELECT COUNT(*) FROM captures
-                 WHERE ((ocr_text IS NOT NULL AND ocr_text != '')
-                    OR (ax_text IS NOT NULL AND ax_text != '')
-                    OR (input_text IS NOT NULL AND input_text != '')
-                    OR (audio_text IS NOT NULL AND audio_text != ''))
-                   AND timeline_id IS NULL
-                   AND is_sensitive = 0
-                   AND ts >= ?1
-                   AND ({app_not_like})
-                   AND ({win_not_like})"
-            );
-            let pending: i64 = conn
-                .query_row(&pending_sql, rusqlite::params![from_ms], |r| r.get(0))
-                .unwrap_or(0);
+            let backlog = load_pipeline_backlog_metrics(conn, now_ms).unwrap_or_default();
 
             let mut stmt = conn.prepare(
                 "SELECT id,
@@ -1042,7 +1310,7 @@ pub async fn monitor_extraction_live(
                 .filter_map(|r| r.ok())
                 .collect();
 
-            Ok((pending, recent))
+            Ok((backlog, recent))
         })
         .await?;
 
@@ -1050,7 +1318,13 @@ pub async fn monitor_extraction_live(
     let mut tmp = KnowledgeFlow {
         today_count: 0,
         period_count: 0,
-        pending_extraction_count,
+        pending_extraction_count: backlog.pending_extraction_count,
+        oldest_pending_extraction_at_ms: backlog.oldest_pending_extraction_at_ms,
+        pending_bake_count: backlog.pending_bake_count,
+        oldest_pending_bake_at_ms: backlog.oldest_pending_bake_at_ms,
+        bake_retry_exhausted_count: backlog.bake_retry_exhausted_count,
+        running_bake_count: backlog.running_bake_count,
+        stale_bake_run_count: backlog.stale_bake_run_count,
         by_time: Vec::new(),
         recent: Vec::new(),
         extracting: Vec::new(),
@@ -1059,13 +1333,21 @@ pub async fn monitor_extraction_live(
     };
     enrich_extractor_status(&mut tmp, now_ms).await;
     let service_health = read_sidecar_runtime_health(now_ms).await;
+    let inference_queue = read_inference_queue_monitor(&state.sidecar_url).await;
 
     Ok(Json(ExtractionLiveResponse {
         extractor_status: tmp.extractor_status,
         service_health,
         extracting: tmp.extracting,
         last_extraction_at_ms: tmp.last_extraction_at_ms,
-        pending_extraction_count,
+        pending_extraction_count: backlog.pending_extraction_count,
+        oldest_pending_extraction_at_ms: backlog.oldest_pending_extraction_at_ms,
+        pending_bake_count: backlog.pending_bake_count,
+        oldest_pending_bake_at_ms: backlog.oldest_pending_bake_at_ms,
+        bake_retry_exhausted_count: backlog.bake_retry_exhausted_count,
+        running_bake_count: backlog.running_bake_count,
+        stale_bake_run_count: backlog.stale_bake_run_count,
+        inference_queue,
         recent,
         server_now_ms: now_ms,
     }))
@@ -2053,6 +2335,12 @@ pub async fn monitor_pipeline_dag(
         today_count: 0,
         period_count: 0,
         pending_extraction_count: 0,
+        oldest_pending_extraction_at_ms: None,
+        pending_bake_count: 0,
+        oldest_pending_bake_at_ms: None,
+        bake_retry_exhausted_count: 0,
+        running_bake_count: 0,
+        stale_bake_run_count: 0,
         by_time: Vec::new(),
         recent: Vec::new(),
         extracting: Vec::new(),
@@ -2082,36 +2370,27 @@ pub async fn monitor_pipeline_dag(
                         .join(",")
                 )
             };
-            let capture_pending_sql = format!(
-                "SELECT COUNT(*) FROM captures
-                 WHERE timeline_id IS NULL
-                   AND ts >= ?1
-                   AND (COALESCE(ax_text, '') != ''
-                        OR COALESCE(ocr_text, '') != ''
-                        OR COALESCE(input_text, '') != ''
-                        OR COALESCE(audio_text, '') != ''){placeholders}"
-            );
-            let capture_pending_count: i64 = conn
-                .query_row(&capture_pending_sql, rusqlite::params![pending_from_ms], |r| {
-                    r.get(0)
-                })
-                .unwrap_or(0);
-
+            let capture_app_not_like =
+                build_not_like_clause("app_name", &SELF_GENERATED_APP_KEYWORDS);
+            let capture_win_not_like =
+                build_not_like_clause("win_title", &SELF_GENERATED_WINDOW_KEYWORDS);
             let capture_items_sql = format!(
                 "SELECT id, ts, COALESCE(app_name, ''), COALESCE(win_title, '')
                  FROM captures
                  WHERE timeline_id IS NULL
-                   AND ts >= ?1
+                   AND is_sensitive = 0
                    AND (COALESCE(ax_text, '') != ''
                         OR COALESCE(ocr_text, '') != ''
                         OR COALESCE(input_text, '') != ''
-                        OR COALESCE(audio_text, '') != ''){placeholders}
-                 ORDER BY ts DESC
-                 LIMIT ?2"
+                        OR COALESCE(audio_text, '') != '')
+                   AND ({capture_app_not_like})
+                   AND ({capture_win_not_like}){placeholders}
+                 ORDER BY ts ASC
+                 LIMIT ?1"
             );
             let mut stmt = conn.prepare(&capture_items_sql)?;
             let capture_pending_items: Vec<DagItem> = stmt
-                .query_map(rusqlite::params![pending_from_ms, DAG_ITEM_LIMIT], |r| {
+                .query_map(rusqlite::params![DAG_ITEM_LIMIT], |r| {
                     let id: i64 = r.get(0)?;
                     let ts: i64 = r.get(1)?;
                     let app: String = r.get(2)?;
@@ -2148,36 +2427,60 @@ pub async fn monitor_pipeline_dag(
             //   3. 排除不满足 is_high_value_candidate 条件的低价值条目
             //      （importance < 4 且 evidence_strength NOT IN ('high','medium')）
             //   4. 排除 unified bake 水位线之前已经处理过但被 LLM 判定丢弃的条目
-            let timeline_watermark_ts: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(last_processed_ts), 0)
-                     FROM bake_watermarks
-                     WHERE pipeline_name = 'unified'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
             let timeline_pending_sql = "
                 SELECT t.id,
-                       CAST(strftime('%s', t.created_at) AS INTEGER) * 1000 AS ts_ms,
+                       MAX(
+                           COALESCE(t.updated_at_ms, 0),
+                           COALESCE((SELECT MAX(c2.ts) FROM captures c2 WHERE c2.timeline_id = t.id), 0)
+                       ) AS ts_ms,
                        COALESCE(t.summary, ''),
                        COALESCE(t.frag_app_name, ''),
                        COALESCE(t.frag_win_title, '')
                 FROM timelines t
                 LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
                 WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
-                  AND t.updated_at_ms > ?1
                   AND t.is_self_generated = 0
                   AND COALESCE(r.failure_count, 0) < 3
                   AND (
                       t.importance >= 4
                       OR t.user_verified = 1
+                      OR t.history_view = 1
                       OR (
                           t.evidence_strength IN ('high', 'medium')
-                          AND (t.history_view = 1
-                               OR t.activity_type IN ('coding','reading','reviewing_history','document_reference')
+                          AND (t.activity_type IN ('coding','reading','reviewing_history','document_reference')
                                OR t.content_origin IN ('historical_content','live_interaction')
                           )
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM captures dc
+                          WHERE dc.timeline_id = t.id
+                            AND (
+                                 LOWER(COALESCE(dc.url, '')) LIKE '%docs.corp%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%/docs/%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%docs.google%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%/document/%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%yuque.com%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%feishu.cn/docx%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%feishu.cn/wiki%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%notion.so%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%confluence%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%/wiki/%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%shimo.im%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%/d/home/%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%/s/home/%'
+                              OR LOWER(COALESCE(dc.url, '')) LIKE '%/k/home/%'
+                            )
+                            AND LENGTH(
+                                  REPLACE(
+                                      REPLACE(
+                                          COALESCE(dc.ax_text, '') || COALESCE(dc.ocr_text, ''),
+                                          ' ',
+                                          ''
+                                      ),
+                                      char(10),
+                                      ''
+                                  )
+                                ) >= 200
                       )
                   )
                   AND NOT EXISTS (SELECT 1 FROM bake_knowledge bk WHERE bk.timeline_id = t.id)
@@ -2185,13 +2488,36 @@ pub async fn monitor_pipeline_dag(
                   AND NOT EXISTS (
                       SELECT 1 FROM bake_documents bd
                       WHERE bd.deleted_at IS NULL
-                        AND bd.source_episode_ids LIKE '%' || t.id || '%'
+                        AND (
+                            EXISTS (
+                                SELECT 1 FROM json_each(bd.source_memory_ids)
+                                WHERE CAST(json_each.value AS TEXT) = CAST(t.id AS TEXT)
+                            )
+                            OR EXISTS (
+                                SELECT 1 FROM json_each(bd.source_episode_ids)
+                                WHERE CAST(json_each.value AS TEXT) = CAST(t.id AS TEXT)
+                            )
+                        )
                   )
-                ORDER BY t.created_at DESC
-                LIMIT ?2";
+                  AND MAX(
+                        COALESCE(t.updated_at_ms, 0),
+                        COALESCE(
+                            (SELECT MAX(c4.ts) FROM captures c4 WHERE c4.timeline_id = t.id),
+                            0
+                        )
+                      ) > COALESCE(
+                            (
+                                SELECT MAX(last_processed_ts)
+                                FROM bake_watermarks
+                                WHERE pipeline_name = 'unified'
+                            ),
+                            0
+                          )
+                ORDER BY ts_ms ASC
+                LIMIT ?1";
             let mut stmt = conn.prepare(timeline_pending_sql)?;
             let timeline_pending_items: Vec<DagItem> = stmt
-                .query_map(rusqlite::params![timeline_watermark_ts, DAG_ITEM_LIMIT], |r| {
+                .query_map(rusqlite::params![DAG_ITEM_LIMIT], |r| {
                     let id: i64 = r.get(0)?;
                     let ts: i64 = r.get(1)?;
                     let summary: String = r.get(2)?;
@@ -2219,79 +2545,6 @@ pub async fn monitor_pipeline_dag(
                 .filter_map(|r| r.ok())
                 .collect();
             drop(stmt);
-
-            let timeline_pending_count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM timelines t
-                     LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
-                     WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
-                       AND t.updated_at_ms > ?1
-                       AND t.is_self_generated = 0
-                       AND COALESCE(r.failure_count, 0) < 3
-                       AND (
-                           t.importance >= 4
-                           OR t.user_verified = 1
-                           OR (
-                               t.evidence_strength IN ('high', 'medium')
-                               AND (t.history_view = 1
-                                    OR t.activity_type IN ('coding','reading','reviewing_history','document_reference')
-                                    OR t.content_origin IN ('historical_content','live_interaction')
-                               )
-                           )
-                       )
-                       AND NOT EXISTS (SELECT 1 FROM bake_knowledge bk WHERE bk.timeline_id = t.id)
-                       AND NOT EXISTS (SELECT 1 FROM bake_sops bs WHERE bs.timeline_id = t.id)
-                       AND NOT EXISTS (
-                           SELECT 1 FROM bake_documents bd
-                           WHERE bd.deleted_at IS NULL
-                             AND bd.source_episode_ids LIKE '%' || t.id || '%'
-                       )",
-                    rusqlite::params![timeline_watermark_ts],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-
-            // bake_watermark_lag_ms：watermark 距离"最老一条仍在排队的高价值候选"有多远。
-            // 用同一套候选过滤 SQL 的前置条件查 MIN(updated_at_ms)，再减 watermark。
-            // 已追上（无候选）时返回 0；watermark 卡死时这个值会持续增长，揭穿"假 0 排队"。
-            let bake_watermark_lag_ms: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MIN(t.updated_at_ms), 0)
-                     FROM timelines t
-                     LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
-                     WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
-                       AND t.updated_at_ms > ?1
-                       AND t.is_self_generated = 0
-                       AND COALESCE(r.failure_count, 0) < 3
-                       AND (
-                           t.importance >= 4
-                           OR t.user_verified = 1
-                           OR (
-                               t.evidence_strength IN ('high', 'medium')
-                               AND (t.history_view = 1
-                                    OR t.activity_type IN ('coding','reading','reviewing_history','document_reference')
-                                    OR t.content_origin IN ('historical_content','live_interaction')
-                               )
-                           )
-                       )
-                       AND NOT EXISTS (SELECT 1 FROM bake_knowledge bk WHERE bk.timeline_id = t.id)
-                       AND NOT EXISTS (SELECT 1 FROM bake_sops bs WHERE bs.timeline_id = t.id)
-                       AND NOT EXISTS (
-                           SELECT 1 FROM bake_documents bd
-                           WHERE bd.deleted_at IS NULL
-                             AND bd.source_episode_ids LIKE '%' || t.id || '%'
-                       )",
-                    rusqlite::params![timeline_watermark_ts],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map(|oldest_pending_ts| {
-                    if oldest_pending_ts <= 0 {
-                        0
-                    } else {
-                        (oldest_pending_ts - timeline_watermark_ts).max(0)
-                    }
-                })
-                .unwrap_or(0);
 
             // 按下游产出表的 created_at（文本格式 YYYY-MM-DD）过滤今日，反映真实的今日 bake 产量
             let timeline_completed_today: i64 = conn
@@ -2374,6 +2627,16 @@ pub async fn monitor_pipeline_dag(
                 .filter_map(|r| r.ok())
                 .collect();
             drop(running_stmt);
+
+            // 首页与 DAG 使用同一份库存口径。上面的列表查询只返回若干条
+            // 用于抽屉展示；节点数字来自与实际 bake 候选一致的全量统计。
+            let backlog = load_pipeline_backlog_metrics(conn, now_ms).unwrap_or_default();
+            let capture_pending_count = backlog.pending_extraction_count;
+            let timeline_pending_count = backlog.pending_bake_count;
+            let bake_watermark_lag_ms = backlog
+                .oldest_pending_bake_at_ms
+                .map(|oldest| now_ms.saturating_sub(oldest).max(0))
+                .unwrap_or(0);
 
             Ok(DagAggregated {
                 capture_pending_count,
@@ -2531,7 +2794,7 @@ struct DagAggregated {
     document_pending_items: Vec<DagItem>,
     document_completed_today: i64,
     running_runs: Vec<DagRunningRun>,
-    /// bake watermark 距离最老一条等待处理候选 timeline 的间隔（ms），0 表示已追上。
+    /// 兼容字段：最老一条待烘焙 timeline 的实际等待时长（ms），0 表示无库存。
     bake_watermark_lag_ms: i64,
 }
 

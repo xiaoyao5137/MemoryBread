@@ -462,8 +462,8 @@
   transform: none;
 }
 
-/* 透明置顶 WebView 中只播放有限次动画：挥手仅响应 hover，
-   --ambient-active 只负责眨眼和脸颊呼吸等轻量闲时细节。 */
+/* 透明置顶 WebView 的闲时动画保持有限播放；咨询执行中的识别和思考动画
+   则跟随 phase 持续循环，并在完成、失败或取消时自动停止。 */
 .system-floating-assist__ball--idle:hover .system-floating-assist__bread-arm--right,
 .system-floating-assist__ball--done:hover .system-floating-assist__bread-arm--right,
 .system-floating-assist__ball--error:hover .system-floating-assist__bread-arm--right,
@@ -541,11 +541,11 @@
 }
 
 .system-floating-assist__ball--capturing .system-floating-assist__mascot {
-  animation: floating-assist-bread-scan-bob 1.16s ease-in-out 2 both;
+  animation: floating-assist-bread-scan-bob 1.16s ease-in-out infinite;
 }
 
 .system-floating-assist__ball--capturing .system-floating-assist__bread-body {
-  animation: floating-assist-bread-scan-warm 1.16s ease-in-out 2 both;
+  animation: floating-assist-bread-scan-warm 1.16s ease-in-out infinite;
 }
 
 .system-floating-assist__ball--capturing .system-floating-assist__bread-eye {
@@ -561,39 +561,39 @@
 }
 
 .system-floating-assist__ball--capturing .system-floating-assist__task-card {
-  animation: floating-assist-bread-task-read 1.16s ease-in-out 2 both;
+  animation: floating-assist-bread-task-read 1.16s ease-in-out infinite;
 }
 
 .system-floating-assist__ball--capturing .system-floating-assist__scan-ring--outer {
-  animation: floating-assist-bread-scan-ring 1.32s ease-out 2 both;
+  animation: floating-assist-bread-scan-ring 1.32s ease-out infinite;
 }
 
 .system-floating-assist__ball--capturing .system-floating-assist__scan-ring--inner {
-  animation: floating-assist-bread-scan-ring 1.32s ease-out 0.24s 2 both;
+  animation: floating-assist-bread-scan-ring 1.32s ease-out 0.24s infinite;
 }
 
 .system-floating-assist__ball--answering {
-  animation: floating-assist-bread-answer-bob 0.82s ease-in-out 2 both;
+  animation: floating-assist-bread-answer-bob 0.82s ease-in-out infinite;
 }
 
 .system-floating-assist__ball--answering .system-floating-assist__mascot {
-  animation: floating-assist-bread-answer-think 1.48s ease-in-out 2 both;
+  animation: floating-assist-bread-answer-think 1.48s ease-in-out infinite;
 }
 
 .system-floating-assist__ball--answering .system-floating-assist__bread-body {
-  animation: floating-assist-bread-answer-squish 0.82s ease-in-out 2 both;
+  animation: floating-assist-bread-answer-squish 0.82s ease-in-out infinite;
 }
 
 .system-floating-assist__ball--answering .system-floating-assist__bread-mouth {
-  animation: floating-assist-bread-talk 0.82s ease-in-out 2 both;
+  animation: floating-assist-bread-talk 0.82s ease-in-out infinite;
 }
 
 .system-floating-assist__ball--answering .system-floating-assist__thinking-dots {
-  animation: floating-assist-bread-thinking-dots 1.05s ease-in-out 2 both;
+  animation: floating-assist-bread-thinking-dots 1.05s ease-in-out infinite;
 }
 
 .system-floating-assist__ball--answering .system-floating-assist__crumbs {
-  animation: floating-assist-bread-crumbs 1.05s ease-in-out 2 both;
+  animation: floating-assist-bread-crumbs 1.05s ease-in-out infinite;
 }
 
 .system-floating-assist__ball--done {
@@ -640,6 +640,10 @@
 
 .system-floating-assist__ball--error .system-floating-assist__bread-body {
   opacity: 0.94;
+}
+
+.system-floating-assist__ball--error .system-floating-assist__bread-leg {
+  bottom: 1px;
 }
 
 .system-floating-assist__ball--error .system-floating-assist__bread-eye--left {
@@ -1074,6 +1078,20 @@
   font-size: 13px;
 }
 
+.system-floating-assist__thinking--streaming {
+  min-height: 52px;
+  align-content: start;
+  justify-content: stretch;
+}
+
+.system-floating-assist__thinking--streaming .system-floating-assist__thinking-row {
+  justify-content: flex-start;
+}
+
+.system-floating-assist__thinking--streaming .system-floating-assist__progress {
+  width: 100%;
+}
+
 .system-floating-assist__thinking-row {
   display: inline-flex;
   align-items: center;
@@ -1090,11 +1108,23 @@
 }
 
 .system-floating-assist__progress span {
+  position: relative;
   display: block;
   height: 100%;
+  overflow: hidden;
   border-radius: inherit;
   background: linear-gradient(90deg, #c45f2a, #d99a42);
   transition: width 0.22s ease;
+}
+
+.system-floating-assist__progress span::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 42%;
+  background: linear-gradient(90deg, transparent, rgba(255, 250, 243, 0.68), transparent);
+  transform: translateX(-140%);
+  animation: floating-assist-progress-glint 1.35s ease-in-out infinite;
 }
 
 .system-floating-assist__error {
@@ -1194,13 +1224,28 @@
   line-height: 1.62;
 }
 
+.system-floating-assist__answer--streaming {
+  min-height: 150px;
+}
+
 .system-floating-assist__output-title {
   margin: 0 0 8px;
   padding-bottom: 6px;
   border-bottom: 1px solid rgba(124, 78, 37, 0.1);
   color: #9a6a31;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 11px;
   font-weight: 800;
+}
+
+.system-floating-assist__output-title small {
+  color: #8c765f;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .system-floating-assist__answer-notice {
@@ -1300,7 +1345,7 @@
 }
 
 .system-floating-assist__spin {
-  animation: floating-assist-spin 0.9s linear 3;
+  animation: floating-assist-spin 0.9s linear infinite;
 }
 
 .system-floating-assist__refs {
@@ -1339,17 +1384,54 @@
   text-decoration: underline;
 }
 
-.system-floating-assist__ref span {
-  width: 24px;
+.system-floating-assist__ref:focus-visible {
+  outline: 2px solid rgba(202, 93, 43, 0.38);
+  outline-offset: 2px;
+  border-radius: 5px;
+}
+
+.system-floating-assist__ref-type {
+  min-width: 40px;
   height: 20px;
+  box-sizing: border-box;
+  padding: 0 7px;
   border-radius: 999px;
-  background: rgba(154, 106, 49, 0.12);
-  color: #8a572f;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font-size: 10px;
   font-weight: 800;
+  letter-spacing: 0.02em;
+  flex: 0 0 auto;
+}
+
+.system-floating-assist__ref-type--knowledge {
+  background: rgba(92, 112, 65, 0.13);
+  color: #52663d;
+}
+
+.system-floating-assist__ref-type--document {
+  background: rgba(82, 99, 130, 0.12);
+  color: #526382;
+}
+
+.system-floating-assist__ref-type--operation {
+  background: rgba(183, 95, 42, 0.13);
+  color: #984d22;
+}
+
+.system-floating-assist__ref-type--timeline {
+  background: rgba(154, 106, 49, 0.12);
+  color: #8a572f;
+}
+
+.system-floating-assist__ref-index {
+  min-width: 18px;
+  color: #a08065;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 750;
+  text-align: center;
   flex: 0 0 auto;
 }
 
@@ -1363,9 +1445,9 @@
 
 .system-floating-assist__refs-toggle {
   justify-self: center;
-  min-height: 26px;
+  min-height: 22px;
   margin-top: 1px;
-  padding: 3px 10px;
+  padding: 1px 7px;
   border: 1px solid rgba(154, 106, 49, 0.18);
   border-radius: 999px;
   background: rgba(255, 252, 247, 0.72);
@@ -1373,10 +1455,11 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: 3px;
   font: inherit;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 750;
+  line-height: 1;
   cursor: pointer;
   transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
 }
@@ -1418,6 +1501,12 @@
 @keyframes floating-assist-spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes floating-assist-progress-glint {
+  to {
+    transform: translateX(340%);
   }
 }
 
@@ -1828,7 +1917,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .system-floating-assist__spin {
+  .system-floating-assist__spin,
+  .system-floating-assist__progress span::after {
     animation: none;
   }
 

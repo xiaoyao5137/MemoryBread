@@ -245,6 +245,485 @@ class CreationService:
             )
             raise
 
+    async def analyze_creation_skill(
+        self,
+        document_title: str,
+        document_content: str,
+        doc_type: str = "",
+    ) -> dict:
+        """用本地模型提炼文档创作方式；模型不可用时返回可编辑的本地规则分析。"""
+        title = document_title.strip()
+        content = document_content.strip()
+        if not title or len(title) > 200:
+            raise ValueError("文档标题需要在 1 到 200 个字符之间")
+        if len(content) < 20 or len(content) > 80000:
+            raise ValueError("文档内容需要在 20 到 80000 个字符之间")
+
+        excerpt = content[:30000]
+        prompt = self._build_creation_skill_analysis_prompt(title, excerpt, doc_type)
+        payload = self._creation_skill_analysis_payload(self.model, prompt)
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                response = await client.post(f"{self.ollama_base_url}/api/generate", json=payload)
+                response.raise_for_status()
+                raw = response.json().get("response", "")
+            parsed = self._normalize_creation_skill_analysis(json.loads(raw), title, content, doc_type)
+            parsed["analysis_mode"] = "local_model"
+            return parsed
+        except Exception as exc:
+            logger.warning("本地模型提炼创作 Skill 失败，使用规则分析: %s", exc)
+            fallback = self._fallback_creation_skill_analysis(title, content, doc_type)
+            fallback["analysis_mode"] = "heuristic_fallback"
+            return fallback
+
+    @staticmethod
+    def _creation_skill_analysis_payload(model: str, prompt: str) -> dict:
+        return {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            # Qwen 3.5 默认把 JSON 写入 thinking，response 为空；关闭思考后
+            # Ollama 才会把可解析的结构化结果放入 response。
+            "think": False,
+            "options": {"temperature": 0.2, "top_p": 0.8, "num_predict": 4096},
+        }
+
+    @staticmethod
+    def _build_creation_skill_analysis_prompt(title: str, content: str, doc_type: str) -> str:
+        return f"""你是 MemoryBread 的本地文档创作分析器。请从给定文档中提炼“如何写这类文档”，不要复述敏感业务事实，不要输出源文档原文。
+
+文档标题：{title}
+文档类型：{doc_type or '未指定'}
+文档正文：
+{content}
+
+Skill 命名与简介原则：
+- 标题要高度概括可复用的工作场景和交付目标，而不是复述源文档标题。
+- 标题中禁止出现具体公司、部门、事业部、团队、项目、产品、客户或人员名称。
+- 标题优先使用“适用场景 + 文档/方案/报告”的形式，例如源文档来自某研发部门的技术沟通会时，写成“跨部门技术沟通会文档”。
+- 简介必须说明这个 Skill 适合在什么场景、帮助谁完成什么目标，不能只罗列写作风格。
+
+隐私与通用化原则（适用于 JSON 中的每一个字段）：
+- 只提炼可复用的方法，不复制原文句子、章节标题、专有名词、数据或事实。
+- 禁止出现真实或可推断的公司、事业群、事业部、部门、团队、项目、产品、系统、客户、人员、地域、日期、指标和金额。
+- 把具体业务对象改写为“目标系统”“相关团队”“示例项目”“通用服务”等抽象角色；不要保留源文档中的名称。
+- 每个字段都提供 1-3 个全新虚构示例。示例只能演示写法，主题、角色、数据和措辞都必须脱离原文。
+- example_document 必须是一份结构完整的 Markdown 示例文档，使用与源文档无关的虚构主题，不得改写、摘要或影射源文档。
+
+类目候选（必须从以下有效路径中选择最接近的一整条，不得自行创造名称或拼接路径）：
+- 互联网 / 电商零售 / 产品经理 / 产品设计文档
+- 互联网 / 电商零售 / 产品经理 / 产品需求文档
+- 互联网 / 电商零售 / UI/UX 设计师 / UI 设计文档
+- 互联网 / 电商零售 / UI/UX 设计师 / 用户体验设计文档
+- 互联网 / 电商零售 / 软件工程师 / 技术设计文档
+- 互联网 / 电商零售 / 软件工程师 / 接口设计文档
+- 互联网 / 电商零售 / 架构师 / 技术架构设计文档
+- 互联网 / 电商零售 / 运营 / 运营方案
+- 互联网 / 企业服务 / 产品经理 / 产品设计文档
+- 互联网 / 企业服务 / 软件工程师 / 技术设计文档
+- 互联网 / 企业服务 / 架构师 / 技术架构设计文档
+- 互联网 / 企业服务 / 客户成功顾问 / 客户实施方案
+- 金融 / 银行与支付 / 风控经理 / 风险策略文档
+- 金融 / 银行与支付 / 数据分析师 / 数据分析报告
+- 金融 / 银行与支付 / 产品经理 / 金融产品设计文档
+- 金融 / 银行与支付 / 架构师 / 技术架构设计文档
+- 金融 / 保险 / 产品经理 / 保险产品设计文档
+- 金融 / 保险 / 精算与风险 / 精算分析报告
+- 金融 / 保险 / 理赔运营 / 理赔处理 SOP
+- 制造 / 智能制造 / 工艺工程师 / 工艺设计文档
+- 制造 / 智能制造 / 软件工程师 / 工业软件设计文档
+- 制造 / 智能制造 / 架构师 / 智能制造架构文档
+- 制造 / 消费品制造 / 工业设计师 / 工业设计文档
+- 制造 / 消费品制造 / 质量工程师 / 质量策划文档
+- 专业服务 / 咨询与研究 / 咨询顾问 / 项目建议书
+- 专业服务 / 咨询与研究 / 咨询顾问 / 咨询方案报告
+- 专业服务 / 咨询与研究 / 研究分析师 / 行业研究报告
+- 专业服务 / 咨询与研究 / 项目经理 / 项目管理计划
+- 专业服务 / 品牌与内容 / 品牌策划 / 品牌策略方案
+- 专业服务 / 品牌与内容 / 内容运营 / 内容策划文档
+- 专业服务 / 品牌与内容 / 视觉设计师 / 视觉设计规范
+
+只输出一个 JSON 对象，字段必须完整：
+{{
+  "title": "高度概括适用场景和交付目标的短标题，不超过 40 字，不含任何具体组织或项目名称",
+  "summary": "说明适用场景、适用对象和创作目标，不超过 160 字",
+  "common_titles": ["3-6 个这类文档常见标题"],
+  "title_style": "总结标题层级、句式、长度和措辞习惯",
+  "text_style": "总结语气、段落、论证、术语和信息密度",
+  "diagram_style": "总结图表类型、视觉层级、配色、标注和使用场景；没有图时给出适合这类文档的克制建议",
+  "structure_pattern": ["按顺序列出 4-10 个常见章节"],
+  "writing_guidelines": ["列出 3-8 条可执行写作规则"],
+  "section_headings": {{
+    "common_titles": "这类文档标题通常怎么命名",
+    "title_style": "概括该字段用途的通用二级标题",
+    "text_style": "概括该字段用途的通用二级标题",
+    "diagram_style": "概括该字段用途的通用二级标题",
+    "structure_pattern": "概括该字段用途的通用二级标题",
+    "writing_guidelines": "概括该字段用途的通用二级标题"
+  }},
+  "field_examples": {{
+    "common_titles": ["1-3 个完全虚构的标题示例"],
+    "title_style": ["1-3 个完全虚构的标题写法示例"],
+    "text_style": ["1-3 个完全虚构的正文片段示例"],
+    "diagram_style": ["1-3 个完全虚构的图示设计示例"],
+    "structure_pattern": ["1-3 个完全虚构的章节顺序示例"],
+    "writing_guidelines": ["1-3 个完全虚构的规则应用示例"]
+  }},
+  "example_document": "一份完整 Markdown 示例文档，使用全新虚构主题，至少包含标题、摘要、4 个章节和结论，不得出现源文档中的名称、事实、数字或句子",
+  "suggested_category_keywords": ["从候选中选择的行业", "从候选中选择的细分行业", "从候选中选择的工种", "从候选中选择的具体文档类型"]
+}}
+"""
+
+    @classmethod
+    def _normalize_creation_skill_analysis(
+        cls, value: dict, document_title: str, document_content: str, doc_type: str
+    ) -> dict:
+        if not isinstance(value, dict):
+            raise ValueError("Skill 分析结果不是对象")
+        fallback = cls._fallback_creation_skill_analysis(document_title, document_content, doc_type)
+
+        def clean_text(key: str, maximum: int) -> str:
+            text = str(value.get(key) or fallback[key]).strip()
+            return cls._generalize_skill_text(
+                text[:maximum],
+                document_title,
+                document_content,
+                str(fallback[key]),
+            )
+
+        def clean_list(key: str, maximum_items: int, item_maximum: int) -> list[str]:
+            raw = value.get(key)
+            items = raw if isinstance(raw, list) else fallback[key]
+            fallback_items = fallback[key]
+            cleaned = [
+                cls._generalize_skill_text(
+                    str(item).strip()[:item_maximum],
+                    document_title,
+                    document_content,
+                    str(fallback_items[min(index, len(fallback_items) - 1)]),
+                )
+                for index, item in enumerate(items)
+                if str(item).strip()
+            ]
+            return cleaned[:maximum_items] or fallback[key]
+
+        raw_headings = value.get("section_headings")
+        headings = raw_headings if isinstance(raw_headings, dict) else fallback["section_headings"]
+        raw_examples = value.get("field_examples")
+        examples = raw_examples if isinstance(raw_examples, dict) else fallback["field_examples"]
+
+        def clean_heading(key: str) -> str:
+            if key == "common_titles":
+                return "这类文档标题通常怎么命名"
+            candidate = str(headings.get(key) or fallback["section_headings"][key]).strip()[:120]
+            return cls._generalize_skill_text(
+                candidate,
+                document_title,
+                document_content,
+                fallback["section_headings"][key],
+            )
+
+        def clean_examples(key: str) -> list[str]:
+            raw = examples.get(key)
+            items = raw if isinstance(raw, list) else fallback["field_examples"][key]
+            cleaned = [
+                cls._generalize_skill_text(
+                    str(item).strip()[:500],
+                    document_title,
+                    document_content,
+                    fallback["field_examples"][key][
+                        min(index, len(fallback["field_examples"][key]) - 1)
+                    ],
+                )
+                for index, item in enumerate(items)
+                if str(item).strip()
+            ]
+            return cleaned[:6] or fallback["field_examples"][key]
+
+        return {
+            "title": cls._normalize_creation_skill_title(
+                clean_text("title", 80), document_title, document_content, doc_type
+            ),
+            "summary": clean_text("summary", 400),
+            "common_titles": clean_list("common_titles", 12, 80),
+            "title_style": clean_text("title_style", 1200),
+            "text_style": clean_text("text_style", 2000),
+            "diagram_style": clean_text("diagram_style", 1200),
+            "structure_pattern": clean_list("structure_pattern", 16, 160),
+            "writing_guidelines": clean_list("writing_guidelines", 16, 240),
+            "section_headings": {
+                key: clean_heading(key)
+                for key in (
+                    "common_titles",
+                    "title_style",
+                    "text_style",
+                    "diagram_style",
+                    "structure_pattern",
+                    "writing_guidelines",
+                )
+            },
+            "field_examples": {
+                key: clean_examples(key)
+                for key in (
+                    "common_titles",
+                    "title_style",
+                    "text_style",
+                    "diagram_style",
+                    "structure_pattern",
+                    "writing_guidelines",
+                )
+            },
+            "example_document": cls._generalize_skill_text(
+                str(value.get("example_document") or fallback["example_document"]).strip()[:12000],
+                document_title,
+                document_content,
+                fallback["example_document"],
+            ),
+            "suggested_category_keywords": clean_list("suggested_category_keywords", 8, 80),
+        }
+
+    @staticmethod
+    def _generalize_skill_text(
+        candidate: str,
+        document_title: str,
+        document_content: str,
+        fallback: str,
+    ) -> str:
+        """拒绝明显的组织线索和大段原文重合，避免提炼结果反向披露来源。"""
+        text = str(candidate or "").strip()
+        if not text:
+            return fallback
+        if re.search(r"\d", text):
+            return fallback
+        if CreationService._contains_named_private_marker(text):
+            return fallback
+
+        compact_candidate = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+        compact_source = re.sub(
+            r"[\s\W_]+",
+            "",
+            f"{document_title}\n{document_content}",
+            flags=re.UNICODE,
+        )
+        if len(compact_candidate) >= 14:
+            window = 14
+            for index in range(0, len(compact_candidate) - window + 1):
+                if compact_candidate[index:index + window] in compact_source:
+                    return fallback
+        return text
+
+    @staticmethod
+    def _contains_named_private_marker(value: str) -> bool:
+        if "有限责任公司" in value or "股份有限公司" in value:
+            return True
+        generic_prefixes = (
+            "跨",
+            "多",
+            "多个",
+            "各",
+            "相关",
+            "某",
+            "示例",
+            "通用",
+            "不同",
+            "该",
+            "由",
+            "与",
+            "和",
+            "及",
+            "为",
+            "在",
+            "向",
+            "对",
+            "于",
+        )
+        for marker in ("事业群", "事业部", "研发中心", "产品部", "项目组", "工作组"):
+            start = 0
+            while True:
+                index = value.find(marker, start)
+                if index < 0:
+                    break
+                prefix = value[:index].rstrip()
+                if prefix and not prefix.endswith(generic_prefixes):
+                    return True
+                start = index + len(marker)
+        return False
+
+    @staticmethod
+    def _normalize_creation_skill_title(
+        candidate: str, document_title: str, document_content: str, doc_type: str
+    ) -> str:
+        """把模型命名收敛为不含具体组织的可复用文档用途。"""
+        source_text = f"{document_title}\n{document_content[:6000]}"
+        if (
+            re.search(r"跨部门|跨团队|多团队", source_text)
+            and re.search(r"技术|架构|研发|系统", source_text)
+            and re.search(r"会议|沟通|评审|纪要", source_text)
+        ):
+            return "跨部门技术沟通会文档"
+        if re.search(r"跨部门|跨团队|多团队", source_text) and re.search(
+            r"会议|沟通|协作|纪要", source_text
+        ):
+            return "跨部门协作会议文档"
+        if re.search(r"架构评审|技术评审|方案评审", source_text):
+            return "技术方案评审文档"
+        if re.search(r"复盘|总结会", source_text):
+            return "项目复盘总结文档"
+        if re.search(r"客户|交付|实施", source_text) and re.search(
+            r"沟通|汇报|会议", source_text
+        ):
+            return "客户交付沟通文档"
+
+        normalized = str(candidate or "").strip()
+        organization_pattern = re.compile(
+            r"[\w·-]{1,16}?(?:事业群|事业部|委员会|项目组|工作组|部门|团队|小组|中心|部)"
+        )
+        normalized = organization_pattern.sub("", normalized)
+        normalized = re.sub(r"(?:创作|写作)\s*Skill$", "", normalized, flags=re.I)
+        normalized = re.sub(r"Skill$", "", normalized, flags=re.I)
+        normalized = re.sub(r"沟通会(?:会议)?纪要(?:撰写)?指南$", "沟通会文档", normalized)
+        normalized = re.sub(r"会议纪要(?:撰写)?指南$", "会议文档", normalized)
+        normalized = normalized.strip(" \t\r\n·—_:：-")
+        if len(normalized) >= 4 and not organization_pattern.search(normalized):
+            return normalized[:80]
+
+        base_type = (doc_type or "专业文档").strip()
+        if re.search(r"文档|方案|报告|规范|计划|SOP$", base_type, flags=re.I):
+            return base_type[:80]
+        return f"{base_type}文档"[:80]
+
+    @classmethod
+    def _fallback_creation_skill_analysis(cls, title: str, content: str, doc_type: str) -> dict:
+        heading_matches = re.findall(r"^\s{0,3}#{1,4}\s+(.+?)\s*$", content, flags=re.MULTILINE)
+        if not heading_matches:
+            heading_matches = re.findall(
+                r"^\s*(?:[一二三四五六七八九十]+、|\d+(?:\.\d+)*[.、]\s*)(.{2,40})$",
+                content,
+                flags=re.MULTILINE,
+            )
+        structure = []
+        for heading in heading_matches:
+            cleaned = re.sub(r"[*_`#]", "", heading).strip().rstrip("：:")
+            cleaned = cls._canonical_skill_heading(cleaned)
+            if cleaned and cleaned not in structure:
+                structure.append(cleaned[:160])
+            if len(structure) >= 10:
+                break
+        if not structure:
+            structure = ["背景与目标", "核心分析", "方案设计", "实施与风险", "结论与后续"]
+
+        base_type = (doc_type or "专业文档").strip()
+        common_titles = cls._generic_common_titles(base_type)
+        common_titles = list(dict.fromkeys(common_titles))
+        has_diagram = bool(re.search(r"```(?:mermaid|plantuml)|架构图|流程图|时序图|示意图|图\s*\d+", content, re.I))
+        avg_line = len(content) / max(1, len(content.splitlines()))
+        dense_style = "段落信息密度较高" if avg_line > 45 else "多用短段落和列表降低阅读负担"
+        abstract_title = cls._normalize_creation_skill_title(base_type, title, content, doc_type)
+        return {
+            "title": abstract_title,
+            "summary": f"适合需要创作{abstract_title}的专业人员，用于复用这类文档的标题、结构、表达和图示习惯，提高沟通与交付效率。"[:400],
+            "common_titles": common_titles,
+            "title_style": "标题以明确的业务对象或交付物为核心，一级标题概括结论，二三级标题说明分析维度或执行动作。",
+            "text_style": f"整体采用正式、直接的专业表达，先交代背景和约束，再给出判断、方案与依据；{dense_style}，关键结论使用列表突出。",
+            "diagram_style": (
+                "文档已有图示习惯，优先延续分层结构、关键流程和关系连线，图题说明结论，避免装饰性图形。"
+                if has_diagram
+                else "只在结构或流程难以用文字快速理解时绘图，优先使用分层架构图、流程图或对比表，配色克制并保持标注一致。"
+            ),
+            "structure_pattern": structure,
+            "writing_guidelines": [
+                "先写目标、范围与约束，再展开方案细节。",
+                "每个关键结论同时给出依据或取舍原因。",
+                "术语保持前后一致，避免空泛形容词。",
+                "图表必须服务于一个明确结论，并配有文字说明。",
+            ],
+            "section_headings": cls._default_skill_section_headings(),
+            "field_examples": cls._default_skill_field_examples(),
+            "example_document": cls._default_skill_example_document(base_type),
+            "suggested_category_keywords": [base_type],
+        }
+
+    @staticmethod
+    def _canonical_skill_heading(heading: str) -> str:
+        """把源章节归并为通用章节角色，不保留项目、产品或组织名称。"""
+        mappings = (
+            (r"背景|现状|概述", "背景与目标"),
+            (r"目标|范围", "目标与范围"),
+            (r"约束|原则", "约束与设计原则"),
+            (r"架构|总体设计", "总体方案"),
+            (r"流程|步骤", "核心流程"),
+            (r"功能|模块", "核心设计"),
+            (r"接口|数据", "接口与数据"),
+            (r"实施|计划|里程碑", "实施计划"),
+            (r"风险|保障", "风险与保障"),
+            (r"验证|验收|指标", "验证与验收"),
+            (r"结论|总结|后续", "结论与后续"),
+        )
+        for pattern, canonical in mappings:
+            if re.search(pattern, heading, re.I):
+                return canonical
+        return ""
+
+    @staticmethod
+    def _generic_common_titles(doc_type: str) -> list[str]:
+        base = re.sub(r"(?:文档|报告)$", "", doc_type or "专业")
+        return [
+            f"{base}方案"[:80],
+            f"{base}设计与实施说明"[:80],
+            f"{base}复盘与后续行动"[:80],
+        ]
+
+    @staticmethod
+    def _default_skill_section_headings() -> dict[str, str]:
+        return {
+            "common_titles": "这类文档标题通常怎么命名",
+            "title_style": "标题如何传递重点",
+            "text_style": "正文怎样组织和表达",
+            "diagram_style": "图示怎样服务于内容",
+            "structure_pattern": "从开篇到结论的章节骨架",
+            "writing_guidelines": "保持这份风格的关键约束",
+        }
+
+    @staticmethod
+    def _default_skill_field_examples() -> dict[str, list[str]]:
+        return {
+            "common_titles": ["协作流程优化方案", "阶段复盘与后续行动报告"],
+            "title_style": ["协作流程优化方案：明确目标、范围与交付边界"],
+            "text_style": ["本方案先明确适用范围，再说明关键步骤、责任边界与验收方式。"],
+            "diagram_style": ["用泳道图展示提出、处理、复核三个阶段，并用统一图例标注责任角色。"],
+            "structure_pattern": ["背景与目标 → 现状与约束 → 方案设计 → 实施计划 → 风险与验证"],
+            "writing_guidelines": ["把“提升效率”改写为“减少交接步骤，并设置可核验的完成标准”"],
+        }
+
+    @staticmethod
+    def _default_skill_example_document(doc_type: str) -> str:
+        return f"""# 通用协作流程优化{doc_type or '方案'}
+
+## 摘要
+
+本示例使用完全虚构的知识交接场景，展示如何明确目标、责任角色、执行步骤和验收方式。
+
+## 背景与目标
+
+相关团队需要在任务变化时稳定传递必要信息，目标是减少遗漏，并让接手者能够独立完成后续工作。
+
+## 现状与约束
+
+当前资料分散、责任边界不清，且交接时间有限。本方案不依赖任何真实组织、项目或业务数据。
+
+## 方案设计
+
+建立“准备、讲解、确认、复核”四个阶段；每个阶段明确输入、责任角色、输出和完成标准。
+
+## 实施与验证
+
+先用一个虚构的非关键任务验证清单，再根据反馈调整模板，最后通过完成情况和独立操作结果验收。
+
+## 结论
+
+通过统一结构和可核验标准，知识交接可以在不依赖特定业务背景的前提下稳定复用。"""
+
     def _log_creation_usage(
         self,
         model_name: str,

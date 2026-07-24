@@ -8,9 +8,18 @@ Ollama 本地 LLM 后端
 from __future__ import annotations
 
 import json
+import http.client
 import logging
 import urllib.request
 import urllib.error
+import urllib.parse
+from typing import Callable
+
+from inference_queue import (
+    current_task_preempt_requested,
+    raise_if_preempted,
+    register_current_preempt_callback,
+)
 
 from .base import LlmBackend, LlmResponse
 
@@ -18,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class OllamaBackend(LlmBackend):
-    """Ollama 本地 LLM 后端（通过 /api/generate 非流式调用）"""
+    """Ollama 本地 LLM 后端（通过 /api/generate 调用）"""
 
     def __init__(
         self,
@@ -45,6 +54,23 @@ class OllamaBackend(LlmBackend):
             return False
 
     def complete(self, prompt: str, system: str = "", **kwargs) -> LlmResponse:
+        # 即使调用方不消费增量，也使用流式传输。这样 P0 到达时可以关闭
+        # 正在运行的后台 HTTP 响应，而不必等待整段非流式推理完成。
+        return self.complete_stream(
+            prompt,
+            system=system,
+            on_delta=None,
+            **kwargs,
+        )
+
+    def complete_stream(
+        self,
+        prompt: str,
+        system: str = "",
+        on_delta: Callable[[str], None] | None = None,
+        **kwargs,
+    ) -> LlmResponse:
+        raise_if_preempted()
         url = f"{self._base_url}/api/generate"
         options = {
             "num_predict": kwargs.pop("num_predict", self._num_predict),
@@ -54,45 +80,79 @@ class OllamaBackend(LlmBackend):
                 options[key] = kwargs[key]
 
         body: dict = {
-            "model":       self._model,
-            "prompt":      prompt,
-            "stream":      False,
-            "options":     options,
-            "think":       False,
-            # keep_alive=10m：请求完成后模型在内存中保留 10 分钟，
-            # 避免频繁调用时 Ollama 反复加载/卸载模型（默认 5 分钟太短）。
-            # 对于 RAG 查询 + 时间线提炼交替使用的场景，10 分钟可以覆盖大部分间隔。
-            "keep_alive":  "10m",
+            "model": self._model,
+            "prompt": prompt,
+            "stream": True,
+            "options": options,
+            "think": False,
+            "keep_alive": "10m",
         }
         if system:
             body["system"] = system
 
-        data = json.dumps(body).encode("utf-8")
-        req  = urllib.request.Request(
-            url,
-            data    = data,
-            headers = {"Content-Type": "application/json"},
-            method  = "POST",
+        parts: list[str] = []
+        model = self._model
+        tokens = 0
+        done_reason = None
+        parsed_url = urllib.parse.urlparse(url)
+        connection_class = (
+            http.client.HTTPSConnection
+            if parsed_url.scheme == "https"
+            else http.client.HTTPConnection
         )
-
+        connection = connection_class(
+            parsed_url.hostname,
+            parsed_url.port,
+            timeout=self._timeout,
+        )
+        unregister = register_current_preempt_callback(connection.close)
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.URLError as exc:
+            connection.request(
+                "POST",
+                parsed_url.path or "/api/generate",
+                body=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            if response.status >= 400:
+                detail = response.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Ollama 请求失败 ({response.status}): {detail[:500]}"
+                )
+            for raw_line in response:
+                raise_if_preempted()
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                delta = payload.get("response", "")
+                if delta:
+                    parts.append(delta)
+                    if on_delta:
+                        on_delta(delta)
+                model = payload.get("model", model)
+                if payload.get("done"):
+                    tokens = payload.get("eval_count", 0)
+                    done_reason = payload.get("done_reason") or payload.get("finish_reason")
+            raise_if_preempted()
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+            if current_task_preempt_requested():
+                raise_if_preempted()
             raise RuntimeError(f"Ollama 服务不可达: {exc}") from exc
+        except Exception:
+            if current_task_preempt_requested():
+                raise_if_preempted()
+            raise
+        finally:
+            unregister()
+            connection.close()
 
-        done_reason = result.get("done_reason") or result.get("finish_reason")
-        if not done_reason:
-            try:
-                if result.get("eval_count", 0) >= int(options.get("num_predict", 0) or 0):
-                    done_reason = "length"
-            except Exception:
-                done_reason = None
-
+        if not done_reason and tokens >= int(options.get("num_predict", 0) or 0):
+            done_reason = "length"
         return LlmResponse(
-            text   = result.get("response", ""),
-            model  = result.get("model", self._model),
-            tokens = result.get("eval_count", 0),
+            text="".join(parts),
+            model=model,
+            tokens=tokens,
             done_reason=done_reason,
         )
 

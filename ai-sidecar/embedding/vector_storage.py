@@ -78,6 +78,201 @@ class VectorStorage:
                 self._qdrant_client = None
         
         return self._qdrant_client
+
+    @staticmethod
+    def _document_point_id(doc_key: str, content_hash: str, chunk_index: int) -> str:
+        """Stable Qdrant id: unchanged document chunks are naturally idempotent."""
+        value = f"memory-bread:{doc_key}:{content_hash}:{chunk_index}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, value))
+
+    def document_version_exists(
+        self,
+        doc_key: str,
+        content_hash: str,
+        chunk_count: int,
+    ) -> bool:
+        expected = {
+            self._document_point_id(doc_key, content_hash, index)
+            for index in range(chunk_count)
+        }
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT qdrant_point_id
+                    FROM vector_index
+                    WHERE doc_key = ? AND source_type = 'document'
+                    """,
+                    (doc_key,),
+                ).fetchall()
+            return bool(expected) and {str(row[0]) for row in rows} == expected
+        except sqlite3.Error as exc:
+            logger.warning("检查文档向量版本失败: doc_key=%s error=%s", doc_key, exc)
+            return False
+
+    def store_document_vectors(
+        self,
+        capture_id: int,
+        chunks: List[str],
+        vectors: List[List[float]],
+        metadata: Dict[str, Any],
+    ) -> bool:
+        """Atomically replace one URL document's vector chunks.
+
+        All chunks share the URL-level ``doc_key`` so retrieval can keep the
+        best matching chunk without allowing one long document to occupy every
+        context slot.
+        """
+        if not chunks or len(chunks) != len(vectors):
+            logger.error(
+                "文档向量数量不匹配: capture_id=%s chunks=%s vectors=%s",
+                capture_id,
+                len(chunks),
+                len(vectors),
+            )
+            return False
+
+        metadata = dict(metadata or {})
+        doc_key = str(metadata.get("doc_key") or "").strip()
+        content_hash = str(metadata.get("content_hash") or "").strip()
+        if not doc_key or not content_hash:
+            logger.error("文档向量缺少稳定键: capture_id=%s", capture_id)
+            return False
+
+        point_ids = [
+            self._document_point_id(doc_key, content_hash, index)
+            for index in range(len(chunks))
+        ]
+        if self.document_version_exists(doc_key, content_hash, len(chunks)):
+            logger.debug("文档向量未变化，跳过重写: doc_key=%s", doc_key)
+            return True
+
+        time_value = metadata.get("ts") or metadata.get("timestamp")
+        payloads = []
+        for index, text in enumerate(chunks):
+            payloads.append(
+                {
+                    "doc_key": doc_key,
+                    "source_type": "document",
+                    "capture_id": capture_id,
+                    "knowledge_id": None,
+                    "time": time_value,
+                    "ts": time_value,
+                    "start_time": None,
+                    "end_time": None,
+                    "observed_at": time_value,
+                    "event_time_start": None,
+                    "event_time_end": None,
+                    "history_view": False,
+                    "content_origin": "document_reference",
+                    "activity_type": "reading",
+                    "is_self_generated": False,
+                    "evidence_strength": "medium",
+                    "app_name": metadata.get("app_name"),
+                    "win_title": metadata.get("win_title"),
+                    "category": "文档",
+                    "user_verified": False,
+                    "url": metadata.get("url"),
+                    "source_url": metadata.get("url"),
+                    "title": metadata.get("title"),
+                    "content_hash": content_hash,
+                    "chunk_index": index,
+                    "chunk_count": len(chunks),
+                    "text": text,
+                }
+            )
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                existing_ids = {
+                    str(row[0])
+                    for row in conn.execute(
+                        """
+                        SELECT qdrant_point_id
+                        FROM vector_index
+                        WHERE doc_key = ? AND source_type = 'document'
+                        """,
+                        (doc_key,),
+                    ).fetchall()
+                }
+
+            qdrant_client = self._get_qdrant_client()
+            if qdrant_client:
+                from qdrant_client.models import PointStruct
+
+                qdrant_client.upsert(
+                    collection_name=self._collection_name,
+                    points=[
+                        PointStruct(id=point_id, vector=vector, payload=payload)
+                        for point_id, vector, payload in zip(point_ids, vectors, payloads)
+                    ],
+                )
+            else:
+                logger.warning("Qdrant 不可用，文档分块仅写 SQLite vector_index")
+
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "DELETE FROM vector_index WHERE doc_key = ? AND source_type = 'document'",
+                    (doc_key,),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO vector_index
+                    (capture_id, qdrant_point_id, chunk_index, chunk_text, model_name, created_at,
+                     doc_key, source_type, knowledge_id, time, start_time, end_time,
+                     observed_at, event_time_start, event_time_end, history_view,
+                     content_origin, activity_type, is_self_generated, evidence_strength,
+                     app_name, win_title, category, user_verified)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'document', NULL, ?, NULL, NULL,
+                            ?, NULL, NULL, 0, 'document_reference', 'reading', 0, 'medium',
+                            ?, ?, '文档', 0)
+                    """,
+                    [
+                        (
+                            capture_id,
+                            point_id,
+                            index,
+                            text,
+                            metadata.get("model_name", "bge-small-zh-v1.5"),
+                            int(time_value or 0),
+                            doc_key,
+                            time_value,
+                            time_value,
+                            metadata.get("app_name"),
+                            metadata.get("win_title"),
+                        )
+                        for index, (point_id, text) in enumerate(zip(point_ids, chunks))
+                    ],
+                )
+
+            stale_ids = existing_ids.difference(point_ids)
+            if qdrant_client and stale_ids:
+                try:
+                    from qdrant_client.models import PointIdsList
+
+                    qdrant_client.delete(
+                        collection_name=self._collection_name,
+                        points_selector=PointIdsList(points=list(stale_ids)),
+                    )
+                except Exception as exc:
+                    logger.warning("清理旧文档向量失败，后续检索仍会按 URL 折叠: %s", exc)
+
+            logger.info(
+                "✅ 文档分块向量完成: capture_id=%s doc_key=%s chunks=%s",
+                capture_id,
+                doc_key,
+                len(chunks),
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                "❌ 文档分块向量存储失败: capture_id=%s doc_key=%s error=%s",
+                capture_id,
+                doc_key,
+                exc,
+                exc_info=True,
+            )
+            return False
     
     def store_vector(
         self,
@@ -133,7 +328,9 @@ class VectorStorage:
                 "win_title": metadata.get("win_title"),
                 "category": metadata.get("category"),
                 "user_verified": bool(metadata.get("user_verified", False)),
-                "text": text[:500],
+                # 普通 activity 本身仍很短；文档长文本走 store_document_vectors，
+                # 在模型上下文范围内完整保存每个 chunk，不再二次截断。
+                "text": text,
             }
 
             qdrant_client = self._get_qdrant_client()

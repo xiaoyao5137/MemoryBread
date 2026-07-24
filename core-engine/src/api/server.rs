@@ -26,6 +26,10 @@ use super::{
             delete_config_check, install_config_check, list_config_checks, run_config_check,
         },
         creation::{generate_document, list_history, preview_references, save_history},
+        creation_skill::{
+            analyze_creation_skill, delete_creation_skill, get_creation_skill,
+            list_creation_skills, save_creation_skill, update_creation_skill,
+        },
         debug::{
             clear_extraction_queue, debug_log_content, debug_log_files, system_stats, vector_status,
         },
@@ -48,7 +52,8 @@ use super::{
         },
         profile::{get_latest_profile, get_profile, list_profiles, update_profile},
         query::{
-            create_rag_job, get_rag_job, rag_history, rag_query, rag_references, save_rag_history,
+            create_rag_job, get_rag_job, rag_history, rag_query, rag_references, rag_stream,
+            save_rag_history,
         },
         runtime::{get_runtime_status, update_runtime_status},
         snapshot::{
@@ -59,6 +64,7 @@ use super::{
             create_task, delete_task, get_task, list_executions, list_tasks, trigger_task,
             update_task,
         },
+        work_profile::get_work_profile,
     },
     state::AppState,
 };
@@ -90,9 +96,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/captures", get(list_captures))
         .route("/captures", get(list_captures))
+        .route("/api/work-profile", get(get_work_profile))
         .route("/query", post(rag_query))
         .route("/api/rag/jobs", post(create_rag_job))
         .route("/api/rag/jobs/:job_id", get(get_rag_job))
+        .route("/api/rag/stream", post(rag_stream))
         .route("/api/rag/references", post(rag_references))
         .route("/api/rag/history", get(rag_history).post(save_rag_history))
         .route("/action/execute", post(execute_action))
@@ -115,6 +123,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/creation/references", post(preview_references))
         .route("/api/creation/history", post(save_history))
         .route("/api/creation/history", get(list_history))
+        .route("/api/creation/skills/analyze", post(analyze_creation_skill))
+        .route(
+            "/api/creation/skills",
+            get(list_creation_skills).post(save_creation_skill),
+        )
+        .route(
+            "/api/creation/skills/:id",
+            get(get_creation_skill)
+                .put(update_creation_skill)
+                .delete(delete_creation_skill),
+        )
         .route("/api/vector/status", get(vector_status))
         .route("/api/stats", get(system_stats))
         .route("/api/debug/log-files", get(debug_log_files))
