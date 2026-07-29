@@ -131,7 +131,7 @@ describe('显式搜索交互', () => {
     expect(screen.getByText('当前还没有知识条目。')).toBeInTheDocument()
   })
 
-  it('BakePanel 关联知识跳转只展示目标知识，清除后恢复列表', async () => {
+  it('BakePanel 关联知识跳转只展示目标知识，不展示额外筛选提示', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('/api/models')) return jsonResponse({ ollama: true, llm: true, embedding: true })
@@ -192,15 +192,9 @@ describe('显式搜索交互', () => {
       expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/knowledge/9')
     })
     expect(screen.getAllByText('目标知识').length).toBeGreaterThan(0)
-    expect(screen.getByText('仅看知识 #9')).toBeInTheDocument()
     expect(screen.queryByText('普通知识')).not.toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: '查看全部' }))
-
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/knowledge?limit=20&offset=0')
-    })
-    expect(useAppStore.getState().bakeKnowledgeFocusId).toBeNull()
+    expect(screen.queryByText('仅看知识 #9')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '查看全部' })).not.toBeInTheDocument()
   })
 
   it('RepositoryPanel 以普通元信息展示 ID 和创建时间，不展示不可靠指标', async () => {
@@ -241,6 +235,58 @@ describe('显式搜索交互', () => {
     expect(screen.queryByText(/打开 \d+ 次/)).not.toBeInTheDocument()
     expect(screen.queryByText(/重复观察 \d+ 次/)).not.toBeInTheDocument()
     expect(screen.queryByText(/权重 \d+/)).not.toBeInTheDocument()
+  })
+
+  it('RepositoryPanel 时间线默认选中当前列表第一条并展示详情', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'http://localhost:7070/api/knowledge?limit=20&offset=0') {
+        return jsonResponse({
+          entries: [{
+            id: 1,
+            summary: '第一条时间线',
+            overview: '第一条时间线详情',
+            capture_id: 41,
+            importance: 6,
+            occurrence_count: 3,
+            created_at: '2026-04-11 09:30',
+            created_at_ms: 0,
+            capture_ids: [],
+          }, {
+            id: 2,
+            summary: '第二条时间线',
+            overview: '第二条时间线详情',
+            capture_id: 42,
+            importance: 5,
+            occurrence_count: 2,
+            created_at: '2026-04-11 09:20',
+            created_at_ms: 0,
+            capture_ids: [],
+          }],
+          total: 2,
+          limit: 20,
+          offset: 0,
+        })
+      }
+      if (url.includes('/api/bake/documents') || url.includes('/api/bake/knowledge') || url.includes('/api/bake/sops')) {
+        return jsonResponse({ items: [], total: 0, limit: 1000, offset: 0 })
+      }
+      throw new Error(`unexpected url: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    useAppStore.setState({
+      repositoryTab: 'memory',
+      selectedMemoryId: 'stale-selection',
+    })
+
+    render(<RepositoryPanel />)
+
+    await waitFor(() => {
+      expect(useAppStore.getState().selectedMemoryId).toBe('1')
+    })
+    expect(screen.getAllByText('第一条时间线详情').length).toBeGreaterThan(1)
+    expect(screen.queryByText('暂无时间线详情')).not.toBeInTheDocument()
   })
 
   it('RepositoryPanel 情节记忆搜索只有点击搜索后才发起带筛选请求', async () => {
@@ -313,7 +359,7 @@ describe('显式搜索交互', () => {
     expect(screen.queryByText('关键词：不存在')).not.toBeInTheDocument()
   })
 
-  it('RepositoryPanel 时间线跳转只展示目标时间线，清除后恢复列表', async () => {
+  it('RepositoryPanel 时间线跳转只展示目标时间线，空条件搜索后恢复列表', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url === 'http://localhost:7070/api/knowledge/7') {
@@ -368,8 +414,9 @@ describe('显式搜索交互', () => {
     expect(screen.getAllByText('目标时间线').length).toBeGreaterThan(0)
     expect(screen.queryByText('仅看时间线 #7')).not.toBeInTheDocument()
     expect(screen.queryByText('普通时间线')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '查看全部' })).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: '查看全部' }))
+    fireEvent.click(screen.getByRole('button', { name: '搜索' }))
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/knowledge?limit=20&offset=0')
@@ -377,7 +424,7 @@ describe('显式搜索交互', () => {
     expect(useAppStore.getState().repositoryMemoryFocusId).toBeNull()
   })
 
-  it('RepositoryPanel 记忆片段清除筛选会恢复默认请求并清掉来源范围', async () => {
+  it('RepositoryPanel 采集记录不显示查看全部，空条件搜索会清掉来源范围', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('/api/bake/captures')) return jsonResponse({ items: [], total: 0, limit: 20, offset: 0 })
@@ -395,21 +442,46 @@ describe('显式搜索交互', () => {
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/captures?source_capture_id=123&limit=20&offset=0')
     })
-    expect(screen.getByText('仅看来源 ID #123')).toBeInTheDocument()
+    expect(screen.queryByText('仅看来源 ID #123')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '查看全部' })).not.toBeInTheDocument()
 
-    fireEvent.change(screen.getByPlaceholderText('搜索标题、正文或 OCR'), { target: { value: '设计稿' } })
     fireEvent.click(screen.getByRole('button', { name: '搜索' }))
-
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/captures?q=%E8%AE%BE%E8%AE%A1%E7%A8%BF&source_capture_id=123&limit=20&offset=0')
-    })
-
-    fireEvent.click(screen.getByRole('button', { name: '清除筛选' }))
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith('http://localhost:7070/api/bake/captures?limit=20&offset=0')
     })
     expect(useAppStore.getState().repositoryCaptureSourceCaptureId).toBeNull()
+  })
+
+  it('RepositoryPanel 采集日期筛选不重复展示开始和结束摘要', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/bake/captures')) return jsonResponse({ items: [], total: 0, limit: 20, offset: 0 })
+      throw new Error(`unexpected url: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    useAppStore.setState({
+      repositoryTab: 'capture',
+      repositoryCaptureFrom: '2026-07-23',
+      repositoryCaptureTo: '2026-07-23',
+    })
+
+    render(<RepositoryPanel />)
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([input]) => {
+        const url = String(input)
+        return url.includes('/api/bake/captures?from=')
+          && url.includes('&to=')
+          && url.includes('&limit=20&offset=0')
+      })).toBe(true)
+    })
+
+    expect(screen.getByLabelText('开始日期')).toHaveValue('2026-07-23')
+    expect(screen.getByLabelText('结束日期')).toHaveValue('2026-07-23')
+    expect(screen.queryByText('开始：2026-07-23')).not.toBeInTheDocument()
+    expect(screen.queryByText('结束：2026-07-23')).not.toBeInTheDocument()
   })
 
   it('RepositoryPanel 从时间线点击采集记录会限定到对应采集片段', async () => {

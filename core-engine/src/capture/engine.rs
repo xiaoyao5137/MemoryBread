@@ -34,6 +34,14 @@ use super::{
     CaptureError,
 };
 
+const LOGINWINDOW_BUNDLE_ID: &str = "com.apple.loginwindow";
+const LOGINWINDOW_APP_NAME: &str = "loginwindow";
+
+fn is_system_session_context(bundle_id: Option<&str>, app_name: Option<&str>) -> bool {
+    bundle_id.is_some_and(|value| value.trim().eq_ignore_ascii_case(LOGINWINDOW_BUNDLE_ID))
+        || app_name.is_some_and(|value| value.trim().eq_ignore_ascii_case(LOGINWINDOW_APP_NAME))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CaptureConfig
 // ─────────────────────────────────────────────────────────────────────────────
@@ -707,6 +715,19 @@ impl CaptureEngine {
     pub async fn process_event(&self, event: CaptureEvent) -> Result<Option<i64>, CaptureError> {
         // 变化事件已携带可信应用身份，先做一次隐私门禁，避免对密码管理器等应用发起 AX 正文读取。
         if let Some(context) = event.context_info() {
+            if is_system_session_context(
+                context.app_bundle_id.as_deref(),
+                context.app_name.as_deref(),
+            ) {
+                self.reset_cached_context();
+                debug!(
+                    event = ?event.to_event_type(),
+                    app = ?context.app_name,
+                    bundle_id = ?context.app_bundle_id,
+                    "登录/锁屏系统会话不属于工作内容，跳过采集"
+                );
+                return Ok(None);
+            }
             let blacklisted = self.blacklist.is_blacklisted_by_bundle_or_name(
                 context.app_bundle_id.as_deref(),
                 context.app_name.as_deref(),
@@ -765,6 +786,16 @@ impl CaptureEngine {
 
         // 变化事件的应用/URL 元数据优先，但保留本轮完整 AX 抓取到的正文与焦点信息。
         let mut merged = self.merge_ax_and_event(&event, ax_info);
+        if is_system_session_context(merged.app_bundle_id.as_deref(), merged.app_name.as_deref()) {
+            self.reset_cached_context();
+            debug!(
+                event = ?event.to_event_type(),
+                app = ?merged.app_name,
+                bundle_id = ?merged.app_bundle_id,
+                "登录/锁屏系统会话不属于工作内容，跳过采集"
+            );
+            return Ok(None);
+        }
         let cache_hit = ax_missing
             && (merged.app_name.is_some()
                 || merged.win_title.is_some()
@@ -1138,6 +1169,12 @@ impl CaptureEngine {
 
         if let Ok(mut guard) = self.last_context.lock() {
             *guard = Some(context);
+        }
+    }
+
+    fn reset_cached_context(&self) {
+        if let Ok(mut guard) = self.last_context.lock() {
+            *guard = None;
         }
     }
 
@@ -1727,6 +1764,10 @@ mod tests {
             "../storage/migrations/035_seed_privacy_defaults.sql"
         ))
         .unwrap();
+        conn.execute_batch(include_str!(
+            "../storage/migrations/059_seed_other_privacy_filter.sql"
+        ))
+        .unwrap();
 
         let storage = StorageManager {
             conn: Arc::new(Mutex::new(conn)),
@@ -1769,6 +1810,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_loginwindow_context_is_not_persisted_and_clears_cached_app() {
+        let engine = make_engine();
+        engine.update_cached_context(&AXInfo {
+            app_name: Some("Code".into()),
+            app_bundle_id: Some("com.microsoft.VSCode".into()),
+            ..Default::default()
+        });
+
+        let result = engine
+            .process_event(CaptureEvent::AppSwitch {
+                app_name: "loginwindow".into(),
+                bundle_id: Some("com.apple.loginwindow".into()),
+                win_title: String::new(),
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(engine
+            .last_context
+            .lock()
+            .expect("cached context lock")
+            .is_none());
+        assert!(engine
+            .storage
+            .list_captures(&CaptureFilter::new())
+            .unwrap()
+            .is_empty());
+
+        engine.update_cached_context(&AXInfo {
+            app_name: Some("Code".into()),
+            app_bundle_id: Some("com.microsoft.VSCode".into()),
+            ..Default::default()
+        });
+        let periodic_result = engine
+            .process_event_with_ax_info(
+                CaptureEvent::Periodic,
+                Some(AXInfo {
+                    app_name: Some("loginwindow".into()),
+                    app_bundle_id: Some("com.apple.loginwindow".into()),
+                    ..Default::default()
+                }),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(periodic_result.is_none());
+        assert!(engine
+            .last_context
+            .lock()
+            .expect("cached context lock")
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn test_key_pause_stores_input_text() {
         let engine = make_engine();
         let id = engine
@@ -1791,7 +1887,7 @@ mod tests {
             app_name: Some("Chrome".into()),
             app_bundle_id: Some("com.google.Chrome".into()),
             win_title: Some("普通网页".into()),
-            extracted_text: Some("客户手机号 13800138000".into()),
+            extracted_text: Some("客户手机号 13800138000，另有色情信息".into()),
             ..Default::default()
         };
         let event = CaptureEvent::KeyPause {
@@ -1811,7 +1907,10 @@ mod tests {
             .unwrap();
 
         let rec = engine.storage.get_capture(id).unwrap().unwrap();
-        assert_eq!(rec.ax_text.as_deref(), Some("客户手机号 [已过滤]"));
+        assert_eq!(
+            rec.ax_text.as_deref(),
+            Some("客户手机号 [已过滤]，另有[已过滤]")
+        );
         assert_eq!(rec.input_text.as_deref(), Some("[已过滤]"));
         assert_eq!(rec.ocr_text.as_deref(), Some("备用手机号 [已过滤]"));
         assert!(rec.pii_scrubbed);
@@ -1826,6 +1925,9 @@ mod tests {
         assert!(stats
             .iter()
             .any(|stat| stat.stat_type == "filter" && stat.target_id == "chat"));
+        assert!(stats
+            .iter()
+            .any(|stat| stat.stat_type == "filter" && stat.target_id == "other"));
     }
 
     #[tokio::test]

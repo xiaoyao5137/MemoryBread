@@ -666,6 +666,11 @@ fn upsert_creation_skills(
             "diagram_style",
             "structure_pattern",
             "writing_guidelines",
+            "distinctive_sections",
+            "section_headings",
+            "field_examples",
+            "example_document",
+            "package_files",
             "status",
             "installed",
             "published",
@@ -686,6 +691,11 @@ fn upsert_creation_skills(
             "diagram_style",
             "structure_pattern",
             "writing_guidelines",
+            "distinctive_sections",
+            "section_headings",
+            "field_examples",
+            "example_document",
+            "package_files",
             "status",
             "installed",
             "published",
@@ -908,12 +918,16 @@ mod tests {
                     "INSERT INTO creation_skills (
                         client_skill_key, source_kind, source_id, title, summary,
                         common_titles, title_style, text_style, diagram_style,
-                        structure_pattern, writing_guidelines, published, created_at, updated_at
+                        structure_pattern, writing_guidelines, distinctive_sections, package_files,
+                        published, created_at, updated_at
                      ) VALUES (
                         'snapshot-skill-1', 'bake_document', '11', '架构文档写作法',
                         '用于验证本地 Skill 快照恢复。', '[\"总体架构设计\"]', '结论先行。',
                         '正式、克制。', '标注系统边界。', '[\"背景\",\"方案\"]',
-                        '[\"写明技术取舍\"]', 0, 1700000000000, 1700000000000
+                        '[\"写明技术取舍\"]',
+                        '[{\"title\":\"定义先行\",\"description\":\"先建立共同概念。\",\"guidance\":\"先解释对象，再说明边界。\",\"examples\":[\"协作入口连接任务与结果证据。\"]}]',
+                        '[{\"path\":\"SKILL.md\",\"media_type\":\"text/markdown\",\"content_base64\":\"IyBTa2lsbA==\",\"size_bytes\":7}]',
+                        0, 1700000000000, 1700000000000
                      )",
                     [],
                 )?;
@@ -995,6 +1009,10 @@ mod tests {
         assert_eq!(timeline_count, 1);
         assert_eq!(knowledge_count, 1);
         assert_eq!(restored_skill.title, "架构文档写作法");
+        assert_eq!(restored_skill.package_files.len(), 1);
+        assert_eq!(restored_skill.package_files[0].path, "SKILL.md");
+        assert_eq!(restored_skill.distinctive_sections.len(), 1);
+        assert_eq!(restored_skill.distinctive_sections[0].title, "定义先行");
         assert!(capture_text.is_none());
         assert!(first.capture_refs.inserted >= 1);
         assert_eq!(second.capture_refs.skipped, 1);

@@ -24,6 +24,7 @@ const fillPasswordLogin = () => {
 const mockSignedInProfileFetch = () => vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input)
   if (url.includes('/api/work-profile')) {
+    const includeDayDetails = new URL(url).searchParams.get('include_day_details') === 'true'
     const today = new Date()
     today.setHours(0, 0, 0, 0)
     const previousDay = new Date(today)
@@ -43,6 +44,7 @@ const mockSignedInProfileFetch = () => vi.fn(async (input: RequestInfo | URL, in
           date: toLocalDateKey(today),
           total_minutes: 205,
           capture_count: 42,
+          active_period_count: 7,
           first_capture_at: today.getTime() + 9 * 3_600_000 + 12 * 60_000,
           last_capture_at: today.getTime() + 16 * 3_600_000 + 48 * 60_000,
           apps: [
@@ -57,8 +59,32 @@ const mockSignedInProfileFetch = () => vi.fn(async (input: RequestInfo | URL, in
           },
         },
         days: [
-          { date: toLocalDateKey(previousDay), minutes: 280, capture_count: 56 },
-          { date: toLocalDateKey(today), minutes: 205, capture_count: 42 },
+          {
+            date: toLocalDateKey(previousDay),
+            minutes: 280,
+            capture_count: 56,
+            ...(includeDayDetails ? {
+              active_period_count: 6,
+              first_capture_at: previousDay.getTime() + 8 * 3_600_000 + 35 * 60_000,
+              last_capture_at: previousDay.getTime() + 17 * 3_600_000 + 10 * 60_000,
+              apps: [
+                { name: 'Figma', minutes: 170, capture_count: 34 },
+                { name: '飞书', minutes: 110, capture_count: 22 },
+              ],
+            } : {}),
+          },
+          {
+            date: toLocalDateKey(today),
+            minutes: 205,
+            capture_count: 42,
+            active_period_count: 7,
+            first_capture_at: today.getTime() + 9 * 3_600_000 + 12 * 60_000,
+            last_capture_at: today.getTime() + 16 * 3_600_000 + 48 * 60_000,
+            apps: [
+              { name: 'Code', minutes: 138, capture_count: 24 },
+              { name: '飞书', minutes: 67, capture_count: 18 },
+            ],
+          },
         ],
       }),
     }
@@ -248,8 +274,9 @@ describe('AuthPanel', () => {
     expect(screen.getByText('旧公司')).toBeInTheDocument()
     expect(screen.getByText(/每项每个自然月最多修改 3 次/)).toBeInTheDocument()
     expect(screen.getByRole('tablist', { name: '个人信息页面导航' })).toBeInTheDocument()
-    expect(screen.getAllByRole('tab')).toHaveLength(4)
+    expect(screen.getAllByRole('tab')).toHaveLength(5)
     expect(screen.getByRole('tab', { name: '个人信息' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tab', { name: '消息' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: '标签卡片' })).toBeInTheDocument()
     expect(screen.queryByRole('tab', { name: '工作热力图' })).not.toBeInTheDocument()
     expect(screen.getByText('运行模式')).toBeInTheDocument()
@@ -278,6 +305,7 @@ describe('AuthPanel', () => {
     fireEvent.click(screen.getByRole('tab', { name: '标签卡片' }))
     expect(await screen.findByText('代码精英')).toBeInTheDocument()
     expect(screen.getByText('×3')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '查看「代码精英」卡片详情' }))
     fireEvent.click(screen.getByRole('button', { name: '佩戴到头像' }))
     expect(await screen.findByText('已将「代码精英」佩戴到个人头像。')).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(
@@ -289,12 +317,38 @@ describe('AuthPanel', () => {
     expect(await screen.findByText('3 小时 25 分钟')).toBeInTheDocument()
     expect(screen.getByText('应用分布')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: '工作热力图' })).toBeInTheDocument()
-    const heatmapCell = screen.getByRole('button', { name: /工作时长 3 小时 25 分钟.*42 条工作记录/ })
+    const heatmapCell = screen.getByRole('button', { name: /查看.*工作数据.*工作时长 4 小时 40 分钟.*56 条工作记录/ })
     fireEvent.mouseEnter(heatmapCell)
-    expect(within(heatmapCell).getByRole('tooltip')).toHaveTextContent('工作时长 3 小时 25 分钟')
-    expect(within(heatmapCell).getByRole('tooltip')).toHaveTextContent('42 条工作记录')
+    expect(within(heatmapCell).getByRole('tooltip')).toHaveTextContent('工作时长 4 小时 40 分钟')
+    expect(within(heatmapCell).getByRole('tooltip')).toHaveTextContent('56 条工作记录')
     fireEvent.click(heatmapCell)
     expect(heatmapCell).toHaveAttribute('aria-pressed', 'true')
+    expect(await screen.findByText('6 段活跃 · 首次 08:35 · 最后 17:10')).toBeInTheDocument()
+    expect(screen.getByText('4 小时 40 分钟')).toBeInTheDocument()
+    const captureLink = screen.getByRole('button', { name: /查看.*56条工作记录/ })
+    expect(captureLink).toHaveTextContent('查看 56 条工作记录')
+    expect(screen.getByText('Figma')).toBeInTheDocument()
+    expect(screen.queryByText('Code')).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([input]) => (
+      String(input).includes('include_day_details=true')
+    ))).toBe(true)
+    fireEvent.click(captureLink)
+    const expectedPreviousDay = new Date()
+    expectedPreviousDay.setHours(0, 0, 0, 0)
+    expectedPreviousDay.setDate(expectedPreviousDay.getDate() - 1)
+    expect(useAppStore.getState()).toMatchObject({
+      windowMode: 'knowledge',
+      repositoryTab: 'capture',
+      repositoryCaptureFrom: toLocalDateKey(expectedPreviousDay),
+      repositoryCaptureTo: toLocalDateKey(expectedPreviousDay),
+      repositoryCaptureQuery: '',
+      bakeCaptureOffset: 0,
+    })
+    fireEvent.click(heatmapCell)
+    expect(heatmapCell).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByText('今日工作时长')).toBeInTheDocument()
+    expect(screen.getByText('3 小时 25 分钟')).toBeInTheDocument()
+    expect(screen.getByText('Code')).toBeInTheDocument()
     expect(screen.queryByText('近一年工作时长')).not.toBeInTheDocument()
     expect(screen.queryByText('当前连续天数')).not.toBeInTheDocument()
     expect(screen.queryByText('最长连续天数')).not.toBeInTheDocument()

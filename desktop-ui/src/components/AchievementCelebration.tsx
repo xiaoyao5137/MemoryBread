@@ -12,11 +12,11 @@ import {
   Sparkles,
   type LucideIcon,
 } from 'lucide-react'
-import type { AchievementBadge } from '../types'
+import type { AchievementAward } from '../types'
 import './AchievementCelebration.css'
 
 interface AchievementCelebrationProps {
-  badges: AchievementBadge[]
+  awards: AchievementAward[]
   onDismiss: () => void
   onViewCards: () => void
 }
@@ -33,15 +33,21 @@ const BADGE_ICONS: Record<string, LucideIcon> = {
 const CRUMB_COUNT = 12
 
 const AchievementCelebration: React.FC<AchievementCelebrationProps> = ({
-  badges,
+  awards,
   onDismiss,
   onViewCards,
 }) => {
   const dialogRef = useRef<HTMLElement>(null)
   const primaryActionRef = useRef<HTMLButtonElement>(null)
-  const primaryBadge = badges[0]
+  const primaryAward = awards[0]
+  const primaryBadge = primaryAward?.badge
   const Icon = BADGE_ICONS[primaryBadge?.icon_key] ?? Briefcase
-  const badgeNames = badges.map((badge) => `「${badge.name}」`).join('、')
+  const totalAwardQuantity = awards.reduce((sum, award) => sum + award.badge_quantity, 0)
+  const awardNames = awards
+    .map(({ badge, badge_quantity: quantity }) => (
+      `「${badge.name}」${quantity > 1 ? ` ×${quantity}` : ''}`
+    ))
+    .join('、')
 
   useEffect(() => {
     const previouslyFocused = document.activeElement instanceof HTMLElement
@@ -98,7 +104,7 @@ const AchievementCelebration: React.FC<AchievementCelebrationProps> = ({
           <span className="achievement-celebration__spark" aria-hidden="true">
             <Sparkles size={18} strokeWidth={2.2} />
           </span>
-          <span>{badges.length > 1 ? `获得 ${badges.length} 张新卡片` : '获得新卡片'}</span>
+          <span>{totalAwardQuantity > 1 ? `获得 ${totalAwardQuantity} 张新卡片` : '获得新卡片'}</span>
         </div>
 
         <div
@@ -107,18 +113,25 @@ const AchievementCelebration: React.FC<AchievementCelebrationProps> = ({
           <span className="achievement-celebration__icon" aria-hidden="true">
             <Icon size={38} strokeWidth={2.1} />
           </span>
-          <span className="achievement-celebration__card-status"><Award size={13} aria-hidden="true" /> 已收入收藏</span>
+          <span className="achievement-celebration__card-status">
+            <Award size={13} aria-hidden="true" />
+            本次 +{primaryAward.badge_quantity} · 累计 ×{primaryAward.total_badge_quantity}
+          </span>
           <strong>{primaryBadge.name}</strong>
           <span>{primaryBadge.tagline}</span>
-          {badges.length > 1 && (
-            <small>本次还获得 {badges.slice(1).map((badge) => badge.name).join('、')}</small>
+          {awards.length > 1 && (
+            <small>
+              本次还获得 {awards.slice(1)
+                .map(({ badge, badge_quantity: quantity }) => `${badge.name} ×${quantity}`)
+                .join('、')}
+            </small>
           )}
         </div>
 
         <div className="achievement-celebration__copy">
           <h2 id="achievement-celebration-title">卡片已经烘焙完成</h2>
           <p id="achievement-celebration-description">
-            你获得了{badgeNames}。前往标签卡片页查看详情，也可以把它佩戴到头像或悬浮球。
+            你获得了{awardNames}。前往标签卡片页查看详情，也可以把它佩戴到头像或悬浮球。
           </p>
         </div>
 

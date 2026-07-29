@@ -88,12 +88,12 @@ AVAILABLE_MODELS = {
     # ========== 向量模型（Embedding） ==========
     "bge-small-zh": ModelInfo(
         id="bge-small-zh",
-        name="BGE-Small-ZH-Q4",
+        name="MBEMB V1.0",
         type=ModelType.EMBEDDING,
         provider="ollama",
         model_id="qllama/bge-small-zh-v1.5:q4_k_m",
         size_gb=0.05,
-        description="BAAI BGE-Small 中文版，512 维，量化版本，内存占用低",
+        description="MemoryBread向量模型",
         is_default=True
     ),
 }
@@ -157,6 +157,21 @@ class ModelManager:
             return None
 
     def _resolve_ollama_command(self) -> Optional[str]:
+        # MemoryBread 首次初始化安装的是无菜单栏的托管 CLI 运行时，不依赖 Homebrew。
+        # 优先复用应用数据目录中的最新已校验版本。
+        managed_root = Path.home() / ".memory-bread" / "initialization" / "runtime" / "ollama"
+        if managed_root.exists():
+            managed_candidates = sorted(
+                [
+                    *managed_root.glob("v*/runtime/bin/ollama"),
+                    *managed_root.glob("v*/runtime/ollama"),
+                ],
+                reverse=True,
+            )
+            for candidate in managed_candidates:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+
         cmd = shutil.which('ollama')
         if cmd:
             return cmd

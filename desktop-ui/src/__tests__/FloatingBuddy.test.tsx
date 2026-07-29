@@ -18,6 +18,7 @@ describe('FloatingBuddy', () => {
     render(<FloatingBuddy />)
     expect(screen.getByTestId('buddy-avatar')).toBeInTheDocument()
     expect(screen.getByTestId('settings-btn')).toBeInTheDocument()
+    expect(screen.queryByTestId('messages-btn')).not.toBeInTheDocument()
   })
 
   it('点击菜单按钮会切换到对应模式', () => {
@@ -43,23 +44,19 @@ describe('FloatingBuddy', () => {
     expect(screen.getByText('记忆')).toBeInTheDocument()
   })
 
-  it('普通模式隐藏环境切换', () => {
+  it('菜单栏不展示环境切换', () => {
     render(<FloatingBuddy />)
 
     expect(screen.queryByLabelText('服务环境切换')).not.toBeInTheDocument()
   })
 
-  it('调试模式可以切换测试和正式环境并同步请求环境', () => {
+  it('调试模式也不在菜单栏展示环境切换', () => {
     useAppStore.getState().setDebugModeEnabled(true)
     render(<FloatingBuddy />)
 
-    expect(screen.getByLabelText('服务环境切换')).toBeInTheDocument()
+    expect(screen.queryByLabelText('服务环境切换')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('选择服务环境')).not.toBeInTheDocument()
     expect(useAppStore.getState().serviceEnvironment).toBe('production')
-
-    fireEvent.click(screen.getByRole('button', { name: '测试' }))
-
-    expect(useAppStore.getState().serviceEnvironment).toBe('staging')
-    expect(screen.getByRole('button', { name: '测试' })).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('账号入口显示用户名和中文运行模式', () => {
@@ -106,6 +103,15 @@ describe('FloatingBuddy', () => {
 
     expect(useAppStore.getState().windowMode).toBe('account')
     expect(accountEntry).toHaveAttribute('aria-current', 'page')
+  })
+
+  it('旧消息深链仍归入个人页入口', () => {
+    useAppStore.getState().setWindowMode('messages')
+
+    render(<FloatingBuddy />)
+
+    expect(screen.getByTestId('account-entry')).toHaveAttribute('aria-current', 'page')
+    expect(screen.queryByTestId('messages-btn')).not.toBeInTheDocument()
   })
 })
 

@@ -1,0 +1,37 @@
+import inspect
+import json
+import threading
+
+import main
+
+
+def test_runtime_status_heartbeat_is_independent_from_asyncio():
+    assert not inspect.iscoroutinefunction(main._runtime_status_heartbeat)
+
+
+def test_runtime_status_writes_remain_atomic_across_threads(tmp_path, monkeypatch):
+    status_file = tmp_path / "state" / "sidecar_runtime_status.json"
+    monkeypatch.setattr(main, "_STATE_DIR", status_file.parent)
+    monkeypatch.setattr(main, "_RUNTIME_STATUS_FILE", status_file)
+    monkeypatch.setattr(main, "_RUNTIME_STATUS_CACHE", None)
+
+    def write_status(index: int) -> None:
+        main._write_runtime_status(
+            mode=f"test-{index}",
+            full_dispatch_ready=True,
+            background_processor_running=True,
+            critical_checks_passed=True,
+            embedding_ok=True,
+        )
+
+    threads = [threading.Thread(target=write_status, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    payload = json.loads(status_file.read_text(encoding="utf-8"))
+    assert payload["mode"].startswith("test-")
+    assert payload["critical_checks_passed"] is True
+    assert isinstance(payload["updated_at_ms"], int)
+    assert not status_file.with_suffix(".json.tmp").exists()

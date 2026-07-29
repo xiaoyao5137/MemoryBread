@@ -27,6 +27,13 @@ const EMPTY_OVERVIEW: MonitorOverview = {
     by_caller: [],
     trend: [],
     trend_by_model: [],
+    bake_distribution: {
+      sample_count: 0,
+      truncated_count: 0,
+      input_over_20k_count: 0,
+      input: { p50: 0, p90: 0, p95: 0, p99: 0, max: 0, buckets: [] },
+      output: { p50: 0, p90: 0, p95: 0, p99: 0, max: 0, buckets: [] },
+    },
   },
   ocr_backfill: {
     submitted_total: 0,
@@ -71,6 +78,7 @@ const EMPTY_OVERVIEW: MonitorOverview = {
   knowledge_flow: {
     today_count: 0,
     period_count: 0,
+    capture_enabled: true,
     pending_extraction_count: 0,
     oldest_pending_extraction_at_ms: null,
     pending_bake_count: 0,
@@ -118,7 +126,7 @@ const EVENT_LABEL: Record<string, string> = {
 function formatLlmModelName(model?: string | null): string {
   const name = (model || '').trim()
   if (!name || name === 'unavailable') return '模型状态待确认'
-  if (/embed|bge|vector/i.test(name)) return '本地语义索引'
+  if (/embed|bge|vector/i.test(name)) return 'MBEMB V1.0'
   if (name === 'qwen3.5:4b' || name === 'mbem-v1-local') return 'MBEM v1.0'
   if (name === 'mbcd-plus-v1') return 'MBCD Plus v1.0'
   if (/^(?:MBEM|MBCD|MBVD|MBID)[\s-]/i.test(name)) return name
@@ -456,16 +464,16 @@ export const SparkLine: React.FC<{
             onMouseLeave={() => setHoverX(null)}
           >
             <defs>
-              {seriesPoints.map(item => (
-                <linearGradient key={item.color} id={`grad-${item.color.replace('#', '')}`} x1="0" y1="0" x2="0" y2="1">
+              {seriesPoints.map((item, seriesIndex) => (
+                <linearGradient key={`${seriesIndex}-${item.color}`} id={`grad-${seriesIndex}-${item.color.replace('#', '')}`} x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor={item.color} stopOpacity="0.22" />
                   <stop offset="100%" stopColor={item.color} stopOpacity="0.01" />
                 </linearGradient>
               ))}
             </defs>
             {seriesPoints.map((item, idx) => (
-              <g key={`${item.label}-${item.color}`}>
-                {idx === 0 && <polygon points={item.area} fill={`url(#grad-${item.color.replace('#', '')})`} />}
+              <g key={`${idx}-${item.label}-${item.color}`}>
+                {idx === 0 && <polygon points={item.area} fill={`url(#grad-${idx}-${item.color.replace('#', '')})`} />}
                 <polyline points={item.pts} fill="none" stroke={item.color} strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" />
               </g>
             ))}
@@ -541,15 +549,21 @@ const BarChart: React.FC<{
           {data.map((d, i) => (
             <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
               <div
+                role="img"
+                tabIndex={0}
+                aria-label={`${d.label || '当前分组'}：${valueFormatter(d.value)}`}
                 style={{
                   width: '100%', borderRadius: '3px 3px 0 0',
                   height: Math.max((d.value / max) * (height - 20), 2),
                   background: d.color || '#007AFF',
                   opacity: hoverIndex === i ? 1 : 0.85,
+                  outlineOffset: 2,
                 }}
                 title={`${d.label}: ${valueFormatter(d.value)}`}
                 onMouseEnter={() => setHoverIndex(i)}
                 onMouseLeave={() => setHoverIndex(null)}
+                onFocus={() => setHoverIndex(i)}
+                onBlur={() => setHoverIndex(null)}
               />
               <span style={{ fontSize: 9, color: '#AEAEB2', textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', width: '100%' }}>
                 {d.label}
@@ -564,6 +578,58 @@ const BarChart: React.FC<{
     </div>
   )
 }
+
+const TokenMetricDistributionPanel: React.FC<{
+  title: string
+  accent: string
+  metric: MonitorOverview['token_usage']['bake_distribution']['input']
+}> = ({ title, accent, metric }) => (
+  <section className="monitor-token-distribution__metric" aria-label={`${title} token 分布`}>
+    <div className="monitor-token-distribution__metric-head">
+      <span>{title}</span>
+      <span>P50 {fmt(metric.p50)} · P95 {fmt(metric.p95)} · P99 {fmt(metric.p99)}</span>
+    </div>
+    <BarChart
+      data={metric.buckets.map((bucket) => ({
+        label: bucket.label,
+        value: bucket.count,
+        color: accent,
+      }))}
+      height={104}
+      valueFormatter={(value) => `${Math.round(value)} 次`}
+    />
+    <div className="monitor-token-distribution__max">最大值 {fmt(metric.max)} tokens</div>
+  </section>
+)
+
+const BakeTokenDistributionCard: React.FC<{
+  distribution: MonitorOverview['token_usage']['bake_distribution']
+  rangeLabel: string
+}> = ({ distribution, rangeLabel }) => (
+  <div style={cardStyle}>
+    <div className="monitor-token-distribution__head">
+      <div>
+        <span style={{ ...sectionTitle, marginBottom: 3 }}>烘焙提炼 Token 分布（{rangeLabel}）</span>
+        <div className="monitor-token-distribution__summary">
+          有效样本 {distribution.sample_count} 次 · 输入 ≥20K {distribution.input_over_20k_count} 次
+          {distribution.truncated_count > 0 ? ` · 长度截断 ${distribution.truncated_count} 次` : ''}
+        </div>
+      </div>
+      <div className="monitor-token-distribution__legend" aria-label="Token 分布图例">
+        <span><i style={{ background: '#FF9500' }} />输入</span>
+        <span><i style={{ background: '#32ADE6' }} />输出</span>
+      </div>
+    </div>
+    {distribution.sample_count > 0 ? (
+      <div className="monitor-token-distribution__grid">
+        <TokenMetricDistributionPanel title="输入 Prompt" accent="#FF9500" metric={distribution.input} />
+        <TokenMetricDistributionPanel title="模型输出" accent="#32ADE6" metric={distribution.output} />
+      </div>
+    ) : (
+      <div className="monitor-token-distribution__empty">当前时间范围内暂无烘焙提炼样本</div>
+    )}
+  </div>
+)
 
 const TrendHeader: React.FC<{
   title: string
@@ -582,8 +648,8 @@ const ChartLegend: React.FC<{
   if (!items.length) return null
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
-      {items.map((item) => (
-        <span key={`${item.color}-${item.label}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#6E6E73' }}>
+      {items.map((item, index) => (
+        <span key={`${index}-${item.color}-${item.label}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#6E6E73' }}>
           <span style={{ width: 8, height: 8, borderRadius: '50%', background: item.color, display: 'inline-block' }} />
           {item.label}
         </span>
@@ -610,13 +676,14 @@ function fontSize_20_weight_700(color: string): React.CSSProperties {
   return { fontSize: 20, fontWeight: 700, color, lineHeight: 1 }
 }
 
-type ExtractorStatus = 'running' | 'waiting' | 'idle' | 'stalled'
+type ExtractorStatus = 'running' | 'waiting' | 'idle' | 'stalled' | 'paused'
 
 const EXTRACTOR_STATUS_META: Record<ExtractorStatus, { label: string; color: string; dot: string }> = {
   running: { label: '运行中', color: '#34C759', dot: '#34C759' },
   waiting: { label: '等待片段成熟', color: '#FF9500', dot: '#FF9500' },
   idle:    { label: '空闲', color: '#8E8E93', dot: '#8E8E93' },
   stalled: { label: '提炼器无响应', color: '#FF3B30', dot: '#FF3B30' },
+  paused:  { label: '已暂停', color: '#8E8E93', dot: '#8E8E93' },
 }
 
 function fmtRelativeTs(ms: number | null | undefined): string {
@@ -659,7 +726,9 @@ const ExtractionQueueCard: React.FC<{
 }> = ({ pending, status, extractingCount, lastExtractionAtMs, oldestPendingAtMs }) => {
   const meta = EXTRACTOR_STATUS_META[status] ?? EXTRACTOR_STATUS_META.idle
   const oldestAge = oldestQueueAge(oldestPendingAtMs)
-  const baseColor = oldestAge >= 86_400_000
+  const baseColor = status === 'paused'
+    ? '#8E8E93'
+    : oldestAge >= 86_400_000
     ? '#FF3B30'
     : pending > 0 ? '#FF9500' : '#8E8E93'
 
@@ -672,6 +741,10 @@ const ExtractionQueueCard: React.FC<{
     sub = '等待片段积累足够（≥3 条且静默 ≥10 分钟）后批量提炼'
   } else if (status === 'stalled') {
     sub = '后台提炼未启动，请检查本机服务'
+  } else if (status === 'paused') {
+    sub = pending > 0
+      ? `自动提炼已暂停 · 保留 ${pending} 条待恢复处理`
+      : '自动提炼已暂停'
   } else {
     sub = pending > 0
       ? `最老已等待 ${fmtDurationMs(oldestAge)}`
@@ -709,16 +782,22 @@ const BakeQueueCard: React.FC<{
   runningCount: number
   staleRunCount: number
   retryExhaustedCount: number
-}> = ({ pending, oldestPendingAtMs, runningCount, staleRunCount, retryExhaustedCount }) => {
+  stalled: boolean
+  paused: boolean
+}> = ({ pending, oldestPendingAtMs, runningCount, staleRunCount, retryExhaustedCount, stalled, paused }) => {
   const oldestAge = oldestQueueAge(oldestPendingAtMs)
-  const color = staleRunCount > 0 || oldestAge >= 86_400_000
+  const color = paused
+    ? '#8E8E93'
+    : staleRunCount > 0 || stalled
     ? '#FF3B30'
     : pending > 0 ? '#FF9500' : '#8E8E93'
-  const sub = pending > 0
+  const sub = paused
+    ? `自动烘焙已暂停 · 保留 ${pending} 条待恢复处理`
+    : pending > 0
     ? `最老已等待 ${fmtDurationMs(oldestAge)} · 运行 ${runningCount}`
     : `当前无待烘焙内容 · 运行 ${runningCount}`
   const detail = retryExhaustedCount > 0
-    ? `${sub} · 重试耗尽 ${retryExhaustedCount}`
+    ? `${sub} · 永久失败 ${retryExhaustedCount}`
     : sub
   return (
     <div
@@ -742,7 +821,7 @@ const InferenceQueueCard: React.FC<{
   const color = queue.oldest_wait_ms >= 600_000
     ? '#FF3B30'
     : queue.queued_total > 0 ? '#FF9500' : '#34C759'
-  const sub = `运行 ${queue.running_total}/${queue.max_concurrency} · P0 ${queue.queued_p0} / P1 ${queue.queued_p1} / P2 ${queue.queued_p2}`
+  const sub = `运行 ${queue.running_total}/${queue.max_concurrency}（烘焙 ${queue.running_p2 ?? 0}） · P0 ${queue.queued_p0} / P1 ${queue.queued_p1} / P2 ${queue.queued_p2}`
   return (
     <StatCard
       label="模型推理队列"
@@ -760,6 +839,11 @@ const PipelineBacklogAlert: React.FC<{
   bakeOldestAtMs: number | null | undefined
   staleBakeRuns: number
   retryExhausted: number
+  bakeStalled: boolean
+  recentBakeFailures: number
+  recentBakeDeferred: number
+  recentBakeRuns: number
+  captureEnabled: boolean
   inferenceQueue: ExtractionLive['inference_queue'] | undefined
 }> = ({
   capturePending,
@@ -768,25 +852,49 @@ const PipelineBacklogAlert: React.FC<{
   bakeOldestAtMs,
   staleBakeRuns,
   retryExhausted,
+  bakeStalled,
+  recentBakeFailures,
+  recentBakeDeferred,
+  recentBakeRuns,
+  captureEnabled,
   inferenceQueue,
 }) => {
+  if (!captureEnabled) {
+    return (
+      <div style={{
+        marginBottom: 10,
+        padding: '10px 12px',
+        borderRadius: 10,
+        background: 'rgba(142,142,147,0.08)',
+        border: '1px solid rgba(142,142,147,0.18)',
+        color: '#6E6E73',
+        fontSize: 12,
+        fontWeight: 600,
+      }}>
+        自动采集与提炼已暂停：时间线队列 {capturePending} 条、烘焙队列 {bakePending} 条将在恢复后继续处理，暂停时长不计为流水线故障。
+      </div>
+    )
+  }
   const issues: string[] = []
   const captureAge = oldestQueueAge(captureOldestAtMs)
   const bakeAge = oldestQueueAge(bakeOldestAtMs)
   if (capturePending > 0 && captureAge >= 7_200_000) {
     issues.push(`时间线队列 ${capturePending} 条，最老等待 ${fmtDurationMs(captureAge)}`)
   }
-  if (bakePending > 0 && bakeAge >= 7_200_000) {
-    issues.push(`烘焙队列 ${bakePending} 条，最老等待 ${fmtDurationMs(bakeAge)}`)
-  }
   if (staleBakeRuns > 0) issues.push(`${staleBakeRuns} 个烘焙批次运行超过 35 分钟`)
-  if (retryExhausted > 0) issues.push(`${retryExhausted} 条候选已重试耗尽`)
+  if (retryExhausted > 0) issues.push(`${retryExhausted} 条候选已永久失败`)
+  if (bakeStalled) {
+    issues.push(`烘焙队列 ${bakePending} 条，最老等待 ${fmtDurationMs(bakeAge)}，水位超过 15 分钟未推进`)
+  }
+  if (bakeStalled && recentBakeRuns >= 3 && recentBakeFailures + recentBakeDeferred >= 3) {
+    issues.push(`最近 ${recentBakeRuns} 批中失败 ${recentBakeFailures}、延后 ${recentBakeDeferred}`)
+  }
   if (inferenceQueue?.available && inferenceQueue.oldest_wait_ms >= 600_000) {
     issues.push(`模型推理队列最老等待 ${fmtDurationMs(inferenceQueue.oldest_wait_ms)}`)
   }
   if (issues.length === 0) return null
   const critical = captureAge >= 86_400_000
-    || bakeAge >= 86_400_000
+    || (bakeStalled && bakeAge >= 86_400_000)
     || staleBakeRuns > 0
     || (inferenceQueue?.oldest_wait_ms ?? 0) >= 1_800_000
   const color = critical ? '#FF3B30' : '#FF9500'
@@ -956,6 +1064,20 @@ const OverviewContent: React.FC<{
     by_caller: data?.token_usage?.by_caller ?? [],
     trend: data?.token_usage?.trend ?? [],
     trend_by_model: data?.token_usage?.trend_by_model ?? [],
+    bake_distribution: {
+      ...EMPTY_OVERVIEW.token_usage.bake_distribution,
+      ...(data?.token_usage?.bake_distribution ?? {}),
+      input: {
+        ...EMPTY_OVERVIEW.token_usage.bake_distribution.input,
+        ...(data?.token_usage?.bake_distribution?.input ?? {}),
+        buckets: data?.token_usage?.bake_distribution?.input?.buckets ?? [],
+      },
+      output: {
+        ...EMPTY_OVERVIEW.token_usage.bake_distribution.output,
+        ...(data?.token_usage?.bake_distribution?.output ?? {}),
+        buckets: data?.token_usage?.bake_distribution?.output?.buckets ?? [],
+      },
+    },
   }
   const capture_flow = {
     ...EMPTY_OVERVIEW.capture_flow,
@@ -987,6 +1109,9 @@ const OverviewContent: React.FC<{
     extractor_status: liveData?.extractor_status
       ?? data?.knowledge_flow?.extractor_status
       ?? 'idle',
+    capture_enabled: liveData?.capture_enabled
+      ?? data?.knowledge_flow?.capture_enabled
+      ?? true,
     pending_extraction_count: liveData?.pending_extraction_count
       ?? data?.knowledge_flow?.pending_extraction_count
       ?? 0,
@@ -1043,6 +1168,11 @@ const OverviewContent: React.FC<{
         bakeOldestAtMs={knowledge_flow.oldest_pending_bake_at_ms}
         staleBakeRuns={knowledge_flow.stale_bake_run_count}
         retryExhausted={knowledge_flow.bake_retry_exhausted_count}
+        bakeStalled={liveData?.bake_stalled ?? false}
+        recentBakeFailures={liveData?.recent_bake_failed_count ?? 0}
+        recentBakeDeferred={liveData?.recent_bake_deferred_count ?? 0}
+        recentBakeRuns={liveData?.recent_bake_run_count ?? 0}
+        captureEnabled={knowledge_flow.capture_enabled}
         inferenceQueue={liveData?.inference_queue}
       />
       <div className="monitor-metric-grid">
@@ -1067,6 +1197,8 @@ const OverviewContent: React.FC<{
           runningCount={knowledge_flow.running_bake_count}
           staleRunCount={knowledge_flow.stale_bake_run_count}
           retryExhaustedCount={knowledge_flow.bake_retry_exhausted_count}
+          stalled={liveData?.bake_stalled ?? false}
+          paused={!knowledge_flow.capture_enabled}
         />
         <InferenceQueueCard queue={liveData?.inference_queue} />
         <StatCard label="待识别截图" value={fmt(ocr_backfill.backlog_count)}
@@ -1110,6 +1242,11 @@ const OverviewContent: React.FC<{
           </>
         ) : <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '12px 0' }}>暂无趋势数据</div>}
       </div>
+
+      <BakeTokenDistributionCard
+        distribution={token_usage.bake_distribution}
+        rangeLabel={rangeLabel}
+      />
 
       <div style={cardStyle}>
         <TrendHeader title="知识提炼趋势" rangeLabel={rangeLabel} bucketLabel={bucketLabel} />
@@ -1627,8 +1764,8 @@ const SystemContent: React.FC<{ data: SystemResources | null; range: SystemRange
       <div style={cardStyle}>
         <div style={sectionTitle}>{getTrendTitle(title, getSystemBucketLabel(range))}</div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
-          {available.map((line) => (
-            <span key={line.label} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#6E6E73' }}>
+          {available.map((line, index) => (
+            <span key={`${index}-${line.label}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#6E6E73' }}>
               <span style={{ width: 8, height: 8, borderRadius: '50%', background: line.color, display: 'inline-block' }} />
               {line.label}
             </span>

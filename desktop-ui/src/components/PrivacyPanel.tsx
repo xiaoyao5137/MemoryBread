@@ -9,7 +9,8 @@ const API_BASE = 'http://127.0.0.1:7070'
 const FILTER_DESCRIPTIONS: Record<string, string> = {
   chat: '检测密码、验证码、账号等聊天敏感内容',
   pii: '检测身份证、银行卡、手机号、邮箱等身份信息',
-  policy: '检测涉密、机密、内部文件等政策敏感信息'
+  policy: '检测涉密、机密、内部文件等政策敏感信息',
+  other: '其它兜底性质的敏感内容过滤'
 }
 
 const PrivacyPanel: React.FC = () => {

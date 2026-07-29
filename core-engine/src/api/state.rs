@@ -109,24 +109,24 @@ impl AppState {
         sidecar_url: String,
         debug_log_specs: Vec<DebugLogSpec>,
     ) -> Arc<Self> {
-        match storage.fail_stale_running_bake_runs() {
+        match storage.fail_orphaned_running_bake_runs_on_startup() {
             Ok(count) if count > 0 => {
-                tracing::warn!("启动时已收敛 {} 个陈旧 running bake run", count);
+                tracing::warn!("启动时已收敛 {} 个孤儿 running bake run", count);
             }
             Err(error) => {
-                tracing::warn!("启动时清理陈旧 bake run 失败: {}", error);
+                tracing::warn!("启动时清理孤儿 bake run 失败: {}", error);
             }
             _ => {}
         }
         match storage.clear_recoverable_bake_retry_failures() {
             Ok(count) if count > 0 => {
                 tracing::warn!(
-                    "启动时已恢复 {} 个由上游瞬态错误或旧文档响应兼容问题阻塞的 bake 候选",
+                    "启动时已恢复 {} 个被瞬态上游错误或旧响应兼容问题阻塞的 bake 候选，并回退处理水位",
                     count
                 );
             }
             Err(error) => {
-                tracing::warn!("启动时恢复可重试 bake 候选失败: {}", error);
+                tracing::warn!("启动时恢复可处理 bake 候选失败: {}", error);
             }
             _ => {}
         }

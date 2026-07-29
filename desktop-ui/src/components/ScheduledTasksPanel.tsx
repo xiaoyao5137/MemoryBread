@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
-import type { ScheduledTask, TaskExecution, TaskTemplate } from '../types'
+import type { NotificationChannel, ScheduledTask, TaskExecution, TaskTemplate } from '../types'
 import { useAppStore } from '../store/useAppStore'
 import { BUILTIN_TEMPLATES, CATEGORY_COLORS, groupTemplatesByCategory } from '../data/taskTemplates'
 import {
@@ -13,6 +13,26 @@ import {
 } from '../utils/floatingAssistAutoTask'
 
 const API = 'http://localhost:7070'
+
+type TaskForm = {
+  name: string
+  user_instruction: string
+  cron_expression: string
+  notification_channel_ids: number[]
+}
+
+type ChannelForm = {
+  name: string
+  channel_type: NotificationChannel['channel_type']
+  webhook_url: string
+}
+
+const emptyTaskForm = (): TaskForm => ({
+  name: '',
+  user_instruction: '',
+  cron_expression: '0 20 * * *',
+  notification_channel_ids: [],
+})
 
 function formatTs(ms: number | null): string {
   if (!ms) return '—'
@@ -49,14 +69,32 @@ function cronHint(expr: string): string {
   return map[displayExpr] || displayExpr
 }
 
+function channelTypeLabel(type: NotificationChannel['channel_type']): string {
+  return {
+    feishu: '飞书',
+    dingtalk: '钉钉',
+    wecom: '企业微信',
+    webhook: '通用 Webhook',
+  }[type]
+}
+
+function webhookHost(value: string): string {
+  try {
+    return `${new URL(value).host}/••••`
+  } catch {
+    return '已配置'
+  }
+}
+
 // ── 子组件：任务卡片 ─────────────────────────────────────────────────────────
 const TaskCard: React.FC<{
   task: ScheduledTask
   onToggle: (id: number, enabled: boolean) => void
   onTrigger: (id: number) => void
+  onEdit: (task: ScheduledTask) => void
   onDelete: (id: number) => void
   onViewResult: (task: ScheduledTask) => void
-}> = ({ task, onToggle, onTrigger, onDelete, onViewResult }) => {
+}> = ({ task, onToggle, onTrigger, onEdit, onDelete, onViewResult }) => {
   const statusColor = task.last_run_status === 'success' ? '#34C759'
     : task.last_run_status === 'failed' ? '#FF3B30' : '#AEAEB2'
 
@@ -91,6 +129,12 @@ const TaskCard: React.FC<{
               fontSize: 11, padding: '1px 6px', borderRadius: 4,
               background: 'rgba(0,122,255,0.08)', color: '#007AFF',
             }}>{cronHint(task.cron_expression)}</span>
+            {task.is_builtin && (
+              <span style={{
+                fontSize: 11, padding: '1px 6px', borderRadius: 4,
+                background: 'rgba(181,122,43,0.1)', color: '#8A5A1F',
+              }}>内置日记</span>
+            )}
             {task.last_run_status && (
               <span style={{ width: 6, height: 6, borderRadius: '50%', background: statusColor, flexShrink: 0 }} />
             )}
@@ -108,23 +152,28 @@ const TaskCard: React.FC<{
 
         {/* 操作按钮 */}
         <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
-          {task.last_run_status === 'success' && (
-            <button onClick={() => onViewResult(task)} style={btnStyle('#007AFF')} title="查看结果">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
-              </svg>
-            </button>
-          )}
+          <button onClick={() => onViewResult(task)} style={btnStyle('#007AFF')} title="查看历史">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+            </svg>
+          </button>
+          <button onClick={() => onEdit(task)} style={btnStyle('#8A5A1F')} title="编辑">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/>
+            </svg>
+          </button>
           <button onClick={() => onTrigger(task.id)} style={btnStyle('#34C759')} title="立即执行">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <polygon points="5 3 19 12 5 21 5 3"/>
             </svg>
           </button>
-          <button onClick={() => onDelete(task.id)} style={btnStyle('#FF3B30')} title="删除">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/>
-            </svg>
-          </button>
+          {task.can_delete && (
+            <button onClick={() => onDelete(task.id)} style={btnStyle('#FF3B30')} title="删除">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/>
+              </svg>
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -137,18 +186,24 @@ const ScheduledTasksPanel: React.FC = () => {
   const base = apiBaseUrl || API
 
   const [tasks, setTasks] = useState<ScheduledTask[]>([])
+  const [channels, setChannels] = useState<NotificationChannel[]>([])
   const [loading, setLoading] = useState(false)
-  const [view, setView] = useState<'list' | 'create' | 'templates' | 'result'>('list')
+  const [view, setView] = useState<'list' | 'create' | 'edit' | 'templates' | 'result' | 'channels'>('list')
   const [selectedTask, setSelectedTask] = useState<ScheduledTask | null>(null)
   const [executions, setExecutions] = useState<TaskExecution[]>([])
   const [toast, setToast] = useState<string | null>(null)
+  const [autoTaskExpanded, setAutoTaskExpanded] = useState(false)
   const [autoTaskConfig, setAutoTaskConfig] = useState<FloatingAssistAutoTaskConfig>(readFloatingAssistAutoTaskConfig)
   const [autoTaskDraft, setAutoTaskDraft] = useState(() => readFloatingAssistAutoTaskConfig())
   const [autoTaskAppDraft, setAutoTaskAppDraft] = useState<FloatingAssistAutoTaskAppTarget>({ bundleId: '', appName: '' })
   const [triggerWordDraft, setTriggerWordDraft] = useState('')
 
-  // 创建表单状态
-  const [form, setForm] = useState({ name: '', user_instruction: '', cron_expression: '0 20 * * *' })
+  const [form, setForm] = useState<TaskForm>(emptyTaskForm)
+  const [channelForm, setChannelForm] = useState<ChannelForm>({
+    name: '',
+    channel_type: 'feishu',
+    webhook_url: '',
+  })
 
   const showToast = (msg: string) => {
     setToast(msg)
@@ -233,44 +288,96 @@ const ScheduledTasksPanel: React.FC = () => {
     setLoading(true)
     try {
       const res = await fetch(`${base}/api/tasks`)
+      if (!res.ok) throw new Error('加载任务失败')
       const data = await res.json()
       setTasks(data.tasks || [])
-    } catch (e) {
+    } catch {
       showToast('加载失败')
     } finally {
       setLoading(false)
     }
   }
 
-  useEffect(() => { loadTasks() }, [])
+  const loadChannels = async () => {
+    try {
+      const res = await fetch(`${base}/api/notification-channels`)
+      if (!res.ok) throw new Error('加载消息渠道失败')
+      const data = await res.json()
+      setChannels(data.channels || [])
+    } catch {
+      showToast('消息渠道加载失败')
+    }
+  }
+
+  useEffect(() => {
+    void loadTasks()
+    void loadChannels()
+  }, [base])
+
+  const responseError = async (res: Response, fallback: string) => {
+    try {
+      const error = await res.json()
+      return error.message || error.error || fallback
+    } catch {
+      return fallback
+    }
+  }
 
   const handleToggle = async (id: number, enabled: boolean) => {
-    await fetch(`${base}/api/tasks/${id}`, {
+    const res = await fetch(`${base}/api/tasks/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled }),
     })
-    loadTasks()
+    if (!res.ok) {
+      showToast(await responseError(res, '更新任务失败'))
+      return
+    }
+    void loadTasks()
   }
 
   const handleTrigger = async (id: number) => {
+    const res = await fetch(`${base}/api/tasks/${id}/trigger`, { method: 'POST' })
+    if (!res.ok) {
+      showToast(await responseError(res, '触发任务失败'))
+      return
+    }
     showToast('任务已触发，正在执行...')
-    await fetch(`${base}/api/tasks/${id}/trigger`, { method: 'POST' })
     setTimeout(loadTasks, 2000)
   }
 
   const handleDelete = async (id: number) => {
     if (!confirm('确认删除此任务？')) return
-    await fetch(`${base}/api/tasks/${id}`, { method: 'DELETE' })
-    loadTasks()
+    const res = await fetch(`${base}/api/tasks/${id}`, { method: 'DELETE' })
+    if (!res.ok) {
+      showToast(await responseError(res, '删除任务失败'))
+      return
+    }
+    showToast('任务已删除')
+    void loadTasks()
   }
 
   const handleViewResult = async (task: ScheduledTask) => {
     setSelectedTask(task)
     const res = await fetch(`${base}/api/tasks/${task.id}/executions?limit=5`)
+    if (!res.ok) {
+      showToast(await responseError(res, '加载执行历史失败'))
+      return
+    }
     const data = await res.json()
     setExecutions(data.executions || [])
     setView('result')
+  }
+
+  const handleEdit = (task: ScheduledTask) => {
+    setSelectedTask(task)
+    setForm({
+      name: task.name,
+      user_instruction: task.user_instruction,
+      cron_expression: task.cron_expression,
+      notification_channel_ids: task.notification_channel_ids || [],
+    })
+    setView('edit')
   }
 
   const handleCreate = async () => {
@@ -285,22 +392,113 @@ const ScheduledTasksPanel: React.FC = () => {
         body: JSON.stringify(form),
       })
       if (!res.ok) {
-        const err = await res.json()
-        showToast(err.error || '创建失败')
+        showToast(await responseError(res, '创建失败'))
         return
       }
       showToast('任务创建成功')
-      setForm({ name: '', user_instruction: '', cron_expression: '0 20 * * *' })
+      setForm(emptyTaskForm())
       setView('list')
-      loadTasks()
-    } catch (e) {
+      void loadTasks()
+    } catch {
       showToast('创建失败')
     }
   }
 
+  const handleUpdate = async () => {
+    if (!selectedTask || !form.name || !form.user_instruction || !form.cron_expression) {
+      showToast('请填写所有字段')
+      return
+    }
+    try {
+      const res = await fetch(`${base}/api/tasks/${selectedTask.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      })
+      if (!res.ok) {
+        showToast(await responseError(res, '保存失败'))
+        return
+      }
+      showToast('任务已保存')
+      setSelectedTask(null)
+      setForm(emptyTaskForm())
+      setView('list')
+      void loadTasks()
+    } catch {
+      showToast('保存失败')
+    }
+  }
+
   const handleUseTemplate = (tpl: TaskTemplate) => {
-    setForm({ name: tpl.name, user_instruction: tpl.user_instruction, cron_expression: tpl.cron })
+    setForm({
+      name: tpl.name,
+      user_instruction: tpl.user_instruction,
+      cron_expression: tpl.cron,
+      notification_channel_ids: [],
+    })
     setView('create')
+  }
+
+  const toggleFormChannel = (channelId: number) => {
+    setForm(value => ({
+      ...value,
+      notification_channel_ids: value.notification_channel_ids.includes(channelId)
+        ? value.notification_channel_ids.filter(id => id !== channelId)
+        : [...value.notification_channel_ids, channelId],
+    }))
+  }
+
+  const handleCreateChannel = async () => {
+    if (!channelForm.name.trim() || !channelForm.webhook_url.trim()) {
+      showToast('请填写渠道名称和 Webhook 地址')
+      return
+    }
+    try {
+      const res = await fetch(`${base}/api/notification-channels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...channelForm, enabled: true }),
+      })
+      if (!res.ok) {
+        showToast(await responseError(res, '创建渠道失败'))
+        return
+      }
+      setChannelForm({ name: '', channel_type: 'feishu', webhook_url: '' })
+      showToast('消息渠道已添加')
+      void loadChannels()
+    } catch {
+      showToast('创建渠道失败')
+    }
+  }
+
+  const handleToggleChannel = async (channel: NotificationChannel) => {
+    const res = await fetch(`${base}/api/notification-channels/${channel.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !channel.enabled }),
+    })
+    if (!res.ok) {
+      showToast(await responseError(res, '更新渠道失败'))
+      return
+    }
+    void loadChannels()
+  }
+
+  const handleDeleteChannel = async (channel: NotificationChannel) => {
+    if (!confirm(`确认删除消息渠道「${channel.name}」？`)) return
+    const res = await fetch(`${base}/api/notification-channels/${channel.id}`, {
+      method: 'DELETE',
+    })
+    if (!res.ok) {
+      showToast(await responseError(res, '删除渠道失败'))
+      return
+    }
+    setForm(value => ({
+      ...value,
+      notification_channel_ids: value.notification_channel_ids.filter(id => id !== channel.id),
+    }))
+    showToast('消息渠道已删除')
+    void Promise.all([loadChannels(), loadTasks()])
   }
 
   // ── 渲染 ──────────────────────────────────────────────────────────────────
@@ -311,11 +509,19 @@ const ScheduledTasksPanel: React.FC = () => {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
           <span style={{ fontSize: 16, fontWeight: 600, color: '#000' }}>定时任务</span>
           <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={() => setView('channels')} style={{
+              fontSize: 12, padding: '5px 10px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.1)',
+              background: 'white', color: '#8A5A1F', cursor: 'pointer',
+            }}>消息渠道</button>
             <button onClick={() => setView('templates')} style={{
               fontSize: 12, padding: '5px 10px', borderRadius: 8, border: '1px solid rgba(0,0,0,0.1)',
               background: 'white', color: '#007AFF', cursor: 'pointer',
             }}>模板库</button>
-            <button onClick={() => setView('create')} style={{
+            <button onClick={() => {
+              setSelectedTask(null)
+              setForm(emptyTaskForm())
+              setView('create')
+            }} style={{
               fontSize: 12, padding: '5px 10px', borderRadius: 8, border: 'none',
               background: '#007AFF', color: 'white', cursor: 'pointer',
             }}>+ 新建</button>
@@ -324,7 +530,10 @@ const ScheduledTasksPanel: React.FC = () => {
 
         {/* Tab bar */}
         {view !== 'list' && (
-          <button onClick={() => setView('list')} style={{
+          <button onClick={() => {
+            setSelectedTask(null)
+            setView('list')
+          }} style={{
             fontSize: 12, color: '#007AFF', background: 'none', border: 'none',
             cursor: 'pointer', padding: 0, marginBottom: 8,
           }}>← 返回列表</button>
@@ -336,12 +545,17 @@ const ScheduledTasksPanel: React.FC = () => {
 
         {/* 任务列表 */}
         {view === 'list' && (
-          <>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
             <div style={{
               background: 'white', borderRadius: 12, padding: 16,
-              border: '1px solid rgba(0,0,0,0.08)', marginBottom: 12,
+              border: '1px solid rgba(0,0,0,0.08)', marginBottom: 12, order: 3,
             }}>
-              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginBottom: 14 }}>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+                marginBottom: autoTaskExpanded ? 14 : 0,
+              }}>
                 <button
                   onClick={handleAutoTaskToggle}
                   style={{
@@ -367,9 +581,23 @@ const ScheduledTasksPanel: React.FC = () => {
                       color: autoTaskConfig.enabled ? '#248A3D' : '#6E6E73',
                     }}>{autoTaskConfig.enabled ? '运行中' : '已关闭'}</span>
                   </div>
+                  <div style={{ fontSize: 11, color: '#8E8E93' }}>按应用和触发词发现可执行任务</div>
                 </div>
+                <button
+                  type="button"
+                  aria-expanded={autoTaskExpanded}
+                  onClick={() => setAutoTaskExpanded(value => !value)}
+                  style={{
+                    border: 'none', background: 'transparent', color: '#8A5A1F',
+                    cursor: 'pointer', fontSize: 12, padding: '4px 0 4px 8px',
+                  }}
+                >
+                  {autoTaskExpanded ? '收起' : '展开设置'} {autoTaskExpanded ? '⌃' : '⌄'}
+                </button>
               </div>
 
+              {autoTaskExpanded && (
+                <>
               <div style={{ marginBottom: 14 }}>
                 <label style={labelStyle}>识别软件</label>
                 <div style={{ display: 'grid', gap: 8 }}>
@@ -474,6 +702,8 @@ const ScheduledTasksPanel: React.FC = () => {
                   background: '#007AFF', color: 'white', cursor: 'pointer',
                 }}>保存配置</button>
               </div>
+                </>
+              )}
             </div>
 
             {loading && <div style={{ textAlign: 'center', color: '#AEAEB2', padding: 20 }}>加载中...</div>}
@@ -487,15 +717,24 @@ const ScheduledTasksPanel: React.FC = () => {
             {tasks.map(task => (
               <TaskCard key={task.id} task={task}
                 onToggle={handleToggle} onTrigger={handleTrigger}
+                onEdit={handleEdit}
                 onDelete={handleDelete} onViewResult={handleViewResult}
               />
             ))}
-          </>
+          </div>
         )}
 
-        {/* 创建表单 */}
-        {view === 'create' && (
+        {/* 创建 / 编辑表单 */}
+        {(view === 'create' || view === 'edit') && (
           <div style={{ background: 'white', borderRadius: 12, padding: 16, border: '1px solid rgba(0,0,0,0.08)' }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#2E2115', marginBottom: 14 }}>
+              {view === 'edit' ? '编辑任务' : '创建任务'}
+              {selectedTask?.is_builtin && (
+                <span style={{ fontSize: 11, color: '#8A5A1F', fontWeight: 400, marginLeft: 8 }}>
+                  内置日记任务可编辑，但不能删除
+                </span>
+              )}
+            </div>
             <div style={{ marginBottom: 14 }}>
               <label style={labelStyle}>任务名称</label>
               <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
@@ -518,10 +757,138 @@ const ScheduledTasksPanel: React.FC = () => {
                 &nbsp;·&nbsp;常用：每天20点 <code>0 20 * * *</code>，每周五18点 <code>0 18 * * 5</code>
               </div>
             </div>
-            <button onClick={handleCreate} style={{
+            <div style={{ marginBottom: 16 }}>
+              <label style={labelStyle}>结果推送到</label>
+              {channels.length === 0 ? (
+                <button
+                  type="button"
+                  onClick={() => setView('channels')}
+                  style={{
+                    ...smallPrimaryButtonStyle,
+                    background: 'rgba(181,122,43,0.1)',
+                    color: '#8A5A1F',
+                  }}
+                >
+                  先添加消息渠道
+                </button>
+              ) : (
+                <div style={{ display: 'grid', gap: 8 }}>
+                  {channels.map(channel => (
+                    <label key={channel.id} style={{
+                      display: 'flex', alignItems: 'center', gap: 9, padding: '8px 10px',
+                      border: '1px solid rgba(181,122,43,0.16)', borderRadius: 8,
+                      background: channel.enabled ? '#FFFCF7' : '#F5F5F5',
+                      opacity: channel.enabled ? 1 : 0.58, cursor: channel.enabled ? 'pointer' : 'default',
+                    }}>
+                      <input
+                        type="checkbox"
+                        checked={form.notification_channel_ids.includes(channel.id)}
+                        disabled={!channel.enabled}
+                        onChange={() => toggleFormChannel(channel.id)}
+                      />
+                      <span style={{ fontSize: 12, color: '#2E2115', flex: 1 }}>{channel.name}</span>
+                      <span style={{ fontSize: 11, color: '#8E8E93' }}>
+                        {channelTypeLabel(channel.channel_type)}{channel.enabled ? '' : ' · 已停用'}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 6 }}>
+                渠道配置仅保存在本机。任务成功后推送，投递失败不会把任务标记为失败。
+              </div>
+            </div>
+            <button onClick={view === 'edit' ? handleUpdate : handleCreate} style={{
               width: '100%', padding: '10px', borderRadius: 8, border: 'none',
               background: '#007AFF', color: 'white', fontSize: 14, fontWeight: 500, cursor: 'pointer',
-            }}>创建任务</button>
+            }}>{view === 'edit' ? '保存修改' : '创建任务'}</button>
+          </div>
+        )}
+
+        {/* 本地消息渠道 */}
+        {view === 'channels' && (
+          <div style={{ display: 'grid', gap: 12 }}>
+            <div style={{
+              background: 'linear-gradient(135deg, #FFF9EF 0%, #FFFDF9 100%)',
+              border: '1px solid rgba(181,122,43,0.2)', borderRadius: 12, padding: 16,
+            }}>
+              <div style={{ fontSize: 14, fontWeight: 600, color: '#2E2115' }}>任务结果消息渠道</div>
+              <p style={{ fontSize: 12, color: '#705D49', lineHeight: 1.6, margin: '6px 0 14px' }}>
+                Webhook 地址只保存在这台电脑上，不会同步到云端。支持飞书、钉钉、企业微信和通用 Webhook。
+              </p>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, .7fr) minmax(120px, .55fr)', gap: 10, marginBottom: 10 }}>
+                <input
+                  value={channelForm.name}
+                  onChange={event => setChannelForm(value => ({ ...value, name: event.target.value }))}
+                  placeholder="渠道名称，如「我的工作群」"
+                  style={inputStyle}
+                />
+                <select
+                  value={channelForm.channel_type}
+                  onChange={event => setChannelForm(value => ({
+                    ...value,
+                    channel_type: event.target.value as NotificationChannel['channel_type'],
+                  }))}
+                  style={{ ...inputStyle, background: 'white' }}
+                >
+                  <option value="feishu">飞书</option>
+                  <option value="dingtalk">钉钉</option>
+                  <option value="wecom">企业微信</option>
+                  <option value="webhook">通用 Webhook</option>
+                </select>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 10 }}>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={channelForm.webhook_url}
+                  onChange={event => setChannelForm(value => ({ ...value, webhook_url: event.target.value }))}
+                  placeholder="https://…"
+                  style={inputStyle}
+                />
+                <button type="button" onClick={handleCreateChannel} style={smallPrimaryButtonStyle}>
+                  添加渠道
+                </button>
+              </div>
+            </div>
+
+            {channels.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: 28, color: '#8E8E93', fontSize: 12 }}>
+                暂无消息渠道。添加后可在创建或编辑任务时选择。
+              </div>
+            ) : channels.map(channel => (
+              <div key={channel.id} style={{
+                display: 'flex', alignItems: 'center', gap: 12, background: 'white',
+                border: '1px solid rgba(0,0,0,0.08)', borderRadius: 10, padding: '12px 14px',
+                opacity: channel.enabled ? 1 : 0.62,
+              }}>
+                <button
+                  type="button"
+                  onClick={() => handleToggleChannel(channel)}
+                  aria-label={`${channel.enabled ? '停用' : '启用'}${channel.name}`}
+                  style={{
+                    width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer',
+                    background: channel.enabled ? '#34C759' : '#E5E5EA', flexShrink: 0,
+                    position: 'relative',
+                  }}
+                >
+                  <span style={{
+                    position: 'absolute', top: 2, left: channel.enabled ? 18 : 2,
+                    width: 16, height: 16, borderRadius: '50%', background: 'white',
+                    transition: 'left .2s',
+                  }} />
+                </button>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: '#2E2115' }}>{channel.name}</div>
+                  <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 3 }}>
+                    {channelTypeLabel(channel.channel_type)} · {webhookHost(channel.webhook_url)}
+                  </div>
+                </div>
+                <button type="button" onClick={() => handleDeleteChannel(channel)} style={smallDangerButtonStyle}>
+                  删除
+                </button>
+              </div>
+            ))}
           </div>
         )}
 
@@ -556,6 +923,11 @@ const ScheduledTasksPanel: React.FC = () => {
         {view === 'result' && selectedTask && (
           <div>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12 }}>{selectedTask.name} — 执行历史</div>
+            {executions.length === 0 && (
+              <div style={{ textAlign: 'center', padding: 32, color: '#8E8E93', fontSize: 12 }}>
+                还没有执行记录
+              </div>
+            )}
             {executions.map(exec => (
               <div key={exec.id} style={{
                 background: 'white', borderRadius: 10, padding: 14,
@@ -579,6 +951,27 @@ const ScheduledTasksPanel: React.FC = () => {
                 )}
                 {exec.error_message && (
                   <div style={{ fontSize: 12, color: '#FF3B30' }}>{exec.error_message}</div>
+                )}
+                {(exec.notification_deliveries?.length || 0) > 0 && (
+                  <div style={{
+                    display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10,
+                    borderTop: '1px solid rgba(0,0,0,0.06)', paddingTop: 9,
+                  }}>
+                    {exec.notification_deliveries.map(delivery => (
+                      <span key={delivery.channel_id} title={delivery.error_message || undefined} style={{
+                        fontSize: 11, borderRadius: 999, padding: '3px 7px',
+                        color: delivery.status === 'success' ? '#248A3D'
+                          : delivery.status === 'failed' ? '#D70015' : '#8A5A1F',
+                        background: delivery.status === 'success' ? 'rgba(52,199,89,.1)'
+                          : delivery.status === 'failed' ? 'rgba(255,59,48,.08)' : 'rgba(181,122,43,.1)',
+                      }}>
+                        {delivery.channel_name} · {
+                          delivery.status === 'success' ? '已推送'
+                            : delivery.status === 'failed' ? '推送失败' : '等待推送'
+                        }
+                      </span>
+                    ))}
+                  </div>
                 )}
               </div>
             ))}

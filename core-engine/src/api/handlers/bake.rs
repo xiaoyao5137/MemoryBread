@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -263,6 +264,17 @@ pub async fn list_bake_memories(
     }))
 }
 
+pub async fn delete_bake_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let service = BakeService::new(state.storage.clone(), state.sidecar_url.clone());
+    tokio::task::spawn_blocking(move || service.delete_memory(id))
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_bake_knowledge(
     State(state): State<Arc<AppState>>,
     Query(params): Query<BakePaginationQuery>,
@@ -354,6 +366,27 @@ pub async fn get_bake_capture(
     Ok(Json(capture))
 }
 
+fn capture_assets_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".memory-bread").join("captures")
+}
+
+pub async fn delete_bake_capture(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let storage = state.storage.clone();
+    let deleted = tokio::task::spawn_blocking(move || {
+        storage.delete_capture_with_assets(id, &capture_assets_dir())
+    })
+    .await
+    .map_err(|err| ApiError::Internal(err.to_string()))??;
+    if !deleted {
+        return Err(ApiError::NotFound(format!("capture {id} not found")));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn get_bake_capture_screenshot(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -367,11 +400,7 @@ pub async fn get_bake_capture_screenshot(
         .screenshot_path
         .ok_or_else(|| ApiError::NotFound(format!("capture {id} has no screenshot")))?;
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let full_path = std::path::PathBuf::from(home)
-        .join(".memory-bread")
-        .join("captures")
-        .join(&relative_path);
+    let full_path = capture_assets_dir().join(&relative_path);
 
     let bytes = tokio::fs::read(&full_path).await.map_err(|err| {
         ApiError::NotFound(format!("failed to read screenshot {relative_path}: {err}"))
@@ -434,6 +463,16 @@ pub async fn run_bake_pipeline(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RunBakeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // 启动时尚未超过阈值的遗留 run 会在运行期变 stale。每次触发前先收敛，
+    // 避免历史 running 状态永久污染并发判断和监控告警。
+    let recovered_stale_runs = state.storage.fail_stale_running_bake_runs()?;
+    if recovered_stale_runs > 0 {
+        tracing::warn!(
+            "触发 bake 前已收敛 {} 个陈旧 running bake run",
+            recovered_stale_runs
+        );
+    }
+
     if !state.is_capture_enabled() {
         return Ok(Json(serde_json::json!({
             "id": null,

@@ -24,6 +24,8 @@ import OnboardingWizard       from './components/OnboardingWizard'
 import AuthPanel              from './components/AuthPanel'
 import AchievementCelebration from './components/AchievementCelebration'
 import SystemFloatingAssist   from './components/SystemFloatingAssist'
+import AboutPanel             from './components/AboutPanel'
+import SoftwareUpdateNotice   from './components/SoftwareUpdateNotice'
 import { fetchConsoleSummary, fetchCurrentUser } from './utils/authApi'
 import { syncEligibleAchievementTasks } from './utils/achievementTasks'
 import {
@@ -34,10 +36,20 @@ import {
 } from './utils/floatingAssistAutoTask'
 import { startGlobalShortcutRuntime } from './utils/interactionSettings'
 import { synchronizeWorkProfile } from './utils/workProfileCloud'
-import type { AccountProfileSection, AchievementBadge } from './types'
+import { getAppMetadata } from './utils/appMetadata'
+import {
+  fetchSoftwareUpdate,
+  registerCurrentDevice,
+  shouldShowSoftwareUpdate,
+  snoozeSoftwareUpdate,
+  type SoftwareUpdateCheck,
+} from './utils/softwareUpdate'
+import { fetchInitializationStatus, initializationIsReady } from './utils/initialization'
+import type { AccountProfileSection, AchievementAward } from './types'
 
 const WORK_PROFILE_SYNC_INTERVAL_MS = 5 * 60 * 1000
 const ACHIEVEMENT_SYNC_INTERVAL_MS = 5 * 60 * 1000
+const SOFTWARE_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 
 interface AccountNavigationRequest {
   section: AccountProfileSection
@@ -53,11 +65,38 @@ const parseReferenceId = (docKey?: string | null) => {
   return match ? match[1] : null
 }
 
+const InitializationGuardedFloatingAssist: React.FC = () => {
+  const [initializationReady, setInitializationReady] = useState(false)
+
+  useEffect(() => {
+    let mounted = true
+    const verify = () => {
+      void fetchInitializationStatus()
+        .then(status => {
+          if (mounted) setInitializationReady(initializationIsReady(status))
+        })
+        .catch(() => {
+          if (mounted) setInitializationReady(false)
+        })
+    }
+    verify()
+    const interval = window.setInterval(verify, 30_000)
+    window.addEventListener('focus', verify)
+    return () => {
+      mounted = false
+      window.clearInterval(interval)
+      window.removeEventListener('focus', verify)
+    }
+  }, [])
+
+  return initializationReady ? <SystemFloatingAssist /> : null
+}
+
 const App: React.FC = () => {
   const searchParams = new URLSearchParams(window.location.search)
   const isFloatingAssistWindow = searchParams.get('view') === 'floating-assist'
   if (isFloatingAssistWindow) {
-    return <SystemFloatingAssist />
+    return <InitializationGuardedFloatingAssist />
   }
 
   const {
@@ -84,12 +123,13 @@ const App: React.FC = () => {
     pushBakeNavigationTarget,
     clearBakeNavigationStack,
     hasCompletedSetup,
-    setupSkipped,
+    setHasCompletedSetup,
     apiBaseUrl,
     adminApiBaseUrl,
     authToken,
     currentUser,
     serviceEnvironment,
+    debugModeEnabled,
     setCreationModelConfigs,
     setAuthSession,
     setCloudBalance,
@@ -97,11 +137,63 @@ const App: React.FC = () => {
     clearAuthSession,
   } = useAppStore()
 
-  const [achievementCelebrations, setAchievementCelebrations] = useState<AchievementBadge[][]>([])
+  const [achievementCelebrations, setAchievementCelebrations] = useState<AchievementAward[][]>([])
   const [accountNavigation, setAccountNavigation] = useState<AccountNavigationRequest | null>(null)
+  const [softwareUpdate, setSoftwareUpdate] = useState<SoftwareUpdateCheck | null>(null)
+  // 每次进程启动都以 sidecar 的实时质检状态为准；已完成用户先走轻量核验，
+  // 避免为了校验而挂载完整初始化页并改变其上次停留位置。
+  const [initializationValidated, setInitializationValidated] = useState<boolean | null>(
+    hasCompletedSetup ? null : false,
+  )
 
-  const showOnboarding = !hasCompletedSetup && !setupSkipped
+  const showOnboarding = initializationValidated !== true || !hasCompletedSetup
   const activeAchievementCelebration = achievementCelebrations[0] ?? null
+
+  const handleInitializationValidated = useCallback((ready: boolean) => {
+    setInitializationValidated(ready)
+  }, [])
+
+  useEffect(() => {
+    if (initializationValidated !== null) return
+    let mounted = true
+    void fetchInitializationStatus()
+      .then(next => {
+        if (!mounted) return
+        const ready = initializationIsReady(next)
+        setInitializationValidated(ready)
+        if (!ready) setHasCompletedSetup(false)
+      })
+      .catch(() => {
+        if (!mounted) return
+        setInitializationValidated(false)
+      })
+    return () => {
+      mounted = false
+    }
+  }, [initializationValidated, setHasCompletedSetup])
+
+  useEffect(() => {
+    if (showOnboarding) return
+    const verify = () => {
+      void fetchInitializationStatus()
+        .then(next => {
+          if (!initializationIsReady(next)) {
+            setHasCompletedSetup(false)
+            setInitializationValidated(false)
+          }
+        })
+        .catch(() => {
+          // 短暂的 sidecar 重启不应清除已经通过质检的本地完成标记。
+        })
+    }
+    verify()
+    const interval = window.setInterval(verify, 30_000)
+    window.addEventListener('focus', verify)
+    return () => {
+      window.clearInterval(interval)
+      window.removeEventListener('focus', verify)
+    }
+  }, [setHasCompletedSetup, showOnboarding])
 
   const dismissAchievementCelebration = useCallback(() => {
     setAchievementCelebrations((queue) => queue.slice(1))
@@ -111,7 +203,7 @@ const App: React.FC = () => {
     if (activeAchievementCelebration) {
       setAccountNavigation({
         section: 'achievements',
-        highlightedAchievementKeys: activeAchievementCelebration.map((badge) => badge.badge_key),
+        highlightedAchievementKeys: activeAchievementCelebration.map(({ badge }) => badge.badge_key),
       })
     }
     setAchievementCelebrations((queue) => queue.slice(1))
@@ -176,6 +268,9 @@ const App: React.FC = () => {
         }
         cleanups.push(await listen('tray-navigate-settings', () => {
           setWindowMode('settings')
+        }))
+        cleanups.push(await listen('tray-navigate-about', () => {
+          setWindowMode('about')
         }))
         cleanups.push(await listen<boolean>('tray-floating-assist-changed', event => {
           localStorage.setItem(FLOATING_ASSIST_ENABLED_KEY, String(event.payload))
@@ -292,6 +387,59 @@ const App: React.FC = () => {
   }, [adminApiBaseUrl, authToken, clearAuthSession, setAuthSession, setCloudBalance, setCloudSubscription])
 
   useEffect(() => {
+    if (showOnboarding) return undefined
+    let cancelled = false
+    let checking = false
+
+    const checkForUpdate = async () => {
+      if (checking || cancelled) return
+      checking = true
+      try {
+        const metadata = await getAppMetadata()
+        const update = await fetchSoftwareUpdate(adminApiBaseUrl, metadata)
+        if (!cancelled) setSoftwareUpdate(shouldShowSoftwareUpdate(update) ? update : null)
+      } catch {
+        // 软件更新检查不阻断本地能力；联网恢复后会自动重试。
+      } finally {
+        checking = false
+      }
+    }
+    const checkWhenVisible = () => {
+      if (document.visibilityState === 'visible') void checkForUpdate()
+    }
+
+    void checkForUpdate()
+    const interval = window.setInterval(() => void checkForUpdate(), SOFTWARE_UPDATE_CHECK_INTERVAL_MS)
+    window.addEventListener('online', checkForUpdate)
+    document.addEventListener('visibilitychange', checkWhenVisible)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+      window.removeEventListener('online', checkForUpdate)
+      document.removeEventListener('visibilitychange', checkWhenVisible)
+    }
+  }, [adminApiBaseUrl, serviceEnvironment, showOnboarding])
+
+  useEffect(() => {
+    if (!authToken || !currentUser) return undefined
+    let cancelled = false
+    const reportVersion = async () => {
+      if (cancelled) return
+      await registerCurrentDevice(adminApiBaseUrl, authToken).catch(() => {
+        // 设备版本上报是可重试的后台动作，不影响离线使用。
+      })
+    }
+    void reportVersion()
+    const interval = window.setInterval(() => void reportVersion(), SOFTWARE_UPDATE_CHECK_INTERVAL_MS)
+    window.addEventListener('online', reportVersion)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+      window.removeEventListener('online', reportVersion)
+    }
+  }, [adminApiBaseUrl, authToken, currentUser?.id, serviceEnvironment])
+
+  useEffect(() => {
     if (!authToken || !currentUser) return undefined
     let cancelled = false
 
@@ -336,14 +484,14 @@ const App: React.FC = () => {
       if (controller.signal.aborted || syncInFlight) return
       syncInFlight = true
       try {
-        const claimedBadges = await syncEligibleAchievementTasks({
+        const awards = await syncEligibleAchievementTasks({
           adminApiBaseUrl,
           apiBaseUrl,
           authToken,
           signal: controller.signal,
         })
-        if (!controller.signal.aborted && claimedBadges.length > 0) {
-          setAchievementCelebrations((queue) => [...queue, claimedBadges])
+        if (!controller.signal.aborted && awards.length > 0) {
+          setAchievementCelebrations((queue) => [...queue, awards])
         }
       } catch {
         // 领取检测属于后台增强；本地或账户服务恢复后会自动重试。
@@ -370,6 +518,7 @@ const App: React.FC = () => {
   // 监听查看采集记录事件
   useEffect(() => {
     const handleViewCapture = (event: CustomEvent) => {
+      if (!debugModeEnabled) return
       const { captureId } = event.detail
       setWindowMode('debug')
       setTimeout(() => {
@@ -383,7 +532,7 @@ const App: React.FC = () => {
     return () => {
       window.removeEventListener('view-capture', handleViewCapture as EventListener)
     }
-  }, [setWindowMode])
+  }, [debugModeEnabled, setWindowMode])
 
   useEffect(() => {
     const openReferenceDetail = (detail: any) => {
@@ -486,10 +635,23 @@ const App: React.FC = () => {
     setWindowMode,
   ])
 
+  if (initializationValidated === null) {
+    return (
+      <div className="app" data-testid="app-root">
+        <main className="initialization-gate" aria-label="正在核验本地能力">
+          <div className="initialization-connection" role="status">
+            <span className="connection-pulse" aria-hidden />
+            正在核验本地能力…
+          </div>
+        </main>
+      </div>
+    )
+  }
+
   if (showOnboarding) {
     return (
       <div className="app" data-testid="app-root">
-        <OnboardingWizard />
+        <OnboardingWizard onStatusValidated={handleInitializationValidated} />
         <ActionConfirm />
       </div>
     )
@@ -506,15 +668,17 @@ const App: React.FC = () => {
         {windowMode === 'models'    && <ModelManager />}
         {windowMode === 'privacy'   && <PrivacyPanel />}
         {windowMode === 'settings'  && <Settings />}
-        {windowMode === 'debug'     && <DebugPanel />}
+        {debugModeEnabled && windowMode === 'debug' && <DebugPanel />}
         {windowMode === 'tasks'     && <ScheduledTasksPanel />}
         {windowMode === 'monitor'   && <MonitorPanel />}
         {windowMode === 'bake'      && <BakePanel />}
         {windowMode === 'diary'     && <DiaryPanel />}
-        {windowMode === 'account'   && (
+        {windowMode === 'about'     && <AboutPanel />}
+        {(windowMode === 'account' || windowMode === 'messages') && (
           <AuthPanel
             highlightedAchievementKeys={accountNavigation?.highlightedAchievementKeys}
-            initialProfileSection={accountNavigation?.section}
+            initialProfileSection={windowMode === 'messages' ? 'messages' : accountNavigation?.section}
+            key={windowMode}
             onInitialProfileSectionHandled={handleAccountNavigationConsumed}
           />
         )}
@@ -522,9 +686,18 @@ const App: React.FC = () => {
 
       {activeAchievementCelebration && (
         <AchievementCelebration
-          badges={activeAchievementCelebration}
+          awards={activeAchievementCelebration}
           onDismiss={dismissAchievementCelebration}
           onViewCards={viewCelebratedAchievements}
+        />
+      )}
+      {softwareUpdate && (
+        <SoftwareUpdateNotice
+          update={softwareUpdate}
+          onDismiss={() => {
+            snoozeSoftwareUpdate(softwareUpdate.latest_version)
+            setSoftwareUpdate(null)
+          }}
         />
       )}
       <ActionConfirm />

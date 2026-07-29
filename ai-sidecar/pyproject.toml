@@ -16,3 +16,7 @@ dependencies    = [
 asyncio_mode = "auto"
 testpaths    = ["tests"]
 pythonpath   = ["."]        # 让 pytest 能找到 ocr/, dispatcher.py 等顶层模块
+markers = [
+    "initialization_cold: 可重复执行的纯本地冷初始化沙箱测试",
+    "live_initialization: 下载真实运行时与模型的手工/夜间冷初始化测试",
+]

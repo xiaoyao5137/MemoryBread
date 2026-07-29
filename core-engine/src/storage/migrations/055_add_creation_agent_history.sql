@@ -1,0 +1,1 @@
+-- Handled by StorageManager::add_column_if_missing for idempotency.

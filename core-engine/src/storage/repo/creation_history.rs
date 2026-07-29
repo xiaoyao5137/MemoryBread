@@ -1,5 +1,33 @@
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
+
+const HISTORY_SELECT: &str = "SELECT id, prompt, generated_content, doc_type, audience,
+    reference_count, references_json, model, latency_ms, session_id, conversation_json,
+    agent_trace_json, goal_json, root_request, parent_history_id, revision_no,
+    edit_operation, document_patch_json, created_at, updated_at
+    FROM creation_history ch";
+
+const LATEST_SESSION_PREDICATE: &str = "(COALESCE(TRIM(ch.session_id), '') = ''
+    OR NOT EXISTS (
+        SELECT 1
+        FROM creation_history newer
+        WHERE newer.session_id = ch.session_id
+          AND (
+              newer.revision_no > ch.revision_no
+              OR (newer.revision_no = ch.revision_no AND newer.updated_at > ch.updated_at)
+              OR (
+                  newer.revision_no = ch.revision_no
+                  AND newer.updated_at = ch.updated_at
+                  AND newer.created_at > ch.created_at
+              )
+              OR (
+                  newer.revision_no = ch.revision_no
+                  AND newer.updated_at = ch.updated_at
+                  AND newer.created_at = ch.created_at
+                  AND newer.id > ch.id
+              )
+          )
+    ))";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreationHistory {
@@ -13,8 +41,32 @@ pub struct CreationHistory {
     pub references_json: Option<String>,
     pub model: Option<String>,
     pub latency_ms: Option<i64>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub conversation_json: Option<String>,
+    #[serde(default)]
+    pub agent_trace_json: Option<String>,
+    #[serde(default)]
+    pub goal_json: Option<String>,
+    #[serde(default)]
+    pub root_request: Option<String>,
+    #[serde(default)]
+    pub parent_history_id: Option<i64>,
+    #[serde(default = "default_revision_no")]
+    pub revision_no: i64,
+    #[serde(default = "default_edit_operation")]
+    pub edit_operation: String,
+    #[serde(default)]
+    pub document_patch_json: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreationSessionContext {
+    pub root_request: String,
+    pub latest: CreationHistory,
 }
 
 pub fn insert(
@@ -27,13 +79,114 @@ pub fn insert(
     references_json: Option<&str>,
     model: Option<&str>,
     latency_ms: Option<i64>,
+    session_id: Option<&str>,
+    conversation_json: Option<&str>,
+    agent_trace_json: Option<&str>,
+    goal_json: Option<&str>,
+    root_request: Option<&str>,
+    parent_history_id: Option<i64>,
+    revision_no: i64,
+    edit_operation: &str,
+    document_patch_json: Option<&str>,
 ) -> Result<i64> {
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
-        "INSERT INTO creation_history (prompt, generated_content, doc_type, audience, reference_count, references_json, model, latency_ms, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        params![prompt, content, doc_type, audience, ref_count, references_json, model, latency_ms, now, now],
+        "INSERT INTO creation_history (
+            prompt, generated_content, doc_type, audience, reference_count,
+            references_json, model, latency_ms, session_id, conversation_json,
+            agent_trace_json, goal_json, root_request, parent_history_id, revision_no,
+            edit_operation, document_patch_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            prompt,
+            content,
+            doc_type,
+            audience,
+            ref_count,
+            references_json,
+            model,
+            latency_ms,
+            session_id,
+            conversation_json,
+            agent_trace_json,
+            goal_json,
+            root_request,
+            parent_history_id,
+            revision_no.max(1),
+            edit_operation,
+            document_patch_json,
+            now,
+            now
+        ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn update_session(
+    conn: &Connection,
+    history_id: i64,
+    prompt: &str,
+    content: &str,
+    doc_type: Option<&str>,
+    audience: Option<&str>,
+    ref_count: i64,
+    references_json: Option<&str>,
+    model: Option<&str>,
+    latency_ms: Option<i64>,
+    session_id: &str,
+    conversation_json: Option<&str>,
+    agent_trace_json: Option<&str>,
+    goal_json: Option<&str>,
+    root_request: &str,
+    revision_no: i64,
+    edit_operation: &str,
+    document_patch_json: Option<&str>,
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "UPDATE creation_history
+         SET prompt = ?1,
+             generated_content = ?2,
+             doc_type = ?3,
+             audience = ?4,
+             reference_count = ?5,
+             references_json = ?6,
+             model = ?7,
+             latency_ms = ?8,
+             session_id = ?9,
+             conversation_json = ?10,
+             agent_trace_json = ?11,
+             goal_json = ?12,
+             root_request = ?13,
+             parent_history_id = NULL,
+             revision_no = ?14,
+             edit_operation = ?15,
+             document_patch_json = ?16,
+             updated_at = ?17
+         WHERE id = ?18",
+        params![
+            prompt,
+            content,
+            doc_type,
+            audience,
+            ref_count,
+            references_json,
+            model,
+            latency_ms,
+            session_id,
+            conversation_json,
+            agent_trace_json,
+            goal_json,
+            root_request,
+            revision_no.max(1),
+            edit_operation,
+            document_patch_json,
+            now,
+            history_id,
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn list_recent(conn: &Connection, limit: i64) -> Result<Vec<CreationHistory>> {
@@ -43,6 +196,15 @@ pub fn list_recent(conn: &Connection, limit: i64) -> Result<Vec<CreationHistory>
     list_page(conn, None, limit as usize, 0).map(|(items, _)| items)
 }
 
+pub fn get_by_id(conn: &Connection, history_id: i64) -> Result<Option<CreationHistory>> {
+    conn.query_row(
+        &format!("{HISTORY_SELECT} WHERE ch.id = ?1 LIMIT 1"),
+        params![history_id],
+        map_history_row,
+    )
+    .optional()
+}
+
 pub fn list_page(
     conn: &Connection,
     query: Option<&str>,
@@ -50,35 +212,106 @@ pub fn list_page(
     offset: usize,
 ) -> Result<(Vec<CreationHistory>, usize)> {
     let query = query.map(str::trim).filter(|value| !value.is_empty());
-    let select = "SELECT id, prompt, generated_content, doc_type, audience, reference_count,
-                         references_json, model, latency_ms, created_at, updated_at
-                  FROM creation_history";
 
     if let Some(query) = query {
-        let predicate = "(instr(lower(COALESCE(prompt, '')), lower(?1)) > 0
-                          OR instr(lower(COALESCE(generated_content, '')), lower(?1)) > 0
-                          OR instr(lower(COALESCE(doc_type, '')), lower(?1)) > 0
-                          OR instr(lower(COALESCE(audience, '')), lower(?1)) > 0)";
+        let predicate = "(instr(lower(COALESCE(ch.prompt, '')), lower(?1)) > 0
+                          OR instr(lower(COALESCE(ch.root_request, '')), lower(?1)) > 0
+                          OR instr(lower(COALESCE(ch.conversation_json, '')), lower(?1)) > 0
+                          OR instr(lower(COALESCE(ch.generated_content, '')), lower(?1)) > 0
+                          OR instr(lower(COALESCE(ch.doc_type, '')), lower(?1)) > 0
+                          OR instr(lower(COALESCE(ch.audience, '')), lower(?1)) > 0)";
         let total = conn.query_row(
-            &format!("SELECT COUNT(*) FROM creation_history WHERE {predicate}"),
+            &format!(
+                "SELECT COUNT(*) FROM creation_history ch
+                 WHERE {LATEST_SESSION_PREDICATE} AND {predicate}"
+            ),
             params![query],
             |row| row.get::<_, i64>(0),
         )?;
         let mut stmt = conn.prepare(&format!(
-            "{select} WHERE {predicate} ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3"
+            "{HISTORY_SELECT}
+             WHERE {LATEST_SESSION_PREDICATE} AND {predicate}
+             ORDER BY ch.updated_at DESC, ch.created_at DESC, ch.id DESC
+             LIMIT ?2 OFFSET ?3"
         ))?;
         let rows = stmt.query_map(params![query, limit as i64, offset as i64], map_history_row)?;
         Ok((rows.collect::<Result<Vec<_>>>()?, total.max(0) as usize))
     } else {
-        let total = conn.query_row("SELECT COUNT(*) FROM creation_history", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
+        let total = conn.query_row(
+            &format!("SELECT COUNT(*) FROM creation_history ch WHERE {LATEST_SESSION_PREDICATE}"),
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
         let mut stmt = conn.prepare(&format!(
-            "{select} ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2"
+            "{HISTORY_SELECT}
+             WHERE {LATEST_SESSION_PREDICATE}
+             ORDER BY ch.updated_at DESC, ch.created_at DESC, ch.id DESC
+             LIMIT ?1 OFFSET ?2"
         ))?;
         let rows = stmt.query_map(params![limit as i64, offset as i64], map_history_row)?;
         Ok((rows.collect::<Result<Vec<_>>>()?, total.max(0) as usize))
     }
+}
+
+pub fn get_session_context(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<CreationSessionContext>> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Ok(None);
+    }
+    let latest = conn
+        .query_row(
+            &format!(
+                "{HISTORY_SELECT}
+                 WHERE ch.session_id = ?1
+                 ORDER BY ch.revision_no DESC, ch.updated_at DESC, ch.created_at DESC, ch.id DESC
+                 LIMIT 1"
+            ),
+            params![session_id],
+            map_history_row,
+        )
+        .optional()?;
+    let Some(latest) = latest else {
+        return Ok(None);
+    };
+    let root_request = latest
+        .root_request
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            conn.query_row(
+                "SELECT prompt
+                 FROM creation_history
+                 WHERE session_id = ?1
+                 ORDER BY revision_no ASC, created_at ASC, id ASC
+                 LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+        .unwrap_or_else(|| latest.prompt.clone());
+    Ok(Some(CreationSessionContext {
+        root_request,
+        latest,
+    }))
+}
+
+pub fn next_revision_no(conn: &Connection, session_id: &str) -> Result<i64> {
+    let (max_revision, count): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(MAX(revision_no), 0), COUNT(*)
+         FROM creation_history
+         WHERE session_id = ?1",
+        params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(max_revision.max(count) + 1)
 }
 
 fn map_history_row(row: &rusqlite::Row<'_>) -> Result<CreationHistory> {
@@ -92,9 +325,26 @@ fn map_history_row(row: &rusqlite::Row<'_>) -> Result<CreationHistory> {
         references_json: row.get(6)?,
         model: row.get(7)?,
         latency_ms: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        session_id: row.get(9)?,
+        conversation_json: row.get(10)?,
+        agent_trace_json: row.get(11)?,
+        goal_json: row.get(12)?,
+        root_request: row.get(13)?,
+        parent_history_id: row.get(14)?,
+        revision_no: row.get(15)?,
+        edit_operation: row.get(16)?,
+        document_patch_json: row.get(17)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
     })
+}
+
+fn default_revision_no() -> i64 {
+    1
+}
+
+fn default_edit_operation() -> String {
+    "create_document".to_string()
 }
 
 #[cfg(test)]
@@ -114,6 +364,15 @@ mod tests {
                 references_json TEXT,
                 model TEXT,
                 latency_ms INTEGER,
+                session_id TEXT,
+                conversation_json TEXT,
+                agent_trace_json TEXT,
+                goal_json TEXT,
+                root_request TEXT,
+                parent_history_id INTEGER,
+                revision_no INTEGER NOT NULL DEFAULT 1,
+                edit_operation TEXT NOT NULL DEFAULT 'create_document',
+                document_patch_json TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );",
@@ -150,5 +409,172 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(second_page.len(), 1);
         assert_ne!(first_page[0].id, second_page[0].id);
+    }
+
+    #[test]
+    fn persists_agent_session_conversation_and_trace() {
+        let conn = connection();
+        let id = insert(
+            &conn,
+            "生成架构方案",
+            "# 架构方案",
+            Some("架构设计方案"),
+            Some("研发团队"),
+            1,
+            Some(r#"[{"id":1}]"#),
+            Some("mbcd-std-v1"),
+            Some(1200),
+            Some("session-1"),
+            Some(r#"[{"role":"user","content":"生成架构方案"}]"#),
+            Some(r#"[{"type":"agent.completed"}]"#),
+            Some(r#"{"status":"complete","revision":6}"#),
+            Some("生成架构方案"),
+            None,
+            1,
+            "create_document",
+            None,
+        )
+        .unwrap();
+
+        let (items, total) = list_page(&conn, None, 20, 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, id);
+        assert_eq!(items[0].session_id.as_deref(), Some("session-1"));
+        assert!(items[0]
+            .conversation_json
+            .as_deref()
+            .unwrap()
+            .contains("生成架构方案"));
+        assert!(items[0]
+            .agent_trace_json
+            .as_deref()
+            .unwrap()
+            .contains("agent.completed"));
+    }
+
+    #[test]
+    fn restores_root_request_and_latest_revision_for_session() {
+        let conn = connection();
+        let first_id = insert(
+            &conn,
+            "生成新能源行业方案",
+            "# 新能源行业方案\n\n## 目标\n\n首版",
+            None,
+            None,
+            0,
+            Some("[]"),
+            None,
+            None,
+            Some("session-2"),
+            Some(r#"[{"role":"user","content":"生成新能源行业方案"}]"#),
+            Some("[]"),
+            None,
+            Some("生成新能源行业方案"),
+            None,
+            1,
+            "create_document",
+            None,
+        )
+        .unwrap();
+        let second_id = insert(
+            &conn,
+            "补充行业调研",
+            "# 新能源行业方案\n\n## 目标\n\n首版\n\n## 行业调研\n\n增量",
+            None,
+            None,
+            0,
+            Some("[]"),
+            None,
+            None,
+            Some("session-2"),
+            Some(r#"[{"role":"user","content":"补充行业调研"}]"#),
+            Some("[]"),
+            None,
+            Some("生成新能源行业方案"),
+            Some(first_id),
+            2,
+            "append_section",
+            Some(r#"{"target_sections":["行业调研"]}"#),
+        )
+        .unwrap();
+
+        let context = get_session_context(&conn, "session-2").unwrap().unwrap();
+        assert_eq!(context.root_request, "生成新能源行业方案");
+        assert_eq!(context.latest.id, second_id);
+        assert_eq!(context.latest.revision_no, 2);
+        assert_eq!(context.latest.parent_history_id, Some(first_id));
+        assert_eq!(context.latest.edit_operation, "append_section");
+        assert_eq!(next_revision_no(&conn, "session-2").unwrap(), 3);
+
+        let (items, total) = list_page(&conn, None, 20, 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, second_id);
+        assert!(items[0].generated_content.contains("行业调研"));
+    }
+
+    #[test]
+    fn updates_the_same_history_row_for_a_complete_session() {
+        let conn = connection();
+        let id = insert(
+            &conn,
+            "生成新能源行业方案",
+            "# 新能源行业方案",
+            Some("行业方案"),
+            Some("管理层"),
+            0,
+            Some("[]"),
+            Some("mbcd-std-v1"),
+            Some(800),
+            Some("session-3"),
+            Some(r#"[{"role":"user","content":"生成新能源行业方案"}]"#),
+            Some("[]"),
+            None,
+            Some("生成新能源行业方案"),
+            None,
+            1,
+            "create_document",
+            None,
+        )
+        .unwrap();
+
+        update_session(
+            &conn,
+            id,
+            "生成新能源行业方案",
+            "# 新能源行业方案\n\n## 风险\n\n已补充",
+            Some("行业方案"),
+            Some("管理层"),
+            1,
+            Some(r#"[{"id":1}]"#),
+            Some("mbcd-plus-v1"),
+            Some(1200),
+            "session-3",
+            Some(
+                r#"[{"role":"user","content":"生成新能源行业方案"},{"role":"user","content":"补充风险"}]"#,
+            ),
+            Some(r#"[{"type":"run.completed"}]"#),
+            None,
+            "生成新能源行业方案",
+            2,
+            "append_section",
+            Some(r#"{"target_sections":["风险"]}"#),
+        )
+        .unwrap();
+
+        let row_count = conn
+            .query_row("SELECT COUNT(*) FROM creation_history", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 1);
+
+        let (items, total) = list_page(&conn, Some("补充风险"), 20, 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, id);
+        assert_eq!(items[0].prompt, "生成新能源行业方案");
+        assert_eq!(items[0].revision_no, 2);
+        assert_eq!(items[0].parent_history_id, None);
+        assert!(items[0].generated_content.contains("已补充"));
     }
 }

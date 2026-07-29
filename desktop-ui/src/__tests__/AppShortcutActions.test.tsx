@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, render } from '@testing-library/react'
+import { act, render, waitFor } from '@testing-library/react'
 import { invoke } from '@tauri-apps/api/core'
 import App from '../App'
 import { useAppStore } from '../store/useAppStore'
@@ -7,6 +7,10 @@ import type { ShortcutAction } from '../utils/interactionSettings'
 
 const shortcutRuntime = vi.hoisted(() => ({
   handler: null as null | ((action: ShortcutAction) => void | Promise<void>),
+}))
+
+const initializationMocks = vi.hoisted(() => ({
+  fetchInitializationStatus: vi.fn(),
 }))
 
 vi.mock('@tauri-apps/api/event', () => ({
@@ -28,6 +32,11 @@ vi.mock('../utils/interactionSettings', async importOriginal => {
   }
 })
 
+vi.mock('../utils/initialization', async importOriginal => ({
+  ...(await importOriginal<typeof import('../utils/initialization')>()),
+  fetchInitializationStatus: initializationMocks.fetchInitializationStatus,
+}))
+
 vi.mock('../components/FloatingBuddy', () => ({ default: () => <aside /> }))
 vi.mock('../components/RagPanel.v2', () => ({ default: () => <section data-testid="rag-panel" /> }))
 vi.mock('../components/CreationPanel', () => ({ default: () => <section data-testid="creation-panel" /> }))
@@ -38,6 +47,20 @@ const mockedInvoke = vi.mocked(invoke)
 beforeEach(() => {
   useAppStore.getState().reset()
   useAppStore.getState().setHasCompletedSetup(true)
+  initializationMocks.fetchInitializationStatus.mockResolvedValue({
+    schema_version: 'initialization.v1',
+    mode: 'normal',
+    state: 'completed',
+    progress: 100,
+    current_stage: 'feature_smoke_tests',
+    message: '初始化完成',
+    stages: [],
+    quality_gate: { passed: true, checks: [] },
+    smoke_tests: [],
+    can_retry: false,
+    can_report: false,
+    test_mode_enabled: false,
+  })
   shortcutRuntime.handler = null
   mockedInvoke.mockClear()
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, json: async () => ({}) })))
@@ -46,7 +69,7 @@ beforeEach(() => {
 describe('App global shortcut actions', () => {
   it('打开目标页面并把当屏识别交给悬浮球原生动作队列', async () => {
     render(<App />)
-    expect(shortcutRuntime.handler).not.toBeNull()
+    await waitFor(() => expect(shortcutRuntime.handler).not.toBeNull())
 
     await act(async () => {
       await shortcutRuntime.handler?.('open_creation')

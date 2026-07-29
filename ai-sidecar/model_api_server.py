@@ -8,6 +8,7 @@ from werkzeug.exceptions import BadGateway, ServiceUnavailable
 from dataclasses import dataclass
 from model_manager import ModelManager, ModelType, AVAILABLE_MODELS as MANAGER_MODELS, MODEL_ID_ALIASES
 from model_registry import AVAILABLE_MODELS, get_recommendations, get_model, list_models as registry_list
+from initialization_manager import InitializationFailure, InitializationManager
 import psutil
 import logging
 import dataclasses
@@ -39,7 +40,6 @@ from inference_queue import (
     QueueEvictedError,
     current_task_preempt_requested,
     get_global_queue,
-    interactive_demand_active,
 )
 from monitor.llm_tracker import estimate_tokens, log_llm_usage
 from idle_compute.model_manager import _log_model_event
@@ -156,6 +156,7 @@ def _rag_release_lock(fd):
 
 # 初始化模型管理器
 model_manager = ModelManager()
+initialization_manager = InitializationManager()
 _rag_pipeline = None
 _rag_pipeline_lock = __import__('threading').Lock()
 _bake_extractor = None
@@ -166,6 +167,21 @@ _TASK_CPU_THRESHOLD = float(os.getenv("BAKE_CPU_THRESHOLD", "85"))
 _TASK_MEM_THRESHOLD = float(os.getenv("BAKE_MEM_THRESHOLD", "90"))
 _task_executor = TaskExecutor(db_path=DB_PATH)
 _idle_diary_backfill_worker = IdleDiaryBackfillWorker(db_path=DB_PATH, executor=_task_executor)
+
+# 32K 上下文只决定模型能看到多少内容，不应决定单条后台任务可以运行多久。
+# 普通输入使用 180 秒运行时预算；>=20K 的长输入使用 300 秒，覆盖现网长输入
+# P95（约 224 秒）。计时基于单调时钟，系统睡眠期间不会误杀后台任务。
+BAKE_LONG_PROMPT_TOKENS = 20_000
+BAKE_INFERENCE_TIMEOUT_SECONDS = 180.0
+BAKE_LONG_INFERENCE_TIMEOUT_SECONDS = 300.0
+
+
+def bake_inference_timeout_seconds(prompt_tokens: int) -> float:
+    return (
+        BAKE_LONG_INFERENCE_TIMEOUT_SECONDS
+        if max(0, int(prompt_tokens or 0)) >= BAKE_LONG_PROMPT_TOKENS
+        else BAKE_INFERENCE_TIMEOUT_SECONDS
+    )
 
 
 def _coerce_rag_top_k(value, default: int = RAG_REFERENCE_LIMIT) -> int:
@@ -725,8 +741,8 @@ def get_inference_queue_status():
     """
     try:
         inference_queue = get_global_queue()
-        interactive_active = interactive_demand_active()
         stats = inference_queue.stats()
+        interactive_active = bool(stats.get('interactive_demand_active'))
         retry_after_ms = int(stats.get('background_retry_after_ms') or 0)
         return jsonify({
             'status': 'ok',
@@ -1022,6 +1038,80 @@ def ollama_setup_status():
     except Exception as e:
         logger.error(f"获取 Ollama 安装状态失败: {e}")
         return jsonify({'status': 'error', 'stage': 'detect', 'message': str(e)}), 500
+
+
+@app.route('/api/initialization/status', methods=['GET'])
+def initialization_status():
+    """返回当前正式或隔离环境的一键初始化状态。"""
+    return jsonify({
+        'status': 'ok',
+        'initialization': initialization_manager.get_status(),
+    })
+
+
+@app.route('/api/initialization/start', methods=['POST'])
+def initialization_start():
+    """启动或继续唯一的后台初始化任务；重复请求返回同一任务。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        state = initialization_manager.start(data.get('mode'))
+        return jsonify({'status': 'ok', 'initialization': state})
+    except InitializationFailure as exc:
+        code = 409 if exc.code in {
+            'INITIALIZATION_ALREADY_RUNNING',
+            'INITIALIZATION_MODE_MISMATCH',
+        } else 400
+        return jsonify({
+            'status': 'error',
+            'error_code': exc.code,
+            'message': str(exc),
+        }), code
+    except Exception as exc:
+        logger.error("启动初始化失败: %s", exc, exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'error_code': 'INITIALIZATION_FAILED',
+            'message': str(exc),
+        }), 500
+
+
+@app.route('/api/initialization/report-bundle', methods=['GET'])
+def initialization_report_bundle():
+    """返回可由用户确认后上报的脱敏白名单诊断包。"""
+    return jsonify({
+        'status': 'ok',
+        'report': initialization_manager.get_report_bundle(),
+    })
+
+
+@app.route('/api/initialization/test-mode', methods=['POST'])
+def initialization_test_mode_enable():
+    try:
+        data = request.get_json(silent=True) or {}
+        state = initialization_manager.enable_test_mode(data.get('confirmation', ''))
+        return jsonify({'status': 'ok', 'initialization': state})
+    except InitializationFailure as exc:
+        code = 409 if exc.code == 'INITIALIZATION_ALREADY_RUNNING' else 400
+        return jsonify({
+            'status': 'error',
+            'error_code': exc.code,
+            'message': str(exc),
+        }), code
+
+
+@app.route('/api/initialization/test-mode', methods=['DELETE'])
+def initialization_test_mode_disable():
+    try:
+        data = request.get_json(silent=True) or {}
+        state = initialization_manager.disable_test_mode(data.get('confirmation', ''))
+        return jsonify({'status': 'ok', 'initialization': state})
+    except InitializationFailure as exc:
+        code = 409 if exc.code == 'INITIALIZATION_ALREADY_RUNNING' else 400
+        return jsonify({
+            'status': 'error',
+            'error_code': exc.code,
+            'message': str(exc),
+        }), code
 
 
 @app.route('/api/ollama/install', methods=['POST'])
@@ -1823,6 +1913,14 @@ def extract_bake():
             trigger_reason,
         )
         extractor = get_bake_extractor()
+        estimated_prompt_tokens = extractor.estimate_bake_bundle_prompt_tokens(candidate)
+        inference_timeout = bake_inference_timeout_seconds(estimated_prompt_tokens)
+        logger.info(
+            "bake extract budget source_timeline_id=%s estimated_prompt_tokens=%s timeout_seconds=%.0f",
+            source_timeline_id,
+            estimated_prompt_tokens,
+            inference_timeout,
+        )
         # 通过 InferenceQueue 统一调度，P2 = bake 大批量提炼
         try:
             result = get_global_queue().submit_sync(
@@ -1831,7 +1929,7 @@ def extract_bake():
                     candidate,
                     preempt_check=current_task_preempt_requested,
                 ),
-                timeout=900.0,
+                timeout=inference_timeout,
                 lane=LANE_P2_BAKE,
             )
         except QueueEvictedError as ee:
@@ -1842,8 +1940,15 @@ def extract_bake():
                 'retryable': True,
             }), 503
         except concurrent.futures.TimeoutError:
-            logger.warning("bake extract 执行超时")
-            return jsonify({'error': 'bake 提炼超时'}), 504
+            logger.warning(
+                "bake extract 执行超过 %.0fs，已取消且不会重试",
+                inference_timeout,
+            )
+            return jsonify({
+                'error': 'bake 提炼超时，任务已取消',
+                'code': 'INFERENCE_TIMEOUT',
+                'retryable': False,
+            }), 504
         lock_wait_ms = int(time.time() * 1000) - lock_wait_start_ms
         logger.info(
             "bake extract done source_timeline_id=%s queue_wait_ms=%s",
@@ -1865,6 +1970,14 @@ def extract_bake():
         return jsonify(result)
     except Exception as e:
         logger.error("bake 提炼失败: %s", e, exc_info=True)
+        error_code = getattr(e, 'code', None)
+        retryable = getattr(e, 'retryable', None)
+        if error_code in {'BAKE_OUTPUT_TRUNCATED', 'BAKE_OUTPUT_INVALID'} and retryable is False:
+            return jsonify({
+                'error': str(e),
+                'code': error_code,
+                'retryable': False,
+            }), 422
         lowered = str(e).lower()
         if 'ollama' in lowered or 'bad gateway' in lowered:
             return jsonify({'error': str(e)}), 502
@@ -1885,10 +1998,21 @@ def merge_bake_document():
         if not candidate.get('source_timeline_id'):
             return jsonify({'error': 'candidate.source_timeline_id 缺失'}), 400
         extractor = get_bake_extractor()
+        estimated_prompt_tokens = extractor.estimate_merge_document_prompt_tokens(
+            existing_document,
+            candidate,
+        )
+        inference_timeout = bake_inference_timeout_seconds(estimated_prompt_tokens)
+        logger.info(
+            "bake merge_document budget source_timeline_id=%s estimated_prompt_tokens=%s timeout_seconds=%.0f",
+            candidate.get('source_timeline_id'),
+            estimated_prompt_tokens,
+            inference_timeout,
+        )
         result = get_global_queue().submit_sync(
             Priority.P2,
             lambda: extractor.merge_bake_document(existing_document, candidate),
-            timeout=600.0,
+            timeout=inference_timeout,
             lane=LANE_P2_BAKE,
         )
         if isinstance(result, dict) and not result.get('title'):
@@ -1902,11 +2026,14 @@ def merge_bake_document():
             'retryable': True,
         }), 503
     except concurrent.futures.TimeoutError:
-        logger.warning("bake merge_document 执行超时")
+        logger.warning(
+            "bake merge_document 执行超过 %.0fs，已取消且不会重试",
+            inference_timeout,
+        )
         return jsonify({
-            'error': 'bake 文档合并超时',
+            'error': 'bake 文档合并超时，任务已取消',
             'code': 'INFERENCE_TIMEOUT',
-            'retryable': True,
+            'retryable': False,
         }), 504
     except Exception as e:
         logger.error("bake merge_document 失败: %s", e, exc_info=True)

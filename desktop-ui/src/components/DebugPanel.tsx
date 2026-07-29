@@ -14,6 +14,7 @@ import {
 } from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
 import type { CaptureRecord, DebugLogContent, DebugLogFile } from '../types'
+import { enableInitializationTestMode } from '../utils/initialization'
 
 interface DebugPanelProps {
   className?: string
@@ -33,7 +34,7 @@ interface SystemStats {
 }
 
 const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
-  const { apiBaseUrl, setWindowMode } = useAppStore()
+  const { apiBaseUrl, setHasCompletedSetup, setWindowMode } = useAppStore()
   const fetchDebugLogFiles = useFetchDebugLogFiles()
   const fetchDebugLogContent = useFetchDebugLogContent()
 
@@ -54,6 +55,9 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
   const [selectedLogContent, setSelectedLogContent] = useState<DebugLogContent | null>(null)
   const [logLoading, setLogLoading] = useState(false)
   const [logError, setLogError] = useState<string | null>(null)
+  const [initializationTestConfirming, setInitializationTestConfirming] = useState(false)
+  const [initializationTestStarting, setInitializationTestStarting] = useState(false)
+  const [initializationTestError, setInitializationTestError] = useState('')
 
   // 获取最新采集记录
   const fetchCaptures = useCallback(async () => {
@@ -222,6 +226,40 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
     }
   }
 
+  const handleEnableInitializationTestMode = async () => {
+    setInitializationTestStarting(true)
+    setInitializationTestError('')
+    try {
+      await enableInitializationTestMode()
+      setInitializationTestConfirming(false)
+      setHasCompletedSetup(false)
+    } catch (cause) {
+      setInitializationTestError(cause instanceof Error ? cause.message : '初始化测试模式开启失败')
+    } finally {
+      setInitializationTestStarting(false)
+    }
+  }
+
+  const requestInitializationTestMode = () => {
+    setInitializationTestError('')
+    setInitializationTestConfirming(true)
+  }
+
+  const cancelInitializationTestMode = useCallback(() => {
+    if (initializationTestStarting) return
+    setInitializationTestConfirming(false)
+    setInitializationTestError('')
+  }, [initializationTestStarting])
+
+  useEffect(() => {
+    if (!initializationTestConfirming) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') cancelInitializationTestMode()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [cancelInitializationTestMode, initializationTestConfirming])
+
   const formatTimestamp = (ts: number | undefined | null) => {
     if (!ts) return '无'
     const date = new Date(ts)
@@ -342,6 +380,107 @@ const DebugPanel: React.FC<DebugPanelProps> = ({ className = '' }) => {
           </div>
         </div>
       </div>
+
+      <section className="bg-amber-50 border border-amber-200 rounded-lg shadow-sm p-6 mb-6" data-testid="initialization-test-mode-card">
+        <div className="flex flex-wrap items-start justify-between gap-5">
+          <div className="max-w-3xl">
+            <div className="flex items-center gap-2 mb-2">
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="text-amber-800"
+                aria-hidden
+              >
+                <path d="M10 2v7.31" />
+                <path d="M14 9.3V2" />
+                <path d="M8.5 2h7" />
+                <path d="M14 9.3a6 6 0 1 1-4 0" />
+                <path d="M5.52 16h12.96" />
+              </svg>
+              <h2 className="text-xl font-semibold text-amber-950">初始化测试模式</h2>
+            </div>
+            <p className="text-sm leading-6 text-amber-900">
+              在独立运行时目录、模型目录、端口和临时数据库中强制执行完整首次初始化，
+              用于验证安装、判重、质检以及采集、提炼、咨询、创作测试。真实模型和记忆库保持不变。
+            </p>
+            <p className="text-xs text-amber-700 mt-2">
+              开启后应用会立即回到初始化门禁；完成或失败后可在那里关闭模式并自动清理沙箱。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={requestInitializationTestMode}
+            disabled={initializationTestStarting}
+            className="px-4 py-2 rounded bg-amber-800 text-white hover:bg-amber-900 disabled:bg-gray-300 text-sm"
+          >
+            {initializationTestStarting ? '正在创建沙箱…' : '开启初始化测试模式'}
+          </button>
+        </div>
+        {initializationTestError && (
+          <p className="mt-3 text-sm text-red-700" role="alert">{initializationTestError}</p>
+        )}
+      </section>
+
+      {initializationTestConfirming && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="initialization-test-confirm-title"
+          aria-describedby="initialization-test-confirm-description"
+          data-testid="initialization-test-confirm-dialog"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) cancelInitializationTestMode()
+          }}
+        >
+          <div className="w-full max-w-lg rounded-xl border border-amber-200 bg-white p-6 shadow-2xl">
+            <h2
+              id="initialization-test-confirm-title"
+              className="text-xl font-semibold text-amber-950"
+            >
+              确认开启初始化测试模式
+            </h2>
+            <p
+              id="initialization-test-confirm-description"
+              className="mt-3 text-sm leading-6 text-gray-700"
+            >
+              应用将暂时忽略真实的本地 AI、模型和数据库，并在独立沙箱中重新安装和质检。
+              关闭模式时会清理临时内容，真实工作环境不会被修改。
+            </p>
+            {initializationTestError && (
+              <p className="mt-3 text-sm text-red-700" role="alert">
+                {initializationTestError}
+              </p>
+            )}
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={cancelInitializationTestMode}
+                disabled={initializationTestStarting}
+                autoFocus
+                className="rounded border border-gray-300 bg-white px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleEnableInitializationTestMode()}
+                disabled={initializationTestStarting}
+                aria-busy={initializationTestStarting}
+                className="rounded bg-amber-800 px-4 py-2 text-sm text-white hover:bg-amber-900 disabled:cursor-not-allowed disabled:bg-gray-300"
+              >
+                {initializationTestStarting ? '正在创建沙箱…' : '确认开启'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-6 flex items-center gap-2">

@@ -39,6 +39,7 @@ const EXTRACTOR_LABEL: Record<string, { text: string; color: string }> = {
   waiting: { text: '等待中', color: '#FF9500' },
   idle:    { text: '空闲',   color: '#8E8E93' },
   stalled: { text: '已停止', color: '#FF3B30' },
+  paused:  { text: '已暂停', color: '#8E8E93' },
 }
 
 function fmtRelTime(ms: number, nowMs: number): string {
@@ -216,6 +217,16 @@ const PipelineDagPanel: React.FC<Props> = ({ base, isVisible }) => {
         <span style={{ color: '#D1D1D6' }}>|</span>
         {(() => {
           const lag = fmtWatermarkLag(data?.bake_watermark_lag_ms ?? 0)
+          if (data?.capture_enabled === false) {
+            return (
+              <span
+                title="自动采集与提炼已暂停；当前库存会在恢复后继续处理。"
+                style={{ color: '#8E8E93', fontWeight: 600, fontVariantNumeric: 'tabular-nums', marginLeft: 'auto' }}
+              >
+                自动烘焙已暂停 · {lag.text}
+              </span>
+            )
+          }
           return (
             <span
               title="最老一条实际待烘焙 timeline 的等待时长。>2h 提示积压，>24h 显示红色告警。"

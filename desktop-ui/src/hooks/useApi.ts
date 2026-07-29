@@ -926,6 +926,15 @@ export function useFetchBakeMemory() {
   }, [apiBaseUrl])
 }
 
+export function useDeleteBakeMemory() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (id: string): Promise<void> => {
+    const resp = await fetch(`${apiBaseUrl}/api/bake/memories/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (!resp.ok) throw new Error(`delete timeline failed: ${resp.status}`)
+  }, [apiBaseUrl])
+}
+
 export function useFetchBakeKnowledge() {
   const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
 
@@ -1000,6 +1009,15 @@ export function useFetchBakeCaptureDetail() {
     const resp = await fetch(`${apiBaseUrl}/api/bake/captures/${encodeURIComponent(id)}`)
     if (!resp.ok) throw new Error(`bake capture detail fetch failed: ${resp.status}`)
     return mapBakeCapture(await resp.json())
+  }, [apiBaseUrl])
+}
+
+export function useDeleteBakeCapture() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (id: string): Promise<void> => {
+    const resp = await fetch(`${apiBaseUrl}/api/bake/captures/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (!resp.ok) throw new Error(`delete capture failed: ${resp.status}`)
   }, [apiBaseUrl])
 }
 

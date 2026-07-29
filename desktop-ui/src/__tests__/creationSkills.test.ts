@@ -3,17 +3,22 @@ import {
   analyzeCreationSkill,
   buildCreationSkillInstruction,
   categoryPathFor,
+  codexSkillPackageFiles,
   creationSkillCategoryOptions,
   DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
   DEFAULT_CREATION_SKILL_FIELD_EXAMPLES,
   DEFAULT_CREATION_SKILL_SECTION_HEADINGS,
   fetchCreationSkillCategories,
+  importCodexSkillPackage,
   listLocalCreationSkills,
   marketCreationSkillToLocalInput,
   matchCreationSkills,
   normalizeCreationSkillTitle,
+  parseCodexSkillMarkdown,
   publishCreationSkill,
+  resolveCreationSkillDependencies,
   searchCreationSkillMarket,
+  skillFileText,
   suggestCreationSkillCategory,
   type CreationSkillCategory,
   type LocalCreationSkill,
@@ -25,6 +30,91 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+describe('Codex 技能包兼容', () => {
+  it('解析标准 SKILL.md 元数据', () => {
+    const metadata = parseCodexSkillMarkdown(`---
+name: meeting-actions
+description: >
+  Extract decisions and action items.
+  Use when reviewing meeting notes.
+---
+
+# Workflow
+
+Read the notes, then list owners and due dates.`)
+
+    expect(metadata).toEqual({
+      name: 'meeting-actions',
+      description: 'Extract decisions and action items. Use when reviewing meeting notes.',
+      instructions: '# Workflow\n\nRead the notes, then list owners and due dates.',
+    })
+  })
+
+  it('导入完整目录并保留脚本与引用文件', async () => {
+    const skillMarkdown = new File([
+      '---\nname: meeting-actions\ndescription: Extract decisions and action items from meeting notes.\n---\n\n# Workflow\n\nRead references/checklist.md.',
+    ], 'SKILL.md', { type: 'text/markdown' })
+    const reference = new File(['# Checklist\n\n- Decisions\n- Owners'], 'checklist.md', { type: 'text/markdown' })
+    Object.defineProperty(skillMarkdown, 'webkitRelativePath', { value: 'meeting-actions/SKILL.md' })
+    Object.defineProperty(reference, 'webkitRelativePath', { value: 'meeting-actions/references/checklist.md' })
+
+    const imported = await importCodexSkillPackage([skillMarkdown, reference])
+
+    expect(imported).toMatchObject({
+      sourceKind: 'imported',
+      sourceId: 'meeting-actions',
+      title: 'meeting-actions',
+      installed: true,
+      published: false,
+    })
+    expect(imported.packageFiles?.map(file => file.path)).toEqual([
+      'SKILL.md',
+      'references/checklist.md',
+    ])
+    expect(skillFileText(imported.packageFiles![1])).toContain('Decisions')
+
+    const instruction = buildCreationSkillInstruction([{
+      skill: { ...imported, id: 10, createdAt: 1, updatedAt: 1 },
+      reason: 'mentioned',
+      score: 1_000,
+    }])
+    expect(instruction).toContain('[技能文件：SKILL.md]')
+    expect(instruction).toContain('[技能文件：references/checklist.md]')
+    expect(instruction).toContain('- Decisions')
+  })
+
+  it('为旧技能生成可复用的 SKILL.md', () => {
+    const files = codexSkillPackageFiles({
+      ...localSkill,
+      id: 9,
+      title: '技术架构设计文档写作法',
+    })
+    const markdown = skillFileText(files[0])
+
+    expect(files.map(file => file.path)).toEqual(['SKILL.md'])
+    expect(markdown).toContain('name: local-skill-1')
+    expect(markdown).toContain('description:')
+    expect(markdown).toContain('帮助架构师把目标、约束和证据组织成可评审的架构设计文档')
+    expect(markdown).toContain('用于创作：技术架构设计文档')
+    expect(markdown).toContain('## 能力描述')
+    expect(markdown).toContain('## 执行工作流')
+    expect(markdown).toContain('Agent：solution_design_agent')
+    expect(markdown).toContain('Tool：plantuml_diagram')
+    expect(markdown).not.toContain('## 章节组织骨架')
+    expect(markdown).toContain('## 话术表达风格')
+    expect(markdown).toContain('## 特色亮点：定义先行的概念建立')
+  })
+
+  it('拒绝目录名与 Skill name 不一致的包', async () => {
+    const file = new File([
+      '---\nname: expected-name\ndescription: A complete description for the reusable workflow.\n---\n',
+    ], 'SKILL.md', { type: 'text/markdown' })
+    Object.defineProperty(file, 'webkitRelativePath', { value: 'different-name/SKILL.md' })
+
+    await expect(importCodexSkillPackage([file])).rejects.toThrow('name 必须与文件夹名称一致')
+  })
+})
+
 const localSkill: Omit<LocalCreationSkill, 'id' | 'createdAt' | 'updatedAt'> = {
   clientSkillKey: 'local-skill-1',
   cloudSkillId: null,
@@ -33,12 +123,34 @@ const localSkill: Omit<LocalCreationSkill, 'id' | 'createdAt' | 'updatedAt'> = {
   title: '技术架构设计文档写作法',
   summary: '帮助架构师稳定产出可评审的架构设计文档。',
   categoryId: 'leaf-category',
+  skillDescription: {
+    purpose: '帮助架构师把目标、约束和证据组织成可评审的架构设计文档。',
+    documentTypes: ['技术架构设计文档'],
+    problems: ['澄清系统边界、关键取舍和实施路径'],
+    domains: ['软件架构'],
+    deliverables: ['包含架构、链路、风险和验证方式的完整文档'],
+  },
+  executionSteps: [{
+    id: 'design-solution',
+    title: '设计总体方案',
+    objective: '把目标、约束和证据转化为结构化架构方案。',
+    output: '总体方案与关键设计',
+    agents: ['solution_design_agent'],
+    skills: [],
+    tools: ['plantuml_diagram'],
+  }],
   commonTitles: ['总体架构设计', '关键链路设计'],
   titleStyle: '结论先行，标题带明确对象。',
   textStyle: '短段落配合约束、方案和取舍。',
   diagramStyle: '统一配色并标注边界与数据流向。',
   structurePattern: ['背景与目标', '架构方案', '风险与演进'],
   writingGuidelines: ['每个决策写明原因', '敏感数据使用占位符'],
+  distinctiveSections: [{
+    title: '定义先行的概念建立',
+    description: '先解释核心对象，再展开方案。',
+    guidance: '对象首次出现时先给通俗解释，再补职责边界。',
+    examples: ['协作工作台可以理解为连接任务、角色与结果证据的统一入口。'],
+  }],
   sectionHeadings: { ...DEFAULT_CREATION_SKILL_SECTION_HEADINGS },
   fieldExamples: {
     commonTitles: [...DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.commonTitles],
@@ -54,7 +166,7 @@ const localSkill: Omit<LocalCreationSkill, 'id' | 'createdAt' | 'updatedAt'> = {
   published: false,
 }
 
-describe('创作 Skill 云端发布边界', () => {
+describe('技能云端发布边界', () => {
   it('只上传结构化 Skill，不上传来源标识或原文', async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body))
@@ -65,6 +177,15 @@ describe('创作 Skill 云端发布边界', () => {
         published: true,
       })
       expect(body.content.common_titles).toEqual(localSkill.commonTitles)
+      expect(body.content.distinctive_sections).toEqual(localSkill.distinctiveSections)
+      expect(body.content.skill_description).toEqual({
+        purpose: localSkill.skillDescription.purpose,
+        document_types: localSkill.skillDescription.documentTypes,
+        problems: localSkill.skillDescription.problems,
+        domains: localSkill.skillDescription.domains,
+        deliverables: localSkill.skillDescription.deliverables,
+      })
+      expect(body.content.execution_steps).toEqual(localSkill.executionSteps)
       expect(body).not.toHaveProperty('source_id')
       expect(body).not.toHaveProperty('source_kind')
       expect(body).not.toHaveProperty('document_content')
@@ -124,7 +245,7 @@ describe('创作 Skill 云端发布边界', () => {
 
     await expect(
       publishCreationSkill('https://api.example.test', 'token', localSkill, false),
-    ).rejects.toThrow('未发布的本地 Skill 草稿不会上传')
+    ).rejects.toThrow('未发布的本地技能草稿不会上传')
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -202,7 +323,7 @@ describe('创作 Skill 云端发布边界', () => {
   })
 })
 
-describe('创作 Skill 本地生成与类目容错', () => {
+describe('技能本地生成与类目容错', () => {
   it('离线类目覆盖主要行业且每个节点都保持完整四级关系', () => {
     const counts = [1, 2, 3, 4].map(level => OFFLINE_CREATION_SKILL_CATEGORIES.filter(item => item.level === level).length)
     const ids = new Set(OFFLINE_CREATION_SKILL_CATEGORIES.map(item => item.id))
@@ -235,12 +356,84 @@ describe('创作 Skill 本地生成与类目容错', () => {
     })
 
     expect(analysis.analysisMode).toBe('client_heuristic_fallback')
+    expect(analysis.fallbackReason).toBe('analysis_request_failed')
     expect(analysis.title).toContain('技术架构设计')
     expect(analysis.structurePattern).toEqual(['背景与目标', '总体方案', '实施计划'])
     expect(analysis.titleStyle).not.toBe('')
     expect(analysis.diagramStyle).not.toBe('')
     expect(analysis.commonTitles.join('')).not.toContain('订单中心')
     expect(analysis.exampleDocument).not.toContain('订单中心')
+    expect(analysis.exampleDocument.length).toBeGreaterThanOrEqual(1000)
+    expect(analysis.exampleDocument.match(/^##\s+/gm)?.length).toBeGreaterThanOrEqual(6)
+    expect(analysis.textStyle.length).toBeGreaterThanOrEqual(400)
+    expect(analysis.diagramStyle.length).toBeGreaterThanOrEqual(400)
+    expect(analysis.writingGuidelines.join('').length).toBeGreaterThanOrEqual(400)
+  })
+
+  it('修复旧分析结果中的短示例、重复占位标题和过短写作指引', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      title: '技术方案文档',
+      summary: '适合需要梳理技术方案的协作场景。',
+      common_titles: [{ level: '一级标题', pattern: '# [核心主题] + OS/整体技术方案' }],
+      title_style: '标题采用中等长度短句',
+      text_style: '先写目标，再写方案。',
+      diagram_style: '默认不生成图片。',
+      structure_pattern: [{ role: '先定义核心对象，再说明核心目标' }],
+      writing_guidelines: ['使用正式语气。'],
+      section_headings: {
+        common_titles: '标题设计风格',
+        title_style: '标题设计风格',
+        text_style: '行文设计思路',
+        diagram_style: '图片生成方式',
+        structure_pattern: '章节组织骨架',
+        writing_guidelines: '话术表达风格',
+      },
+      field_examples: {
+        common_titles: ['目标对象 目标对象 目标对象', '从业务视角看，目标对象', '核心目标'],
+        title_style: ['目标对象 目标对象 目标对象'],
+        text_style: ['先写目标，再写方案。'],
+        diagram_style: ['默认不生成图片。'],
+        structure_pattern: ['目标与范围 → 总体方案 → 验证与验收'],
+        writing_guidelines: ['需要明确适用边界。'],
+      },
+      example_document: '# 示例方案\n\n## 摘要\n\n这是一份过短示例。\n\n## 方案\n\n内容不足。',
+      distinctive_sections: [{
+        title: '定义先行',
+        description: '先解释核心对象的角色与边界，再进入方案。',
+        guidance: '对象首次出现时先给通俗解释，再补职责边界。',
+        examples: ['协作工作台可以理解为任务流转的统一入口。'],
+      }],
+      suggested_category_keywords: ['技术设计文档'],
+      analysis_mode: 'local_model',
+    })))
+
+    const analysis = await analyzeCreationSkill('http://127.0.0.1:7070', {
+      kind: 'bake_document',
+      id: 'doc-old-analysis',
+      title: 'TieAgent OS 整体技术方案',
+      docType: '技术文档',
+      content: [
+        '# TieAgent OS 整体技术方案',
+        '## 从业务视角看，TieAgent',
+        '### TieAgent OS 定义',
+        '### 核心目标',
+        '## runtime: TieAgent',
+      ].join('\n\n'),
+    })
+
+    expect(analysis.analysisMode).toBe('local_model')
+    expect(analysis.fieldExamples.commonTitles.join(' ')).not.toContain('目标对象 目标对象')
+    expect(analysis.fieldExamples.commonTitles).toContain('从业务视角看，协作工作台的角色与边界')
+    expect(analysis.commonTitles[0]).toContain('一级标题：采用“')
+    expect(analysis.structurePattern[0]).toBe('先定义核心对象，再说明核心目标')
+    expect(JSON.stringify(analysis)).not.toContain('[object Object]')
+    expect(analysis.distinctiveSections?.[0].title).toBe('定义先行')
+    expect(analysis.commonTitles.length).toBeGreaterThanOrEqual(4)
+    expect(analysis.textStyle.length).toBeGreaterThanOrEqual(400)
+    expect(analysis.diagramStyle.length).toBeGreaterThanOrEqual(400)
+    expect(analysis.writingGuidelines.join('').length).toBeGreaterThanOrEqual(400)
+    expect(analysis.exampleDocument.length).toBeGreaterThanOrEqual(1000)
+    expect(analysis.exampleDocument.match(/^##\s+/gm)?.length).toBeGreaterThanOrEqual(6)
   })
 
   it('合并同一来源的并发分析，避免开发模式重复占用本地模型', async () => {
@@ -315,8 +508,10 @@ describe('创作 Skill 本地生成与类目容错', () => {
 
   it('根据总结、正文和文档类型自动选中完整四级类目', () => {
     const analysis = {
-      title: '订单中心架构创作 Skill',
+      title: '订单中心架构技能',
       summary: '用于企业系统的关键链路架构评审。',
+      skillDescription: localSkill.skillDescription,
+      executionSteps: localSkill.executionSteps,
       commonTitles: ['订单中心总体架构设计'],
       titleStyle: '结论先行。',
       textStyle: '正式。',
@@ -342,8 +537,14 @@ describe('创作 Skill 本地生成与类目容错', () => {
 
   it('能为新增行业内容推荐对应的四级类目', () => {
     const leaf = suggestCreationSkillCategory(OFFLINE_CREATION_SKILL_CATEGORIES, {
-      title: '临床诊疗路径创作 Skill',
+      title: '临床诊疗路径技能',
       summary: '用于医院临床医师整理标准化诊疗流程。',
+      skillDescription: {
+        ...localSkill.skillDescription,
+        documentTypes: ['临床诊疗路径'],
+        domains: ['医疗健康'],
+      },
+      executionSteps: localSkill.executionSteps,
       commonTitles: ['呼吸科临床诊疗路径'],
       titleStyle: '规范、明确。',
       textStyle: '按临床阶段说明。',
@@ -373,6 +574,19 @@ describe('创作 Skill 本地生成与类目容错', () => {
     expect(title).not.toContain('研发中心')
   })
 
+  it('不会被正文中偶然出现的复盘案例误导技能用途', () => {
+    const title = normalizeCreationSkillTitle('技术架构设计文档', {
+      kind: 'bake_document',
+      id: 'doc-with-review-case',
+      title: '通用运行平台整体技术方案',
+      docType: '技术文档',
+      content: '# 背景\n正文引用了一段案例复盘和年度总结，但文档本身仍是技术方案。',
+    })
+
+    expect(title).toBe('运行平台整体技术方案')
+    expect(title).not.toBe('项目复盘总结文档')
+  })
+
   it('只匹配已保存且已安装的 Skill，并把简介和类目写入创作指令', () => {
     const installedSkill: LocalCreationSkill = {
       ...localSkill,
@@ -396,7 +610,70 @@ describe('创作 Skill 本地生成与类目容错', () => {
     expect(instruction).toContain('适用场景与目标：')
     expect(instruction).toContain('互联网 / 企业服务 / 架构师 / 技术架构设计文档')
     expect(instruction).toContain('完全脱离源文档的 few-shot 示例文档')
-    expect(instruction).toContain('这类文档标题通常怎么命名')
+    expect(instruction).toContain('标题设计风格：')
+    expect(instruction).toContain('行文设计思路：')
+    expect(instruction).toContain('图片生成方式：')
+    expect(instruction).toContain('话术表达风格：')
+    expect(instruction).toContain('特色亮点｜定义先行的概念建立')
+    expect(instruction).toContain('复刻指引：对象首次出现时先给通俗解释')
+    expect(instruction).not.toContain('章节组织骨架：')
+    expect(instruction).not.toContain('章节推进示例：')
+    expect(instruction).not.toContain('标题如何传递重点')
+  })
+
+  it('使用 Skill 描述中的问题和领域触发自动匹配', () => {
+    const skill: LocalCreationSkill = {
+      ...localSkill,
+      id: 71,
+      title: '决策材料写作法',
+      summary: '用于形成专业材料。',
+      commonTitles: ['目标与路径'],
+      skillDescription: {
+        purpose: '帮助管理团队评估新市场。',
+        documentTypes: ['市场进入决策材料'],
+        problems: ['比较区域机会并设计进入路径'],
+        domains: ['海外市场战略'],
+        deliverables: ['包含证据缺口和关键取舍的决策材料'],
+      },
+      installed: true,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+
+    const matches = matchCreationSkills('请比较区域机会，给出海外市场进入路径', [skill])
+
+    expect(matches).toHaveLength(1)
+    expect(matches[0]).toMatchObject({ reason: 'automatic', skill: { id: 71 } })
+  })
+
+  it('把执行步骤引用的已安装 Skill 一并加入本轮调用', () => {
+    const primary: LocalCreationSkill = {
+      ...localSkill,
+      id: 72,
+      installed: true,
+      createdAt: 1,
+      updatedAt: 2,
+      executionSteps: [{
+        ...localSkill.executionSteps[0],
+        skills: ['evidence-brief'],
+      }],
+    }
+    const dependency: LocalCreationSkill = {
+      ...localSkill,
+      id: 73,
+      clientSkillKey: 'evidence-brief',
+      title: '证据简报 Skill',
+      installed: true,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+
+    const resolved = resolveCreationSkillDependencies(
+      [primary],
+      [primary, dependency, { ...dependency, id: 74, clientSkillKey: 'not-installed', installed: false }],
+    )
+
+    expect(resolved.map(skill => skill.id)).toEqual([72, 73])
   })
 
   it('支持按来源文档查询关联 Skill 并读取安装状态', async () => {
@@ -416,6 +693,23 @@ describe('创作 Skill 本地生成与类目容错', () => {
         diagram_style: '时间线',
         structure_pattern: ['目标', '结果', '行动项'],
         writing_guidelines: [],
+        section_headings: {
+          common_titles: '这类文档标题通常怎么命名',
+          title_style: '标题如何传递重点',
+          text_style: '正文怎样组织和表达',
+          diagram_style: '图示怎样服务于内容',
+          structure_pattern: '从开篇到结论的章节骨架',
+          writing_guidelines: '保持这份风格的关键约束',
+        },
+        field_examples: {
+          common_titles: ['项目复盘'],
+          title_style: ['项目复盘：结论与行动'],
+          text_style: ['先陈述结果，再解释原因。'],
+          diagram_style: ['用时间线展示阶段变化。'],
+          structure_pattern: ['目标 → 结果 → 行动项'],
+          writing_guidelines: ['需要说明的是，结论只覆盖已确认范围。'],
+        },
+        example_document: DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
         status: 'saved',
         installed: true,
         published: false,
@@ -432,5 +726,65 @@ describe('创作 Skill 本地生成与类目容错', () => {
 
     expect(skills).toHaveLength(1)
     expect(skills[0]).toMatchObject({ status: 'saved', installed: true })
+    expect(skills[0].commonTitles).toEqual(['结论先行'])
+    expect(skills[0].fieldExamples.commonTitles).toContain('项目复盘')
+    expect(skills[0].sectionHeadings.commonTitles).toBe('标题设计风格')
+  })
+
+  it('读取旧本地记录时把 Python 字典字符串还原为可读规则', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json([{
+      id: 16,
+      client_skill_key: 'doc-skill-object-array',
+      source_kind: 'bake_document',
+      source_id: '20',
+      title: '项目复盘总结文档',
+      summary: '适合技术方案写作。',
+      common_titles: ["{'level': '一级标题', 'pattern': '# [核心主题] + OS/整体技术方案'}"],
+      title_style: '标题规则',
+      text_style: '行文规则',
+      diagram_style: '默认不生成图片。',
+      structure_pattern: ["{'role': '先定义核心对象，再说明核心目标'}"],
+      writing_guidelines: [],
+      distinctive_sections: [],
+      section_headings: { ...Object.fromEntries(Object.entries(DEFAULT_CREATION_SKILL_SECTION_HEADINGS).map(([key, value]) => [
+        key.replace(/[A-Z]/g, match => `_${match.toLowerCase()}`),
+        value,
+      ])) },
+      field_examples: {
+        common_titles: ["{'level': '一级标题', 'pattern': '# [核心主题] + OS/整体技术方案'}"],
+        title_style: ["{'level': '一级标题', 'pattern': '# [核心主题] + OS/整体技术方案'}"],
+        text_style: DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.textStyle,
+        diagram_style: DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.diagramStyle,
+        structure_pattern: DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.structurePattern,
+        writing_guidelines: DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.writingGuidelines,
+      },
+      example_document: DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
+      status: 'saved',
+      installed: false,
+      published: false,
+      created_at: 1,
+      updated_at: 2,
+    }])))
+
+    const [skill] = await listLocalCreationSkills('http://127.0.0.1:7070')
+
+    expect(skill.commonTitles[0]).toBe('一级标题：采用“# [核心主题] + OS/整体技术方案”的标题骨架')
+    expect(skill.structurePattern[0]).toBe('先定义核心对象，再说明核心目标')
+    expect(skill.fieldExamples.commonTitles[0]).not.toContain("{'level':")
+    expect(skill.title).toBe('运行平台整体技术方案')
+    expect(skill.textStyle.length).toBeGreaterThanOrEqual(400)
+    expect(skill.textStyle).toContain('交付前逐节检查')
+    expect(skill.diagramStyle.length).toBeGreaterThanOrEqual(400)
+    expect(skill.writingGuidelines.join('').length).toBeGreaterThanOrEqual(400)
+    expect(skill.sectionHeadings.structurePattern).toBe('内部章节推进信息')
+    expect(skill.skillDescription.purpose).toBe('适合技术方案写作。')
+    expect(skill.skillDescription.documentTypes).toEqual(['运行平台整体技术方案'])
+    expect(skill.executionSteps.map(step => step.id)).toEqual([
+      'collect-context',
+      'design-solution',
+      'draft-document',
+      'review-delivery',
+    ])
+    expect(skill.executionSteps[0].tools).toEqual(['memory_search'])
   })
 })

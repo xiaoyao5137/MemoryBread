@@ -3,7 +3,10 @@ import {
   authenticateWithPassword,
   completeCloudSnapshotUpload,
   fetchCloudDevices,
+  fetchCloudMessages,
   fetchCloudSnapshots,
+  markAllCloudMessagesRead,
+  markCloudMessageRead,
   upsertCloudDevice,
   updateUserProfile,
 } from '../utils/authApi'
@@ -228,5 +231,70 @@ describe('cloud device and snapshot API', () => {
     }, 503)))
 
     await expect(fetchCloudDevices('http://127.0.0.1:8080', 'mbs_token')).rejects.toThrow('账户服务暂时未就绪')
+  })
+
+  it('reads and marks cloud messages with the account token', async () => {
+    const message = {
+      id: '018f0000-0000-7000-8000-000000000099',
+      title: '新版本可用',
+      body: '重启后即可更新。',
+      category: 'product',
+      priority: 'normal',
+      read_at: null,
+      published_at: '2026-07-24T08:00:00Z',
+    }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        data: { items: [message], page: 1, page_size: 20, total: 1, unread_count: 1 },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        data: { ...message, read_at: '2026-07-24T09:00:00Z' },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        data: { updated_count: 0, read_at: '2026-07-24T09:00:00Z' },
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const page = await fetchCloudMessages(
+      'http://127.0.0.1:8080',
+      'mbs_token',
+      { pageSize: 20, unreadOnly: true },
+    )
+    await markCloudMessageRead('http://127.0.0.1:8080', 'mbs_token', message.id)
+    await markAllCloudMessagesRead('http://127.0.0.1:8080', 'mbs_token')
+
+    expect(page.unread_count).toBe(1)
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://127.0.0.1:8080/v1/messages?page=1&page_size=20&unread_only=true',
+      {
+        headers: {
+          'X-MemoryBread-Environment': 'production',
+          Authorization: 'Bearer mbs_token',
+        },
+      },
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://127.0.0.1:8080/v1/messages/${message.id}/read`,
+      {
+        method: 'PUT',
+        headers: {
+          'X-MemoryBread-Environment': 'production',
+          Authorization: 'Bearer mbs_token',
+        },
+      },
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://127.0.0.1:8080/v1/messages/read-all',
+      {
+        method: 'PUT',
+        headers: {
+          'X-MemoryBread-Environment': 'production',
+          Authorization: 'Bearer mbs_token',
+        },
+      },
+    )
   })
 })

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+import time
 
 from background_processor import BackgroundProcessor, _is_self_generated_capture
 from knowledge.fragment_grouper import FragmentGrouper
@@ -752,6 +753,84 @@ def test_battery_backlog_keeps_rate_limited_batch_size(tmp_path) -> None:
     )()
 
     assert processor._timeline_batch_limit(profile, 500) == 4
+
+
+def test_periodic_bake_check_excludes_permanent_failures(tmp_path) -> None:
+    db_path = str(tmp_path / "captures.db")
+    _init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        ALTER TABLE timelines ADD COLUMN user_verified INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE bake_retry_state (
+            timeline_id INTEGER PRIMARY KEY,
+            failure_count INTEGER NOT NULL,
+            last_error TEXT,
+            last_failed_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE bake_knowledge (timeline_id INTEGER);
+        CREATE TABLE bake_sops (timeline_id INTEGER);
+        CREATE TABLE bake_documents (
+            deleted_at INTEGER,
+            source_episode_ids TEXT
+        );
+        INSERT INTO captures (id, ts, app_name, win_title, ax_text, timeline_id)
+        VALUES (1, 1000, 'Chrome', '文档', '正文', 1);
+        INSERT INTO timelines (
+            id, capture_id, summary, category, importance, is_self_generated,
+            history_view, created_at_ms, updated_at_ms
+        )
+        VALUES (1, 1, '候选', '文档', 5, 0, 0, 1000, 1000);
+        INSERT INTO bake_retry_state
+        VALUES (1, 1, 'terminal payload error', 1000);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    processor = BackgroundProcessor(db_path=db_path)
+    assert processor._has_pending_bake_timelines() is False
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("DELETE FROM bake_retry_state")
+    conn.commit()
+    conn.close()
+    assert processor._has_pending_bake_timelines() is True
+
+
+def test_recent_deferred_bake_run_applies_bounded_backoff(tmp_path) -> None:
+    db_path = str(tmp_path / "captures.db")
+    _init_db(db_path)
+    now_ms = int(time.time() * 1000)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE bake_runs (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            completed_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO bake_runs (id, status, started_at, completed_at) VALUES (1, 'deferred', ?, ?)",
+        (now_ms - 10_000, now_ms - 5_000),
+    )
+    conn.commit()
+    conn.close()
+
+    processor = BackgroundProcessor(db_path=db_path)
+    assert 0 < processor._deferred_bake_backoff_remaining_ms() <= 120_000
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE bake_runs SET completed_at = ? WHERE id = 1",
+        (now_ms - 121_000,),
+    )
+    conn.commit()
+    conn.close()
+    assert processor._deferred_bake_backoff_remaining_ms() == 0
 
 
 def test_battery_idle_check_requires_local_and_model_api_queues_idle(

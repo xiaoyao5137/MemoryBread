@@ -102,6 +102,30 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+maybe_delegate_to_workspace_supervisor() {
+    local command="${1:-start}"
+    local workspace_start="$PROJECT_ROOT/../start.sh"
+
+    case "$command" in
+        start|stop|restart|status|logs)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    if [ "${MEMORYBREAD_MB_ALL_CHILD:-}" = "1" ] || is_truthy "${MEMORYBREAD_LOCAL_ONLY:-}"; then
+        return 0
+    fi
+
+    if [ -f "$workspace_start" ] \
+        && [ -f "$PROJECT_ROOT/../mb-admin/start.sh" ] \
+        && [ -f "$PROJECT_ROOT/../mb-gateway/start.sh" ]; then
+        log_info "检测到完整 mb-all 工作区，交由总启动器管理账户、网关与客户端组件"
+        exec bash "$workspace_start" "$@"
+    fi
+}
+
 is_truthy() {
     case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes|on|debug)
@@ -233,6 +257,61 @@ core_sources_changed() {
         "$PROJECT_ROOT/core-engine/Cargo.toml" \
         "$PROJECT_ROOT/core-engine/Cargo.lock" \
         "$PROJECT_ROOT/shared/ipc-protocol/rust"
+}
+
+python_sources_newer_than() {
+    local marker=$1
+    shift
+
+    if [ ! -e "$marker" ]; then
+        return 0
+    fi
+
+    local path
+    local newer_file
+    for path in "$@"; do
+        if [ -f "$path" ]; then
+            if [ "$path" -nt "$marker" ]; then
+                return 0
+            fi
+            continue
+        fi
+        if [ -d "$path" ]; then
+            newer_file=$(find "$path" -type f -name '*.py' -newer "$marker" -print -quit 2>/dev/null)
+            if [ -n "$newer_file" ]; then
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+sidecar_sources_changed() {
+    python_sources_newer_than \
+        "$SIDECAR_PID_FILE" \
+        "$PROJECT_ROOT/ai-sidecar/main.py" \
+        "$PROJECT_ROOT/ai-sidecar/background_processor.py" \
+        "$PROJECT_ROOT/ai-sidecar/energy_policy.py" \
+        "$PROJECT_ROOT/ai-sidecar/inference_queue.py" \
+        "$PROJECT_ROOT/ai-sidecar/model_registry.py" \
+        "$PROJECT_ROOT/ai-sidecar/scheduled_task_executor.py" \
+        "$PROJECT_ROOT/ai-sidecar/ocr" \
+        "$PROJECT_ROOT/ai-sidecar/asr" \
+        "$PROJECT_ROOT/ai-sidecar/vlm"
+}
+
+model_api_sources_changed() {
+    python_sources_newer_than \
+        "$MODEL_API_PID_FILE" \
+        "$PROJECT_ROOT/ai-sidecar/model_api_server.py" \
+        "$PROJECT_ROOT/ai-sidecar/initialization_manager.py" \
+        "$PROJECT_ROOT/ai-sidecar/model_manager.py" \
+        "$PROJECT_ROOT/ai-sidecar/model_registry.py" \
+        "$PROJECT_ROOT/ai-sidecar/model_registry_global.py" \
+        "$PROJECT_ROOT/ai-sidecar/inference_queue.py" \
+        "$PROJECT_ROOT/ai-sidecar/rag" \
+        "$PROJECT_ROOT/ai-sidecar/knowledge"
 }
 
 stop_managed_process() {
@@ -476,6 +555,7 @@ check_core_api_readiness() {
     local failed=0
 
     wait_for_http "http://localhost:${CORE_PORT}/health" "Core Engine" 20 1 || failed=1
+    wait_for_http "http://localhost:${CORE_PORT}/api/creation/history?paged=true&limit=1&offset=0" "Core API /api/creation/history" 10 1 || failed=1
     wait_for_http "http://localhost:${CORE_PORT}/api/bake/captures?limit=1" "Core API /api/bake/captures" 10 1 || failed=1
     wait_for_http "http://localhost:${CORE_PORT}/api/monitor/overview?range=7d" "Core API /api/monitor/overview" 10 1 || failed=1
 
@@ -489,11 +569,14 @@ check_core_api_readiness() {
 }
 
 show_status() {
+    local failed=0
+
     echo ""
     if is_running "$SIDECAR_PID_FILE"; then
         log_success "AI Sidecar: 运行中 (PID: $(cat "$SIDECAR_PID_FILE"))"
     else
         log_error "AI Sidecar: 未运行"
+        failed=1
     fi
 
     if is_running "$MODEL_API_PID_FILE"; then
@@ -502,9 +585,11 @@ show_status() {
             log_success "Model API / RAG API: 运行中 (PID: ${model_api_pid}, Port: ${MODEL_API_PORT})"
         else
             log_error "Model API / RAG API: 进程存在但接口未就绪 (PID: ${model_api_pid}, Port: ${MODEL_API_PORT})"
+            failed=1
         fi
     else
         log_error "Model API / RAG API: 未运行"
+        failed=1
     fi
 
     if is_ollama_ready; then
@@ -515,6 +600,7 @@ show_status() {
         fi
     else
         log_error "Ollama: 未运行 (Port: ${OLLAMA_PORT})"
+        failed=1
     fi
 
     if is_running "$CREATION_PID_FILE"; then
@@ -523,9 +609,11 @@ show_status() {
             log_success "Creation Service: 运行中 (PID: ${creation_pid}, Port: ${CREATION_PORT})"
         else
             log_error "Creation Service: 进程存在但接口未就绪 (PID: ${creation_pid}, Port: ${CREATION_PORT})"
+            failed=1
         fi
     else
         log_error "Creation Service: 未运行"
+        failed=1
     fi
 
     if is_running "$CORE_PID_FILE"; then
@@ -534,20 +622,28 @@ show_status() {
             log_success "Core Engine: 运行中 (PID: ${core_pid}, Port: ${CORE_PORT})"
         else
             log_error "Core Engine: 进程存在但接口未就绪 (PID: ${core_pid}, Port: ${CORE_PORT})"
+            failed=1
         fi
     else
         log_error "Core Engine: 未运行"
+        failed=1
     fi
 
     if is_running "$UI_PID_FILE"; then
-        local ui_msg="Desktop UI: 运行中 (启动器 PID: $(cat "$UI_PID_FILE"), Port: ${UI_PORT}"
-        if is_running "$UI_APP_PID_FILE"; then
-            ui_msg+="，窗口 PID: $(cat "$UI_APP_PID_FILE")"
+        if is_http_ok "http://localhost:${UI_PORT}"; then
+            local ui_msg="Desktop UI: 运行中 (启动器 PID: $(cat "$UI_PID_FILE"), Port: ${UI_PORT}"
+            if is_running "$UI_APP_PID_FILE"; then
+                ui_msg+="，窗口 PID: $(cat "$UI_APP_PID_FILE")"
+            fi
+            ui_msg+=")"
+            log_success "$ui_msg"
+        else
+            log_error "Desktop UI: 启动器存在但接口未就绪 (PID: $(cat "$UI_PID_FILE"), Port: ${UI_PORT})"
+            failed=1
         fi
-        ui_msg+=")"
-        log_success "$ui_msg"
     else
         log_error "Desktop UI: 未运行"
+        failed=1
     fi
 
     local desktop_pids=$(find_desktop_app_pids)
@@ -556,8 +652,10 @@ show_status() {
         log_info "Desktop UI 窗口进程数: ${desktop_count} (PID: $(echo "$desktop_pids" | tr '\n' ' ' | xargs))"
     else
         log_info "Desktop UI 窗口进程数: 0"
+        failed=1
     fi
     echo ""
+    return "$failed"
 }
 
 # 停止所有服务
@@ -777,9 +875,20 @@ start_sidecar() {
     cleanup_duplicate_sidecars
 
     if is_running "$SIDECAR_PID_FILE" && is_running "$MODEL_API_PID_FILE"; then
-        log_info "AI Sidecar 与 Model API 已在运行，复用现有进程"
-        wait_for_http "http://localhost:${MODEL_API_PORT}/health" "Model API / RAG API" 10 1 || log_warn "现有 Model API 进程健康检查失败，建议执行 ./start.sh restart"
-        return 0
+        if sidecar_sources_changed; then
+            log_info "检测到 AI Sidecar 源码已更新，将自动加载最新代码"
+            stop_managed_process "$SIDECAR_PID_FILE" "AI Sidecar"
+        elif model_api_sources_changed; then
+            log_info "检测到 Model API 源码已更新，将自动加载最新代码"
+            stop_managed_process "$MODEL_API_PID_FILE" "Model API"
+        elif ! is_http_ok "http://localhost:${MODEL_API_PORT}/api/initialization/status"; then
+            log_warn "现有 Model API 缺少初始化接口，将自动升级运行中的服务"
+            stop_managed_process "$MODEL_API_PID_FILE" "Model API"
+        else
+            log_info "AI Sidecar 与 Model API 已在运行，复用现有进程"
+            wait_for_http "http://localhost:${MODEL_API_PORT}/health" "Model API / RAG API" 10 1 || log_warn "现有 Model API 进程健康检查失败，建议执行 ./start.sh restart"
+            return 0
+        fi
     fi
 
     if is_running "$SIDECAR_PID_FILE" && ! is_running "$MODEL_API_PID_FILE"; then
@@ -850,6 +959,10 @@ start_sidecar() {
             rm -f "$MODEL_API_PID_FILE"
         fi
     }
+    wait_for_http "http://localhost:${MODEL_API_PORT}/api/initialization/status" "Initialization API" 10 1 || {
+        log_error "Initialization API 未就绪，请查看日志: $MODEL_API_LOG"
+        return 1
+    }
 }
 
 # 启动 Creation Service
@@ -898,10 +1011,12 @@ start_creation_service() {
 
 # 启动 Core Engine
 start_core() {
+    local replace_running_core=false
+
     if is_running "$CORE_PID_FILE"; then
         if core_sources_changed; then
-            log_info "检测到 Core Engine 源码晚于当前进程，将重新构建并加载最新代码"
-            stop_managed_process "$CORE_PID_FILE" "Core Engine"
+            log_info "检测到 Core Engine 源码晚于当前进程，将先完成构建再加载最新代码"
+            replace_running_core=true
         else
             log_info "Core Engine 已在运行且代码未变化，复用现有进程"
             check_core_api_readiness || log_warn "当前 Core Engine 进程存在接口异常，建议执行 ./start.sh restart 进行完整重启"
@@ -916,6 +1031,12 @@ start_core() {
     # 构建最新 Core Engine
     log_info "构建最新 Core Engine..."
     cargo build --release
+
+    # 构建失败时 `set -e` 会直接退出，现有 Core 继续服务；仅在新二进制
+    # 准备完毕后切换进程，避免 Desktop UI 在编译期间同时失去创作和记录接口。
+    if [ "$replace_running_core" = true ]; then
+        stop_managed_process "$CORE_PID_FILE" "Core Engine"
+    fi
 
     cleanup_port "$CORE_PORT" "Core Engine"
 
@@ -989,6 +1110,8 @@ start_ui() {
 
 # 主函数
 main() {
+    maybe_delegate_to_workspace_supervisor "$@"
+
     local command="${1:-start}"
     if [ "$#" -gt 0 ]; then
         shift
@@ -1058,11 +1181,11 @@ main() {
             echo "用法: $0 {start|stop|restart|status|logs} [--debug|--no-debug]"
             echo ""
             echo "命令说明:"
-            echo "  start [--debug]   - 启动所有服务"
-            echo "  stop              - 停止所有服务"
-            echo "  restart [--debug] - 重启所有服务"
-            echo "  status            - 查看服务状态"
-            echo "  logs              - 查看实时日志"
+            echo "  start [--debug]   - 启动完整工作区；设置 MEMORYBREAD_LOCAL_ONLY=1 时仅启动客户端本地组件"
+            echo "  stop              - 停止对应范围的服务"
+            echo "  restart [--debug] - 重启对应范围的服务"
+            echo "  status            - 查看对应范围的服务状态"
+            echo "  logs              - 查看对应范围的实时日志"
             exit 1
             ;;
     esac

@@ -1,0 +1,4 @@
+interface:
+  display_name: "记忆检索"
+  short_description: "从本机记忆面包召回与当前任务相关的真实工作记忆和上下文"
+  default_prompt: "Use $memory-retrieval to recall relevant MemoryBread context before completing this task."

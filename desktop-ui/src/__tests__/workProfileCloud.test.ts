@@ -5,6 +5,8 @@ import {
   buildSyncWorkProfileRequest,
   mergeWorkProfiles,
   synchronizeWorkProfile,
+  WORK_PROFILE_SYNCED_EVENT,
+  type SyncWorkProfileEventDetail,
 } from '../utils/workProfileCloud'
 
 const profile = (
@@ -91,6 +93,81 @@ describe('work profile cloud sync', () => {
     expect(merged.today.mood.mood).toBe('energized')
   })
 
+  it('同一天汇总相同时保留可用于热力图联动的历史明细', () => {
+    const yesterdayDate = new Date()
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1)
+    const yesterday = toLocalDateKey(yesterdayDate)
+    const local = profile([{ date: yesterday, minutes: 50, capture_count: 10 }])
+    const cloud = profile([{
+      date: yesterday,
+      minutes: 50,
+      capture_count: 10,
+      first_capture_at: yesterdayDate.getTime() + 9 * 3_600_000,
+      last_capture_at: yesterdayDate.getTime() + 11 * 3_600_000,
+      apps: [{ name: 'Code', minutes: 50, capture_count: 10 }],
+    }])
+
+    const merged = mergeWorkProfiles(local, cloud)
+
+    expect(merged.days[0]).toMatchObject({
+      date: yesterday,
+      first_capture_at: yesterdayDate.getTime() + 9 * 3_600_000,
+      last_capture_at: yesterdayDate.getTime() + 11 * 3_600_000,
+      apps: [{ name: 'Code', minutes: 50, capture_count: 10 }],
+    })
+  })
+
+  it('同步历史日期时携带工作时段和应用分布', () => {
+    const yesterdayDate = new Date()
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1)
+    const yesterday = toLocalDateKey(yesterdayDate)
+    const local = profile([{
+      date: yesterday,
+      minutes: 80,
+      capture_count: 16,
+      first_capture_at: yesterdayDate.getTime() + 8 * 3_600_000,
+      last_capture_at: yesterdayDate.getTime() + 12 * 3_600_000,
+      apps: [{ name: 'Figma', minutes: 80, capture_count: 16 }],
+    }])
+
+    const request = buildSyncWorkProfileRequest(local)
+
+    expect(request.days[0]).toMatchObject({
+      date: yesterday,
+      first_capture_at: yesterdayDate.getTime() + 8 * 3_600_000,
+      last_capture_at: yesterdayDate.getTime() + 12 * 3_600_000,
+      apps: [{ name: 'Figma', minutes: 80, capture_count: 16 }],
+    })
+  })
+
+  it('重新同步前会清理云端旧数据中的 loginwindow 污染', () => {
+    const yesterdayDate = new Date()
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1)
+    const yesterday = toLocalDateKey(yesterdayDate)
+    const local = profile([{
+      date: yesterday,
+      minutes: 967,
+      capture_count: 1141,
+      first_capture_at: yesterdayDate.getTime(),
+      last_capture_at: yesterdayDate.getTime() + 86_399_000,
+      apps: [
+        { name: 'Code', minutes: 756, capture_count: 1070 },
+        { name: 'loginwindow', minutes: 211, capture_count: 71 },
+      ],
+    }])
+
+    const request = buildSyncWorkProfileRequest(local)
+
+    expect(request.days[0]).toMatchObject({
+      date: yesterday,
+      minutes: 756,
+      capture_count: 1070,
+      first_capture_at: undefined,
+      last_capture_at: undefined,
+      apps: [{ name: 'Code', minutes: 756, capture_count: 1070 }],
+    })
+  })
+
   it('复用稳定设备标识并生成单调递增同步版本', () => {
     vi.spyOn(Date, 'now').mockReturnValue(1000)
     const today = toLocalDateKey(new Date())
@@ -115,6 +192,69 @@ describe('work profile cloud sync', () => {
       capture_count: 6,
       mood: { mood: 'focused', expression_count: 2 },
     })
+  })
+
+  it('云端同步完成前先发布本地画像供页面展示', async () => {
+    const today = toLocalDateKey(new Date())
+    const local = profile([{ date: today, minutes: 30, capture_count: 6 }], {
+      apps: [{ name: 'Code', minutes: 30, capture_count: 6 }],
+    })
+    let resolveCloud!: (response: Response) => void
+    const pendingCloud = new Promise<Response>((resolve) => {
+      resolveCloud = resolve
+    })
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/api/work-profile')) {
+        return new Response(JSON.stringify(local), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return pendingCloud
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const published: WorkProfileSummary[] = []
+    const handleSynced = (event: Event) => {
+      const detail = (event as CustomEvent<SyncWorkProfileEventDetail>).detail
+      if (detail.userId === 'user-progressive') published.push(detail.profile)
+    }
+    window.addEventListener(WORK_PROFILE_SYNCED_EVENT, handleSynced)
+
+    const sync = synchronizeWorkProfile({
+      apiBaseUrl: 'http://127.0.0.1:7070',
+      adminApiBaseUrl: 'http://127.0.0.1:8080',
+      authToken: 'mbs_token',
+      userId: 'user-progressive',
+    })
+
+    await vi.waitFor(() => {
+      expect(published[published.length - 1]?.today.total_minutes).toBe(30)
+    })
+
+    resolveCloud(new Response(JSON.stringify({
+      data: {
+        applied: true,
+        profile: {
+          range_start_date: today,
+          range_end_date: today,
+          synced_at: new Date().toISOString(),
+          days: [{
+            date: today,
+            minutes: 30,
+            capture_count: 6,
+            first_capture_at: null,
+            last_capture_at: null,
+            apps: [{ name: 'Code', minutes: 30, capture_count: 6 }],
+            mood: null,
+          }],
+        },
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    await sync
+    window.removeEventListener(WORK_PROFILE_SYNCED_EVENT, handleSynced)
   })
 
   it('新机器本机为空时，登录同步会恢复云端历史和今日数据', async () => {

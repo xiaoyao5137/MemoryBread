@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { useAppStore } from '../../store/useAppStore'
 import type { BakeCaptureItem } from '../../types'
 import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './BakeShared'
@@ -59,8 +59,8 @@ const BakeCaptureTab: React.FC<{
   onDraftToChange: (value: string) => void
   onSearch: () => void
   onClearFilters: () => void
-  onClearScope: () => void
   onViewLinkedTimeline: (timelineId?: string | null) => void
+  onDeleteCapture: (id: string) => void
   canGoBack: boolean
   onGoBack: () => void
 }> = ({
@@ -85,8 +85,8 @@ const BakeCaptureTab: React.FC<{
   onDraftToChange,
   onSearch,
   onClearFilters,
-  onClearScope,
   onViewLinkedTimeline,
+  onDeleteCapture,
   canGoBack,
   onGoBack,
 }) => {
@@ -97,12 +97,6 @@ const BakeCaptureTab: React.FC<{
   const page = Math.floor(offset / limit) + 1
   const totalPages = Math.max(1, Math.ceil(total / limit))
   const screenshotUrl = selected?.screenshotPath ? `${apiBaseUrl}/api/bake/captures/${encodeURIComponent(selected.id)}/screenshot` : null
-  const activeFilters = useMemo(() => {
-    const items: string[] = []
-    if (from) items.push(`开始：${from}`)
-    if (to) items.push(`结束：${to}`)
-    return items
-  }, [from, to])
 
   useEffect(() => {
     if (!screenshotUrl && isScreenshotOpen) {
@@ -174,14 +168,6 @@ const BakeCaptureTab: React.FC<{
           </div>
         </div>
       </form>
-
-      {(sourceCaptureId || activeFilters.length > 0) && (
-        <div className="bake-filter-summary">
-          {sourceCaptureId && <BakePill text={`仅看来源 ID #${sourceCaptureId}`} />}
-          {activeFilters.map(item => <BakePill key={item} text={item} />)}
-          {sourceCaptureId && <BakeButton compact onClick={onClearScope}>查看全部</BakeButton>}
-        </div>
-      )}
 
       <div className="bake-split-list-detail bake-split-list-detail--capture">
         <BakeCard className="bake-capture-list-card">
@@ -348,13 +334,12 @@ const BakeCaptureTab: React.FC<{
             )}
 
             <div className="bake-actions">
-              {selected.linkedTimelineId ? (
+              {selected.linkedTimelineId && (
                 <BakeButton onClick={() => onViewLinkedTimeline(selected.linkedTimelineId)}>
-                  查看所属时间线{selected.linkedTimelineSummary ? ` · ${selected.linkedTimelineSummary.slice(0, 24)}` : ''}
+                  查看所属时间线
                 </BakeButton>
-              ) : (
-                <BakePill text="尚未归入时间线" />
               )}
+              <BakeButton compact danger onClick={() => onDeleteCapture(selected.id)}>删除</BakeButton>
             </div>
           </div>
         ) : (

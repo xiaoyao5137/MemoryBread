@@ -285,6 +285,80 @@
   accent-color: #007AFF;
 }
 
+.settings-v2__environment-row {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid rgba(180, 111, 42, 0.2);
+  border-radius: 12px;
+  background: #FFF9F0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.settings-v2__environment-copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.settings-v2__environment-copy strong {
+  color: #3A2414;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.settings-v2__environment-copy small {
+  color: #7A6251;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.settings-v2__environment-options {
+  min-width: 220px;
+  padding: 3px;
+  border: 1px solid rgba(154, 106, 49, 0.18);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.78);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+}
+
+.settings-v2__environment-option {
+  min-height: 36px;
+  padding: 7px 18px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #6B4A25;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.settings-v2__environment-option:hover {
+  background: rgba(180, 111, 42, 0.08);
+}
+
+.settings-v2__environment-option:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(196, 106, 50, 0.2);
+}
+
+.settings-v2__environment-option--active {
+  background: #B46F2A;
+  color: #FFFFFF;
+  box-shadow: 0 4px 12px rgba(180, 111, 42, 0.2);
+}
+
+.settings-v2__environment-option--active:hover {
+  background: #A76424;
+}
+
 .settings-v2__debug-routes {
   margin-top: 12px;
   padding: 12px;
@@ -527,6 +601,13 @@
   font-size: 14px;
   color: #6E6E73;
   font-family: 'SF Mono', Monaco, monospace;
+}
+
+.settings-v2__version-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 /* 提示文字 */
@@ -836,12 +917,28 @@
     gap: 4px;
   }
 
+  .settings-v2__version-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .settings-v2__check-item {
     grid-template-columns: 1fr;
   }
 
   .settings-v2__check-actions {
     justify-content: flex-start;
+  }
+
+  .settings-v2__environment-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .settings-v2__environment-options {
+    min-width: 0;
+    width: 100%;
   }
 
   .settings-v2__interaction-heading,
@@ -996,6 +1093,60 @@
 
   .settings-v2__hint {
     color: #AEAEB2;
+  }
+
+  .settings-v2__toggle-row {
+    border-top-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .settings-v2__toggle-row strong {
+    color: #FFFFFF;
+  }
+
+  .settings-v2__toggle-row small {
+    color: #AEAEB2;
+  }
+
+  .settings-v2__environment-row {
+    border-color: rgba(244, 193, 119, 0.2);
+    background: rgba(68, 48, 31, 0.58);
+  }
+
+  .settings-v2__environment-copy strong {
+    color: #FFF4EA;
+  }
+
+  .settings-v2__environment-copy small {
+    color: #C6B3A7;
+  }
+
+  .settings-v2__environment-options {
+    border-color: rgba(244, 193, 119, 0.18);
+    background: rgba(28, 28, 30, 0.5);
+  }
+
+  .settings-v2__environment-option {
+    color: #F6D6A8;
+  }
+
+  .settings-v2__environment-option:hover {
+    background: rgba(244, 193, 119, 0.1);
+  }
+
+  .settings-v2__environment-option--active,
+  .settings-v2__environment-option--active:hover {
+    background: #D98C38;
+    color: #1F1308;
+  }
+
+  .settings-v2__debug-routes {
+    border-color: rgba(244, 193, 119, 0.18);
+    background: rgba(68, 48, 31, 0.4);
+    color: #C6B3A7;
+  }
+
+  .settings-v2__debug-routes strong {
+    color: #FFF4EA;
   }
 
   .settings-v2__card--interactions {

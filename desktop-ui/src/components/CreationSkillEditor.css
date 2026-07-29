@@ -15,6 +15,32 @@
 .creation-skill-analysis-progress > div > span { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #b96f2d, #dd9a48); transition: width .38s ease; }
 .creation-skill-analysis-progress > strong { color: #8a4d1d; font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; }
 .creation-skill-form-grid, .creation-skill-recipe-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.creation-skill-description { padding: 18px; border: 1px solid rgba(164, 93, 34, .22); border-radius: 14px; background: linear-gradient(180deg, #fffaf3 0%, #fff 32%); display: grid; gap: 16px; }
+.creation-skill-description > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.creation-skill-description > header span, .creation-skill-workflow-heading span { color: #a45d22; font-size: 10px; font-weight: 750; letter-spacing: .04em; }
+.creation-skill-description > header h3 { margin: 5px 0 0; color: #172033; font-size: 18px; }
+.creation-skill-description > header p, .creation-skill-workflow-heading p { margin: 5px 0 0; color: #667085; font-size: 11px; line-height: 1.6; }
+.creation-skill-description__grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.creation-skill-workflow-heading { padding-top: 15px; border-top: 1px solid #eadfd3; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.creation-skill-workflow-heading h4 { margin: 5px 0 0; color: #172033; font-size: 16px; }
+.creation-skill-workflow-heading button { min-height: 36px; padding: 0 12px; border: 1px solid rgba(164, 93, 34, .3); border-radius: 9px; background: #fff; color: #945019; display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; font: inherit; font-size: 11px; font-weight: 700; cursor: pointer; }
+.creation-skill-workflow-heading button:disabled { cursor: not-allowed; opacity: .48; }
+.creation-skill-workflow { display: grid; gap: 12px; }
+.creation-skill-workflow-step { padding: 14px; border: 1px solid #e1d8cf; border-radius: 12px; background: #fff; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.creation-skill-workflow-step > header { grid-column: 1 / -1; display: grid; grid-template-columns: 30px minmax(0, 1fr) 34px; align-items: center; gap: 9px; }
+.creation-skill-workflow-step > header > span { width: 30px; height: 30px; border-radius: 9px; background: #f8e8d4; color: #a35b12; display: grid; place-items: center; font: 750 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.creation-skill-workflow-step > header input { min-height: 36px; border: 0; border-bottom: 1px solid #eadfd3; border-radius: 0; color: #172033; font-size: 15px; font-weight: 700; }
+.creation-skill-workflow-step > header button { width: 34px; height: 34px; padding: 0; border: 1px solid #e2d6ce; border-radius: 8px; background: #fff; color: #9b4d3f; display: grid; place-items: center; cursor: pointer; }
+.creation-skill-workflow-step > header button:disabled { cursor: not-allowed; opacity: .35; }
+.creation-skill-workflow-heading button:focus-visible, .creation-skill-workflow-step > header button:focus-visible { outline: 3px solid rgba(15, 118, 110, .2); outline-offset: 2px; }
+.creation-skill-resource-group { min-width: 0; margin: 0; padding: 11px; border: 1px solid #e5e0da; border-radius: 10px; background: #faf9f7; }
+.creation-skill-resource-group legend { padding: 0 4px; color: #5f5146; font-size: 11px; font-weight: 700; }
+.creation-skill-resource-group > div { display: flex; flex-wrap: wrap; gap: 7px; }
+.creation-skill-editor .creation-skill-resource-group label { min-height: 30px; padding: 0 9px; border: 1px solid #ded7cf; border-radius: 999px; background: #fff; color: #625548; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 10px; font-weight: 650; }
+.creation-skill-resource-group label:has(input:checked) { border-color: rgba(15, 118, 110, .36); background: #edf8f5; color: #0f6b63; }
+.creation-skill-editor .creation-skill-resource-group input { width: 13px; min-height: 0; height: 13px; margin: 0; accent-color: #0f766e; }
+.creation-skill-resource-group label:has(input:disabled) { cursor: not-allowed; opacity: .45; }
+.creation-skill-resource-group label:has(input:focus-visible) { outline: 3px solid rgba(15, 118, 110, .18); outline-offset: 2px; }
 .creation-skill-recipe-field { min-width: 0; padding: 18px; border: 1px solid #e0d8ce; border-radius: 13px; background: #fff; display: grid; align-content: start; gap: 14px; }
 .creation-skill-recipe-field > header { min-height: 74px; padding-bottom: 13px; border-bottom: 1px solid #eee7df; display: grid; align-content: start; gap: 8px; }
 .creation-skill-recipe-field > header > span { color: #a45d22; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; font-weight: 750; letter-spacing: .04em; }
@@ -24,6 +50,18 @@
 .creation-skill-recipe-field > header input:focus { outline: 2px solid rgba(15, 118, 110, .12); outline-offset: 3px; border-color: #0f766e; }
 .creation-skill-example-field { padding: 12px; border: 1px solid #ead8bd; border-radius: 10px; background: #fff9ef; }
 .creation-skill-example-field textarea { border-color: #e5d4ba; background: rgba(255, 255, 255, .82); }
+.creation-skill-distinctive-heading { grid-column: 1 / -1; margin-top: 4px; padding: 15px 16px; border: 1px solid rgba(15, 118, 110, .18); border-radius: 12px; background: #f2faf8; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.creation-skill-distinctive-heading > div { min-width: 0; }
+.creation-skill-distinctive-heading span { color: #0f766e; font-size: 10px; font-weight: 750; letter-spacing: .04em; }
+.creation-skill-distinctive-heading h3 { margin: 5px 0 0; color: #172033; font-size: 16px; }
+.creation-skill-distinctive-heading p { margin: 5px 0 0; color: #667085; font-size: 11px; line-height: 1.55; }
+.creation-skill-distinctive-heading button { min-height: 36px; padding: 0 12px; border: 1px solid rgba(15, 118, 110, .32); border-radius: 9px; background: #fff; color: #0f766e; display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; font: inherit; font-size: 11px; font-weight: 700; cursor: pointer; }
+.creation-skill-distinctive-heading button:disabled { cursor: not-allowed; opacity: .48; }
+.creation-skill-recipe-field--distinctive { border-color: rgba(15, 118, 110, .24); box-shadow: inset 0 3px 0 rgba(15, 118, 110, .08); }
+.creation-skill-recipe-field--distinctive > header > span { color: #0f766e; }
+.creation-skill-recipe-field--distinctive > header > div { display: flex; align-items: center; gap: 8px; }
+.creation-skill-recipe-field--distinctive > header input { flex: 1 1 auto; min-width: 0; }
+.creation-skill-recipe-field--distinctive > header button { width: 34px; height: 34px; padding: 0; border: 1px solid #e2d6ce; border-radius: 8px; background: #fff; color: #9b4d3f; display: grid; place-items: center; flex: 0 0 auto; cursor: pointer; }
 .creation-skill-recipe-field--document { grid-column: 1 / -1; }
 .creation-skill-recipe-field--document > header { min-height: 0; }
 .creation-skill-recipe-field--document > p { margin: -2px 0 0; color: #667085; font-size: 12px; line-height: 1.65; }
@@ -86,11 +124,14 @@
   .creation-skill-modal { padding: 0; }
   .creation-skill-editor { max-height: 100dvh; height: 100dvh; border-radius: 0; }
   .creation-skill-editor__header, .creation-skill-editor__body, .creation-skill-editor__footer { padding-inline: 16px; }
-  .creation-skill-form-grid, .creation-skill-recipe-grid, .creation-skill-category-grid, .creation-skill-category-skeleton { grid-template-columns: 1fr; }
+  .creation-skill-form-grid, .creation-skill-description__grid, .creation-skill-workflow-step, .creation-skill-recipe-grid, .creation-skill-category-grid, .creation-skill-category-skeleton { grid-template-columns: 1fr; }
+  .creation-skill-workflow-heading { align-items: flex-start; flex-direction: column; }
+  .creation-skill-workflow-step > header { grid-column: auto; }
   .creation-skill-category-level, .creation-skill-category-skeleton > div { min-height: 188px; }
   .creation-skill-category-options { max-height: 160px; }
   .creation-skill-category-empty { min-height: 116px; }
-  .creation-skill-field--wide, .creation-skill-recipe-field--document { grid-column: auto; }
+  .creation-skill-field--wide, .creation-skill-recipe-field--document, .creation-skill-distinctive-heading { grid-column: auto; }
+  .creation-skill-distinctive-heading { align-items: flex-start; flex-direction: column; }
   .creation-skill-editor__footer { flex-wrap: wrap; }
   .creation-skill-button { flex: 1 1 auto; }
 }

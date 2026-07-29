@@ -59,9 +59,9 @@ AVAILABLE_MODELS: List[ModelMeta] = [
 
     # ── 本地 Embedding（Ollama）──────────────────────────────────────────────
     ModelMeta(
-        id="bge-small-zh", name="BGE-Small-ZH-Q4", category="embedding", provider="ollama",
+        id="bge-small-zh", name="MBEMB V1.0", category="embedding", provider="ollama",
         size_gb=0.05, min_memory_gb=1.0, is_default=True,
-        description="BAAI BGE-Small 中文版，512 维，量化版本，内存占用低",
+        description="MemoryBread向量模型",
         tags=["推荐", "超轻量", "中文"],
     ),
 

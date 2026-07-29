@@ -33,6 +33,7 @@ const SYSTEM_SCOPE: &str = "system_global";
 const SUITE_SCOPE: &str = "app_suite_total";
 const MODEL_SCOPE: &str = "model_process_total";
 const MODEL_SERIES_SCOPE: &str = "model_runtime_series";
+const BAKE_WATERMARK_STALL_MS: i64 = 15 * 60 * 1000;
 
 fn build_not_like_clause(column: &str, keywords: &[&str]) -> String {
     keywords
@@ -42,9 +43,29 @@ fn build_not_like_clause(column: &str, keywords: &[&str]) -> String {
         .join(" AND ")
 }
 
+fn is_bake_pipeline_stalled(
+    capture_enabled: bool,
+    now_ms: i64,
+    pending_bake_count: i64,
+    oldest_pending_bake_at_ms: Option<i64>,
+    bake_watermark_updated_at_ms: Option<i64>,
+) -> bool {
+    if !capture_enabled {
+        return false;
+    }
+    let backlog_old_enough = oldest_pending_bake_at_ms
+        .map(|oldest| now_ms.saturating_sub(oldest) >= BAKE_WATERMARK_STALL_MS)
+        .unwrap_or(false);
+    let watermark_stale = bake_watermark_updated_at_ms
+        .map(|updated| now_ms.saturating_sub(updated) >= BAKE_WATERMARK_STALL_MS)
+        .unwrap_or(true);
+    pending_bake_count > 0 && backlog_old_enough && watermark_stale
+}
+
 fn load_pipeline_backlog_metrics(
     conn: &rusqlite::Connection,
     now_ms: i64,
+    capture_enabled: bool,
 ) -> Result<PipelineBacklogMetrics, rusqlite::Error> {
     let app_not_like = build_not_like_clause("c.app_name", &SELF_GENERATED_APP_KEYWORDS);
     let win_not_like = build_not_like_clause("c.win_title", &SELF_GENERATED_WINDOW_KEYWORDS);
@@ -89,7 +110,7 @@ fn load_pipeline_backlog_metrics(
                     'bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate'
                   )
               AND t.is_self_generated = 0
-              AND COALESCE(r.failure_count, 0) < 3
+              AND COALESCE(r.failure_count, 0) < 1
               AND (
                     t.importance >= 4
                  OR t.user_verified = 1
@@ -187,7 +208,7 @@ fn load_pipeline_backlog_metrics(
 
     let bake_retry_exhausted_count = conn
         .query_row(
-            "SELECT COUNT(*) FROM bake_retry_state WHERE failure_count >= 3",
+            "SELECT COUNT(*) FROM bake_retry_state WHERE failure_count >= 1",
             [],
             |row| row.get(0),
         )
@@ -208,6 +229,49 @@ fn load_pipeline_backlog_metrics(
             |row| row.get(0),
         )
         .unwrap_or(0);
+    let bake_watermark_updated_at_ms = conn
+        .query_row(
+            "SELECT MAX(updated_at) FROM bake_watermarks WHERE pipeline_name = 'unified'",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .unwrap_or(None);
+    let latest_bake_status = conn
+        .query_row(
+            "SELECT status FROM bake_runs ORDER BY started_at DESC, id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let (recent_bake_run_count, recent_bake_failed_count, recent_bake_deferred_count) = conn
+        .query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(status = 'failed'), 0),
+                    COALESCE(SUM(status = 'deferred'), 0)
+             FROM (
+                 SELECT status FROM bake_runs
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT 5
+             )",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap_or((0, 0, 0));
+    let bake_stalled = is_bake_pipeline_stalled(
+        capture_enabled,
+        now_ms,
+        pending_bake_count,
+        oldest_pending_bake_at_ms,
+        bake_watermark_updated_at_ms,
+    );
+    let recent_bake_runs_unhealthy =
+        recent_bake_run_count >= 3 && recent_bake_failed_count + recent_bake_deferred_count >= 3;
 
     Ok(PipelineBacklogMetrics {
         pending_extraction_count,
@@ -217,6 +281,13 @@ fn load_pipeline_backlog_metrics(
         bake_retry_exhausted_count,
         running_bake_count,
         stale_bake_run_count,
+        bake_watermark_updated_at_ms,
+        latest_bake_status,
+        recent_bake_run_count,
+        recent_bake_failed_count,
+        recent_bake_deferred_count,
+        recent_bake_runs_unhealthy,
+        bake_stalled,
     })
 }
 
@@ -246,6 +317,7 @@ async fn read_inference_queue_monitor(sidecar_url: &str) -> InferenceQueueMonito
     let queued_p0 = stats.queue_lengths.get("P0").copied().unwrap_or(0);
     let queued_p1 = stats.queue_lengths.get("P1").copied().unwrap_or(0);
     let queued_p2 = stats.queue_lengths.get("P2").copied().unwrap_or(0);
+    let running_p2 = stats.running_by_lane.get("p2_bake").copied().unwrap_or(0);
     InferenceQueueMonitor {
         available: true,
         idle: body.idle,
@@ -254,6 +326,7 @@ async fn read_inference_queue_monitor(sidecar_url: &str) -> InferenceQueueMonito
         queued_p1,
         queued_p2,
         running_total: stats.running_total,
+        running_p2,
         oldest_wait_ms: stats.oldest_wait_ms,
         max_concurrency: stats.max_concurrency,
         on_external_power: stats.on_external_power,
@@ -403,6 +476,31 @@ impl ServiceHealth {
     }
 }
 
+fn apply_bake_pipeline_health(health: &mut ServiceHealth, backlog: &PipelineBacklogMetrics) {
+    // Sidecar 队列与 SQLite 是先后采样的，P2 推理也可能在请求方收尾后短暂继续。
+    // 单次快照不一致不是故障；这里只使用持续积压和连续异常批次等稳定信号。
+    let mut degraded = false;
+    if backlog.bake_stalled {
+        health.issues.push(format!(
+            "烘焙流水线有 {} 条积压且水位超过 15 分钟未推进",
+            backlog.pending_bake_count,
+        ));
+        degraded = true;
+    }
+    if backlog.recent_bake_runs_unhealthy && backlog.bake_stalled {
+        let recent_problem_count =
+            backlog.recent_bake_failed_count + backlog.recent_bake_deferred_count;
+        health.issues.push(format!(
+            "最近 {} 个烘焙批次中有 {} 个失败或延后",
+            backlog.recent_bake_run_count, recent_problem_count,
+        ));
+        degraded = true;
+    }
+    if degraded && health.status == "ok" {
+        health.status = "degraded".to_string();
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct TokenUsage {
     pub total_period: i64,
@@ -411,6 +509,32 @@ pub struct TokenUsage {
     pub by_caller: Vec<CallerUsage>,
     pub trend: Vec<DayTrend>,
     pub trend_by_model: Vec<ModelTrend>,
+    pub bake_distribution: BakeTokenDistribution,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BakeTokenDistribution {
+    pub sample_count: i64,
+    pub truncated_count: i64,
+    pub input_over_20k_count: i64,
+    pub input: TokenMetricDistribution,
+    pub output: TokenMetricDistribution,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenMetricDistribution {
+    pub p50: i64,
+    pub p90: i64,
+    pub p95: i64,
+    pub p99: i64,
+    pub max: i64,
+    pub buckets: Vec<TokenBucket>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenBucket {
+    pub label: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -443,6 +567,105 @@ pub struct ModelTrend {
     pub total: i64,
     pub calls: i64,
     pub trend: Vec<DayTrend>,
+}
+
+fn nearest_rank(sorted: &[i64], percentile: f64) -> i64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (percentile.clamp(0.0, 1.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn build_token_buckets(values: &[i64], definitions: &[(&str, Option<i64>)]) -> Vec<TokenBucket> {
+    let mut lower = 0_i64;
+    definitions
+        .iter()
+        .map(|(label, upper)| {
+            let count = values
+                .iter()
+                .filter(|value| {
+                    **value >= lower && upper.is_none_or(|upper_bound| **value < upper_bound)
+                })
+                .count() as i64;
+            if let Some(upper_bound) = upper {
+                lower = *upper_bound;
+            }
+            TokenBucket {
+                label: (*label).to_string(),
+                count,
+            }
+        })
+        .collect()
+}
+
+fn build_token_metric_distribution(
+    mut values: Vec<i64>,
+    bucket_definitions: &[(&str, Option<i64>)],
+) -> TokenMetricDistribution {
+    values.sort_unstable();
+    TokenMetricDistribution {
+        p50: nearest_rank(&values, 0.50),
+        p90: nearest_rank(&values, 0.90),
+        p95: nearest_rank(&values, 0.95),
+        p99: nearest_rank(&values, 0.99),
+        max: values.last().copied().unwrap_or(0),
+        buckets: build_token_buckets(&values, bucket_definitions),
+    }
+}
+
+fn load_bake_token_distribution(
+    conn: &rusqlite::Connection,
+    from_ms: i64,
+) -> rusqlite::Result<BakeTokenDistribution> {
+    const INPUT_BUCKETS: &[(&str, Option<i64>)] = &[
+        ("<4K", Some(4_000)),
+        ("4–8K", Some(8_000)),
+        ("8–12K", Some(12_000)),
+        ("12–16K", Some(16_000)),
+        ("16–20K", Some(20_000)),
+        ("20–24K", Some(24_000)),
+        ("24–32K", Some(32_000)),
+        ("≥32K", None),
+    ];
+    const OUTPUT_BUCKETS: &[(&str, Option<i64>)] = &[
+        ("<512", Some(512)),
+        ("512–1K", Some(1_000)),
+        ("1–2K", Some(2_000)),
+        ("2–4K", Some(4_000)),
+        ("4–8K", Some(8_000)),
+        ("8–20K", Some(20_000)),
+        ("≥20K", None),
+    ];
+
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(prompt_tokens, 0),
+                COALESCE(completion_tokens, 0),
+                COALESCE(done_reason, '')
+         FROM llm_usage_logs
+         WHERE ts >= ?1
+           AND caller = 'bake'
+           AND status = 'success'
+           AND COALESCE(prompt_tokens, 0) >= 100",
+    )?;
+    let samples: Vec<(i64, i64, String)> = stmt
+        .query_map(rusqlite::params![from_ms], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    let input_values: Vec<i64> = samples.iter().map(|sample| sample.0).collect();
+    let output_values: Vec<i64> = samples.iter().map(|sample| sample.1).collect();
+    Ok(BakeTokenDistribution {
+        sample_count: samples.len() as i64,
+        truncated_count: samples.iter().filter(|sample| sample.2 == "length").count() as i64,
+        input_over_20k_count: input_values
+            .iter()
+            .filter(|tokens| **tokens >= 20_000)
+            .count() as i64,
+        input: build_token_metric_distribution(input_values, INPUT_BUCKETS),
+        output: build_token_metric_distribution(output_values, OUTPUT_BUCKETS),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -485,6 +708,8 @@ pub struct AppCount {
 pub struct KnowledgeFlow {
     pub today_count: i64,
     pub period_count: i64,
+    /// 采集与自动提炼总开关。关闭时库存仍可见，但等待时长不表示流水线故障。
+    pub capture_enabled: bool,
     /// 全量库存：尚未归入 timeline 的可提炼 capture，不受趋势时间范围影响。
     pub pending_extraction_count: i64,
     pub oldest_pending_extraction_at_ms: Option<i64>,
@@ -513,6 +738,13 @@ struct PipelineBacklogMetrics {
     bake_retry_exhausted_count: i64,
     running_bake_count: i64,
     stale_bake_run_count: i64,
+    bake_watermark_updated_at_ms: Option<i64>,
+    latest_bake_status: Option<String>,
+    recent_bake_run_count: i64,
+    recent_bake_failed_count: i64,
+    recent_bake_deferred_count: i64,
+    recent_bake_runs_unhealthy: bool,
+    bake_stalled: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -524,6 +756,7 @@ pub struct InferenceQueueMonitor {
     pub queued_p1: i64,
     pub queued_p2: i64,
     pub running_total: i64,
+    pub running_p2: i64,
     pub oldest_wait_ms: i64,
     pub max_concurrency: i64,
     pub on_external_power: Option<bool>,
@@ -539,6 +772,7 @@ impl Default for InferenceQueueMonitor {
             queued_p1: 0,
             queued_p2: 0,
             running_total: 0,
+            running_p2: 0,
             oldest_wait_ms: 0,
             max_concurrency: 0,
             on_external_power: None,
@@ -559,6 +793,8 @@ struct UpstreamInferenceQueueStats {
     queue_lengths: HashMap<String, i64>,
     #[serde(default)]
     running_total: i64,
+    #[serde(default)]
+    running_by_lane: HashMap<String, i64>,
     #[serde(default)]
     oldest_wait_ms: i64,
     #[serde(default)]
@@ -636,6 +872,7 @@ pub async fn monitor_overview(
     Query(params): Query<MonitorQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
+    let capture_enabled = state.is_capture_enabled();
     let range_ms = query_range_ms(&params);
     let from_ms = now_ms - range_ms;
     let today_start = local_day_start_ms(now_ms);
@@ -746,6 +983,7 @@ pub async fn monitor_overview(
                 trend: model_trend,
             });
         }
+        let bake_distribution = load_bake_token_distribution(conn, from_ms)?;
 
         let today_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM captures WHERE ts >= ?1",
@@ -831,7 +1069,8 @@ pub async fn monitor_overview(
             rusqlite::params![from_ms, fallback_noise_pattern.as_str()],
             |r| r.get(0),
         ).unwrap_or(0);
-        let backlog = load_pipeline_backlog_metrics(conn, now_ms).unwrap_or_default();
+        let backlog =
+            load_pipeline_backlog_metrics(conn, now_ms, capture_enabled).unwrap_or_default();
 
         let mut knowledge_by_time_stmt = conn.prepare(
             "SELECT (CAST(strftime('%s', created_at) AS INTEGER) * 1000 / ?1) * ?1 + ?1/2 as bucket, COUNT(*)
@@ -956,6 +1195,7 @@ pub async fn monitor_overview(
                 by_caller,
                 trend,
                 trend_by_model,
+                bake_distribution,
             },
             ocr_backfill: ocr_backfill_metrics_snapshot(range_ms, now_ms),
             capture_flow: CaptureFlow {
@@ -975,6 +1215,7 @@ pub async fn monitor_overview(
             knowledge_flow: KnowledgeFlow {
                 today_count: knowledge_today_count,
                 period_count: knowledge_period_count,
+                capture_enabled,
                 pending_extraction_count: backlog.pending_extraction_count,
                 oldest_pending_extraction_at_ms: backlog.oldest_pending_extraction_at_ms,
                 pending_bake_count: backlog.pending_bake_count,
@@ -1061,13 +1302,14 @@ async fn read_sidecar_runtime_health(now_ms: i64) -> ServiceHealth {
         issues.push("Sidecar 运行时状态超过 5 分钟未更新".to_string());
     }
 
-    let status = if stale || !body.critical_checks_passed || !body.full_dispatch_ready {
-        "down"
-    } else if !body.background_processor_running || !body.embedding_ok || !issues.is_empty() {
-        "degraded"
-    } else {
-        "ok"
-    };
+    let status = service_health_status(
+        stale,
+        body.critical_checks_passed,
+        body.full_dispatch_ready,
+        body.background_processor_running,
+        body.embedding_ok,
+        !issues.is_empty(),
+    );
 
     ServiceHealth {
         status: status.to_string(),
@@ -1085,6 +1327,23 @@ async fn read_sidecar_runtime_health(now_ms: i64) -> ServiceHealth {
     }
 }
 
+fn service_health_status(
+    stale: bool,
+    critical_checks_passed: bool,
+    full_dispatch_ready: bool,
+    background_processor_running: bool,
+    embedding_ok: bool,
+    has_issues: bool,
+) -> &'static str {
+    if !critical_checks_passed || !full_dispatch_ready {
+        "down"
+    } else if stale || !background_processor_running || !embedding_ok || has_issues {
+        "degraded"
+    } else {
+        "ok"
+    }
+}
+
 /// 直接读取 sidecar 写入的 ~/.memory-bread/state/extraction_status.json，
 /// 并据此推导 extractor_status 文案。
 ///
@@ -1098,6 +1357,12 @@ async fn enrich_extractor_status(flow: &mut KnowledgeFlow, now_ms: i64) {
     // BackgroundProcessor 每次扫描（30s 间隔）会通过 mark/unmark 触发写入，
     // 即使分组未成熟也会因为下一轮发现 pending 而再次触达此处。
     const STATUS_FILE_STALENESS_MS: i64 = 15 * 60 * 1000;
+
+    if !flow.capture_enabled {
+        flow.extracting.clear();
+        flow.extractor_status = "paused".to_string();
+        return;
+    }
 
     let path = match std::env::var_os("HOME") {
         Some(home) => std::path::PathBuf::from(home)
@@ -1252,6 +1517,7 @@ async fn enrich_extractor_status(flow: &mut KnowledgeFlow, now_ms: i64) {
 #[derive(Debug, Serialize)]
 pub struct ExtractionLiveResponse {
     pub extractor_status: String,
+    pub capture_enabled: bool,
     pub service_health: ServiceHealth,
     pub extracting: Vec<ExtractingCapture>,
     pub last_extraction_at_ms: Option<i64>,
@@ -1262,6 +1528,13 @@ pub struct ExtractionLiveResponse {
     pub bake_retry_exhausted_count: i64,
     pub running_bake_count: i64,
     pub stale_bake_run_count: i64,
+    pub bake_watermark_updated_at_ms: Option<i64>,
+    pub latest_bake_status: Option<String>,
+    pub recent_bake_run_count: i64,
+    pub recent_bake_failed_count: i64,
+    pub recent_bake_deferred_count: i64,
+    pub recent_bake_runs_unhealthy: bool,
+    pub bake_stalled: bool,
     pub inference_queue: InferenceQueueMonitor,
     pub recent: Vec<KnowledgeItem>,
     pub server_now_ms: i64,
@@ -1272,12 +1545,14 @@ pub async fn monitor_extraction_live(
     Query(params): Query<MonitorQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
+    let capture_enabled = state.is_capture_enabled();
     let from_ms = now_ms - query_range_ms(&params);
     let fallback_noise_pattern = format!("{}%", FALLBACK_NOISE_OVERVIEW_PREFIX);
-    let (backlog, recent) = state
+    let (mut backlog, recent) = state
         .storage
         .with_conn_async(move |conn| {
-            let backlog = load_pipeline_backlog_metrics(conn, now_ms).unwrap_or_default();
+            let backlog =
+                load_pipeline_backlog_metrics(conn, now_ms, capture_enabled).unwrap_or_default();
 
             let mut stmt = conn.prepare(
                 "SELECT id,
@@ -1314,10 +1589,35 @@ pub async fn monitor_extraction_live(
         })
         .await?;
 
+    // 监控已经识别出陈旧 run 时就地自愈，但仅在确有 stale 记录时写库，
+    // 避免 3 秒轮询退化成持续 SQLite 写事务。
+    if backlog.stale_bake_run_count > 0 {
+        match state.storage.fail_stale_running_bake_runs() {
+            Ok(recovered) if recovered > 0 => {
+                tracing::warn!("监控轮询已收敛 {} 个陈旧 running bake run", recovered);
+                backlog = state
+                    .storage
+                    .with_conn_async(move |conn| {
+                        Ok(load_pipeline_backlog_metrics(
+                            conn,
+                            now_ms,
+                            capture_enabled,
+                        )?)
+                    })
+                    .await?;
+            }
+            Err(error) => {
+                tracing::warn!("监控轮询收敛陈旧 bake run 失败: {}", error);
+            }
+            _ => {}
+        }
+    }
+
     // 复用 enrich_extractor_status 的状态判定逻辑：把字段塞进临时 KnowledgeFlow 跑一遍
     let mut tmp = KnowledgeFlow {
         today_count: 0,
         period_count: 0,
+        capture_enabled,
         pending_extraction_count: backlog.pending_extraction_count,
         oldest_pending_extraction_at_ms: backlog.oldest_pending_extraction_at_ms,
         pending_bake_count: backlog.pending_bake_count,
@@ -1332,11 +1632,13 @@ pub async fn monitor_extraction_live(
         extractor_status: "stalled".to_string(),
     };
     enrich_extractor_status(&mut tmp, now_ms).await;
-    let service_health = read_sidecar_runtime_health(now_ms).await;
+    let mut service_health = read_sidecar_runtime_health(now_ms).await;
     let inference_queue = read_inference_queue_monitor(&state.sidecar_url).await;
+    apply_bake_pipeline_health(&mut service_health, &backlog);
 
     Ok(Json(ExtractionLiveResponse {
         extractor_status: tmp.extractor_status,
+        capture_enabled,
         service_health,
         extracting: tmp.extracting,
         last_extraction_at_ms: tmp.last_extraction_at_ms,
@@ -1347,6 +1649,13 @@ pub async fn monitor_extraction_live(
         bake_retry_exhausted_count: backlog.bake_retry_exhausted_count,
         running_bake_count: backlog.running_bake_count,
         stale_bake_run_count: backlog.stale_bake_run_count,
+        bake_watermark_updated_at_ms: backlog.bake_watermark_updated_at_ms,
+        latest_bake_status: backlog.latest_bake_status,
+        recent_bake_run_count: backlog.recent_bake_run_count,
+        recent_bake_failed_count: backlog.recent_bake_failed_count,
+        recent_bake_deferred_count: backlog.recent_bake_deferred_count,
+        recent_bake_runs_unhealthy: backlog.recent_bake_runs_unhealthy,
+        bake_stalled: backlog.bake_stalled,
         inference_queue,
         recent,
         server_now_ms: now_ms,
@@ -2276,6 +2585,7 @@ const DAG_RUNNING_BAKE_STALE_MS: i64 = 35 * 60 * 1000;
 pub struct PipelineDagResponse {
     pub server_now_ms: i64,
     pub extractor_status: String,
+    pub capture_enabled: bool,
     /// 兼容旧 UI：第一个 running bake run（如果有）
     pub running_bake_run: Option<DagRunningRun>,
     /// 所有正在运行的 bake run 列表
@@ -2323,6 +2633,7 @@ pub async fn monitor_pipeline_dag(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let now_ms = Utc::now().timestamp_millis();
+    let capture_enabled = state.is_capture_enabled();
     let day_start_ms = local_day_start_ms(now_ms);
     // bake_knowledge/bake_sops 的 created_at 是文本格式 "YYYY-MM-DD HH:MM:SS"，用字符串前缀比较今日
     let day_start_str = chrono::DateTime::<Utc>::from_timestamp_millis(day_start_ms)
@@ -2334,6 +2645,7 @@ pub async fn monitor_pipeline_dag(
     let mut tmp_flow = KnowledgeFlow {
         today_count: 0,
         period_count: 0,
+        capture_enabled,
         pending_extraction_count: 0,
         oldest_pending_extraction_at_ms: None,
         pending_bake_count: 0,
@@ -2440,7 +2752,7 @@ pub async fn monitor_pipeline_dag(
                 LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
                 WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
                   AND t.is_self_generated = 0
-                  AND COALESCE(r.failure_count, 0) < 3
+                  AND COALESCE(r.failure_count, 0) < 1
                   AND (
                       t.importance >= 4
                       OR t.user_verified = 1
@@ -2630,7 +2942,8 @@ pub async fn monitor_pipeline_dag(
 
             // 首页与 DAG 使用同一份库存口径。上面的列表查询只返回若干条
             // 用于抽屉展示；节点数字来自与实际 bake 候选一致的全量统计。
-            let backlog = load_pipeline_backlog_metrics(conn, now_ms).unwrap_or_default();
+            let backlog =
+                load_pipeline_backlog_metrics(conn, now_ms, capture_enabled).unwrap_or_default();
             let capture_pending_count = backlog.pending_extraction_count;
             let timeline_pending_count = backlog.pending_bake_count;
             let bake_watermark_lag_ms = backlog
@@ -2770,6 +3083,7 @@ pub async fn monitor_pipeline_dag(
     Ok(Json(PipelineDagResponse {
         server_now_ms: now_ms,
         extractor_status,
+        capture_enabled,
         running_bake_run: first_run,
         running_bake_runs: aggregated.running_runs,
         bake_watermark_lag_ms: aggregated.bake_watermark_lag_ms,
@@ -2875,4 +3189,102 @@ fn load_candidate_stage(
         .unwrap_or(0);
 
     Ok((pending_count, pending_items, completed_today))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bake_stall_requires_old_backlog_and_no_recent_progress() {
+        let now_ms = 10_000_000;
+        let old = now_ms - BAKE_WATERMARK_STALL_MS - 1;
+        let recent = now_ms - BAKE_WATERMARK_STALL_MS + 1;
+
+        assert!(is_bake_pipeline_stalled(
+            true,
+            now_ms,
+            12,
+            Some(old),
+            Some(old),
+        ));
+        assert!(!is_bake_pipeline_stalled(
+            true,
+            now_ms,
+            12,
+            Some(old),
+            Some(recent),
+        ));
+        assert!(!is_bake_pipeline_stalled(
+            true,
+            now_ms,
+            0,
+            Some(old),
+            Some(old),
+        ));
+        assert!(!is_bake_pipeline_stalled(
+            false,
+            now_ms,
+            12,
+            Some(old),
+            Some(old),
+        ));
+    }
+
+    #[test]
+    fn stale_heartbeat_does_not_report_healthy_services_as_down() {
+        assert_eq!(
+            service_health_status(true, true, true, true, true, true),
+            "degraded",
+        );
+        assert_eq!(
+            service_health_status(false, true, true, true, true, false),
+            "ok",
+        );
+        assert_eq!(
+            service_health_status(false, false, true, true, true, true),
+            "down",
+        );
+    }
+
+    #[test]
+    fn bake_token_distribution_reports_quantiles_and_separate_buckets() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE llm_usage_logs (
+                ts INTEGER NOT NULL,
+                caller TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                status TEXT,
+                done_reason TEXT
+             );
+             INSERT INTO llm_usage_logs VALUES
+                (1000, 'bake', 3500, 400, 'success', 'stop'),
+                (2000, 'bake', 21000, 2500, 'success', 'stop'),
+                (3000, 'bake', 6500, 26190, 'success', 'length'),
+                (4000, 'bake', 10, 8, 'success', 'stop'),
+                (5000, 'rag', 25000, 9000, 'success', 'stop');",
+        )
+        .unwrap();
+
+        let distribution = load_bake_token_distribution(&conn, 0).unwrap();
+
+        assert_eq!(distribution.sample_count, 3);
+        assert_eq!(distribution.truncated_count, 1);
+        assert_eq!(distribution.input_over_20k_count, 1);
+        assert_eq!(distribution.input.p50, 6500);
+        assert_eq!(distribution.input.max, 21000);
+        assert_eq!(distribution.output.p50, 2500);
+        assert_eq!(distribution.output.max, 26190);
+        assert_eq!(
+            distribution
+                .output
+                .buckets
+                .iter()
+                .find(|bucket| bucket.label == "≥20K")
+                .map(|bucket| bucket.count),
+            Some(1),
+        );
+    }
 }

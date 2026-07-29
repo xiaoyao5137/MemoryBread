@@ -1,6 +1,6 @@
 import React, { useState } from 'react'
 import type { SopCandidate } from '../../types'
-import { BakeButton, BakeCard, BakeMarkdown, BakePill, BakeSectionHeader } from './BakeShared'
+import { BakeButton, BakeCard, BakeMarkdown, BakeSectionHeader } from './BakeShared'
 
 const formatCreatedTime = (item: Pick<SopCandidate, 'createdAt' | 'createdAtMs'>) => {
   if ((item.createdAtMs ?? 0) > 0) {
@@ -137,7 +137,6 @@ const BakeSopTab: React.FC<{
       <BakeCard>
         <BakeSectionHeader
           title="操作"
-          subtitle="管理可复用的操作流程和最佳实践"
           right={onCreateSop && <BakeButton primary onClick={() => setShowCreateDialog(true)}>新建</BakeButton>}
         />
         <form
@@ -189,12 +188,6 @@ const BakeSopTab: React.FC<{
             </div>
           </div>
         </form>
-        {focusId && (
-          <div className="bake-filter-summary">
-            <BakePill text={`仅看操作 #${focusId}`} />
-            <BakeButton compact onClick={onClearFilters}>查看全部</BakeButton>
-          </div>
-        )}
       </BakeCard>
       <div className="bake-split-list-detail bake-split-list-detail--sop">
         <BakeCard className="bake-knowledge-list-card">
@@ -287,7 +280,7 @@ const BakeSopTab: React.FC<{
             </div>
             <div className="bake-actions--primary">
               <BakeButton onClick={() => onViewSourceTimeline(selected.sourceTimelineId || selected.id)}>关联时间线</BakeButton>
-              <BakeButton onClick={() => onDeleteSop(selected.id)}>删除操作手册</BakeButton>
+              <BakeButton danger onClick={() => onDeleteSop(selected.id)}>删除操作手册</BakeButton>
             </div>
             <div className="bake-related-summary">
               <div className="bake-related-row">

@@ -162,7 +162,7 @@ export interface ActionResult {
   action_id:   string
 }
 
-export type WindowMode = 'buddy' | 'rag' | 'creation' | 'knowledge' | 'models' | 'privacy' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake' | 'diary' | 'account'
+export type WindowMode = 'buddy' | 'rag' | 'creation' | 'knowledge' | 'messages' | 'models' | 'privacy' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake' | 'diary' | 'account' | 'about'
 
 export type ServiceEnvironment = 'production' | 'staging'
 
@@ -201,8 +201,29 @@ export interface CloudBalance {
   as_of: string
 }
 
+export interface CloudMessage {
+  id: string
+  title: string
+  body: string
+  category: 'system' | 'product' | 'account' | 'task'
+  priority: 'normal' | 'important' | 'urgent'
+  action_label?: string | null
+  action_url?: string | null
+  read_at?: string | null
+  published_at: string
+  expires_at?: string | null
+}
+
+export interface CloudMessagePage {
+  items: CloudMessage[]
+  page: number
+  page_size: number
+  total: number
+  unread_count: number
+}
+
 export type AchievementSurface = 'profile_avatar' | 'floating_avatar'
-export type AccountProfileSection = 'personal' | 'achievements' | 'investment' | 'mood'
+export type AccountProfileSection = 'personal' | 'messages' | 'achievements' | 'investment' | 'mood'
 
 export interface AchievementBadge {
   id: string
@@ -257,6 +278,12 @@ export interface TaskClaimResult {
   badge_quantity: number
   total_badge_quantity: number
   credit_granted: string
+}
+
+export interface AchievementAward {
+  badge: AchievementBadge
+  badge_quantity: number
+  total_badge_quantity: number
 }
 
 export interface CloudSubscription {
@@ -573,6 +600,13 @@ export interface MonitorOverview {
     by_caller:     { caller: string; total: number; calls: number }[]
     trend:         { ts: number; date: string; tokens: number; calls: number }[]
     trend_by_model:{ model: string; total: number; calls: number; trend: { ts: number; date: string; tokens: number; calls: number }[] }[]
+    bake_distribution: {
+      sample_count: number
+      truncated_count: number
+      input_over_20k_count: number
+      input: TokenMetricDistribution
+      output: TokenMetricDistribution
+    }
   }
   ocr_backfill: {
     submitted_total: number
@@ -617,6 +651,7 @@ export interface MonitorOverview {
   knowledge_flow: {
     today_count: number
     period_count: number
+    capture_enabled: boolean
     pending_extraction_count: number
     oldest_pending_extraction_at_ms: number | null
     pending_bake_count: number
@@ -628,7 +663,7 @@ export interface MonitorOverview {
     recent: { id: number; ts: number; summary: string; category: string; importance: number; app_name: string; win_title: string }[]
     extracting: { id: number; ts: number; app_name: string; win_title: string; group_started_at_ms: number }[]
     last_extraction_at_ms: number | null
-    extractor_status: 'running' | 'waiting' | 'idle' | 'stalled'
+    extractor_status: 'running' | 'waiting' | 'idle' | 'stalled' | 'paused'
   }
   rag_sessions: {
     today_count:    number
@@ -645,6 +680,15 @@ export interface MonitorOverview {
   }
 }
 
+export interface TokenMetricDistribution {
+  p50: number
+  p90: number
+  p95: number
+  p99: number
+  max: number
+  buckets: { label: string; count: number }[]
+}
+
 export interface ServiceHealth {
   status: 'ok' | 'degraded' | 'down' | string
   mode: string
@@ -657,7 +701,8 @@ export interface ServiceHealth {
 }
 
 export interface ExtractionLive {
-  extractor_status: 'running' | 'waiting' | 'idle' | 'stalled'
+  extractor_status: 'running' | 'waiting' | 'idle' | 'stalled' | 'paused'
+  capture_enabled: boolean
   service_health?: ServiceHealth
   extracting:       { id: number; ts: number; app_name: string; win_title: string; group_started_at_ms: number }[]
   last_extraction_at_ms: number | null
@@ -668,6 +713,13 @@ export interface ExtractionLive {
   bake_retry_exhausted_count: number
   running_bake_count: number
   stale_bake_run_count: number
+  bake_watermark_updated_at_ms: number | null
+  latest_bake_status: string | null
+  recent_bake_run_count: number
+  recent_bake_failed_count: number
+  recent_bake_deferred_count: number
+  recent_bake_runs_unhealthy: boolean
+  bake_stalled: boolean
   inference_queue: InferenceQueueMonitor
   recent:           { id: number; ts: number; summary: string; category: string; importance: number; app_name: string; win_title: string }[]
   server_now_ms:    number
@@ -681,6 +733,7 @@ export interface InferenceQueueMonitor {
   queued_p1: number
   queued_p2: number
   running_total: number
+  running_p2: number
   oldest_wait_ms: number
   max_concurrency: number
   on_external_power: boolean | null
@@ -713,7 +766,8 @@ export interface DagStage {
 
 export interface PipelineDagResponse {
   server_now_ms:     number
-  extractor_status:  'running' | 'waiting' | 'idle' | 'stalled'
+  extractor_status:  'running' | 'waiting' | 'idle' | 'stalled' | 'paused'
+  capture_enabled:   boolean
   /// 兼容旧 UI：第一个 running bake run（如有）
   running_bake_run:  { id: number; trigger_reason: string; started_at: number; candidate_count: number } | null
   /// 所有正在运行的 bake run 列表
@@ -734,6 +788,9 @@ export interface ScheduledTask {
   cron_expression:  string
   enabled:          boolean
   template_id:      string | null
+  is_builtin:       boolean
+  can_delete:       boolean
+  notification_channel_ids: number[]
   run_count:        number
   last_run_at:      number | null
   last_run_status:  string | null
@@ -753,6 +810,24 @@ export interface TaskExecution {
   result_text:     string | null
   error_message:   string | null
   latency_ms:      number | null
+  notification_deliveries: Array<{
+    channel_id: number
+    channel_name: string
+    channel_type: 'feishu' | 'dingtalk' | 'wecom' | 'webhook'
+    status: 'pending' | 'success' | 'failed'
+    error_message: string | null
+    delivered_at: number | null
+  }>
+}
+
+export interface NotificationChannel {
+  id: number
+  name: string
+  channel_type: 'feishu' | 'dingtalk' | 'wecom' | 'webhook'
+  webhook_url: string
+  enabled: boolean
+  created_at: number
+  updated_at: number
 }
 
 export interface TaskTemplate {
@@ -911,7 +986,7 @@ export interface AppBlacklistRecord {
 
 export interface PrivacyFilterRecord {
   id: number
-  filter_type: "chat" | "pii" | "policy"
+  filter_type: "chat" | "pii" | "policy" | "other"
   filter_name: string
   enabled: boolean
   config_json: string | null

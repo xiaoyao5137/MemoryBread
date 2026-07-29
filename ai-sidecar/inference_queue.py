@@ -7,7 +7,8 @@
     P0 — 用户在线咨询与创作（立即抢占后台推理）
     P1 — 时间线提炼（Timeline Extraction）
     P2 — bake 提炼大批量
-- 推理并发由供电状态自动决定：外接电源为 3，使用电池为 1。
+- 推理并发由供电状态和模型服务实际并行度共同决定；模型并行度默认 1，
+  可通过 MEMORY_BREAD_MODEL_PARALLELISM 配置，使用电池时固定为 1。
   P0 保留快速通道，P1/P2 后台 lane 不占满全部并发。
 - 同优先级内 FIFO；高优先级整体先于低优先级出队，阻塞 lane 不影响同优先级其他 lane。
 - 长度淘汰：
@@ -23,6 +24,7 @@ import collections
 import concurrent.futures
 import enum
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -106,7 +108,20 @@ _POWER_STATE_REFRESH_SECS = 5.0
 _BACKGROUND_PREEMPT_COOLDOWN_SECS = 120.0
 _GLOBAL_SLOT_PREFIX = "/tmp/memory-bread-inference-slot"
 _INTERACTIVE_DEMAND_LOCK_FILE = "/tmp/memory-bread-interactive-demand.lock"
+_INTERACTIVE_DEMAND_PROBE_LOCK_FILE = (
+    "/tmp/memory-bread-interactive-demand-probe.lock"
+)
 _PREEMPT_POLL_INTERVAL_SECS = 0.05
+_MODEL_PARALLELISM_ENV = "MEMORY_BREAD_MODEL_PARALLELISM"
+
+
+def _configured_model_parallelism() -> int:
+    """返回模型服务实际可并行执行的请求数，未配置时按单路执行。"""
+    try:
+        configured = int(os.environ.get(_MODEL_PARALLELISM_ENV, "1"))
+    except (TypeError, ValueError):
+        configured = 1
+    return max(1, min(_MAX_CONCURRENCY_CAP, configured))
 
 
 class InferenceQueue:
@@ -135,6 +150,7 @@ class InferenceQueue:
         self._last_power_state_refresh = 0.0
         self._last_background_preempted_at = 0.0
         self._on_external_power: Optional[bool] = None
+        self._model_parallelism = _configured_model_parallelism()
         if self._power_aware:
             self._max_concurrency = self._power_aware_max_concurrency()
         else:
@@ -165,6 +181,7 @@ class InferenceQueue:
                 "completed": 0,
                 "evicted": 0,
                 "preempted": 0,
+                "timed_out": 0,
                 "failed": 0,
             }
             for p in Priority
@@ -227,12 +244,62 @@ class InferenceQueue:
         timeout: Optional[float] = None,
         lane: Optional[str] = None,
     ) -> Any:
-        """阻塞提交：内部 await future.result(timeout)。"""
+        """阻塞提交；调用方超时后同步取消排队项或抢占正在执行的后台项。
+
+        `Future.result(timeout=...)` 本身只停止等待，不会取消任务。若不显式
+        中断，HTTP 已返回 504 后底层 Ollama 仍会继续占用唯一推理槽。
+        """
         if getattr(_WORKER_STATE, "queue", None) is self:
             logger.debug("InferenceQueue reentrant submit_sync，直接执行 %s", priority.name)
             return fn()
         future = self.submit(priority, fn, lane=lane)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            self._cancel_timed_out_future(future)
+            raise
+
+    def _cancel_timed_out_future(
+        self,
+        future: concurrent.futures.Future,
+    ) -> None:
+        """取消超时 future，并触发活动任务注册的可中断 I/O 回调。"""
+        callbacks: list[Callable[[], None]] = []
+        timed_out_task: Optional[_Task] = None
+        was_active = False
+        with self._cv:
+            for queue in self._queues.values():
+                for index, task in enumerate(queue):
+                    if task.future is not future:
+                        continue
+                    del queue[index]
+                    _release_interactive_demand(task)
+                    future.cancel()
+                    timed_out_task = task
+                    break
+                if timed_out_task is not None:
+                    break
+
+            if timed_out_task is None:
+                for task in self._active_tasks.values():
+                    if task.future is future:
+                        timed_out_task = task
+                        was_active = True
+                        callbacks = task.request_preempt()
+                        break
+
+            if timed_out_task is not None:
+                self._stats[timed_out_task.priority.name]["timed_out"] += 1
+                self._cv.notify_all()
+
+        _invoke_preempt_callbacks(callbacks)
+        if timed_out_task is not None:
+            logger.warning(
+                "InferenceQueue timeout cancel %s seq=%d active=%s",
+                timed_out_task.priority.name,
+                timed_out_task.seq,
+                was_active,
+            )
 
     def stats(self) -> dict[str, Any]:
         with self._cv:
@@ -283,6 +350,7 @@ class InferenceQueue:
             "concurrency_mode": "power_aware" if self._power_aware else "fixed",
             "on_external_power": self._on_external_power,
             "cross_process_limit": self._max_concurrency if self._global_slot_prefix else None,
+            "model_parallelism": self._model_parallelism,
             "interactive_demand_active": interactive_demand_active(),
             "background_retry_after_ms": background_retry_after_ms,
             "lane_limits": dict(self._lane_limits),
@@ -583,9 +651,9 @@ class InferenceQueue:
         return self._max_concurrency - 1
 
     def _try_acquire_global_slot_locked(self, task: _Task) -> bool:
-        """跨进程获取整机推理槽；P1/P2 在三并发时最多使用前两个槽。
+        """跨进程获取整机推理槽；多并发时 P1/P2 为 P0 保留最后一个槽。
 
-        第三个槽只允许 P0 使用，从而即使 main.py 与 model_api_server.py
+        保留槽只允许 P0 使用，从而即使 main.py 与 model_api_server.py
         同时有后台积压，也不会把在线咨询完全堵住。
         """
         if not self._global_slot_prefix:
@@ -645,9 +713,9 @@ class InferenceQueue:
             return 1
         if battery is None:
             self._on_external_power = True
-            return _MAX_CONCURRENCY_CAP
+            return self._model_parallelism
         self._on_external_power = bool(getattr(battery, "power_plugged", False))
-        return _MAX_CONCURRENCY_CAP if self._on_external_power else 1
+        return self._model_parallelism if self._on_external_power else 1
 
     def _refresh_power_state_locked(self, *, force: bool = False) -> None:
         if not self._power_aware:
@@ -705,18 +773,31 @@ def _release_interactive_demand(task: _Task) -> None:
 
 
 def interactive_demand_active() -> bool:
-    """检测其他进程是否有已提交或正在运行的咨询/创作 P0。"""
+    """检测其他进程是否有已提交或正在运行的咨询/创作 P0。
+
+    多个观察者若同时对 P0 共享锁做排他探测，会彼此冲突并误报 P0 活跃。
+    因此先用独立文件锁串行化探测，再检查真正的 demand 锁。
+    """
     try:
         import fcntl
-        handle = open(_INTERACTIVE_DEMAND_LOCK_FILE, "a+")
+        probe_handle = open(_INTERACTIVE_DEMAND_PROBE_LOCK_FILE, "a+")
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(handle, fcntl.LOCK_UN)
-            return False
-        except (IOError, OSError):
-            return True
+            fcntl.flock(probe_handle, fcntl.LOCK_EX)
+            demand_handle = open(_INTERACTIVE_DEMAND_LOCK_FILE, "a+")
+            try:
+                fcntl.flock(demand_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(demand_handle, fcntl.LOCK_UN)
+                return False
+            except (IOError, OSError):
+                return True
+            finally:
+                demand_handle.close()
         finally:
-            handle.close()
+            try:
+                fcntl.flock(probe_handle, fcntl.LOCK_UN)
+            except (IOError, OSError):
+                pass
+            probe_handle.close()
     except (ImportError, IOError, OSError):
         return False
 

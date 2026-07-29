@@ -14,6 +14,8 @@ import os
 import re
 import sqlite3
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
@@ -203,6 +205,10 @@ DIARY_LANGUAGE_LABELS = {
 }
 
 
+class NotificationDeliveryRejected(Exception):
+    """消息渠道返回了 HTTP 成功，但业务状态明确拒绝投递。"""
+
+
 class TaskExecutor:
     """定时任务执行器"""
 
@@ -305,9 +311,23 @@ class TaskExecutor:
             # 7. 更新任务统计
             self._update_task_stats(conn, task_id, "success", completed_at)
 
+            # 8. 将成功结果投递到用户本地配置的消息渠道。投递失败不改变任务结果。
+            notification_deliveries = self._deliver_task_result(
+                conn,
+                task,
+                exec_id,
+                result_text,
+                completed_at,
+            )
+
             conn.close()
             logger.info(f"✅ 任务 {task_id} 执行成功，耗时 {completed_at - started_at}ms")
-            return {"status": "success", "exec_id": exec_id, "result": result_text}
+            return {
+                "status": "success",
+                "exec_id": exec_id,
+                "result": result_text,
+                "notification_deliveries": notification_deliveries,
+            }
 
         except Exception as e:
             completed_at = int(time.time() * 1000)
@@ -629,23 +649,42 @@ class TaskExecutor:
         now_ms = int(time.time() * 1000)
         try:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO scheduled_tasks (
-                    name, user_instruction, cron_expression, template_id,
-                    enabled, run_count, next_run_at, created_at, updated_at
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO scheduled_tasks (
+                        name, user_instruction, cron_expression, template_id, is_builtin,
+                        enabled, run_count, next_run_at, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, 1, 1, 0, 0, ?, ?)
+                    """,
+                    (
+                        template["name"],
+                        template["user_instruction"],
+                        template["cron"],
+                        template["id"],
+                        now_ms,
+                        now_ms,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, 1, 0, 0, ?, ?)
-                """,
-                (
-                    template["name"],
-                    template["user_instruction"],
-                    template["cron"],
-                    template["id"],
-                    now_ms,
-                    now_ms,
-                ),
-            )
+            except sqlite3.OperationalError:
+                cursor.execute(
+                    """
+                    INSERT INTO scheduled_tasks (
+                        name, user_instruction, cron_expression, template_id,
+                        enabled, run_count, next_run_at, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, 1, 0, 0, ?, ?)
+                    """,
+                    (
+                        template["name"],
+                        template["user_instruction"],
+                        template["cron"],
+                        template["id"],
+                        now_ms,
+                        now_ms,
+                    ),
+                )
             conn.commit()
         except sqlite3.OperationalError as e:
             logger.warning("创建默认 daily_journal 任务失败: %s", e)
@@ -1832,20 +1871,207 @@ class TaskExecutor:
 
     def _get_task(self, conn: sqlite3.Connection, task_id: int) -> Optional[dict]:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, name, user_instruction, cron_expression, template_id FROM scheduled_tasks WHERE id = ?",
-            (task_id,)
-        )
+        try:
+            cursor.execute(
+                """SELECT id, name, user_instruction, cron_expression, template_id,
+                          notification_channel_ids
+                   FROM scheduled_tasks WHERE id = ?""",
+                (task_id,),
+            )
+        except sqlite3.OperationalError:
+            # 兼容仍在使用旧测试夹具或尚未迁移的本地数据库。
+            cursor.execute(
+                """SELECT id, name, user_instruction, cron_expression, template_id
+                   FROM scheduled_tasks WHERE id = ?""",
+                (task_id,),
+            )
         row = cursor.fetchone()
         if not row:
             return None
+        channel_ids = []
+        if len(row) > 5:
+            try:
+                decoded_ids = json.loads(row[5] or "[]")
+                if isinstance(decoded_ids, list):
+                    channel_ids = [
+                        int(channel_id)
+                        for channel_id in decoded_ids
+                        if isinstance(channel_id, int) and channel_id > 0
+                    ]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                channel_ids = []
         return {
             "id": row[0],
             "name": row[1],
             "user_instruction": row[2],
             "cron_expression": row[3],
             "template_id": row[4],
+            "notification_channel_ids": channel_ids,
         }
+
+    def _deliver_task_result(
+        self,
+        conn: sqlite3.Connection,
+        task: dict,
+        execution_id: int,
+        result_text: str,
+        completed_at: int,
+    ) -> list[dict]:
+        channel_ids = sorted(set(task.get("notification_channel_ids") or []))
+        if not channel_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in channel_ids)
+        try:
+            rows = conn.execute(
+                f"""SELECT id, name, channel_type, webhook_url
+                    FROM notification_channels
+                    WHERE enabled = 1 AND id IN ({placeholders})
+                    ORDER BY id""",
+                channel_ids,
+            ).fetchall()
+        except sqlite3.Error as exc:
+            logger.warning(
+                "任务结果消息渠道读取失败: task_id=%s error_type=%s",
+                task["id"],
+                type(exc).__name__,
+            )
+            return []
+
+        deliveries = []
+        for channel_id, channel_name, channel_type, webhook_url in rows:
+            created_at = int(time.time() * 1000)
+            try:
+                conn.execute(
+                    """INSERT INTO task_notification_deliveries
+                         (execution_id, channel_id, status, created_at)
+                       VALUES (?, ?, 'pending', ?)
+                       ON CONFLICT(execution_id, channel_id) DO UPDATE SET
+                         status = 'pending',
+                         error_message = NULL,
+                         delivered_at = NULL""",
+                    (execution_id, channel_id, created_at),
+                )
+                conn.commit()
+
+                payload = self._notification_payload(
+                    channel_type=channel_type,
+                    task=task,
+                    execution_id=execution_id,
+                    result_text=result_text,
+                    completed_at=completed_at,
+                )
+                self._post_notification(webhook_url, payload, channel_type)
+                delivered_at = int(time.time() * 1000)
+                conn.execute(
+                    """UPDATE task_notification_deliveries
+                       SET status = 'success', error_message = NULL, delivered_at = ?
+                       WHERE execution_id = ? AND channel_id = ?""",
+                    (delivered_at, execution_id, channel_id),
+                )
+                conn.commit()
+                deliveries.append(
+                    {
+                        "channel_id": channel_id,
+                        "channel_name": channel_name,
+                        "status": "success",
+                    }
+                )
+            except Exception as exc:
+                error_message = self._safe_delivery_error(exc)
+                try:
+                    conn.execute(
+                        """UPDATE task_notification_deliveries
+                           SET status = 'failed', error_message = ?, delivered_at = NULL
+                           WHERE execution_id = ? AND channel_id = ?""",
+                        (error_message, execution_id, channel_id),
+                    )
+                    conn.commit()
+                except sqlite3.Error:
+                    pass
+                logger.warning(
+                    "任务结果消息投递失败: task_id=%s channel_id=%s error=%s",
+                    task["id"],
+                    channel_id,
+                    error_message,
+                )
+                deliveries.append(
+                    {
+                        "channel_id": channel_id,
+                        "channel_name": channel_name,
+                        "status": "failed",
+                        "error_message": error_message,
+                    }
+                )
+        return deliveries
+
+    @staticmethod
+    def _notification_payload(
+        *,
+        channel_type: str,
+        task: dict,
+        execution_id: int,
+        result_text: str,
+        completed_at: int,
+    ) -> dict:
+        safe_result = (result_text or "")[:12000]
+        content = f"MemoryBread · {task['name']}\n\n{safe_result}"
+        if channel_type == "feishu":
+            return {"msg_type": "text", "content": {"text": content}}
+        if channel_type in {"dingtalk", "wecom"}:
+            return {"msgtype": "text", "text": {"content": content}}
+        return {
+            "event": "memorybread.task.completed",
+            "task": {"id": task["id"], "name": task["name"]},
+            "execution_id": execution_id,
+            "result": safe_result,
+            "completed_at": completed_at,
+        }
+
+    @staticmethod
+    def _post_notification(webhook_url: str, payload: dict, channel_type: str) -> None:
+        request = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": "MemoryBread/TaskNotification",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response_body = response.read(16_384)
+        if channel_type == "webhook" or not response_body:
+            return
+        try:
+            response_payload = json.loads(response_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(response_payload, dict):
+            return
+        if channel_type == "feishu":
+            status_code = response_payload.get(
+                "code",
+                response_payload.get("StatusCode", 0),
+            )
+        else:
+            status_code = response_payload.get("errcode", 0)
+        if status_code not in (0, "0", None):
+            raise NotificationDeliveryRejected()
+
+    @staticmethod
+    def _safe_delivery_error(exc: Exception) -> str:
+        if isinstance(exc, urllib.error.HTTPError):
+            return f"http_{exc.code}"
+        if isinstance(exc, urllib.error.URLError):
+            return "connection_error"
+        if isinstance(exc, TimeoutError):
+            return "timeout"
+        if isinstance(exc, sqlite3.Error):
+            return "storage_error"
+        if isinstance(exc, NotificationDeliveryRejected):
+            return "provider_rejected"
+        return type(exc).__name__
 
     def _create_execution(self, conn: sqlite3.Connection, task_id: int, started_at: int) -> int:
         cursor = conn.cursor()

@@ -7,6 +7,7 @@
 
 pub(crate) mod cron_expression;
 pub mod models;
+pub mod notification_repo;
 pub mod profile_task;
 pub mod repo;
 pub mod runner;

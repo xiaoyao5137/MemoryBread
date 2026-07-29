@@ -745,6 +745,7 @@ const BakePanel: React.FC = () => {
   }
 
   const handleDeleteTemplate = async (templateId: string) => {
+    if (!window.confirm('确认删除这份文档？删除后无法恢复，来源时间线和其他内容会保留。')) return
     try {
       await deleteTemplate(templateId)
       const nextOffset = getFallbackOffsetAfterRemoval(templates.length, bakeTemplateOffset, bakeTemplateLimit)
@@ -756,7 +757,7 @@ const BakePanel: React.FC = () => {
       if (selectedTemplateId === templateId || resolvedTemplateId === templateId) {
         setSelectedTemplateId(null)
       }
-      setStatusMessage('已删除模板')
+      setStatusMessage('已删除文档')
       await refreshOverview()
     } catch (error) {
       setStatusMessage(toUserFacingError(error, '删除文档失败'))
@@ -806,6 +807,7 @@ const BakePanel: React.FC = () => {
   }
 
   const handleDeleteKnowledge = async (id: string) => {
+    if (!window.confirm('确认删除这条知识？删除后无法恢复，来源时间线和采集记录会保留。')) return
     try {
       await deleteKnowledge(id)
       const nextOffset = getFallbackOffsetAfterRemoval(knowledgeItems.length, bakeKnowledgeOffset, bakeKnowledgeLimit)
@@ -825,6 +827,7 @@ const BakePanel: React.FC = () => {
   }
 
   const handleDeleteSop = async (id: string) => {
+    if (!window.confirm('确认删除这条操作？删除后无法恢复，来源时间线和采集记录会保留。')) return
     try {
       await deleteSop(id)
       const nextOffset = getFallbackOffsetAfterRemoval(sopCandidates.length, bakeSopOffset, bakeSopLimit)
@@ -1044,7 +1047,7 @@ const BakePanel: React.FC = () => {
             initialSkill={creationSkillEditor.initialSkill}
             onClose={() => setCreationSkillEditor(null)}
             onSaved={(skill) => {
-              setStatusMessage(skill.status === 'draft' ? '创作 Skill 草稿已自动保存' : '创作 Skill 已保存')
+              setStatusMessage(skill.status === 'draft' ? '技能草稿已自动保存' : '技能已保存')
               if (skill.sourceKind === 'bake_document' && skill.sourceId === resolvedTemplateId) {
                 setRelatedTemplateSkills(prev => [skill, ...prev.filter(item => item.id !== skill.id)])
               }

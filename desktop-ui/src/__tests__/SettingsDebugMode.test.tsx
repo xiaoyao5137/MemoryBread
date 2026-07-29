@@ -8,6 +8,7 @@ beforeEach(() => {
   useAppStore.setState({
     debugModeEnabled: false,
     localDebugModeEnabled: false,
+    serviceEnvironment: 'production',
   })
   vi.stubGlobal('fetch', vi.fn(async () => ({
     ok: true,
@@ -21,34 +22,37 @@ afterEach(() => {
 })
 
 describe('Settings debug mode visibility', () => {
-  it('普通启动时展示调试模式和开发者工具入口', async () => {
+  it('普通启动时隐藏调试面板入口', async () => {
+    render(<Settings />)
+
+    expect(screen.queryByTestId('settings-debug-section')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('open-debug-btn')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('debug-mode-toggle')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('settings-api-section')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('local-debug-mode-toggle')).not.toBeInTheDocument()
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
+  })
+
+  it('Debug 启动时展示调试面板入口，但普通账号仍隐藏本机服务配置', async () => {
+    useAppStore.setState({ debugModeEnabled: true })
     render(<Settings />)
 
     expect(screen.getByTestId('settings-debug-section')).toBeInTheDocument()
     expect(screen.getByTestId('open-debug-btn')).toBeInTheDocument()
-    expect(screen.getByTestId('debug-mode-toggle')).not.toBeChecked()
+    expect(screen.getByTestId('debug-mode-toggle')).toBeChecked()
     expect(screen.queryByTestId('settings-api-section')).not.toBeInTheDocument()
-    expect(screen.queryByTestId('local-debug-mode-toggle')).not.toBeInTheDocument()
+    expect(screen.getByTestId('local-debug-mode-toggle')).toBeInTheDocument()
+    expect(screen.getByRole('group', { name: '选择服务环境' })).toBeInTheDocument()
+    expect(screen.getByTestId('service-environment-production')).toHaveAttribute('aria-pressed', 'true')
 
     fireEvent.click(screen.getByTestId('open-debug-btn'))
     expect(useAppStore.getState().windowMode).toBe('debug')
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
   })
 
-  it('普通账号开启调试模式后仍隐藏本机服务配置', async () => {
-    render(<Settings />)
-
-    fireEvent.click(screen.getByTestId('debug-mode-toggle'))
-
-    await waitFor(() => expect(screen.getByTestId('debug-mode-toggle')).toBeChecked())
-    expect(screen.queryByTestId('settings-api-section')).not.toBeInTheDocument()
-    expect(screen.getByTestId('local-debug-mode-toggle')).toBeInTheDocument()
-    expect(useAppStore.getState().debugModeEnabled).toBe(true)
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
-  })
-
-  it('测试账号开启调试模式后显示本机服务配置', async () => {
+  it('测试账号以 Debug 启动后显示本机服务配置', async () => {
     useAppStore.setState({
+      debugModeEnabled: true,
       currentUser: {
         id: '01900000-0000-7000-8000-000000000001',
         status: 'active',
@@ -61,13 +65,23 @@ describe('Settings debug mode visibility', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByTestId('debug-mode-toggle'))
-
-    await waitFor(() => expect(screen.getByTestId('debug-mode-toggle')).toBeChecked())
+    expect(screen.getByTestId('debug-mode-toggle')).toBeChecked()
     expect(screen.getByTestId('settings-api-section')).toBeInTheDocument()
     expect(screen.getByTestId('api-url-input')).toBeInTheDocument()
     expect(screen.getByTestId('local-debug-mode-toggle')).toBeInTheDocument()
     expect(useAppStore.getState().debugModeEnabled).toBe(true)
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
+  })
+
+  it('在开发者模式中切换正式和测试服务环境', async () => {
+    useAppStore.setState({ debugModeEnabled: true })
+    render(<Settings />)
+
+    fireEvent.click(screen.getByTestId('service-environment-staging'))
+
+    expect(useAppStore.getState().serviceEnvironment).toBe('staging')
+    expect(screen.getByTestId('service-environment-staging')).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTestId('service-environment-production')).toHaveAttribute('aria-pressed', 'false')
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
   })
 })

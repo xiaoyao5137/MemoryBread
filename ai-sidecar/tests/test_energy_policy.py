@@ -26,7 +26,7 @@ def _battery(percent: float, plugged: bool):
     return SimpleNamespace(percent=percent, power_plugged=plugged)
 
 
-def test_charging_profile_keeps_maximum_background_throughput(tmp_path):
+def test_charging_profile_matches_model_parallelism(tmp_path):
     db_path = str(tmp_path / "memory-bread.db")
     _init_preferences(db_path)
     policy = EnergyPolicy(
@@ -45,8 +45,20 @@ def test_charging_profile_keeps_maximum_background_throughput(tmp_path):
     assert profile.timeline_interval_secs == 30
     assert profile.timeline_batch_size == 20
     assert profile.bake_interval_secs == 30
-    assert profile.bake_limit == 20
-    assert profile.bake_concurrency == 3
+    assert profile.bake_limit == 10
+    assert profile.bake_concurrency == 1
+
+
+def test_charging_profile_allows_explicit_model_parallelism(tmp_path):
+    db_path = str(tmp_path / "memory-bread.db")
+    _init_preferences(db_path)
+    policy = EnergyPolicy(
+        db_path,
+        battery_provider=lambda: _battery(72, True),
+        model_parallelism=2,
+    )
+
+    assert policy.current_profile().bake_concurrency == 2
 
 
 def test_battery_profile_reduces_frequency_batch_and_bake_concurrency(tmp_path):

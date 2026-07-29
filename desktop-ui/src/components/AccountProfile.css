@@ -177,6 +177,7 @@
 .account-profile__tab:active,
 .account-profile__panel-heading button:active,
 .account-profile__data-error button:active,
+.account-profile__empty button:active,
 .account-profile__heatmap-cell:active,
 .account-profile__logout-area button:active,
 .account-profile__dialog-actions button:active {
@@ -186,6 +187,7 @@
 .account-profile__tab:focus-visible,
 .account-profile__panel-heading button:focus-visible,
 .account-profile__data-error button:focus-visible,
+.account-profile__empty button:focus-visible,
 .account-profile__heatmap-cell:focus-visible,
 .account-profile__logout-area button:focus-visible,
 .account-profile__dialog-actions button:focus-visible {
@@ -401,8 +403,8 @@
 .account-profile__achievement-grid {
   width: 100%;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+  gap: 12px;
 }
 
 .account-profile__achievement-card {
@@ -411,37 +413,49 @@
   --badge-wash: #f7dfd0;
   position: relative;
   min-width: 0;
-  min-height: 310px;
-  padding: 20px;
+  min-height: 162px;
+  padding: 0;
   border: 1px solid color-mix(in srgb, var(--badge-accent) 30%, #ddd6cf);
-  border-radius: 16px;
+  border-radius: 14px;
   background:
     radial-gradient(circle at 92% 8%, color-mix(in srgb, var(--badge-accent) 18%, transparent), transparent 32%),
     linear-gradient(145deg, var(--badge-wash), #fffdfa 70%);
   color: var(--badge-accent-dark);
-  display: flex;
-  flex-direction: column;
   overflow: hidden;
-  box-shadow: 0 10px 26px color-mix(in srgb, var(--badge-accent) 10%, transparent);
+  box-shadow: 0 7px 18px color-mix(in srgb, var(--badge-accent) 8%, transparent);
   scroll-margin-block: 28px;
+  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.account-profile__achievement-card:hover {
+  border-color: color-mix(in srgb, var(--badge-accent) 55%, #ddd6cf);
+  box-shadow: 0 12px 24px color-mix(in srgb, var(--badge-accent) 13%, transparent);
+  transform: translateY(-2px);
 }
 
 .account-profile__achievement-card::before {
   content: '';
   position: absolute;
   top: 0;
-  right: 20px;
-  left: 20px;
-  height: 4px;
+  right: 14px;
+  left: 14px;
+  z-index: 1;
+  height: 3px;
   border-radius: 0 0 4px 4px;
   background: var(--badge-accent);
+  pointer-events: none;
 }
 
-.account-profile__achievement-card--cobalt { --badge-accent: #31649f; --badge-accent-dark: #294b72; --badge-wash: #e1ebf7; }
-.account-profile__achievement-card--midnight { --badge-accent: #494c78; --badge-accent-dark: #343653; --badge-wash: #e6e7f1; }
-.account-profile__achievement-card--forest { --badge-accent: #3c7656; --badge-accent-dark: #2f5941; --badge-wash: #e0eee5; }
-.account-profile__achievement-card--honey { --badge-accent: #a76d26; --badge-accent-dark: #744b1c; --badge-wash: #f7ead1; }
-.account-profile__achievement-card--rose { --badge-accent: #a84e58; --badge-accent-dark: #743a40; --badge-wash: #f4e1e3; }
+.account-profile__achievement-card--cobalt,
+.account-profile__achievement-dialog--cobalt { --badge-accent: #31649f; --badge-accent-dark: #294b72; --badge-wash: #e1ebf7; }
+.account-profile__achievement-card--midnight,
+.account-profile__achievement-dialog--midnight { --badge-accent: #494c78; --badge-accent-dark: #343653; --badge-wash: #e6e7f1; }
+.account-profile__achievement-card--forest,
+.account-profile__achievement-dialog--forest { --badge-accent: #3c7656; --badge-accent-dark: #2f5941; --badge-wash: #e0eee5; }
+.account-profile__achievement-card--honey,
+.account-profile__achievement-dialog--honey { --badge-accent: #a76d26; --badge-accent-dark: #744b1c; --badge-wash: #f7ead1; }
+.account-profile__achievement-card--rose,
+.account-profile__achievement-dialog--rose { --badge-accent: #a84e58; --badge-accent-dark: #743a40; --badge-wash: #f4e1e3; }
 
 .account-profile__achievement-card--new {
   border-color: var(--badge-accent);
@@ -452,15 +466,21 @@
 
 .account-profile__achievement-new-label {
   position: absolute;
-  top: 64px;
-  right: 20px;
-  padding: 5px 8px;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  padding: 4px 6px;
   border: 1px solid color-mix(in srgb, var(--badge-accent) 28%, transparent);
-  border-radius: 8px;
+  border-radius: 7px;
   background: color-mix(in srgb, var(--badge-accent) 9%, #fffdfa);
   color: var(--badge-accent-dark);
-  font-size: 9px;
+  font-size: 8px;
   font-weight: 780;
+  pointer-events: none;
+}
+
+.account-profile__achievement-card--new .account-profile__achievement-card-trigger {
+  padding-top: 38px;
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -475,18 +495,18 @@
 }
 
 .account-profile__achievement-card-top {
-  min-height: 52px;
+  min-height: 42px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 9px;
+  align-items: center;
+  gap: 7px;
 }
 
 .account-profile__achievement-icon {
-  width: 48px;
-  height: 48px;
+  width: 40px;
+  height: 40px;
   border: 1px solid color-mix(in srgb, var(--badge-accent) 25%, transparent);
-  border-radius: 13px;
+  border-radius: 11px;
   background: color-mix(in srgb, var(--badge-accent) 10%, #fffdfa);
   display: grid;
   place-items: center;
@@ -495,47 +515,74 @@
 
 .account-profile__achievement-rarity {
   width: max-content;
-  margin-top: 4px;
-  padding: 4px 7px;
+  padding: 3px 6px;
   border: 1px solid color-mix(in srgb, var(--badge-accent) 24%, transparent);
-  border-radius: 7px;
+  border-radius: 6px;
   background: color-mix(in srgb, var(--badge-accent) 7%, #fffdfa);
-  font-size: 9px;
+  font-size: 8px;
   font-weight: 760;
 }
 
 .account-profile__achievement-quantity {
   color: var(--badge-accent);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 800;
 }
 
 .account-profile__achievement-copy {
-  margin-top: 22px;
+  min-width: 0;
+  margin-top: 13px;
   display: grid;
-  gap: 5px;
+  gap: 4px;
 }
 
 .account-profile__achievement-copy > strong {
   color: var(--badge-accent-dark);
-  font-size: 22px;
+  overflow: hidden;
+  font-size: 16px;
   font-weight: 800;
-  letter-spacing: -0.035em;
+  letter-spacing: -0.025em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .account-profile__achievement-copy > span {
   color: var(--badge-accent);
-  font-size: 11px;
+  overflow: hidden;
+  font-size: 9px;
   font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.account-profile__achievement-copy p {
-  min-height: 40px;
-  margin: 7px 0 0;
-  color: color-mix(in srgb, var(--badge-accent-dark) 70%, #766d66);
-  font-size: 11px;
-  line-height: 1.65;
+.account-profile__achievement-card-trigger {
+  width: 100%;
+  min-height: 160px;
+  padding: 16px 14px 13px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+  cursor: zoom-in;
+}
+
+.account-profile__achievement-card-trigger:active {
+  transform: scale(.985);
+}
+
+.account-profile__achievement-card-trigger:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--badge-accent) 28%, transparent);
+  outline-offset: -4px;
+}
+
+.account-profile__achievement-open-hint {
+  margin-top: auto;
+  color: color-mix(in srgb, var(--badge-accent-dark) 62%, #8a817b);
+  font-size: 8px;
+  font-weight: 700;
 }
 
 .account-profile__achievement-meta {
@@ -609,6 +656,159 @@
 .account-profile__achievement-actions button:disabled {
   cursor: wait;
   opacity: .62;
+}
+
+.account-profile__achievement-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  padding: 20px;
+  background: rgb(48 36 29 / 48%);
+  display: grid;
+  place-items: center;
+  backdrop-filter: blur(5px);
+}
+
+.account-profile__achievement-dialog {
+  --badge-accent: #a54c26;
+  --badge-accent-dark: #71351f;
+  --badge-wash: #f7dfd0;
+  position: relative;
+  width: min(500px, 100%);
+  max-height: calc(100dvh - 40px);
+  padding: 30px;
+  border: 1px solid color-mix(in srgb, var(--badge-accent) 38%, #ddd6cf);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at 92% 8%, color-mix(in srgb, var(--badge-accent) 20%, transparent), transparent 34%),
+    linear-gradient(145deg, var(--badge-wash), #fffdfa 72%);
+  color: var(--badge-accent-dark);
+  overflow-y: auto;
+  box-shadow: 0 28px 80px rgb(48 36 29 / 28%);
+}
+
+.account-profile__achievement-dialog-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--badge-accent) 24%, #d9d1ca);
+  border-radius: 9px;
+  background: rgb(255 253 250 / 78%);
+  color: var(--badge-accent-dark);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.account-profile__achievement-dialog-close:hover {
+  border-color: var(--badge-accent);
+  background: #fffdfa;
+}
+
+.account-profile__achievement-dialog-close:active {
+  transform: scale(.96);
+}
+
+.account-profile__achievement-dialog-close:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--badge-accent) 25%, transparent);
+  outline-offset: 2px;
+}
+
+.account-profile__achievement-dialog-top {
+  min-height: 64px;
+  padding-right: 46px;
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.account-profile__achievement-dialog-top .account-profile__achievement-quantity {
+  justify-self: start;
+  font-size: 18px;
+}
+
+.account-profile__achievement-dialog-icon {
+  width: 62px;
+  height: 62px;
+  border: 1px solid color-mix(in srgb, var(--badge-accent) 28%, transparent);
+  border-radius: 15px;
+  background: color-mix(in srgb, var(--badge-accent) 11%, #fffdfa);
+  display: grid;
+  place-items: center;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 72%);
+}
+
+.account-profile__achievement-dialog-copy {
+  margin-top: 22px;
+}
+
+.account-profile__achievement-dialog-copy h2 {
+  margin: 0;
+  color: var(--badge-accent-dark);
+  font-size: 27px;
+  font-weight: 820;
+  letter-spacing: -0.035em;
+}
+
+.account-profile__achievement-dialog-copy > span {
+  margin-top: 5px;
+  color: var(--badge-accent);
+  display: block;
+  font-size: 12px;
+  font-weight: 740;
+}
+
+.account-profile__achievement-dialog-copy p {
+  margin: 13px 0 0;
+  color: color-mix(in srgb, var(--badge-accent-dark) 72%, #766d66);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.account-profile__achievement-dialog .account-profile__achievement-meta {
+  margin-top: 22px;
+  padding-top: 14px;
+  font-size: 10px;
+}
+
+.account-profile__achievement-dialog .account-profile__achievement-rest-note {
+  margin-top: 13px;
+  padding: 10px 11px;
+  font-size: 10px;
+}
+
+.account-profile__achievement-dialog .account-profile__achievement-actions {
+  margin-top: 22px;
+  padding-top: 0;
+}
+
+.account-profile__achievement-dialog .account-profile__achievement-actions button {
+  min-height: 40px;
+  font-size: 10px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .account-profile__achievement-dialog-backdrop {
+    animation: account-profile-achievement-backdrop-in 160ms ease-out both;
+  }
+
+  .account-profile__achievement-dialog {
+    animation: account-profile-achievement-dialog-in 240ms cubic-bezier(.16, 1, .3, 1) both;
+  }
+}
+
+@keyframes account-profile-achievement-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes account-profile-achievement-dialog-in {
+  from { opacity: 0; transform: translateY(10px) scale(.975); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 .account-profile__achievement-empty {
@@ -823,6 +1023,36 @@
   font-size: 12px;
 }
 
+.account-profile__active-periods {
+  line-height: 1.6;
+}
+
+.account-profile__capture-link {
+  min-height: 30px;
+  margin: 3px 0 0;
+  padding: 5px 9px;
+  border: 1px solid rgb(255 255 255 / 28%);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 9%);
+  color: #f8e8de;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.account-profile__capture-link:hover {
+  border-color: rgb(255 255 255 / 52%);
+  background: rgb(255 255 255 / 16%);
+}
+
+.account-profile__capture-link:focus-visible {
+  outline: 2px solid #fff8f3;
+  outline-offset: 2px;
+}
+
 .account-profile__today-total small {
   color: #eac4b0;
   font-size: 10px;
@@ -918,6 +1148,24 @@
   gap: 10px;
   text-align: center;
   font-size: 11px;
+}
+
+.account-profile__empty button {
+  min-width: 84px;
+  height: 34px;
+  padding: 0 13px;
+  border: 1px solid #d8a78d;
+  border-radius: 9px;
+  background: #fff8f3;
+  color: #9a3f21;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.account-profile__empty button:hover {
+  background: #fbe9dd;
+  border-color: #bd7650;
 }
 
 .account-profile__mood-layout {
@@ -1117,6 +1365,10 @@
 .account-profile__heatmap-cell--3 { background: #c66d36; }
 .account-profile__heatmap-cell--4 { background: #8f3f20; }
 .account-profile__heatmap-cell--future { background: transparent; }
+
+button.account-profile__heatmap-cell {
+  cursor: pointer;
+}
 
 button.account-profile__heatmap-cell:hover,
 button.account-profile__heatmap-cell:focus-visible,
@@ -1406,7 +1658,7 @@ button.account-profile__heatmap-cell:focus-visible,
   }
 
   .account-profile__achievement-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
   }
 }
 
@@ -1472,11 +1724,48 @@ button.account-profile__heatmap-cell:focus-visible,
   }
 
   .account-profile__achievement-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
   }
 
   .account-profile__achievement-card {
-    min-height: 300px;
+    min-height: 150px;
+  }
+
+  .account-profile__achievement-card-trigger {
+    min-height: 148px;
+    padding: 14px 12px 12px;
+  }
+
+  .account-profile__achievement-dialog-backdrop {
+    padding: 12px;
+  }
+
+  .account-profile__achievement-dialog {
+    max-height: calc(100dvh - 24px);
+    padding: 24px 18px 18px;
+    border-radius: 16px;
+  }
+
+  .account-profile__achievement-dialog-top {
+    padding-right: 40px;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .account-profile__achievement-dialog-top .account-profile__achievement-quantity {
+    grid-column: 2;
+  }
+
+  .account-profile__achievement-dialog-icon {
+    grid-row: span 2;
+  }
+
+  .account-profile__achievement-dialog-copy h2 {
+    font-size: 24px;
+  }
+
+  .account-profile__achievement-dialog .account-profile__achievement-actions {
+    grid-template-columns: 1fr;
   }
 
   .account-profile__detail-grid {

@@ -6,6 +6,7 @@ import { useAppStore } from '../store/useAppStore'
 const mocks = vi.hoisted(() => ({
   fetchConsoleSummary: vi.fn(),
   fetchCurrentUser: vi.fn(),
+  fetchInitializationStatus: vi.fn(),
   syncEligibleAchievementTasks: vi.fn(),
   synchronizeWorkProfile: vi.fn(),
 }))
@@ -30,6 +31,11 @@ vi.mock('../utils/achievementTasks', () => ({
 
 vi.mock('../utils/workProfileCloud', () => ({
   synchronizeWorkProfile: mocks.synchronizeWorkProfile,
+}))
+
+vi.mock('../utils/initialization', async importOriginal => ({
+  ...(await importOriginal<typeof import('../utils/initialization')>()),
+  fetchInitializationStatus: mocks.fetchInitializationStatus,
 }))
 
 vi.mock('../components/RagPanel.v2', () => ({
@@ -86,15 +92,33 @@ beforeEach(() => {
   })
   mocks.fetchCurrentUser.mockResolvedValue(user)
   mocks.fetchConsoleSummary.mockResolvedValue({})
+  mocks.fetchInitializationStatus.mockResolvedValue({
+    schema_version: 'initialization.v1',
+    mode: 'normal',
+    state: 'completed',
+    progress: 100,
+    current_stage: 'feature_smoke_tests',
+    message: '初始化完成',
+    stages: [],
+    quality_gate: { passed: true, checks: [] },
+    smoke_tests: [],
+    can_retry: false,
+    can_report: false,
+    test_mode_enabled: false,
+  })
   mocks.synchronizeWorkProfile.mockResolvedValue(null)
-  mocks.syncEligibleAchievementTasks.mockResolvedValue([overnightBadge])
+  mocks.syncEligibleAchievementTasks.mockResolvedValue([{
+    badge: overnightBadge,
+    badge_quantity: 1,
+    total_badge_quantity: 1,
+  }])
 })
 
 describe('App achievement celebration', () => {
   it('celebrates on the main panel and opens the highlighted card collection', async () => {
     render(<App />)
 
-    expect(screen.getByTestId('rag-panel')).toBeInTheDocument()
+    expect(await screen.findByTestId('rag-panel')).toBeInTheDocument()
     expect(await screen.findByRole('dialog', { name: '卡片已经烘焙完成' })).toBeInTheDocument()
     expect(mocks.syncEligibleAchievementTasks).toHaveBeenCalledWith(expect.objectContaining({
       authToken: 'mbs_celebration_token',

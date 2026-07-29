@@ -93,6 +93,22 @@ const relatedSkill: LocalCreationSkill = {
   title: '跨部门技术沟通会文档',
   summary: '用于跨部门技术沟通、阶段复盘与规划。',
   categoryId: '11401',
+  skillDescription: {
+    purpose: '用于整理跨部门技术沟通中的事实、判断和行动项。',
+    documentTypes: ['跨部门技术沟通会文档'],
+    problems: ['统一技术背景、阶段结论和后续责任'],
+    domains: ['技术协作'],
+    deliverables: ['包含结论与行动项的会议文档'],
+  },
+  executionSteps: [{
+    id: 'draft-document',
+    title: '撰写会议文档',
+    objective: '把事实与结论组织成完整文档。',
+    output: '可继续编辑的 Markdown 文档',
+    agents: ['document_writer_agent'],
+    skills: [],
+    tools: [],
+  }],
   commonTitles: ['跨部门技术沟通会'],
   titleStyle: '标题概括目标',
   textStyle: '结论先行',
@@ -151,7 +167,7 @@ describe('Bake 详情展示优化', () => {
     expect(screen.queryByText(/使用 \d+ 次/)).not.toBeInTheDocument()
     expect(screen.queryByText('high')).not.toBeInTheDocument()
     expect(screen.queryByText(/匹配分|匹配等级|来源记忆|提炼状态/)).not.toBeInTheDocument()
-    expect(screen.getByText('关联创作 Skill')).toBeInTheDocument()
+    expect(screen.getByText('关联技能')).toBeInTheDocument()
     expect(screen.getByText('跨部门技术沟通会文档')).toBeInTheDocument()
     expect(screen.getByText('已安装')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /跨部门技术沟通会文档/ }))

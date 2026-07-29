@@ -1,11 +1,11 @@
 .model-select {
   position: relative;
-  min-width: 246px;
+  min-width: 216px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   color: #667085;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 650;
 }
 
@@ -15,20 +15,20 @@
 }
 
 .model-select__trigger {
-  min-width: 204px;
-  height: 40px;
-  padding: 0 10px;
+  min-width: 178px;
+  height: 34px;
+  padding: 0 8px;
   border: 1px solid rgba(212, 134, 11, 0.24);
-  border-radius: 10px;
+  border-radius: 9px;
   background:
     linear-gradient(180deg, rgba(255, 250, 244, 0.98) 0%, rgba(255, 255, 255, 0.98) 100%),
     #fff;
   color: #2f3542;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   font-family: inherit;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 700;
   cursor: pointer;
   box-shadow: 0 1px 2px rgba(44, 34, 20, 0.06), inset 0 0 0 1px rgba(255, 255, 255, 0.72);
@@ -56,9 +56,9 @@
 }
 
 .model-select__icon {
-  width: 24px;
-  height: 24px;
-  border-radius: 8px;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -87,10 +87,10 @@
 
 .model-select__menu {
   position: absolute;
-  left: 36px;
-  top: calc(100% + 8px);
+  left: 31px;
+  top: calc(100% + 6px);
   z-index: 30;
-  width: min(320px, calc(100vw - 48px));
+  width: min(300px, calc(100vw - 48px));
   padding: 6px;
   border: 1px solid rgba(212, 134, 11, 0.18);
   border-radius: 12px;
@@ -101,15 +101,15 @@
 
 .model-select__option {
   width: 100%;
-  min-height: 58px;
-  padding: 9px 10px;
+  min-height: 50px;
+  padding: 8px 9px;
   border: 1px solid transparent;
   border-radius: 9px;
   background: transparent;
   color: #344054;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   font-family: inherit;
   text-align: left;
   cursor: pointer;
@@ -133,9 +133,9 @@
 }
 
 .model-select__option-icon {
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
   color: #b76f08;
   background: rgba(242, 178, 88, 0.16);
   display: inline-flex;
@@ -154,14 +154,14 @@
 
 .model-select__option-name {
   color: #1d2939;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 760;
   line-height: 1.25;
 }
 
 .model-select__option-desc {
   color: #667085;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 500;
   line-height: 1.35;
 }

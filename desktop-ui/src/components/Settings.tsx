@@ -20,6 +20,8 @@ import {
 } from '../hooks/useApi'
 import type { ConfigCheckItem, ConfigCheckStatus, PreferenceRecord } from '../types'
 import { toUserFacingError } from '../utils/userFacingError'
+import { openExternalUrl, useAppMetadata } from '../utils/appMetadata'
+import { fetchSoftwareUpdate, type SoftwareUpdateCheck } from '../utils/softwareUpdate'
 import InteractionSettings from './InteractionSettings'
 import './Settings.v2.css'
 
@@ -34,6 +36,7 @@ const USER_VISIBLE_PREFERENCE_KEYS = new Set<string>([
 ])
 
 const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
+  const appMetadata = useAppMetadata()
   const CAPTURE_INTERVAL_KEY = 'privacy.capture_interval_sec'
   const SCREENSHOT_KEEP_DAYS_KEY = 'privacy.screenshot_keep_days'
   const CAPTURE_RETENTION_DAYS_KEY = 'privacy.capture_retention_days'
@@ -53,6 +56,7 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
     setApiBaseUrl,
     setDebugModeEnabled,
     setLocalDebugModeEnabled,
+    setServiceEnvironment,
     setWindowMode,
   } = useAppStore()
 
@@ -71,6 +75,8 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const [configChecks, setConfigChecks] = useState<ConfigCheckItem[]>([])
   const [configChecksLoading, setConfigChecksLoading] = useState(false)
   const [configActionRunning, setConfigActionRunning] = useState<string | null>(null)
+  const [softwareUpdate, setSoftwareUpdate] = useState<SoftwareUpdateCheck | null>(null)
+  const [softwareUpdateChecking, setSoftwareUpdateChecking] = useState(false)
 
   const fetchPrefs = useFetchPreferences()
   const fetchConfigChecks = useFetchConfigChecks()
@@ -131,6 +137,18 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   useEffect(() => {
     void refreshConfigChecks()
   }, [refreshConfigChecks])
+
+  const handleCheckSoftwareUpdate = useCallback(async () => {
+    setSoftwareUpdateChecking(true)
+    setError(null)
+    try {
+      setSoftwareUpdate(await fetchSoftwareUpdate(adminApiBaseUrl, appMetadata))
+    } catch (cause) {
+      setError(toUserFacingError(cause, '软件更新检查失败'))
+    } finally {
+      setSoftwareUpdateChecking(false)
+    }
+  }, [adminApiBaseUrl, appMetadata])
 
   const handleSaveApiUrl = useCallback(() => {
     const trimmed = apiUrlInput.trim()
@@ -688,8 +706,9 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
           </div>
         </section>
 
-        {/* 开发者工具 */}
-        <section className="settings-v2__card" data-testid="settings-debug-section">
+        {/* 开发者工具只在显式 Debug 启动时出现，普通用户不可自行开启。 */}
+        {debugModeEnabled && (
+          <section className="settings-v2__card" data-testid="settings-debug-section">
           <div className="settings-v2__card-header">
             <div className="settings-v2__card-icon settings-v2__card-icon--orange">
               {/* wrench 图标 */}
@@ -707,9 +726,9 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
               </svg>
             </div>
             <div>
-              <h2 className="settings-v2__card-title">开发者工具</h2>
+              <h2 className="settings-v2__card-title">开发者模式</h2>
               <p className="settings-v2__card-desc">
-                查看实时采集记录、处理状态和系统性能指标
+                切换调试服务环境，或查看实时采集和处理状态
               </p>
             </div>
           </div>
@@ -751,6 +770,36 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
 
           {debugModeEnabled && (
             <>
+              <div className="settings-v2__environment-row">
+                <span className="settings-v2__environment-copy">
+                  <strong>服务环境</strong>
+                  <small>切换后，云端请求和登录状态都会使用所选环境。</small>
+                </span>
+                <div
+                  className="settings-v2__environment-options"
+                  role="group"
+                  aria-label="选择服务环境"
+                >
+                  <button
+                    type="button"
+                    data-testid="service-environment-production"
+                    className={`settings-v2__environment-option${serviceEnvironment === 'production' ? ' settings-v2__environment-option--active' : ''}`}
+                    aria-pressed={serviceEnvironment === 'production'}
+                    onClick={() => setServiceEnvironment('production')}
+                  >
+                    正式
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="service-environment-staging"
+                    className={`settings-v2__environment-option${serviceEnvironment === 'staging' ? ' settings-v2__environment-option--active' : ''}`}
+                    aria-pressed={serviceEnvironment === 'staging'}
+                    onClick={() => setServiceEnvironment('staging')}
+                  >
+                    测试
+                  </button>
+                </div>
+              </div>
               <label className="settings-v2__toggle-row" htmlFor="local-debug-mode-toggle">
                 <span>
                   <strong>本地调试模式</strong>
@@ -773,7 +822,8 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
               </div>
             </>
           )}
-        </section>
+          </section>
+        )}
 
         {/* 版本信息 */}
         <section className="settings-v2__card" data-testid="settings-version-section">
@@ -807,8 +857,29 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
             </div>
             <div className="settings-v2__version-item" data-testid="app-version">
               <span className="settings-v2__version-label">桌面应用</span>
-              <span className="settings-v2__version-value">0.1.0</span>
+              <span className="settings-v2__version-value">v{appMetadata.version}</span>
             </div>
+            {softwareUpdate && (
+              <div className="settings-v2__version-item">
+                <span className="settings-v2__version-label">更新状态</span>
+                <span className="settings-v2__version-value">
+                  {softwareUpdate.update_available ? `v${softwareUpdate.latest_version} 可下载` : '已是最新版本'}
+                </span>
+              </div>
+            )}
+          </div>
+          <div className="settings-v2__version-actions">
+            <button className="settings-v2__btn settings-v2__btn--secondary" onClick={() => setWindowMode('about')} type="button">
+              关于记忆面包
+            </button>
+            <button className="settings-v2__btn settings-v2__btn--secondary" disabled={softwareUpdateChecking} onClick={() => void handleCheckSoftwareUpdate()} type="button">
+              {softwareUpdateChecking ? '检查中' : '检查更新'}
+            </button>
+            {softwareUpdate?.update_available && softwareUpdate.release && (
+              <button className="settings-v2__btn settings-v2__btn--primary" onClick={() => void openExternalUrl(softwareUpdate.release!.download_url).catch((cause) => setError(toUserFacingError(cause, '下载页面打开失败')))} type="button">
+                下载新版本
+              </button>
+            )}
           </div>
         </section>
       </div>

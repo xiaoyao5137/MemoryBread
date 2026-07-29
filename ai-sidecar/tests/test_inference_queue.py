@@ -1,10 +1,13 @@
 """inference_queue 的功能测试。"""
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
+import inference_queue as inference_queue_module
 from inference_queue import (
     InferenceQueue,
     InferencePreemptedError,
@@ -14,6 +17,7 @@ from inference_queue import (
     LANE_P2_BAKE,
     Priority,
     QueueEvictedError,
+    interactive_demand_active,
     raise_if_preempted,
 )
 
@@ -77,6 +81,30 @@ def test_is_idle_tracks_queued_and_running_tasks(small_queue):
         time.sleep(0.01)
 
     assert small_queue.is_idle() is True
+
+
+def test_submit_sync_timeout_preempts_active_background_task(small_queue):
+    """调用方超时后，活动任务必须释放槽位，不能继续幽灵运行。"""
+    started = threading.Event()
+
+    def background():
+        started.set()
+        while True:
+            raise_if_preempted()
+            time.sleep(0.005)
+
+    with pytest.raises(TimeoutError):
+        small_queue.submit_sync(Priority.P2, background, timeout=0.05)
+
+    assert started.wait(timeout=0.5)
+    assert small_queue.submit_sync(
+        Priority.P2,
+        lambda: "next",
+        timeout=1,
+    ) == "next"
+    stats = small_queue.stats()["totals"]["P2"]
+    assert stats["timed_out"] == 1
+    assert stats["preempted"] == 1
 
 
 def test_per_priority_eviction_drops_oldest(small_queue):
@@ -186,7 +214,11 @@ def test_max_concurrency_reserves_p0_lane():
         q.shutdown()
 
 
-def test_power_aware_concurrency_uses_three_when_charging_and_one_on_battery(tmp_path):
+def test_power_aware_concurrency_uses_configured_parallelism_when_charging(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEMORY_BREAD_MODEL_PARALLELISM", "3")
     state = {"plugged": True}
 
     def _power():
@@ -215,7 +247,11 @@ def test_power_aware_concurrency_uses_three_when_charging_and_one_on_battery(tmp
         q.shutdown()
 
 
-def test_power_aware_slots_cap_background_across_process_queues_and_reserve_p0(tmp_path):
+def test_power_aware_slots_cap_background_across_process_queues_and_reserve_p0(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEMORY_BREAD_MODEL_PARALLELISM", "3")
     prefix = str(tmp_path / "shared-slot")
     power = lambda: SimpleNamespace(percent=80, power_plugged=True)
     q1 = InferenceQueue(
@@ -302,7 +338,37 @@ def test_battery_single_slot_p0_preempts_background_in_another_queue(tmp_path):
             background_future.exception(timeout=1),
             InferencePreemptedError,
         )
-        assert time.monotonic() - started < 0.5
+        assert time.monotonic() - started < 0.2
     finally:
         q1.shutdown()
         q2.shutdown()
+
+
+def test_concurrent_observers_never_create_false_interactive_demand(
+    tmp_path,
+    monkeypatch,
+):
+    """没有 P0 时，并发状态读取不能彼此误判成在线任务。"""
+    monkeypatch.setattr(
+        inference_queue_module,
+        "_INTERACTIVE_DEMAND_LOCK_FILE",
+        str(tmp_path / "interactive.lock"),
+    )
+    monkeypatch.setattr(
+        inference_queue_module,
+        "_INTERACTIVE_DEMAND_PROBE_LOCK_FILE",
+        str(tmp_path / "interactive-probe.lock"),
+    )
+    worker_count = 8
+    rounds = 200
+    barrier = threading.Barrier(worker_count)
+
+    def observe() -> int:
+        false_positives = 0
+        for _ in range(rounds):
+            barrier.wait(timeout=2)
+            false_positives += int(interactive_demand_active())
+        return false_positives
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        assert sum(pool.map(lambda _: observe(), range(worker_count))) == 0

@@ -54,6 +54,41 @@ export interface CreationReferencePreview {
   references: CreationReferenceItem[]
 }
 
+export interface CreationChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  createdAt: number
+  runId?: string
+  runIds?: string[]
+}
+
+export interface CreationAgentEvent {
+  schema_version: 'creation.agent.v1' | string
+  event_id: string
+  session_id: string
+  run_id: string
+  sequence: number
+  timestamp: number
+  type: string
+  status: 'running' | 'waiting' | 'completed' | 'failed' | string
+  actor: {
+    kind: 'agent' | 'tool' | 'skill' | string
+    id: string
+    name: string
+  }
+  summary: string
+  goal?: {
+    objective: string
+    status: string
+    revision: number
+    remaining_steps: string[]
+    outcome?: string
+  }
+  environment_patch?: Record<string, unknown>
+  data?: Record<string, unknown>
+}
+
 export interface CreationDraft {
   prompt: string
   docType: string
@@ -70,6 +105,10 @@ export interface CreationDraft {
   formatWeight: number
   freshnessWeight: number
   referencePreview: CreationReferencePreview | null
+  sessionId: string | null
+  rootRequest: string
+  conversation: CreationChatMessage[]
+  agentEvents: CreationAgentEvent[]
 }
 
 export interface CreationBackTarget {
@@ -228,7 +267,9 @@ export interface AppState {
   reset:                 () => void
 }
 
-const SETUP_KEY = 'memory-bread_setup_done'
+// v2 完成标记只会在一键初始化的质检与功能冒烟测试全部通过后写入。
+// 旧引导的“已完成/已跳过”不能绕过新版强制门禁。
+const SETUP_KEY = 'memory-bread_initialization_v2_done'
 const SKIP_KEY  = 'memory-bread_setup_skipped'
 export const AUTH_SESSION_KEY = 'memory-bread_auth_session'
 export const ACCOUNT_TYPE_KEY = 'memory-bread_account_type'
@@ -411,7 +452,7 @@ const initialCreationDraft: CreationDraft = {
   generatedContent: '',
   inheritFormat: true,
   enableRag: true,
-  enableWebSearch: false,
+  enableWebSearch: true,
   enableImageGeneration: false,
   contentWeight: 45,
   qualityWeight: 15,
@@ -420,6 +461,10 @@ const initialCreationDraft: CreationDraft = {
   formatWeight: 10,
   freshnessWeight: 5,
   referencePreview: null,
+  sessionId: null,
+  rootRequest: '',
+  conversation: [],
+  agentEvents: [],
 }
 
 const startupDebugModeEnabled = getStartupDebugModeEnabled()

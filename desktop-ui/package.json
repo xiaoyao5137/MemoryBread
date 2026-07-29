@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm run version:check && tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -14,7 +14,8 @@
     "tauri:build": "tauri build",
     "macos:build:dmg": "../scripts/build-macos.sh dmg",
     "macos:build:appstore": "../scripts/build-macos.sh appstore",
-    "macos:verify": "../scripts/verify-macos-bundle.sh"
+    "macos:verify": "../scripts/verify-macos-bundle.sh",
+    "version:check": "node ../scripts/check-version-sync.mjs"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",

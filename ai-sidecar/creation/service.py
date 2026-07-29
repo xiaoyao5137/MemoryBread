@@ -15,9 +15,149 @@ from urllib.parse import quote_plus, urlparse
 
 import httpx
 
+from .tools import (
+    INTERNET_SEARCH_TOOL_ID,
+    MEMORY_SEARCH_TOOL_ID,
+    normalize_creation_tool_ids,
+)
+
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
+
+CREATION_SKILL_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "skill_description": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "purpose": {"type": "string"},
+                "document_types": {"type": "array", "items": {"type": "string"}},
+                "problems": {"type": "array", "items": {"type": "string"}},
+                "domains": {"type": "array", "items": {"type": "string"}},
+                "deliverables": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": [
+                "purpose",
+                "document_types",
+                "problems",
+                "domains",
+                "deliverables",
+            ],
+        },
+        "execution_steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "objective": {"type": "string"},
+                    "output": {"type": "string"},
+                    "agents": {"type": "array", "items": {"type": "string"}},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                    "tools": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "id",
+                    "title",
+                    "objective",
+                    "output",
+                    "agents",
+                    "skills",
+                    "tools",
+                ],
+            },
+        },
+        "common_titles": {"type": "array", "items": {"type": "string"}},
+        "title_style": {"type": "string"},
+        "text_style": {"type": "string"},
+        "diagram_style": {"type": "string"},
+        "structure_pattern": {"type": "array", "items": {"type": "string"}},
+        "writing_guidelines": {"type": "array", "items": {"type": "string"}},
+        "distinctive_sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "guidance": {"type": "string"},
+                    "examples": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["title", "description", "guidance", "examples"],
+            },
+        },
+        "section_headings": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "common_titles": {"type": "string"},
+                "title_style": {"type": "string"},
+                "text_style": {"type": "string"},
+                "diagram_style": {"type": "string"},
+                "structure_pattern": {"type": "string"},
+                "writing_guidelines": {"type": "string"},
+            },
+            "required": [
+                "common_titles",
+                "title_style",
+                "text_style",
+                "diagram_style",
+                "structure_pattern",
+                "writing_guidelines",
+            ],
+        },
+        "field_examples": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "common_titles": {"type": "array", "items": {"type": "string"}},
+                "title_style": {"type": "array", "items": {"type": "string"}},
+                "text_style": {"type": "array", "items": {"type": "string"}},
+                "diagram_style": {"type": "array", "items": {"type": "string"}},
+                "structure_pattern": {"type": "array", "items": {"type": "string"}},
+                "writing_guidelines": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": [
+                "common_titles",
+                "title_style",
+                "text_style",
+                "diagram_style",
+                "structure_pattern",
+                "writing_guidelines",
+            ],
+        },
+        "example_document": {"type": "string"},
+        "suggested_category_keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "title",
+        "summary",
+        "skill_description",
+        "execution_steps",
+        "common_titles",
+        "title_style",
+        "text_style",
+        "diagram_style",
+        "structure_pattern",
+        "writing_guidelines",
+        "distinctive_sections",
+        "section_headings",
+        "field_examples",
+        "example_document",
+        "suggested_category_keywords",
+    ],
+}
 
 
 @dataclass
@@ -38,6 +178,16 @@ class CreationOptions:
     format_weight: float = 0.10
     freshness_weight: float = 0.05
     max_references: int = 6
+    enabled_tools: tuple[str, ...] = (
+        INTERNET_SEARCH_TOOL_ID,
+        MEMORY_SEARCH_TOOL_ID,
+    )
+
+    def __post_init__(self) -> None:
+        self.enabled_tools = normalize_creation_tool_ids(self.enabled_tools)
+        # 旧布尔字段继续保留，但其值投影自新 Tool 契约，不能关闭必备 Tool。
+        self.enable_rag = MEMORY_SEARCH_TOOL_ID in self.enabled_tools
+        self.enable_web_search = INTERNET_SEARCH_TOOL_ID in self.enabled_tools
 
 
 @dataclass
@@ -69,6 +219,16 @@ class WebSearchResult:
     title: str
     url: str
     snippet: str
+
+
+@dataclass
+class GithubSearchResult:
+    full_name: str
+    url: str
+    description: str
+    stars: int
+    language: str
+    updated_at: str
 
 
 class CreationService:
@@ -245,6 +405,149 @@ class CreationService:
             )
             raise
 
+    async def run_specialist_agent(
+        self,
+        *,
+        agent_id: str,
+        system_prompt: str,
+        user_prompt: str,
+        creation_model: Optional[str] = None,
+        creation_api_key: Optional[str] = None,
+        creation_base_url: Optional[str] = None,
+    ) -> str:
+        """执行一个需要模型推理的专业子 Agent，并返回可写回环境的结论。"""
+        parts: list[str] = []
+        started_ms = int(time.time() * 1000)
+        model_name = creation_model or self.model
+        try:
+            async for chunk in self._stream_direct_completion(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                creation_model=creation_model,
+                creation_api_key=creation_api_key,
+                creation_base_url=creation_base_url,
+                num_predict=1600,
+                temperature=0.25,
+            ):
+                parts.append(chunk)
+            result = "".join(parts).strip()
+            if not result:
+                raise RuntimeError(f"{agent_id} 未返回分析结果")
+            self._log_creation_usage(
+                model_name=model_name,
+                prompt_text=system_prompt + "\n\n" + user_prompt,
+                response_text=result,
+                latency_ms=int(time.time() * 1000) - started_ms,
+                status="success",
+            )
+            return result
+        except Exception as exc:
+            self._log_creation_usage(
+                model_name=model_name,
+                prompt_text=system_prompt + "\n\n" + user_prompt,
+                response_text="".join(parts),
+                latency_ms=int(time.time() * 1000) - started_ms,
+                status="failed",
+                error_msg=str(exc),
+            )
+            raise
+
+    async def stream_agent_document(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        creation_model: Optional[str] = None,
+        creation_api_key: Optional[str] = None,
+        creation_base_url: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """执行文档撰写 Agent，并把最终文档按块返回。"""
+        async for chunk in self._stream_direct_completion(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            creation_model=creation_model,
+            creation_api_key=creation_api_key,
+            creation_base_url=creation_base_url,
+            num_predict=8192,
+            temperature=0.55,
+        ):
+            yield chunk
+
+    async def _stream_direct_completion(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        creation_model: Optional[str],
+        creation_api_key: Optional[str],
+        creation_base_url: Optional[str],
+        num_predict: int,
+        temperature: float,
+    ) -> AsyncIterator[str]:
+        """统一子 Agent 的本地/自带密钥模型调用，不包含 RAG 等上层编排。"""
+        if creation_model and creation_api_key:
+            async for chunk in self._generate_cloud(
+                system_prompt,
+                user_prompt,
+                creation_model,
+                creation_api_key,
+                creation_base_url or "",
+            ):
+                yield chunk
+            return
+
+        local_model = creation_model or self.model
+        is_qwen35 = "qwen3.5" in local_model.lower()
+        if is_qwen35:
+            payload = {
+                "model": local_model,
+                "prompt": self._build_qwen35_prompt(system_prompt, user_prompt),
+                "raw": True,
+                "stream": True,
+                "options": {
+                    "temperature": temperature,
+                    "top_p": 0.9,
+                    "num_predict": num_predict,
+                },
+            }
+            endpoint = "/api/generate"
+        else:
+            payload = {
+                "model": local_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "stream": True,
+                "options": {
+                    "temperature": temperature,
+                    "top_p": 0.9,
+                    "num_predict": num_predict,
+                },
+            }
+            endpoint = "/api/chat"
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            async with client.stream(
+                "POST", f"{self.ollama_base_url}{endpoint}", json=payload
+            ) as response:
+                response.raise_for_status()
+                if is_qwen35:
+                    async for chunk in self._stream_qwen35_raw(response):
+                        if chunk:
+                            yield chunk
+                else:
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        content = data.get("message", {}).get("content", "")
+                        if content:
+                            yield content
+
     async def analyze_creation_skill(
         self,
         document_title: str,
@@ -259,22 +562,107 @@ class CreationService:
         if len(content) < 20 or len(content) > 80000:
             raise ValueError("文档内容需要在 20 到 80000 个字符之间")
 
-        excerpt = content[:30000]
-        prompt = self._build_creation_skill_analysis_prompt(title, excerpt, doc_type)
+        style_content = self._select_creation_skill_style_content(title, content)
+        prompt = self._build_creation_skill_analysis_prompt(title, style_content, doc_type)
         payload = self._creation_skill_analysis_payload(self.model, prompt)
         try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 response = await client.post(f"{self.ollama_base_url}/api/generate", json=payload)
                 response.raise_for_status()
                 raw = response.json().get("response", "")
-            parsed = self._normalize_creation_skill_analysis(json.loads(raw), title, content, doc_type)
+            parsed = self._normalize_creation_skill_analysis(
+                json.loads(raw), title, style_content, doc_type
+            )
             parsed["analysis_mode"] = "local_model"
             return parsed
         except Exception as exc:
-            logger.warning("本地模型提炼创作 Skill 失败，使用规则分析: %s", exc)
-            fallback = self._fallback_creation_skill_analysis(title, content, doc_type)
+            logger.warning("本地模型提炼技能失败，使用规则分析: %s", exc)
+            fallback = self._fallback_creation_skill_analysis(
+                title, style_content, doc_type
+            )
             fallback["analysis_mode"] = "heuristic_fallback"
+            if isinstance(exc, json.JSONDecodeError):
+                fallback["fallback_reason"] = "invalid_model_output"
+            elif isinstance(exc, httpx.TimeoutException):
+                fallback["fallback_reason"] = "model_timeout"
+            elif isinstance(exc, httpx.HTTPError):
+                fallback["fallback_reason"] = "model_request_failed"
+            else:
+                fallback["fallback_reason"] = "analysis_failed"
             return fallback
+
+    @staticmethod
+    def _select_creation_skill_style_content(
+        document_title: str, document_content: str, maximum: int = 30000
+    ) -> str:
+        """只取与主文档连续相关的 Markdown 主章节，隔离 Bake 追加的异质正文。"""
+        content = str(document_content or "").strip()
+        if not content:
+            return ""
+        matches = list(re.finditer(r"(?m)^\s{0,3}#\s+(.+?)\s*$", content))
+        if not matches:
+            return content[:maximum]
+
+        normalized_title = re.sub(
+            r"[\s\W_]+", "", document_title, flags=re.UNICODE
+        ).lower()
+        title_core = re.sub(
+            r"(?:整体)?(?:技术)?(?:方案|文档|报告|设计|规划|说明|手册|指南)$",
+            "",
+            normalized_title,
+        )
+        ascii_anchors = {
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", document_title)
+            if token.lower() not in {"the", "and", "for", "with"}
+        }
+
+        start_index = 0
+        for index, match in enumerate(matches):
+            heading = re.sub(r"[\s\W_]+", "", match.group(1), flags=re.UNICODE).lower()
+            if heading == normalized_title:
+                start_index = index
+                break
+
+        selected: list[str] = []
+        for index in range(start_index, len(matches)):
+            match = matches[index]
+            heading = match.group(1).strip()
+            normalized_heading = re.sub(
+                r"[\s\W_]+", "", heading, flags=re.UNICODE
+            ).lower()
+            heading_tokens = {
+                token.lower()
+                for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", heading)
+            }
+            related = (
+                index == start_index
+                or bool(ascii_anchors & heading_tokens)
+                or (
+                    len(title_core) >= 3
+                    and (
+                        title_core in normalized_heading
+                        or normalized_heading in title_core
+                    )
+                )
+            )
+            looks_like_appendix = bool(
+                re.search(
+                    r"近期|补充|更新版|最新调研|浏览(?:记录|快照)|页面快照|历史版本|专项资源|用户行为|^\s*20\d{2}[年/-]",
+                    heading,
+                )
+            )
+            if not related and looks_like_appendix:
+                break
+            block_end = (
+                matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(content)
+            )
+            selected.append(content[match.start():block_end].strip())
+
+        excerpt = "\n\n".join(selected).strip()
+        return (excerpt or content[matches[start_index].start():])[:maximum]
 
     @staticmethod
     def _creation_skill_analysis_payload(model: str, prompt: str) -> dict:
@@ -282,16 +670,20 @@ class CreationService:
             "model": model,
             "prompt": prompt,
             "stream": False,
-            "format": "json",
+            # 普通 JSON 模式下，长结果仍可能包含未闭合字符串或缺失分隔符。
+            # 传入完整 Schema，让 Ollama 在解码阶段约束输出结构。
+            "format": CREATION_SKILL_ANALYSIS_SCHEMA,
             # Qwen 3.5 默认把 JSON 写入 thinking，response 为空；关闭思考后
             # Ollama 才会把可解析的结构化结果放入 response。
             "think": False,
-            "options": {"temperature": 0.2, "top_p": 0.8, "num_predict": 4096},
+            # 完整示例文档本身需要保留足够篇幅，再加上五类风格指纹，
+            # 四千 token 很容易让 JSON 在 example_document 中途被截断。
+            "options": {"temperature": 0.2, "top_p": 0.8, "num_predict": 8192},
         }
 
     @staticmethod
     def _build_creation_skill_analysis_prompt(title: str, content: str, doc_type: str) -> str:
-        return f"""你是 MemoryBread 的本地文档创作分析器。请从给定文档中提炼“如何写这类文档”，不要复述敏感业务事实，不要输出源文档原文。
+        return f"""你是 MemoryBread 的本地文档风格分析器。你的任务不是给出通用写作建议，而是为这份源文档制作一枚可复用的“风格指纹”：后续模型只看分析结果，也能明显模仿作者的标题句式、行文组织、惯用话术和配图方式。
 
 文档标题：{title}
 文档类型：{doc_type or '未指定'}
@@ -304,12 +696,37 @@ Skill 命名与简介原则：
 - 标题优先使用“适用场景 + 文档/方案/报告”的形式，例如源文档来自某研发部门的技术沟通会时，写成“跨部门技术沟通会文档”。
 - 简介必须说明这个 Skill 适合在什么场景、帮助谁完成什么目标，不能只罗列写作风格。
 
-隐私与通用化原则（适用于 JSON 中的每一个字段）：
-- 只提炼可复用的方法，不复制原文句子、章节标题、专有名词、数据或事实。
+来源忠实度原则（适用于 JSON 中的每一个字段）：
+- 每条结论都必须能在源文档中找到依据。不要只写“标题突出重点”“表达专业正式”“结论先行”“图文结合”这类放到任何文档都成立的判断；如果使用，必须继续说清作者具体在哪一层、按什么顺序、用什么句式或词语实现。
+- 可以保留源文档的非敏感短语、专业用语、虚词、动词、句式、标点和标题骨架；禁止复制完整句子或连续正文。
+- 标题示例要以源文档子标题为直接母版，只替换其中可能泄密的主语、宾语、专名、数字和事实，尽量保持原有词序、动词、虚词、标点、长短和语气，不能另起炉灶写成通用标题。
+- example_document 使用全新虚构主题，但必须实际复现本次提炼出的标题句式、章节推进方式、过渡话术、专业表达和图示习惯。
+- 标题设计风格不能只给形容词。每条都按“可观察特征 → 可复用句式骨架 → 适用位置或使用边界”写，让创作者可以照着执行；至少覆盖层级分工、长度节奏、词序句法、标点和常用动作词。
+- 行文设计思路不能只列章节名称。要依次说清开篇如何定调、章节如何递进、段内先写判断还是依据、列表何时出现、信息密度如何控制、结尾如何收束，并明确哪些写法不应迁移。
+- 固定字段之外，还要寻找真正属于这份源文档的高辨识度写法，例如定义先行、短标签加冒号、代码与解释成对出现、分隔线切换议题、括号注脚或双入口并列。只在有明确证据时放入 distinctive_sections，输出零至四个，可提炼多个，但不能换名重复固定字段。
+- skill_description 是给创作 Agent 做触发判断的能力说明，不是宣传文案。必须明确能创作哪些文档、解决哪些问题、涉及哪些领域以及交付什么。
+- execution_steps 描述如何从需求走到成稿。按真实先后顺序给出三至八步，并为每一步明确目标、产出，以及可调用的 Agent、Skill、Tool；没有必要的资源数组留空，不得为了显得智能而堆满能力。
+- 每一步的 Agent 与 Tool 合计最多四个；只列这一步真正需要的能力。同一能力可以在不同步骤重复出现，例如先调研、后复核。
+- Agent 只能从 industry_research_agent、data_analysis_agent、solution_design_agent、document_writer_agent、quality_review_agent 中选择；Tool 只能从 memory_search、internet_search、github_search、plantuml_diagram 中选择。Skill 使用可复用技能名称或稳定标识，没有依赖时留空。
+
+隐私与通用化原则：
 - 禁止出现真实或可推断的公司、事业群、事业部、部门、团队、项目、产品、系统、客户、人员、地域、日期、指标和金额。
-- 把具体业务对象改写为“目标系统”“相关团队”“示例项目”“通用服务”等抽象角色；不要保留源文档中的名称。
-- 每个字段都提供 1-3 个全新虚构示例。示例只能演示写法，主题、角色、数据和措辞都必须脱离原文。
-- example_document 必须是一份结构完整的 Markdown 示例文档，使用与源文档无关的虚构主题，不得改写、摘要或影射源文档。
+- 把敏感主语或宾语最小替换为“目标对象”“相关角色”“示例项目”“通用服务”等抽象词；替换后继续保留原有表达骨架，不要把整句重写成另一种风格。
+- 不输出源文档事实、论点或完整句子。允许收集可安全复用的短话术和专业词语，并说明作者如何使用它们。
+- 所有字段禁止出现阿拉伯数字；需要表达顺序时使用 Markdown 无序列表，需要表达大致长度时使用中文数词。
+- 脱敏后的标题必须仍是自然、可理解的中文标题。“目标对象 目标对象”“相关角色相关角色”或只剩占位词的结果属于错误，必须重写为保留原句式的完整标题。
+
+完整示例文档质量标准：
+- 正文目标篇幅为一千二百至两千二百个中文字符，不含 Markdown 标记；不能用摘要式短文冒充完整文档。
+- 至少包含一个主标题、摘要、六个承担不同内容角色的二级章节和结论。每个核心章节至少有两个完整段落，必要时加入同语法起点的无序列表。
+- 开篇、章节过渡、段内展开、列表和收束都要实际使用本次提炼出的写法；不能只是章节名相似。
+- 若 diagram_style 明确默认不生成图片，示例中也不强行加图；若源文档有稳定图示习惯，则提供一段可执行的 PlantUML 或 Mermaid 代码，并在正文中先解释图的阅读方式。
+- 输出前检查：文档主题必须完全虚构，标题示例语义完整，JSON 字符串正确转义，所有字段均无阿拉伯数字。
+
+JSON 类型硬约束：
+- common_titles、structure_pattern、writing_guidelines、suggested_category_keywords 只能是字符串数组；数组项禁止使用对象、键值对或嵌套数组。
+- field_examples 的每个值只能是字符串数组。
+- 只有 distinctive_sections 是对象数组。不要把 Python 字典、JSON 对象或类似 {{'level': '一级标题'}} 的文本塞进字符串数组。
 
 类目候选（必须从以下有效路径中选择最接近的一整条，不得自行创造名称或拼接路径）：
 - 互联网 / 电商零售 / 产品经理 / 产品设计文档
@@ -346,31 +763,57 @@ Skill 命名与简介原则：
 
 只输出一个 JSON 对象，字段必须完整：
 {{
-  "title": "高度概括适用场景和交付目标的短标题，不超过 40 字，不含任何具体组织或项目名称",
-  "summary": "说明适用场景、适用对象和创作目标，不超过 160 字",
-  "common_titles": ["3-6 个这类文档常见标题"],
-  "title_style": "总结标题层级、句式、长度和措辞习惯",
-  "text_style": "总结语气、段落、论证、术语和信息密度",
-  "diagram_style": "总结图表类型、视觉层级、配色、标注和使用场景；没有图时给出适合这类文档的克制建议",
-  "structure_pattern": ["按顺序列出 4-10 个常见章节"],
-  "writing_guidelines": ["列出 3-8 条可执行写作规则"],
+  "title": "高度概括适用场景和交付目标的短标题，不超过四十字，不含任何具体组织或项目名称",
+  "summary": "说明适用场景、适用对象和创作目标，不超过一百六十字",
+  "skill_description": {{
+    "purpose": "说明这个 Skill 在什么场景下，为谁解决什么创作问题",
+    "document_types": ["可以创作的具体文档类型"],
+    "problems": ["要解决的内容组织、分析、决策或交付问题"],
+    "domains": ["涉及的行业、职能或专业领域；无明确领域时可为空"],
+    "deliverables": ["执行完成后应产出的可验收成果"]
+  }},
+  "execution_steps": [
+    {{
+      "id": "使用小写英文、数字和连字符组成的稳定步骤标识",
+      "title": "步骤短标题",
+      "objective": "这一步要完成什么，以及为什么要先完成它",
+      "output": "这一步留给下一步的明确产出",
+      "agents": ["从允许的 Agent 标识中选择"],
+      "skills": ["需要协同调用的其它 Skill；没有则为空数组"],
+      "tools": ["从允许的 Tool 标识中选择"]
+    }}
+  ],
+  "common_titles": ["标题设计风格：写五至八条从源文档子标题归纳出的具体规则；每条包含可观察特征、可复用句式骨架、适用位置或边界，覆盖标题层级、词序、常用动词或名词、虚词、长度和标点"],
+  "title_style": "旧版兼容字段：复制 common_titles 中的内容，不增加新的标题规则",
+  "text_style": "行文设计思路：用四百至七百个中文字符写成可执行配方，依次说明开篇定调、章节递进、段内顺序、列表条件、信息密度、过渡方式、结尾收束和不应迁移的写法；每一项都落到源文档可观察到的组织特征",
+  "diagram_style": "图片生成方式：用四百至七百个中文字符写成可执行配方。依次说明源文档是否存在图示证据、什么情况下才需要生成、推荐 PlantUML 或 Mermaid 的哪一种图、正文信息如何筛选、阅读方向与分组如何安排、节点与连线怎样命名、颜色与边界怎样克制、正文在图前后怎样引导，以及哪些内容禁止画入和交付前如何自检；没有图示依据时先明确写“默认不生成图片”，再说明真正需要补图的触发条件，不能为了完整感强行配图",
+  "structure_pattern": ["兼容字段：按源文档实际顺序抽象出四至十个章节角色，仅供内部保持推进信息，不得把它渲染成独立的“章节组织骨架”章节"],
+  "writing_guidelines": ["话术表达风格：输出五至八条、合计四百至七百个中文字符的可执行规则。每条从源文档中的非敏感原词、短语、过渡语、动作动词、专业用语、标点或句式出发，写清证据表达、常见位置、承担作用、句法语气、迁移方式和使用边界；没有稳定证据时明确禁止额外植入模板话术，不要改写成放到任何文档都成立的通用规范"],
+  "distinctive_sections": [
+    {{
+      "title": "源文档独有写法的短名称，不与标题、行文、配图、话术四个固定章节重名",
+      "description": "说明这种写法在源文档里如何出现、为什么形成辨识度",
+      "guidance": "说明后续创作在什么位置、按什么步骤复刻，以及不适用的边界",
+      "examples": ["一至三个使用全新虚构主题的完整示例，不能是占位词、残句或源文复述"]
+    }}
+  ],
   "section_headings": {{
-    "common_titles": "这类文档标题通常怎么命名",
-    "title_style": "概括该字段用途的通用二级标题",
-    "text_style": "概括该字段用途的通用二级标题",
-    "diagram_style": "概括该字段用途的通用二级标题",
-    "structure_pattern": "概括该字段用途的通用二级标题",
-    "writing_guidelines": "概括该字段用途的通用二级标题"
+    "common_titles": "标题设计风格",
+    "title_style": "标题设计风格",
+    "text_style": "行文设计思路",
+    "diagram_style": "图片生成方式",
+    "structure_pattern": "内部章节推进信息",
+    "writing_guidelines": "话术表达风格"
   }},
   "field_examples": {{
-    "common_titles": ["1-3 个完全虚构的标题示例"],
-    "title_style": ["1-3 个完全虚构的标题写法示例"],
-    "text_style": ["1-3 个完全虚构的正文片段示例"],
-    "diagram_style": ["1-3 个完全虚构的图示设计示例"],
-    "structure_pattern": ["1-3 个完全虚构的章节顺序示例"],
-    "writing_guidelines": ["1-3 个完全虚构的规则应用示例"]
+    "common_titles": ["四至六个以源文档子标题为母版的脱敏仿写示例：只替换敏感主语、宾语、专名和事实，其余句式与标点尽量不动；示例必须语义完整且不能连续重复占位词"],
+    "title_style": ["旧版兼容字段：复制 common_titles 示例"],
+    "text_style": ["一至三个使用全新虚构主题、但严格复现源文档组织次序和段落推进的正文片段"],
+    "diagram_style": ["一至三个可执行的代码生图说明，明确 PlantUML 或 Mermaid 的图类型、启用条件、信息范围、元素、布局、标注和图文衔接方式；必要时给出短代码骨架"],
+    "structure_pattern": ["兼容字段：一至三个复现源文档推进节奏、但替换业务主题的内部章节顺序示例，不单独渲染为技能章节"],
+    "writing_guidelines": ["一至三个把收集到的惯用短语、动词、标点或专业表达迁移到虚构主题中的完整仿写句，并让示例体现对应规则的出现位置和语气"]
   }},
-  "example_document": "一份完整 Markdown 示例文档，使用全新虚构主题，至少包含标题、摘要、4 个章节和结论，不得出现源文档中的名称、事实、数字或句子",
+  "example_document": "一份一千二百至两千二百个中文字符的完整 Markdown 示例文档，使用全新虚构主题，至少包含主标题、摘要、六个二级章节和结论；核心章节至少两个完整段落，必须实际体现上述标题句式、行文逻辑、话术和图示方式，不得出现源文档中的名称、事实、阿拉伯数字或完整句子",
   "suggested_category_keywords": ["从候选中选择的行业", "从候选中选择的细分行业", "从候选中选择的工种", "从候选中选择的具体文档类型"]
 }}
 """
@@ -380,7 +823,7 @@ Skill 命名与简介原则：
         cls, value: dict, document_title: str, document_content: str, doc_type: str
     ) -> dict:
         if not isinstance(value, dict):
-            raise ValueError("Skill 分析结果不是对象")
+            raise ValueError("技能分析结果不是对象")
         fallback = cls._fallback_creation_skill_analysis(document_title, document_content, doc_type)
 
         def clean_text(key: str, maximum: int) -> str:
@@ -396,92 +839,468 @@ Skill 命名与简介原则：
             raw = value.get(key)
             items = raw if isinstance(raw, list) else fallback[key]
             fallback_items = fallback[key]
-            cleaned = [
-                cls._generalize_skill_text(
-                    str(item).strip()[:item_maximum],
-                    document_title,
-                    document_content,
-                    str(fallback_items[min(index, len(fallback_items) - 1)]),
+            cleaned = []
+            for index, item in enumerate(items):
+                text = cls._coerce_skill_list_item(key, item)
+                if not text:
+                    continue
+                fallback_item = str(
+                    fallback_items[min(index, len(fallback_items) - 1)]
                 )
-                for index, item in enumerate(items)
-                if str(item).strip()
-            ]
+                cleaned.append(
+                    cls._generalize_skill_text(
+                        text[:item_maximum],
+                        document_title,
+                        document_content,
+                        fallback_item,
+                    )
+                )
             return cleaned[:maximum_items] or fallback[key]
 
-        raw_headings = value.get("section_headings")
-        headings = raw_headings if isinstance(raw_headings, dict) else fallback["section_headings"]
         raw_examples = value.get("field_examples")
         examples = raw_examples if isinstance(raw_examples, dict) else fallback["field_examples"]
-
-        def clean_heading(key: str) -> str:
-            if key == "common_titles":
-                return "这类文档标题通常怎么命名"
-            candidate = str(headings.get(key) or fallback["section_headings"][key]).strip()[:120]
-            return cls._generalize_skill_text(
-                candidate,
-                document_title,
-                document_content,
-                fallback["section_headings"][key],
-            )
 
         def clean_examples(key: str) -> list[str]:
             raw = examples.get(key)
             items = raw if isinstance(raw, list) else fallback["field_examples"][key]
-            cleaned = [
-                cls._generalize_skill_text(
-                    str(item).strip()[:500],
-                    document_title,
-                    document_content,
-                    fallback["field_examples"][key][
-                        min(index, len(fallback["field_examples"][key]) - 1)
-                    ],
+            if key == "common_titles":
+                # 标题示例以从源标题结构确定性生成的完整仿写为准，模型只补充，
+                # 避免机械脱敏产出“从某视角看，目标对象”一类残句。
+                items = [*fallback["field_examples"][key], *items]
+            cleaned = []
+            for index, item in enumerate(items):
+                text = cls._coerce_skill_list_item(key, item)
+                if key == "common_titles":
+                    text = cls._compact_skill_placeholders(text)
+                    if not cls._is_complete_skill_heading_example(text):
+                        continue
+                if not text:
+                    continue
+                fallback_examples = fallback["field_examples"][key]
+                fallback_example = fallback_examples[
+                    min(index, len(fallback_examples) - 1)
+                ]
+                cleaned.append(
+                    cls._generalize_skill_text(
+                        text[:500],
+                        document_title,
+                        document_content,
+                        fallback_example,
+                        overlap_window=28 if key == "common_titles" else 14,
+                    )
                 )
-                for index, item in enumerate(items)
-                if str(item).strip()
-            ]
-            return cleaned[:6] or fallback["field_examples"][key]
+            cleaned = cls._distinct_skill_items(cleaned, 6)
+            minimum = 3 if key in ("common_titles", "writing_guidelines") else 1
+            if len(cleaned) < minimum:
+                cleaned = cls._distinct_skill_items(
+                    [*cleaned, *fallback["field_examples"][key]], 6
+                )
+            return cleaned or fallback["field_examples"][key]
+
+        title_design = cls._distinct_skill_items(
+            [
+                *clean_list("common_titles", 12, 80),
+                *fallback["common_titles"],
+            ],
+            8,
+        )
+        if len(title_design) < 4:
+            title_design = fallback["common_titles"]
+        text_style = clean_text("text_style", 2000)
+        if len(text_style) < 400:
+            text_style = cls._merge_skill_prose(
+                text_style,
+                fallback["text_style"],
+                2000,
+            )
+        diagram_style = clean_text("diagram_style", 1200)
+        if len(diagram_style) < 400:
+            diagram_style = cls._merge_skill_prose(
+                diagram_style,
+                fallback["diagram_style"],
+                1200,
+            )
+        writing_guidelines = cls._distinct_skill_items(
+            [
+                *clean_list("writing_guidelines", 5, 240),
+                *fallback["writing_guidelines"],
+            ],
+            8,
+        )
+        field_examples = {
+            key: clean_examples(key)
+            for key in (
+                "common_titles",
+                "text_style",
+                "diagram_style",
+                "structure_pattern",
+                "writing_guidelines",
+            )
+        }
+        # title_style 是旧版协议键。新版本不再生成独立内容，仅复制标题设计风格，
+        # 让旧客户端仍能读取，同时避免在新界面和创作指令中出现重复字段。
+        legacy_title_style = "；".join(title_design)[:1200]
+        field_examples["title_style"] = list(field_examples["common_titles"])
+        raw_example_document = str(
+            value.get("example_document") or fallback["example_document"]
+        ).strip()[:12000]
+        # 阿拉伯数字编号本身不携带业务信息，先转成无序列表，避免一份合格长文
+        # 仅因模型习惯写“1.”而整体退回通用示例。
+        raw_example_document = re.sub(
+            r"(?m)^(\s*)\d+(?:\.\d+)*[.、]\s+",
+            r"\1- ",
+            raw_example_document,
+        )
+        example_document = cls._generalize_skill_text(
+            raw_example_document,
+            document_title,
+            document_content,
+            fallback["example_document"],
+            overlap_window=40,
+        )
+        if not cls._is_complete_skill_example_document(example_document):
+            example_document = fallback["example_document"]
+        distinctive_sections = cls._normalize_distinctive_sections(
+            value.get("distinctive_sections"),
+            fallback["distinctive_sections"],
+            document_title,
+            document_content,
+        )
+        skill_description = cls._normalize_skill_description(
+            value.get("skill_description"),
+            fallback["skill_description"],
+            document_title,
+            document_content,
+        )
+        execution_steps = cls._normalize_skill_execution_steps(
+            value.get("execution_steps"),
+            fallback["execution_steps"],
+            document_title,
+            document_content,
+        )
 
         return {
             "title": cls._normalize_creation_skill_title(
                 clean_text("title", 80), document_title, document_content, doc_type
             ),
             "summary": clean_text("summary", 400),
-            "common_titles": clean_list("common_titles", 12, 80),
-            "title_style": clean_text("title_style", 1200),
-            "text_style": clean_text("text_style", 2000),
-            "diagram_style": clean_text("diagram_style", 1200),
+            "common_titles": title_design,
+            "title_style": legacy_title_style,
+            "text_style": text_style,
+            "diagram_style": diagram_style,
             "structure_pattern": clean_list("structure_pattern", 16, 160),
-            "writing_guidelines": clean_list("writing_guidelines", 16, 240),
-            "section_headings": {
-                key: clean_heading(key)
-                for key in (
-                    "common_titles",
-                    "title_style",
-                    "text_style",
-                    "diagram_style",
-                    "structure_pattern",
-                    "writing_guidelines",
-                )
-            },
-            "field_examples": {
-                key: clean_examples(key)
-                for key in (
-                    "common_titles",
-                    "title_style",
-                    "text_style",
-                    "diagram_style",
-                    "structure_pattern",
-                    "writing_guidelines",
-                )
-            },
-            "example_document": cls._generalize_skill_text(
-                str(value.get("example_document") or fallback["example_document"]).strip()[:12000],
-                document_title,
-                document_content,
-                fallback["example_document"],
-            ),
+            "writing_guidelines": writing_guidelines,
+            "distinctive_sections": distinctive_sections,
+            "section_headings": cls._default_skill_section_headings(),
+            "field_examples": field_examples,
+            "example_document": example_document,
+            "skill_description": skill_description,
+            "execution_steps": execution_steps,
             "suggested_category_keywords": clean_list("suggested_category_keywords", 8, 80),
         }
+
+    @classmethod
+    def _normalize_skill_description(
+        cls,
+        value: object,
+        fallback: dict,
+        document_title: str,
+        document_content: str,
+    ) -> dict:
+        raw = value if isinstance(value, dict) else {}
+
+        def clean_text(candidate: object, fallback_text: str, maximum: int) -> str:
+            text = str(candidate or fallback_text).strip()[:maximum]
+            return cls._generalize_skill_text(
+                text,
+                document_title,
+                document_content,
+                fallback_text,
+            )
+
+        def clean_items(key: str, maximum_items: int, item_maximum: int) -> list[str]:
+            fallback_items = fallback.get(key) or []
+            items = raw.get(key)
+            source = items if isinstance(items, list) else fallback_items
+            cleaned = [
+                clean_text(
+                    item,
+                    str(fallback_items[min(index, len(fallback_items) - 1)])
+                    if fallback_items
+                    else "",
+                    item_maximum,
+                )
+                for index, item in enumerate(source)
+                if str(item or "").strip()
+            ]
+            return cls._distinct_skill_items(cleaned, maximum_items) or list(fallback_items)
+
+        return {
+            "purpose": clean_text(raw.get("purpose"), str(fallback["purpose"]), 1200),
+            "document_types": clean_items("document_types", 12, 120),
+            "problems": clean_items("problems", 12, 240),
+            "domains": clean_items("domains", 12, 120),
+            "deliverables": clean_items("deliverables", 12, 240),
+        }
+
+    @classmethod
+    def _normalize_skill_execution_steps(
+        cls,
+        value: object,
+        fallback: list[dict],
+        document_title: str,
+        document_content: str,
+    ) -> list[dict]:
+        allowed_agents = {
+            "industry_research_agent",
+            "data_analysis_agent",
+            "solution_design_agent",
+            "document_writer_agent",
+            "quality_review_agent",
+        }
+        allowed_tools = {
+            "memory_search",
+            "internet_search",
+            "github_search",
+            "plantuml_diagram",
+        }
+        raw_steps = value if isinstance(value, list) else fallback
+        normalized: list[dict] = []
+        for index, item in enumerate(raw_steps[:12]):
+            if not isinstance(item, dict):
+                continue
+            fallback_step = fallback[min(index, len(fallback) - 1)] if fallback else {}
+            raw_id = str(item.get("id") or fallback_step.get("id") or f"step-{index + 1}")
+            step_id = re.sub(r"[^a-z0-9_-]+", "-", raw_id.lower()).strip("-_")[:80]
+            if not step_id:
+                step_id = f"step-{index + 1}"
+
+            def clean_step_text(key: str, maximum: int) -> str:
+                fallback_text = str(fallback_step.get(key) or "")
+                return cls._generalize_skill_text(
+                    str(item.get(key) or fallback_text).strip()[:maximum],
+                    document_title,
+                    document_content,
+                    fallback_text,
+                )
+
+            def resources(key: str, allowed: set[str] | None = None) -> list[str]:
+                raw = item.get(key)
+                source = raw if isinstance(raw, list) else fallback_step.get(key, [])
+                result = []
+                for candidate in source:
+                    resource_id = str(candidate or "").strip()[:80]
+                    if not resource_id or (allowed is not None and resource_id not in allowed):
+                        continue
+                    if resource_id not in result:
+                        result.append(resource_id)
+                return result[:8]
+
+            title = clean_step_text("title", 80)
+            objective = clean_step_text("objective", 500)
+            output = clean_step_text("output", 240)
+            if not title or not objective or not output:
+                continue
+            tools = resources("tools", allowed_tools)
+            agents = resources("agents", allowed_agents)
+            tools = tools[:2]
+            agents = agents[: max(0, 4 - len(tools))]
+            normalized.append(
+                {
+                    "id": step_id,
+                    "title": title,
+                    "objective": objective,
+                    "output": output,
+                    "agents": agents,
+                    "skills": resources("skills"),
+                    "tools": tools,
+                }
+            )
+        return normalized or fallback
+
+    @staticmethod
+    def _coerce_skill_list_item(key: str, item: object) -> str:
+        """把模型误写的对象项转换为自然语言，永不暴露 Python dict repr。"""
+        if isinstance(item, str):
+            return item.strip()
+        if not isinstance(item, dict):
+            return ""
+
+        def first(*names: str) -> str:
+            for name in names:
+                value = item.get(name)
+                if isinstance(value, (str, int, float)) and str(value).strip():
+                    return str(value).strip()
+            return ""
+
+        if key in ("common_titles", "title_style"):
+            level = first("level", "层级", "position", "位置")
+            pattern = first("pattern", "骨架", "rule", "规则", "title", "标题")
+            boundary = first("boundary", "usage", "适用位置", "说明")
+            if pattern:
+                prefix = f"{level}：" if level else ""
+                suffix = f"；{boundary}" if boundary else ""
+                return f"{prefix}采用“{pattern}”的标题骨架{suffix}"
+        if key == "structure_pattern":
+            return first("role", "section", "title", "name", "章节角色", "内容")
+        if key == "writing_guidelines":
+            phrase = first("phrase", "term", "wording", "短语", "话术")
+            usage = first("role", "usage", "effect", "作用", "说明")
+            if phrase and usage:
+                return f"习惯用“{phrase}”{usage}"
+            return phrase or usage
+        if key == "suggested_category_keywords":
+            return first("path", "keyword", "name", "value", "类目")
+        return first("example", "text", "content", "value", "示例")
+
+    @classmethod
+    def _normalize_distinctive_sections(
+        cls,
+        raw: object,
+        fallback: list[dict],
+        document_title: str,
+        document_content: str,
+    ) -> list[dict]:
+        items = raw if isinstance(raw, list) else fallback
+        normalized: list[dict] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            title = cls._first_skill_mapping_text(item, "title", "name", "heading")
+            description = cls._first_skill_mapping_text(
+                item, "description", "analysis", "characteristic", "why"
+            )
+            guidance = cls._first_skill_mapping_text(
+                item, "guidance", "instruction", "how_to", "usage"
+            )
+            raw_examples = item.get("examples")
+            if not isinstance(raw_examples, list):
+                raw_examples = [item.get("example")] if item.get("example") else []
+
+            title = cls._generalize_skill_text(
+                title[:80], document_title, document_content, ""
+            )
+            description = cls._generalize_skill_text(
+                description[:1200], document_title, document_content, ""
+            )
+            guidance = cls._generalize_skill_text(
+                guidance[:1200], document_title, document_content, ""
+            )
+            examples = cls._distinct_skill_items(
+                [
+                    cls._generalize_skill_text(
+                        cls._coerce_skill_list_item("examples", example)[:800],
+                        document_title,
+                        document_content,
+                        "",
+                        overlap_window=28,
+                    )
+                    for example in raw_examples
+                    if cls._coerce_skill_list_item("examples", example)
+                ],
+                6,
+            )
+            fingerprint = re.sub(r"[\s\W_]+", "", title, flags=re.UNICODE)
+            if (
+                not title
+                or not description
+                or not guidance
+                or not examples
+                or fingerprint in seen
+            ):
+                continue
+            seen.add(fingerprint)
+            normalized.append(
+                {
+                    "title": title,
+                    "description": description,
+                    "guidance": guidance,
+                    "examples": examples,
+                }
+            )
+            if len(normalized) >= 6:
+                break
+        return normalized or fallback
+
+    @staticmethod
+    def _first_skill_mapping_text(value: dict, *keys: str) -> str:
+        for key in keys:
+            item = value.get(key)
+            if isinstance(item, (str, int, float)) and str(item).strip():
+                return str(item).strip()
+        return ""
+
+    @staticmethod
+    def _distinct_skill_items(items: list[str], maximum: int) -> list[str]:
+        result: list[str] = []
+        fingerprints: set[str] = set()
+        for item in items:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            fingerprint = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+            if not fingerprint or fingerprint in fingerprints:
+                continue
+            fingerprints.add(fingerprint)
+            result.append(text)
+            if len(result) >= maximum:
+                break
+        return result
+
+    @staticmethod
+    def _merge_skill_prose(primary: str, fallback: str, maximum: int) -> str:
+        first = str(primary or "").strip()
+        second = str(fallback or "").strip()
+        if not first:
+            return second[:maximum]
+        if not second or second in first:
+            return first[:maximum]
+        return f"{first}\n\n执行配方：{second}"[:maximum]
+
+    @staticmethod
+    def _compact_skill_placeholders(value: str) -> str:
+        """压缩脱敏产生的连续占位词，并拒绝只剩占位词的伪标题。"""
+        text = str(value or "").strip()
+        text = re.sub(
+            r"(?:目标对象[\s·—_:：/\\-]*){2,}",
+            "目标对象",
+            text,
+        )
+        text = re.sub(
+            r"(?:相关角色[\s·—_:：/\\-]*){2,}",
+            "相关角色",
+            text,
+        )
+        text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+        return re.sub(r"\s{2,}", " ", text).strip(" ：:·—_-/\\")
+
+    @staticmethod
+    def _is_complete_skill_heading_example(value: str) -> bool:
+        text = str(value or "").strip()
+        if len(re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)) < 4:
+            return False
+        if re.search(r"(?:目标对象|相关角色|相关团队)[的之]?$", text):
+            return False
+        if re.search(r"(?:看|关于|针对|面向)[，,:：]?$", text):
+            return False
+        return not bool(re.fullmatch(r"(?:目标对象|相关角色|相关团队)+", text))
+
+    @staticmethod
+    def _is_complete_skill_example_document(value: str) -> bool:
+        text = str(value or "").strip()
+        if len(text) < 1000:
+            return False
+        if len(re.findall(r"(?m)^#\s+\S", text)) != 1:
+            return False
+        if len(re.findall(r"(?m)^##\s+\S", text)) < 6:
+            return False
+        body_blocks = [
+            block.strip()
+            for block in re.split(r"\n\s*\n", text)
+            if block.strip() and not block.lstrip().startswith("#")
+        ]
+        return len([block for block in body_blocks if len(block) >= 40]) >= 8
 
     @staticmethod
     def _generalize_skill_text(
@@ -489,6 +1308,7 @@ Skill 命名与简介原则：
         document_title: str,
         document_content: str,
         fallback: str,
+        overlap_window: int = 14,
     ) -> str:
         """拒绝明显的组织线索和大段原文重合，避免提炼结果反向披露来源。"""
         text = str(candidate or "").strip()
@@ -506,8 +1326,8 @@ Skill 命名与简介原则：
             f"{document_title}\n{document_content}",
             flags=re.UNICODE,
         )
-        if len(compact_candidate) >= 14:
-            window = 14
+        if len(compact_candidate) >= overlap_window:
+            window = overlap_window
             for index in range(0, len(compact_candidate) - window + 1):
                 if compact_candidate[index:index + window] in compact_source:
                     return fallback
@@ -555,7 +1375,10 @@ Skill 命名与简介原则：
         candidate: str, document_title: str, document_content: str, doc_type: str
     ) -> str:
         """把模型命名收敛为不含具体组织的可复用文档用途。"""
-        source_text = f"{document_title}\n{document_content[:6000]}"
+        # 文档正文可能包含案例、引用或多轮 Bake 追加内容，不能仅因正文偶然
+        # 出现“复盘”“会议”等词就覆盖整枚技能的用途。用途特判只看标题和
+        # 已确认的文档类型，正文仍用于模型提炼具体写法。
+        source_text = f"{document_title}\n{doc_type}"
         if (
             re.search(r"跨部门|跨团队|多团队", source_text)
             and re.search(r"技术|架构|研发|系统", source_text)
@@ -574,6 +1397,14 @@ Skill 命名与简介原则：
             r"沟通|汇报|会议", source_text
         ):
             return "客户交付沟通文档"
+        if re.search(r"整体技术方案", source_text):
+            return "运行平台整体技术方案"
+        if re.search(r"技术架构|架构设计", source_text):
+            return "技术架构设计文档"
+        if re.search(r"技术方案", source_text):
+            return "技术方案文档"
+        if re.search(r"评测接入", source_text):
+            return "评测接入文档"
 
         normalized = str(candidate or "").strip()
         organization_pattern = re.compile(
@@ -585,6 +1416,10 @@ Skill 命名与简介原则：
         normalized = re.sub(r"沟通会(?:会议)?纪要(?:撰写)?指南$", "沟通会文档", normalized)
         normalized = re.sub(r"会议纪要(?:撰写)?指南$", "会议文档", normalized)
         normalized = normalized.strip(" \t\r\n·—_:：-")
+        if re.search(r"复盘|总结", normalized) and not re.search(
+            r"复盘|总结", source_text
+        ):
+            normalized = ""
         if len(normalized) >= 4 and not organization_pattern.search(normalized):
             return normalized[:80]
 
@@ -595,17 +1430,10 @@ Skill 命名与简介原则：
 
     @classmethod
     def _fallback_creation_skill_analysis(cls, title: str, content: str, doc_type: str) -> dict:
-        heading_matches = re.findall(r"^\s{0,3}#{1,4}\s+(.+?)\s*$", content, flags=re.MULTILINE)
-        if not heading_matches:
-            heading_matches = re.findall(
-                r"^\s*(?:[一二三四五六七八九十]+、|\d+(?:\.\d+)*[.、]\s*)(.{2,40})$",
-                content,
-                flags=re.MULTILINE,
-            )
+        source_headings = cls._extract_skill_source_headings(content, title)
         structure = []
-        for heading in heading_matches:
-            cleaned = re.sub(r"[*_`#]", "", heading).strip().rstrip("：:")
-            cleaned = cls._canonical_skill_heading(cleaned)
+        for heading in source_headings:
+            cleaned = cls._canonical_skill_heading(heading)
             if cleaned and cleaned not in structure:
                 structure.append(cleaned[:160])
             if len(structure) >= 10:
@@ -614,44 +1442,653 @@ Skill 命名与简介原则：
             structure = ["背景与目标", "核心分析", "方案设计", "实施与风险", "结论与后续"]
 
         base_type = (doc_type or "专业文档").strip()
-        common_titles = cls._generic_common_titles(base_type)
-        common_titles = list(dict.fromkeys(common_titles))
-        has_diagram = bool(re.search(r"```(?:mermaid|plantuml)|架构图|流程图|时序图|示意图|图\s*\d+", content, re.I))
-        avg_line = len(content) / max(1, len(content.splitlines()))
-        dense_style = "段落信息密度较高" if avg_line > 45 else "多用短段落和列表降低阅读负担"
+        title_design = cls._describe_heading_design_style(source_headings, content)
+        heading_examples = cls._heading_style_examples(source_headings, structure, title)
+        text_style = cls._describe_writing_flow(structure, content)
+        voice_style, voice_examples = cls._extract_voice_style(content)
+        diagram_style, diagram_examples = cls._diagram_generation_style(content)
+        distinctive_sections = cls._fallback_distinctive_sections(content)
         abstract_title = cls._normalize_creation_skill_title(base_type, title, content, doc_type)
+        field_examples = cls._default_skill_field_examples()
+        field_examples.update(
+            {
+                "common_titles": heading_examples,
+                "title_style": list(heading_examples),
+                "text_style": [cls._fallback_flow_example(structure, content)],
+                "diagram_style": diagram_examples,
+                "structure_pattern": [" → ".join(structure)],
+                "writing_guidelines": voice_examples,
+            }
+        )
+        skill_description = cls._fallback_skill_description(
+            abstract_title,
+            base_type,
+            title,
+            content,
+        )
+        execution_steps = cls._fallback_skill_execution_steps(
+            abstract_title,
+            base_type,
+            title,
+            content,
+        )
         return {
             "title": abstract_title,
-            "summary": f"适合需要创作{abstract_title}的专业人员，用于复用这类文档的标题、结构、表达和图示习惯，提高沟通与交付效率。"[:400],
-            "common_titles": common_titles,
-            "title_style": "标题以明确的业务对象或交付物为核心，一级标题概括结论，二三级标题说明分析维度或执行动作。",
-            "text_style": f"整体采用正式、直接的专业表达，先交代背景和约束，再给出判断、方案与依据；{dense_style}，关键结论使用列表突出。",
-            "diagram_style": (
-                "文档已有图示习惯，优先延续分层结构、关键流程和关系连线，图题说明结论，避免装饰性图形。"
-                if has_diagram
-                else "只在结构或流程难以用文字快速理解时绘图，优先使用分层架构图、流程图或对比表，配色克制并保持标注一致。"
-            ),
+            "summary": f"适合需要创作{abstract_title}的专业人员，用于直接复刻源文档的子标题句式、章节推进、惯用话术和代码生图方式。"[:400],
+            "common_titles": title_design,
+            "title_style": "；".join(title_design)[:1200],
+            "text_style": text_style,
+            "diagram_style": diagram_style,
             "structure_pattern": structure,
-            "writing_guidelines": [
-                "先写目标、范围与约束，再展开方案细节。",
-                "每个关键结论同时给出依据或取舍原因。",
-                "术语保持前后一致，避免空泛形容词。",
-                "图表必须服务于一个明确结论，并配有文字说明。",
-            ],
+            "writing_guidelines": voice_style,
+            "distinctive_sections": distinctive_sections,
             "section_headings": cls._default_skill_section_headings(),
-            "field_examples": cls._default_skill_field_examples(),
-            "example_document": cls._default_skill_example_document(base_type),
+            "field_examples": field_examples,
+            "example_document": cls._fallback_skill_example_document(
+                base_type,
+                source_headings,
+                content,
+            ),
+            "skill_description": skill_description,
+            "execution_steps": execution_steps,
             "suggested_category_keywords": [base_type],
         }
+
+    @staticmethod
+    def _fallback_skill_description(
+        abstract_title: str,
+        doc_type: str,
+        document_title: str,
+        content: str,
+    ) -> dict:
+        evidence = f"{document_title}\n{doc_type}\n{content[:6000]}"
+        domains = []
+        domain_rules = (
+            (r"金融|银行|支付|信贷|保险|证券|基金", "金融"),
+            (r"制造|工艺|产线|工业|质量", "制造"),
+            (r"电商|零售|商品|订单|履约", "电商零售"),
+            (r"产品|需求|用户体验|运营", "产品与运营"),
+            (r"技术|架构|系统|接口|软件|数据平台", "软件与技术"),
+            (r"咨询|行业研究|市场研究", "咨询与研究"),
+            (r"医疗|临床|药品|康养", "医疗健康"),
+            (r"教育|课程|教学|培训", "教育培训"),
+        )
+        for pattern, domain in domain_rules:
+            if re.search(pattern, evidence, re.I) and domain not in domains:
+                domains.append(domain)
+        if not domains:
+            domains.append("专业办公")
+
+        if re.search(r"研究|调研|分析|报告", evidence, re.I):
+            problem = "把分散资料和证据转化为有依据、可比较、可形成结论的分析"
+        elif re.search(r"方案|架构|设计|规划|建设", evidence, re.I):
+            problem = "把目标、约束和关键取舍转化为可评审、可执行、可验证的方案"
+        elif re.search(r"复盘|总结|纪要", evidence, re.I):
+            problem = "从过程记录中提炼事实、判断、行动项和后续验证方式"
+        else:
+            problem = "把零散需求与事实组织成结构清晰、可直接使用的专业文档"
+
+        return {
+            "purpose": (
+                f"用于在需要创作{abstract_title}时，复用源文档形成事实、分析、"
+                "方案和交付结论的方法，同时保持其标题、结构与表达特征。"
+            )[:1200],
+            "document_types": [abstract_title[:120]],
+            "problems": [problem[:240]],
+            "domains": domains[:12],
+            "deliverables": [
+                f"一份结构完整、依据清楚并包含后续动作的{abstract_title}"[:240]
+            ],
+        }
+
+    @staticmethod
+    def _fallback_skill_execution_steps(
+        abstract_title: str,
+        doc_type: str,
+        document_title: str,
+        content: str,
+    ) -> list[dict]:
+        evidence = f"{document_title}\n{doc_type}\n{content[:6000]}"
+        steps = [
+            {
+                "id": "collect-context",
+                "title": "收集需求与事实",
+                "objective": "明确创作目标、读者、范围、已有资料和不能推断的事实边界。",
+                "output": "需求清单、事实材料和待核验项",
+                "agents": [],
+                "skills": [],
+                "tools": ["memory_search"],
+            }
+        ]
+        if re.search(r"行业|市场|竞品|研究|调研|政策|趋势", evidence, re.I):
+            steps.append(
+                {
+                    "id": "research-industry",
+                    "title": "开展行业调研",
+                    "objective": "补充外部环境、通行做法和来源可追溯的行业证据。",
+                    "output": "带来源的行业事实、趋势与可比较案例",
+                    "agents": ["industry_research_agent"],
+                    "skills": [],
+                    "tools": ["internet_search"],
+                }
+            )
+        if re.search(r"数据|指标|统计|趋势|成本|收益|测算|分析", evidence, re.I):
+            steps.append(
+                {
+                    "id": "analyze-data",
+                    "title": "分析数据与证据",
+                    "objective": "核对数据口径，识别关键关系、差异和支撑结论的证据。",
+                    "output": "数据判断、口径说明和证据缺口",
+                    "agents": ["data_analysis_agent"],
+                    "skills": [],
+                    "tools": [],
+                }
+            )
+        if re.search(r"方案|架构|设计|规划|建设|实施", evidence, re.I):
+            steps.append(
+                {
+                    "id": "design-solution",
+                    "title": "设计方案",
+                    "objective": "把目标、约束和证据转化为有边界、有取舍、有验证方式的方案。",
+                    "output": "方案结构、关键设计、实施路径和风险控制",
+                    "agents": ["solution_design_agent"],
+                    "skills": [],
+                    "tools": ["plantuml_diagram"]
+                    if re.search(r"架构|流程|链路|交互|模块", evidence, re.I)
+                    else [],
+                }
+            )
+        steps.extend(
+            [
+                {
+                    "id": "draft-document",
+                    "title": "撰写完整文档",
+                    "objective": f"依据前序产出和 Skill 的风格指纹完成{abstract_title}，不补造事实。",
+                    "output": "可继续编辑的完整 Markdown 文档",
+                    "agents": ["document_writer_agent"],
+                    "skills": [],
+                    "tools": [],
+                },
+                {
+                    "id": "review-delivery",
+                    "title": "审校并交付",
+                    "objective": "检查目标回应、事实依据、结构完整、术语一致和行动可执行性。",
+                    "output": "通过质量检查的最终文档与待核验项",
+                    "agents": ["quality_review_agent"],
+                    "skills": [],
+                    "tools": [],
+                },
+            ]
+        )
+        return steps[:8]
+
+    @staticmethod
+    def _extract_skill_source_headings(content: str, document_title: str) -> list[str]:
+        markdown_matches = re.findall(
+            r"^\s{0,3}(#{1,6})\s+(.+?)\s*$",
+            content,
+            flags=re.MULTILINE,
+        )
+        candidates: list[tuple[int, str]] = [
+            (
+                len(markers),
+                re.sub(r"[*_`#]", "", heading).strip().rstrip("：:"),
+            )
+            for markers, heading in markdown_matches
+        ]
+        if not candidates:
+            numbered = re.findall(
+                r"^\s*(?:[一二三四五六七八九十]+、|\d+(?:\.\d+)*[.、]\s*)(.{2,80})$",
+                content,
+                flags=re.MULTILINE,
+            )
+            candidates = [(2, heading.strip().rstrip("：:")) for heading in numbered]
+
+        normalized_title = re.sub(r"[\s\W_]+", "", document_title, flags=re.UNICODE)
+        result: list[str] = []
+        fingerprints: set[str] = set()
+        for _, heading in candidates:
+            if not heading:
+                continue
+            fingerprint = re.sub(r"[\s\W_]+", "", heading, flags=re.UNICODE)
+            if not fingerprint or fingerprint == normalized_title or fingerprint in fingerprints:
+                continue
+            fingerprints.add(fingerprint)
+            result.append(heading[:120])
+            if len(result) >= 24:
+                break
+        return result
+
+    @staticmethod
+    def _describe_heading_design_style(headings: list[str], content: str) -> list[str]:
+        """从实际子标题归纳可复刻的命名指纹，不虚构常见标题。"""
+        if not headings:
+            return [
+                "层级边界：源文档没有可识别的独立子标题；仿写时只在话题明确切换处增加标题",
+                "句式骨架：新增标题用“内容对象＋章节动作”的短名词结构，不写完整结论句",
+                "使用边界：连续论述优先靠段落承接，不为了显得完整而强行拆成多层目录",
+                "措辞选择：标题直接概括下一段承担的职责，不使用宣传口号或空泛形容词",
+            ]
+
+        lengths = [len(re.sub(r"\s+", "", item)) for item in headings]
+        average = sum(lengths) / len(lengths)
+        length_style = (
+            "长度节奏：子标题以四到八字的短名词结构为主；同层标题保持相近长度，便于扫读"
+            if average <= 8
+            else "长度节奏：子标题多为带限定语的中等长度短句；先限定对象或范围，再落到章节动作"
+        )
+        observations = [length_style]
+        joined = "\n".join(headings)
+        if re.search(r"[与及和]", joined):
+            observations.append("并列骨架：使用“名词或动作＋与/及＋名词或结果”；只并列同一章节内同层级的两个重点")
+        if re.search(r"[：:]", joined):
+            observations.append("冒号骨架：使用“主题＋冒号＋具体判断或动作”；冒号前定位话题，冒号后给阅读重点")
+        if re.search(r"[？?]|为何|为什么|如何|怎么", joined):
+            observations.append("问句骨架：把待回答的问题直接写入标题；正文首段必须紧接着给出判断或方案")
+        if re.search(r"从.{1,12}(?:视角|角度|层面).{0,4}看", joined):
+            observations.append("视角骨架：使用“从某一视角看，目标对象”；只在切换分析立场时使用，不当通用前缀")
+        if re.search(r"建设|设计|实现|落地|优化|验证|复盘|说明|分析", joined):
+            observations.append("动作标记：保留“设计、实现、验证、复盘”等任务词；用动作说明章节职责，不用抽象形容词")
+        if re.search(r"背景|目标|现状|方案|风险|验证|结论|后续", joined):
+            observations.append("路线标题：直接使用背景、目标、方案、风险、验证、后续等内容角色词，让目录呈现推进顺序")
+        if re.search(r"[A-Za-z]{2,}", joined):
+            observations.append("术语嵌入：英文技术词作为精确对象嵌入中文标题；保留必要术语，不把整句改成英文口号")
+        if len(observations) < 4:
+            observations.append("层级一致：同层标题保持相同语法结构，不在名词短语、问句和完整结论句之间随意切换")
+        return list(dict.fromkeys(observations))[:8]
+
+    @classmethod
+    def _heading_style_examples(
+        cls, headings: list[str], structure: list[str], document_title: str
+    ) -> list[str]:
+        """最小替换标题中的敏感对象，保留源标题的词序、动词和标点。"""
+        examples: list[str] = []
+        generic_prefixes = ("总体", "核心", "背景", "现状", "目标", "范围", "风险", "结论", "后续")
+        sensitive_tail = re.compile(
+            r"^(.{2,16}?)(迁移方案|优化方案|实施方案|设计方案|架构设计|流程设计|复盘报告|分析报告)$"
+        )
+        preserved_terms = {
+            "api", "sdk", "os", "runtime", "agent", "ai", "ui", "ux", "http", "https"
+        }
+        title_fragments = [
+            fragment
+            for fragment in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", document_title)
+            if fragment.lower() not in preserved_terms
+        ]
+        chinese_core = re.sub(
+            r"(?:整体)?(?:技术)?(?:方案|文档|报告|设计|规划|说明|手册|指南)$",
+            "",
+            re.sub(r"[A-Za-z0-9_\-\s]+", "", document_title),
+        ).strip()
+        if len(chinese_core) >= 2:
+            title_fragments.append(chinese_core)
+
+        source_examples = [document_title, *headings]
+        for heading in source_examples:
+            candidate = re.sub(r"`[^`]+`|“[^”]+”|「[^」]+」", "目标对象", heading)
+            candidate = re.sub(r"\d+(?:\.\d+)*", "阶段", candidate)
+            candidate = re.sub(
+                r"[\w·-]{1,16}?(?:事业群|事业部|研发中心|产品部|项目组|工作组)",
+                "相关团队",
+                candidate,
+            )
+            for fragment in sorted(title_fragments, key=len, reverse=True):
+                candidate = re.sub(
+                    re.escape(fragment),
+                    "协作工作台",
+                    candidate,
+                    flags=re.IGNORECASE,
+                )
+            candidate = re.sub(
+                r"\b[A-Z][A-Za-z0-9_-]{2,}\b",
+                lambda match: (
+                    match.group(0)
+                    if match.group(0).lower() in preserved_terms
+                    else "协作工作台"
+                ),
+                candidate,
+            )
+            candidate = cls._compact_skill_placeholders(candidate)
+            matched = sensitive_tail.match(candidate)
+            if matched and not matched.group(1).startswith(generic_prefixes):
+                candidate = f"协作工作台{matched.group(2)}"
+            if re.fullmatch(
+                r"从.{1,12}(?:视角|角度|层面)看[，,:：]?(?:协作工作台|目标对象)",
+                candidate,
+            ):
+                candidate = f"{candidate}的角色与边界"
+            if re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_-]*\s*[：:]\s*(?:协作工作台|目标对象)",
+                candidate,
+            ):
+                candidate = f"{candidate}的调度边界"
+            if cls._contains_named_private_marker(candidate):
+                candidate = cls._canonical_skill_heading(candidate)
+            candidate = cls._compact_skill_placeholders(candidate)
+            semantic_remainder = re.sub(
+                r"目标对象|相关角色|相关团队|阶段|[\s\W_]+",
+                "",
+                candidate,
+                flags=re.UNICODE,
+            )
+            if (
+                len(semantic_remainder) >= 2
+                and cls._is_complete_skill_heading_example(candidate)
+                and candidate not in examples
+            ):
+                examples.append(candidate[:80])
+            if len(examples) >= 6:
+                break
+        if not examples:
+            examples = structure[:3]
+        return examples
+
+    @staticmethod
+    def _fallback_distinctive_sections(content: str) -> list[dict]:
+        """从可观察证据生成固定字段之外的特色亮点，最多保留四项。"""
+        sections: list[dict] = []
+
+        def add(title: str, description: str, guidance: str, examples: list[str]) -> None:
+            if len(sections) < 4:
+                sections.append(
+                    {
+                        "title": title,
+                        "description": description,
+                        "guidance": guidance,
+                        "examples": examples,
+                    }
+                )
+
+        if re.search(r"定义|可以理解为|核心目标|换言之", content[:4000]):
+            add(
+                "定义先行的概念建立",
+                "源文档在展开方案前先解释核心对象是什么、解决什么问题，再用核心目标限定后续讨论，定义本身承担阅读入口。",
+                "核心对象首次出现时，先用一句通俗类比降低理解门槛，再补一句职责边界；随后列出目标或非目标。仅在术语可能被不同角色误解时使用。",
+                [
+                    "协作工作台可以理解为任务流转的统一入口：它连接请求、处理角色与结果证据，但不替代各环节的专业判断。",
+                    "核心目标是让接手者在不额外询问的情况下，判断当前状态、下一步动作与完成依据。",
+                ],
+            )
+        label_count = len(re.findall(r"(?:\*\*)?[^。\n：:]{2,18}(?:\*\*)?[：:]", content))
+        if label_count >= 3:
+            add(
+                "短标签驱动的信息展开",
+                "源文档反复用短标签加冒号定位信息角色，再在同一行或后续短段中补充解释，使高密度内容仍能快速扫描。",
+                "标签控制在一个概念或动作内，并让同组标签保持同一语法类型；冒号后先给结论，再补条件。连续论证不要强行拆成标签。",
+                [
+                    "职责边界：维护角色只确认自己能够验证的资源状态，不代替申请角色补写用途。",
+                    "完成证据：释放动作必须留下可观察结果，无法确认时回到复核状态。",
+                ],
+            )
+        if re.search(r"```(?:plantuml|mermaid)", content, re.I):
+            add(
+                "代码图示与正文同词复现",
+                "源文档把可执行图示代码放在解释之后，并让节点、分组和连线继续使用正文已经建立的术语，图不是独立装饰。",
+                "先用正文说明阅读顺序和关键关系，再给 PlantUML 或 Mermaid 代码；图中只保留正文已有对象，连线使用动作词，图后补充异常或边界。",
+                [
+                    "正文先说明申请、确认与释放的主链路，再用 PlantUML 活动图纵向排列动作，并把跨角色步骤放入对应泳道。"
+                ],
+            )
+        if len(re.findall(r"(?m)^\s*---+\s*$", content)) >= 2:
+            add(
+                "分隔线控制议题切换",
+                "源文档用独立分隔线标记较大的议题或文档入口切换，让读者在长内容中明确感知上下文已经重置。",
+                "只在讨论对象或交付目标发生明显变化时使用分隔线；分隔线后重新给出标题或一句入口判断，不把它当作普通段落装饰。",
+                [
+                    "完成总体方案说明后使用分隔线，下一部分以“评测接入：先明确入口与返回结果”重新建立阅读上下文。"
+                ],
+            )
+        return sections
+
+    @staticmethod
+    def _describe_writing_flow(structure: list[str], content: str) -> str:
+        route = " → ".join(structure)
+        list_count = len(re.findall(r"^\s*(?:[-*+]|\d+[.、])\s+", content, re.MULTILINE))
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", content) if part.strip()]
+        avg_paragraph = sum(map(len, paragraphs)) / max(1, len(paragraphs))
+        paragraph_style = (
+            "段内承载较多解释，通常先给判断，再连续补充原因、边界和落法"
+            if avg_paragraph > 120
+            else "用短段落推进，一个段落只承担一个判断、动作或补充说明"
+        )
+        list_style = (
+            "遇到并列动作或条件时切成列表，列表项保持同一语法起点"
+            if list_count
+            else "主要依靠连续段落而非清单推进，段与段之间用因果或递进关系承接"
+        )
+        opener = (
+            "开篇先给定义或核心判断，再补适用范围，读者无需读完背景才知道文档要解决什么"
+            if re.search(r"定义|可以理解为|核心目标|总体来看", content[:1200])
+            else "开篇先交代问题角色、适用范围和目标，再进入分析，不用口号或宽泛行业背景铺垫"
+        )
+        label_style = (
+            "信息展开时大量使用“短标签＋冒号＋解释”，标签负责定位信息类型，冒号后补依据或动作"
+            if len(re.findall(r"\*\*[^*\n]{2,20}\*\*[：:]", content)) >= 2
+            else "信息展开以完整判断句为主，只在同层信息需要快速扫描时切换为标签或列表"
+        )
+        transition_phrases = [
+            phrase
+            for phrase in ("需要说明的是", "具体而言", "基于此", "同时", "此外", "因此", "最后")
+            if phrase in content
+        ]
+        transition_style = (
+            f"章节与段落之间沿用“{'、'.join(transition_phrases[:4])}”等连接词，分别承担补充、递进或收束"
+            if transition_phrases
+            else "章节之间靠标题角色和前后因果自然承接，不额外堆叠“首先、其次、最后”等模板连接词"
+        )
+        return (
+            f"章节路线：全文沿“{route}”推进，标题本身承担阅读导航；中段展开分析、方案或取舍，"
+            f"末段必须落到验证和后续动作。开篇配方：{opener}。段内配方：{paragraph_style}，"
+            f"通常先写本段判断，再补原因、边界和落法。列表条件：{list_style}，不要把相互依赖的论证"
+            f"拆成彼此孤立的要点。信息密度：{label_style}。衔接方式：{transition_style}。"
+            "段落节奏：定义、判断、依据和动作分别承担清晰职责；同一段出现多个转折时应拆段，但不要把一句完整论证切成口号。"
+            "收束要求：结尾回看目标、给出可验证结果和下一步，不重复摘要，也不新增未经前文论证的判断。"
+            "不可迁移项：只复刻标题句法、信息顺序和语气，不复制源文档的专名、事实、结论、日期或指标；"
+            "源文档缺少证据的图示、列表和结论句也不能为了形式完整而补造。"
+            "交付前自检：逐节确认标题是否预告正文职责、首段是否立即回应标题、并列项是否同构、结尾是否留下可执行动作与验证依据。"
+        )
+
+    @staticmethod
+    def _extract_voice_style(content: str) -> tuple[list[str], list[str]]:
+        phrase_roles = (
+            ("需要说明的是", "引出边界、例外或容易误解的前提"),
+            ("值得注意的是", "提示风险或需要读者停顿关注的信息"),
+            ("具体而言", "把上一层判断拆成可执行细节"),
+            ("基于此", "承接前文依据并转入结论或方案"),
+            ("换言之", "用更直接的说法重述复杂判断"),
+            ("总体来看", "在段落或章节末收束判断"),
+            ("首先", "开启有顺序的论述或动作清单"),
+            ("其次", "延续同层级的第二个论点"),
+            ("最后", "收束一组论点并转入结论"),
+            ("同时", "补充并行条件或同步动作"),
+            ("此外", "增加独立但相关的补充信息"),
+            ("因此", "从原因过渡到判断、动作或结果"),
+            ("建议", "用克制语气提出行动"),
+            ("需要", "直接声明必要动作或约束"),
+            ("应当", "以规范性语气提出要求"),
+            ("必须", "标记不可让步的硬约束"),
+            ("优先", "表达取舍顺序而不使用夸张措辞"),
+            ("避免", "用负向动作明确禁止项"),
+            ("确保", "把动作落到预期结果"),
+            ("明确", "要求把模糊对象、边界或责任说具体"),
+        )
+        matched_phrases = [
+            (phrase, role)
+            for phrase, role in phrase_roles
+            if phrase in content
+        ]
+        styles = [
+            (
+                f"证据话术“{phrase}”：源文档用它{role}；复刻时把它放在承担同类职责的句首，"
+                "后面紧接完整判断、条件或动作，不让短语单独成句；同一段只使用一次，"
+                "没有对应逻辑关系时不要把它当作装饰性连接词。"
+            )
+            for phrase, role in matched_phrases[:5]
+        ]
+
+        if "：" in content:
+            styles.append(
+                "标点句式“短标签＋冒号＋解释”：源文档用冒号把信息角色和具体内容分开；"
+                "复刻时标签保持短而同构，冒号后先写核心判断再补依据，适合定义、约束和并列说明；"
+                "连续论证或因果链不要硬拆成标签。"
+            )
+        if "；" in content:
+            styles.append(
+                "长句节奏“分号切分同层判断”：源文档用分号承载彼此并列且各自完整的信息；"
+                "复刻时让分号两侧保持相同语法起点和相近粒度，读完仍是一组判断；"
+                "存在先后、因果或转折时应拆句，不用分号掩盖关系。"
+            )
+        if re.search(r"^\s*[-*+]\s+", content, re.MULTILINE):
+            styles.append(
+                "列表话术“动作词先行”：源文档把可并列扫描的动作、条件或结果写成列表；"
+                "复刻时每项先用同类动词或名词短语点明职责，再补对象与边界，语气直接克制；"
+                "相互依赖的论证仍保留连续段落。"
+            )
+
+        modal_words = [
+            word for word in ("建议", "需要", "应当", "必须", "优先", "避免", "确保", "明确")
+            if word in content
+        ]
+        if modal_words:
+            styles.append(
+                f"动作语气“{'、'.join(modal_words[:4])}”：源文档用这些词区分建议、必要动作、"
+                "优先级与禁止项；复刻时把动作主体、作用对象和预期结果写全，强弱程度沿用原文证据；"
+                "没有硬约束依据时不得把“建议”擅自升级为“必须”。"
+            )
+
+        if not matched_phrases:
+            styles.insert(
+                0,
+                "话术证据边界：源文档没有识别出稳定反复出现的标志性短语，复刻时以原有句法、"
+                "标点和动作词为准，不额外植入“首先、其次、综上”等模板过渡语；"
+                "需要承接时直接写清前后判断的因果、递进或范围变化。"
+            )
+
+        styles.extend(
+            [
+                (
+                    "句式节奏复刻：源文档以能够独立成立的陈述句承载判断，复刻时先写清谁对什么采取何种动作，"
+                    "再用后句补原因、条件或结果；一个句子只保留一条主逻辑，出现多次转折时拆句，"
+                    "但不把完整论证切成缺少主谓的口号。"
+                ),
+                (
+                    "术语与指代控制：从源文档提取可公开复用的专业称呼后，为同一概念固定一种叫法，"
+                    "后文只在指代对象明确时使用“该对象”“这一过程”等代词；"
+                    "不得为了显得专业堆叠近义词，也不得把来源专名带入新的虚构主题。"
+                ),
+                (
+                    "段落语气迁移：延续源文档先判断、再补依据与适用边界的完整陈述，"
+                    "主语和动作保持明确，专业词首次出现时给出足够上下文；"
+                    "只迁移表达顺序与语气，不复制来源中的专名、事实、指标和业务结论。"
+                ),
+                (
+                    "话术交付自检：逐段检查连接词是否真的对应补充、递进、因果或收束，"
+                    "动作词是否带清楚的执行对象与结果，列表项是否同构，强制语气是否有依据；"
+                    "删去不承担信息作用的套话，并统一同一概念的称呼。"
+                ),
+            ]
+        )
+        styles = list(dict.fromkeys(styles))
+        # 优先保留源文档中的短语证据，同时保证配方至少包含迁移边界和交付检查。
+        if len(styles) > 8:
+            styles = [*styles[:6], *styles[-2:]]
+        while sum(len(item) for item in styles) > 700 and len(styles) > 5:
+            styles.pop(-3)
+        phrases = [
+            phrase for phrase, _ in phrase_roles if phrase in content
+        ][:3]
+        examples = (
+            [
+                f"{phrase}，相关角色先确认适用边界，再推进后续动作。"
+                for phrase in phrases
+            ]
+            if phrases
+            else ["源文档没有稳定的惯用短语，仿写时不额外植入模板化套话。"]
+        )
+        return styles[:8], examples
+
+    @staticmethod
+    def _diagram_generation_style(content: str) -> tuple[str, list[str]]:
+        lower = content.lower()
+        if "```plantuml" in lower or "@startuml" in lower:
+            choice = (
+                "源文档存在 PlantUML 代码图示，继续使用 PlantUML，并根据正文实际关系选择组件图、"
+                "时序图或活动图；默认保留源图从左到右的主阅读方向，用 package 或 rectangle 表达边界。"
+            )
+            example = "PlantUML：按正文层级用 package 分组，核心对象放在主轴上，关系箭头使用正文中的动作词标注。"
+        elif "```mermaid" in lower:
+            choice = (
+                "源文档存在 Mermaid 代码图示，继续使用 Mermaid，并沿用 flowchart 或 "
+                "sequenceDiagram 的表达方式；节点使用短名词，连线使用动作词，分组边界与正文层级对应。"
+            )
+            example = "Mermaid flowchart：主流程沿同一方向排列，分支只表达正文已经解释的判断条件。"
+        elif re.search(r"时序图|调用链|交互顺序", content, re.I):
+            choice = (
+                "源文档以时间顺序解释交互，推荐 PlantUML sequence diagram；参与者按正文首次出现"
+                "顺序排列，消息箭头使用动作词，异常或条件链路放入 alt 分组。"
+            )
+            example = "PlantUML 时序图：参与者按出现顺序排列，主链路使用实线箭头，条件分支放入 alt 区块。"
+        elif re.search(r"架构图|组件图|分层|模块关系", content, re.I):
+            choice = (
+                "源文档存在分层、模块或依赖关系，推荐 PlantUML component diagram；"
+                "同层对象横向对齐，使用 package 分组边界，只保留正文重点讨论的关键依赖。"
+            )
+            example = "PlantUML 组件图：用 package 表示层级，用 component 表示模块，依赖箭头标注正文中的关系动词。"
+        elif re.search(r"流程图|步骤|流转|审批", content, re.I):
+            choice = (
+                "源文档存在步骤、流转或审批关系，推荐 PlantUML activity diagram；"
+                "主流程从上到下排列，判断节点写成问题，角色发生切换时使用泳道。"
+            )
+            example = "PlantUML 活动图：主流程纵向排列，判断使用条件分支，跨角色动作放入对应泳道。"
+        else:
+            choice = (
+                "源文档未识别到图示代码或图片说明，默认不生成图片；只有当对象关系、时间交互或"
+                "条件流程仅靠连续文字难以准确理解时，才使用 PlantUML 补充组件图、时序图或活动图。"
+            )
+            example = "默认不生成图片；确需补图时使用 PlantUML，并只画正文已经说明的对象、边界和关系。"
+
+        recipe = (
+            f"证据与启用条件：{choice}"
+            "选型判断：稳定依赖或分层关系用组件图，跨角色的先后消息用时序图，带判断与回退的动作链用活动图；"
+            "同一张图只回答一个核心问题，无法明确图要解释什么时继续使用文字。"
+            "信息筛选：先从正文提取已经定义的对象、边界、动作、条件和结果，再删去背景铺垫、评价性形容词、"
+            "未被正文解释的内部细节与敏感事实；图中不得新增来源没有支持的节点、关系或结论。"
+            "布局与阅读路径：主链路保持单一方向，核心对象放在视觉主轴，同层元素对齐，跨层关系通过分组边界表达；"
+            "分支从触发点就近展开，避免箭头交叉和读者来回跳读。"
+            "元素与标注：节点名称沿用正文中的短名词，箭头使用可执行的关系动词，条件写在分支或消息上，"
+            "边界用 package、rectangle、subgraph 或泳道表示；同类元素必须采用同一种形状和命名粒度。"
+            "视觉规则：使用暖灰、深棕与低饱和强调色区分层级，颜色只承担分组、状态或重点提示，不用渐变、阴影、"
+            "装饰图标和无意义图例；正文术语、图中术语与标题保持完全一致。"
+            "图文衔接：在图前先用一段话说明阅读方向、图要回答的问题和暂不覆盖的边界，图后只解释关键关系、"
+            "异常分支及其对方案的影响，不逐节点复述图面。"
+            "禁用边界与自检：不把大段正文塞进节点，不用一张图同时承载架构、时序和流程，不用图替代必要的决策依据；"
+            "交付前检查代码能否渲染、方向是否唯一、连线是否有语义、术语是否一致、每个元素是否都能回指正文。"
+        )
+        return recipe, [example]
+
+    @staticmethod
+    def _fallback_flow_example(structure: list[str], content: str) -> str:
+        opener = "首先，" if "首先" in content else ""
+        connector = "基于此，" if "基于此" in content else "随后，"
+        closer = "因此，" if "因此" in content else "最后，"
+        return (
+            f"{opener}先界定示例事项的目标与适用范围，并直接说明本次不处理的边界，"
+            "让读者在进入方案前先形成同一问题定义。\n\n"
+            f"{connector}按“{' → '.join(structure[:4])}”推进：每一节先给判断，"
+            "再补充形成判断的依据、影响范围和具体落法；只有并列条件需要快速比较时才改用列表。\n\n"
+            f"{closer}回到开篇目标，用可观察的验证结果收束判断，并明确后续动作、责任边界和复核方式。"
+        )
 
     @staticmethod
     def _canonical_skill_heading(heading: str) -> str:
         """把源章节归并为通用章节角色，不保留项目、产品或组织名称。"""
         mappings = (
             (r"背景|现状|概述", "背景与目标"),
+            (r"为什么|为何|原因|必要性|问题", "问题与原因"),
             (r"目标|范围", "目标与范围"),
             (r"约束|原则", "约束与设计原则"),
             (r"架构|总体设计", "总体方案"),
+            (r"方案|策略|路径|落地", "方案设计"),
             (r"流程|步骤", "核心流程"),
             (r"功能|模块", "核心设计"),
             (r"接口|数据", "接口与数据"),
@@ -677,52 +2114,205 @@ Skill 命名与简介原则：
     @staticmethod
     def _default_skill_section_headings() -> dict[str, str]:
         return {
-            "common_titles": "这类文档标题通常怎么命名",
-            "title_style": "标题如何传递重点",
-            "text_style": "正文怎样组织和表达",
-            "diagram_style": "图示怎样服务于内容",
-            "structure_pattern": "从开篇到结论的章节骨架",
-            "writing_guidelines": "保持这份风格的关键约束",
+            "common_titles": "标题设计风格",
+            "title_style": "标题设计风格",
+            "text_style": "行文设计思路",
+            "diagram_style": "图片生成方式",
+            "structure_pattern": "内部章节推进信息",
+            "writing_guidelines": "话术表达风格",
         }
 
     @staticmethod
     def _default_skill_field_examples() -> dict[str, list[str]]:
         return {
-            "common_titles": ["协作流程优化方案", "阶段复盘与后续行动报告"],
-            "title_style": ["协作流程优化方案：明确目标、范围与交付边界"],
-            "text_style": ["本方案先明确适用范围，再说明关键步骤、责任边界与验收方式。"],
-            "diagram_style": ["用泳道图展示提出、处理、复核三个阶段，并用统一图例标注责任角色。"],
+            "common_titles": ["现状与约束", "方案如何落到执行"],
+            "title_style": ["现状与约束", "方案如何落到执行"],
+            "text_style": ["先界定适用范围，再沿“现状 → 判断 → 动作 → 验证”逐层收束。"],
+            "diagram_style": ["PlantUML 活动图：主流程纵向排列，跨角色动作放入对应泳道。"],
             "structure_pattern": ["背景与目标 → 现状与约束 → 方案设计 → 实施计划 → 风险与验证"],
-            "writing_guidelines": ["把“提升效率”改写为“减少交接步骤，并设置可核验的完成标准”"],
+            "writing_guidelines": ["需要说明的是，目标对象只覆盖已经确认的适用范围。"],
         }
 
+    @classmethod
+    def _default_skill_example_document(cls, doc_type: str) -> str:
+        return cls._fallback_skill_example_document(doc_type, [], "")
+
     @staticmethod
-    def _default_skill_example_document(doc_type: str) -> str:
-        return f"""# 通用协作流程优化{doc_type or '方案'}
+    def _fallback_skill_example_document(
+        doc_type: str,
+        source_headings: list[str],
+        source_content: str,
+    ) -> str:
+        """构造足够长且随源标题句式变化的安全示例，供模型失败或结果过短时使用。"""
+        joined_headings = "\n".join(source_headings)
+        question_style = bool(
+            re.search(r"[？?]|为何|为什么|如何|怎么", joined_headings)
+        )
+        colon_style = bool(re.search(r"[：:]", joined_headings))
+        parallel_style = bool(re.search(r"[与及]", joined_headings))
+
+        def heading(
+            plain: str,
+            detail: str,
+            question: str,
+            parallel: str | None = None,
+        ) -> str:
+            if question_style:
+                return question
+            if colon_style:
+                return f"{plain}：{detail}"
+            if parallel_style and parallel:
+                return parallel
+            return plain
+
+        main_title = (
+            "共享评审空间：预约流程与协作边界优化方案"
+            if colon_style
+            else (
+                "共享评审空间预约流程与协作边界优化方案"
+                if parallel_style
+                else "共享评审空间预约流程优化方案"
+            )
+        )
+        background_heading = heading(
+            "背景与问题",
+            "一次冲突暴露出的状态断点",
+            "为什么现有预约方式需要调整",
+            "背景与问题界定",
+        )
+        scope_heading = heading(
+            "目标与范围",
+            "先明确要解决什么",
+            "这次要解决什么，不解决什么",
+            "目标与适用范围",
+        )
+        design_heading = heading(
+            "方案设计",
+            "让状态、责任与动作相互对应",
+            "方案如何落到执行",
+            "方案设计与角色分工",
+        )
+        flow_heading = heading(
+            "核心流程",
+            "从提出申请到完成释放",
+            "一次预约如何走完整个流程",
+            "申请流程与状态流转",
+        )
+        risk_heading = heading(
+            "风险与保障",
+            "异常不能重新回到人工猜测",
+            "出现异常时如何保持边界清楚",
+            "风险识别与异常保障",
+        )
+        validation_heading = heading(
+            "验证与复盘",
+            "用可观察结果收束判断",
+            "怎样判断这套方案真正有效",
+            "验证方式与后续复盘",
+        )
+        conclusion_heading = heading(
+            "结论与后续",
+            "把临时协调变成稳定机制",
+            "最终要形成什么结果",
+            "结论与后续行动",
+        )
+        connector = (
+            "基于此"
+            if "基于此" in source_content
+            else ("因此" if "因此" in source_content else "随后")
+        )
+        boundary_lead = (
+            "需要说明的是"
+            if "需要说明的是" in source_content
+            else "需要明确的是"
+        )
+        diagram = ""
+        lower_content = source_content.lower()
+        if "```plantuml" in lower_content or "@startuml" in lower_content:
+            diagram = """
+
+正文中的关系可按同样术语画成组件图，阅读顺序从申请角色进入状态服务，再到资源维护角色：
+
+```plantuml
+@startuml
+left to right direction
+actor 申请角色
+component 状态服务
+actor 维护角色
+申请角色 --> 状态服务 : 提交与确认
+状态服务 --> 维护角色 : 通知与复核
+维护角色 --> 状态服务 : 更新可用状态
+@enduml
+```"""
+        elif "```mermaid" in lower_content:
+            diagram = """
+
+正文中的状态变化使用同一组动作词表达，避免图中另造一套术语：
+
+```mermaid
+flowchart LR
+    提交申请 --> 检查冲突
+    检查冲突 --> 确认使用
+    确认使用 --> 完成释放
+```"""
+
+        return f"""# {main_title}
 
 ## 摘要
 
-本示例使用完全虚构的知识交接场景，展示如何明确目标、责任角色、执行步骤和验收方式。
+本文围绕一个完全虚构的共享评审空间场景，讨论预约信息分散、资源状态不透明和异常处理依赖口头协调的问题。方案的重点不是增加审批，而是让每次申请都能回答三个问题：当前由谁使用、下一步由谁处理、完成后凭什么确认资源已经释放。
 
-## 背景与目标
+全文先界定问题和适用范围，再把目标拆成可观察状态，随后给出角色分工、核心流程、异常保障与验证方式。所有判断都落到动作和证据，不使用真实组织、项目或业务数据。
 
-相关团队需要在任务变化时稳定传递必要信息，目标是减少遗漏，并让接手者能够独立完成后续工作。
+## {background_heading}
 
-## 现状与约束
+共享评审空间同时服务准备材料、集中讨论和结果确认等活动。现有做法只记录“有人预约”，却没有说明准备是否完成、临时变更是否被接收、使用结束后资源是否已经恢复。信息看似存在，真正执行时仍要逐人询问。
 
-当前资料分散、责任边界不清，且交接时间有限。本方案不依赖任何真实组织、项目或业务数据。
+问题的核心不是缺少一张登记表，而是状态、动作和责任没有对应关系。申请角色关心能否使用，维护角色关心是否满足开放条件，后续使用者关心资源何时重新可用；如果这些问题混在一个备注框里，任何变更都会重新触发人工确认。
 
-## 方案设计
+## {scope_heading}
 
-建立“准备、讲解、确认、复核”四个阶段；每个阶段明确输入、责任角色、输出和完成标准。
+本次优化只处理预约发起、冲突确认、使用准备、完成释放和异常复核。目标是让相关角色不依赖额外询问，也能从同一处判断当前状态、待办动作和完成证据。界面样式、空间硬件和人员排班不在本次方案范围内。
 
-## 实施与验证
+{boundary_lead}，范围约束不是附注，而是后续取舍的依据。凡是不能改变状态判断、责任归属或验证结果的信息，都不进入主流程；确需保留的补充说明放在对应动作之后，避免重要条件被长段背景淹没。
 
-先用一个虚构的非关键任务验证清单，再根据反馈调整模板，最后通过完成情况和独立操作结果验收。
+## {design_heading}
 
-## 结论
+方案把一次预约拆成“申请、确认、准备、使用、释放、复核”几个连续状态。每个状态都绑定进入条件、责任角色、应执行动作和完成证据；只有证据满足要求，状态才向后流转。这样既能保持流程简洁，也能避免角色凭经验猜测。
 
-通过统一结构和可核验标准，知识交接可以在不依赖特定业务背景的前提下稳定复用。"""
+角色分工遵循“谁产生信息，谁负责首次更新；谁消费结果，谁负责确认可用”的原则：
+
+- 申请角色说明使用目的、期望范围和必要准备，并对变更及时更新。
+- 维护角色检查冲突与开放条件，只对自己能够验证的状态作确认。
+- 使用角色在开始前确认资源状态，在结束后提交释放结果和遗留事项。
+- 复核角色只处理异常和争议，不重复参与每一次正常流转。
+
+## {flow_heading}
+
+流程从申请角色提交用途和范围开始。系统先检查同一时段是否存在冲突；没有冲突时进入准备状态，有冲突时返回可调整的条件，而不是只给出“失败”结果。申请角色据此修改范围或撤回请求，避免维护角色在多个沟通渠道间转述。
+
+{connector}，准备完成后由使用角色确认接手。确认动作意味着必要材料、访问边界和现场状态已经可用，而不是简单点击按钮。使用结束后，使用角色提交释放结果；若仍有遗留事项，则同时标明影响范围和下一位处理角色，流程不会把“已结束”误写成“已恢复”。
+
+## {risk_heading}
+
+主要风险来自三类断点：状态被更新但相关角色没有接收、异常被记录却没有明确下一步、完成结果缺少可复核证据。对应保障也不应写成宽泛口号，而要直接嵌入流程。
+
+- 关键状态变化只保留一个正式入口，其他渠道只发送提醒，不形成第二份事实。
+- 异常记录必须同时包含影响范围、临时处理和下一位责任角色。
+- 释放动作必须附带可观察结果；无法确认时回到复核状态，不直接标记完成。
+- 长时间没有推进的事项进入待复核列表，由相关角色判断继续、调整或关闭。{diagram}
+
+## {validation_heading}
+
+验证分为流程可执行性和结果可判断性。前者关注相关角色能否只凭当前记录完成下一步，后者关注状态变化是否都有对应证据。试运行期间不追求覆盖所有例外，而是优先验证主流程是否连续、异常是否能回到明确责任人。
+
+复盘时按“现象、判断、动作、结果”记录，不把意见数量当作效果。若某个节点仍需要反复口头确认，应先检查进入条件是否含糊；若不同角色对完成状态理解不一，应先修正证据定义，而不是继续增加提醒。
+
+## {conclusion_heading}
+
+这套方案把一次临时协调转化为可以被读取、执行和复核的状态链路。它保留必要的人为判断，但让判断发生在边界明确的位置；它减少重复询问，但不以隐藏异常为代价。
+
+后续优化应继续围绕同一目标展开：让每位相关角色在进入流程时知道自己为什么接手、需要完成什么、完成后留下什么证据。只要这三个问题能够稳定回答，共享资源的协作就不再依赖某位熟悉情况的人持续兜底。"""
 
     def _log_creation_usage(
         self,
@@ -967,14 +2557,23 @@ Skill 命名与简介原则：
             except Exception as exc:
                 logger.warning("向量召回失败: %s", exc)
 
-        # 合并去重
-        seen_ids = set()
-        merged_rows = []
+        # 合并去重。向量相似度必须保留下来参与统一评分；否则同一文档先被
+        # 关键词路径命中时，后到的向量证据会在去重时被静默丢弃。
+        merged_by_id: dict[int, dict] = {}
         for row in keyword_rows + vector_rows:
             doc_id = int(row.get("id") or 0)
-            if doc_id and doc_id not in seen_ids:
-                seen_ids.add(doc_id)
-                merged_rows.append(row)
+            if not doc_id:
+                continue
+            candidate = dict(row)
+            existing = merged_by_id.get(doc_id)
+            if existing is None:
+                merged_by_id[doc_id] = candidate
+                continue
+            existing["_vector_similarity"] = max(
+                float(existing.get("_vector_similarity") or 0),
+                float(candidate.get("_vector_similarity") or 0),
+            )
+        merged_rows = list(merged_by_id.values())
 
         if not merged_rows:
             return []
@@ -1055,6 +2654,65 @@ Skill 命名与简介原则：
             seen.add(key)
             deduped.append(item)
         return deduped[:6]
+
+    async def search_github_context(
+        self,
+        user_prompt: str,
+        parsed_requirement: dict,
+    ) -> list[GithubSearchResult]:
+        """检索公开 GitHub 仓库；不接收、不读取也不记录用户 Token。"""
+        keywords = [
+            str(item).strip()
+            for item in (parsed_requirement.get("keywords") or [])
+            if str(item).strip()
+        ]
+        topic = str(parsed_requirement.get("topic") or user_prompt).strip()
+        query = " ".join([*keywords[:5], topic[:80]]).strip()[:220]
+        if not query:
+            return []
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "MemoryBreadCreation/1.0",
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=12.0,
+                follow_redirects=True,
+                headers=headers,
+            ) as client:
+                response = await client.get(
+                    "https://api.github.com/search/repositories",
+                    params={
+                        "q": query,
+                        "sort": "stars",
+                        "order": "desc",
+                        "per_page": 5,
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            logger.warning("GitHub 公开仓库检索失败: %s", type(exc).__name__)
+            return []
+
+        results: list[GithubSearchResult] = []
+        for item in payload.get("items", [])[:5]:
+            full_name = str(item.get("full_name") or "").strip()
+            url = str(item.get("html_url") or "").strip()
+            if not full_name or not self._is_reasonable_web_url(url):
+                continue
+            results.append(
+                GithubSearchResult(
+                    full_name=full_name,
+                    url=url,
+                    description=self._clip(str(item.get("description") or ""), 320),
+                    stars=max(0, int(item.get("stargazers_count") or 0)),
+                    language=str(item.get("language") or ""),
+                    updated_at=str(item.get("updated_at") or ""),
+                )
+            )
+        return results
 
     def _query_document_rows(
         self,
@@ -1167,7 +2825,12 @@ Skill 命名与简介原则：
             # 按相似度排序
             scored_docs.sort(key=lambda x: x[1], reverse=True)
             logger.info("向量召回: %d个文档（相似度>0.5）", len(scored_docs))
-            return [doc for doc, score in scored_docs[:limit]]
+            recalled = []
+            for doc, score in scored_docs[:limit]:
+                item = dict(doc)
+                item["_vector_similarity"] = float(score)
+                recalled.append(item)
+            return recalled
 
         finally:
             conn.close()
@@ -1400,6 +3063,7 @@ Skill 命名与简介原则：
             ("汇报材料", ["汇报", "述职", "总结", "报告"]),
             ("制度文档", ["制度", "规范", "管理办法", "规定"]),
             ("产品方案", ["产品方案", "需求文档", "PRD", "MRD"]),
+            ("指南", ["指南"]),
         ]
         for doc_type, words in mapping:
             if any(word in text for word in words):
@@ -1433,20 +3097,26 @@ Skill 命名与简介原则：
             import jieba
             tokens = list(jieba.cut(text))
         except (ImportError, Exception):
-            # 智能切分：优先长词，避免重叠
+            # 无 jieba 时使用可预测的中文片段和二元词，避免把
+            # “写一份周年员工礼物指南”切成无法命中文档的畸形长词。
+            text_clean = re.sub(
+                r"(?:请|帮我|帮忙|给我|写一份|生成一份|生成|撰写|输出|制作)",
+                " ",
+                text,
+            )
+            segments = [
+                item
+                for item in re.split(r"[\s，。；：、,.!?！？的了是在]+", text_clean)
+                if len(item) >= 2
+            ]
             tokens = []
-            text_clean = text.replace("生成一份", "").replace("帮我", "")
-            i = 0
-            while i < len(text_clean):
-                matched = False
-                for length in [6, 5, 4, 3, 2]:
-                    if i + length <= len(text_clean):
-                        token = text_clean[i:i+length]
-                        if all(c not in "的了是在" for c in token):
-                            tokens.append(token)
-                            matched = True
-                            break
-                i += 1 if not matched else length
+            for segment in segments:
+                tokens.append(segment)
+                if len(segment) > 2:
+                    tokens.extend(
+                        segment[index:index + 2]
+                        for index in range(len(segment) - 1)
+                    )
 
         stop = {"帮我", "生成", "一份", "关于", "根据", "参考", "文档", "内容", "格式", "需要", "本次"}
         seen: set[str] = set()
@@ -1459,21 +3129,26 @@ Skill 命名与简介原则：
         return result[:12]
 
     def _score_relevance(self, row: dict, parsed_requirement: dict) -> float:
+        vector_similarity = min(
+            max(float(row.get("_vector_similarity") or 0), 0.0),
+            1.0,
+        )
         haystack = "\n".join(
             str(row.get(key) or "")
             for key in ["title", "doc_type", "summary", "full_content", "sections_json", "prompt_hint"]
         )
         keywords = parsed_requirement.get("keywords") or []
         if not keywords:
-            return 0.35
+            return max(0.35, vector_similarity)
         hits = sum(1 for word in keywords if word and word in haystack)
         title_hits = sum(1 for word in keywords if word and word in str(row.get("title") or ""))
         score = (hits / max(len(keywords), 1)) + min(title_hits, 3) * 0.12
-        if score < 0.4:  # 相关度过低直接返回0
-            return 0.0
+        if score < 0.4:
+            score = 0.0
         if parsed_requirement.get("doc_type") and parsed_requirement["doc_type"] == row.get("doc_type"):
             score += 0.15
-        return min(score, 1.0)
+        # 向量召回本身就是独立的相关性证据，不能再被词面分词结果清零。
+        return min(max(score, vector_similarity), 1.0)
 
     def _score_quality(self, row: dict) -> float:
         status = str(row.get("review_status") or "")

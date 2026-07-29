@@ -40,6 +40,7 @@ _STATE_DIR = Path.home() / ".memory-bread" / "state"
 _RUNTIME_STATUS_FILE = _STATE_DIR / "sidecar_runtime_status.json"
 _INSTANCE_LOCK_FILE = _STATE_DIR / "sidecar.instance.lock"
 _RUNTIME_STATUS_CACHE: dict | None = None
+_RUNTIME_STATUS_LOCK = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 日志配置
@@ -65,40 +66,37 @@ def _write_runtime_status(
 ) -> None:
     """写入关键后台能力状态，供 Core Engine 监控页读取。"""
     global _RUNTIME_STATUS_CACHE
-    _RUNTIME_STATUS_CACHE = {
-        "mode": mode,
-        "full_dispatch_ready": full_dispatch_ready,
-        "background_processor_running": background_processor_running,
-        "critical_checks_passed": critical_checks_passed,
-        "embedding_ok": embedding_ok,
-        "issues": list(issues or []),
-        "checks": checks or {},
-    }
-    payload = {
-        "mode": mode,
-        "full_dispatch_ready": full_dispatch_ready,
-        "background_processor_running": background_processor_running,
-        "critical_checks_passed": critical_checks_passed,
-        "embedding_ok": embedding_ok,
-        "issues": issues or [],
-        "checks": checks or {},
-        "updated_at_ms": int(time.time() * 1000),
-    }
-    try:
-        _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = _RUNTIME_STATUS_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(_RUNTIME_STATUS_FILE)
-    except Exception as exc:
-        logger.warning("写入 sidecar_runtime_status.json 失败: %s", exc)
+    with _RUNTIME_STATUS_LOCK:
+        _RUNTIME_STATUS_CACHE = {
+            "mode": mode,
+            "full_dispatch_ready": full_dispatch_ready,
+            "background_processor_running": background_processor_running,
+            "critical_checks_passed": critical_checks_passed,
+            "embedding_ok": embedding_ok,
+            "issues": list(issues or []),
+            "checks": checks or {},
+        }
+        payload = {
+            **_RUNTIME_STATUS_CACHE,
+            "updated_at_ms": int(time.time() * 1000),
+        }
+        try:
+            _STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = _RUNTIME_STATUS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(_RUNTIME_STATUS_FILE)
+        except Exception as exc:
+            logger.warning("写入 sidecar_runtime_status.json 失败: %s", exc)
 
 
-async def _runtime_status_heartbeat() -> None:
+def _runtime_status_heartbeat() -> None:
+    """独立于 asyncio 推理循环刷新状态，避免长任务造成健康误报。"""
     while True:
-        await asyncio.sleep(60)
-        if _RUNTIME_STATUS_CACHE is None:
+        time.sleep(60)
+        cached_status = _RUNTIME_STATUS_CACHE
+        if cached_status is None:
             continue
-        _write_runtime_status(**_RUNTIME_STATUS_CACHE)
+        _write_runtime_status(**cached_status)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,7 +259,11 @@ async def _run_main(args: argparse.Namespace) -> None:
         embedding_ok=False,
         issues=["Sidecar 正在启动，完整能力尚未就绪"],
     )
-    asyncio.create_task(_runtime_status_heartbeat())
+    threading.Thread(
+        target=_runtime_status_heartbeat,
+        daemon=True,
+        name="runtime-status-heartbeat",
+    ).start()
 
     # 启动内部向量搜索 HTTP 服务（daemon 线程）
     threading.Thread(target=_start_vector_search_server, daemon=True, name="vector-search-server").start()

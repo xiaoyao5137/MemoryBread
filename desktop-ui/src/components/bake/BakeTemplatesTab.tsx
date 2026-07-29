@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import type { ArticleTemplate } from '../../types'
 import type { LocalCreationSkill } from '../../utils/creationSkills'
-import { BakeButton, BakeCard, BakeMarkdown, BakePill, BakeSectionHeader } from './BakeShared'
+import { BakeButton, BakeCard, BakeMarkdown, BakeSectionHeader } from './BakeShared'
 
 const BakeTemplatesTab: React.FC<{
   templates: ArticleTemplate[]
@@ -182,12 +182,6 @@ const BakeTemplatesTab: React.FC<{
             </div>
           </div>
         </form>
-        {focusId && (
-          <div className="bake-filter-summary">
-            <BakePill text={`仅看文档 #${focusId}`} />
-            <BakeButton compact onClick={onClearFilters}>查看全部</BakeButton>
-          </div>
-        )}
       </BakeCard>
       <div className="bake-split-list-detail bake-split-list-detail--templates">
         <BakeCard className="bake-knowledge-list-card">
@@ -328,7 +322,7 @@ const BakeTemplatesTab: React.FC<{
             )}
 
             <div className="bake-knowledge-detail__section bake-related-skills">
-              <div className="bake-kv__title">关联创作 Skill</div>
+              <div className="bake-kv__title">关联技能</div>
               {relatedSkills.length ? (
                 <div className="bake-related-skills__list">
                   {relatedSkills.map(skill => (
@@ -339,7 +333,7 @@ const BakeTemplatesTab: React.FC<{
                   ))}
                 </div>
               ) : (
-                <div className="bake-muted">这份文档还没有关联 Skill，可点击下方「沉淀 Skill」创建。</div>
+                <div className="bake-muted">这份文档还没有关联技能，可点击下方「沉淀技能」创建。</div>
               )}
             </div>
 
@@ -353,10 +347,10 @@ const BakeTemplatesTab: React.FC<{
                 <>
                   <BakeButton primary onClick={() => setIsEditing(true)}>编辑模板</BakeButton>
                   {onSettleSkill ? (
-                    <BakeButton onClick={() => onSettleSkill(selected)}>沉淀 Skill</BakeButton>
+                    <BakeButton onClick={() => onSettleSkill(selected)}>沉淀技能</BakeButton>
                   ) : null}
                   <BakeButton onClick={() => onToggleTemplateStatus(selected.id)}>{selected.status === 'enabled' ? '停用' : '启用'}</BakeButton>
-                  <BakeButton onClick={() => onDeleteTemplate(selected.id)}>删除模板</BakeButton>
+                  <BakeButton danger onClick={() => onDeleteTemplate(selected.id)}>删除文档</BakeButton>
                   <BakeButton compact onClick={() => onViewSourceMemory(selected.sourceMemoryIds[0])}>查看来源时间线</BakeButton>
                 </>
               )}

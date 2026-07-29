@@ -1,653 +1,497 @@
-import React, { useEffect, useState } from 'react'
-import type { HardwareInfo, ModelEntry } from '../types'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
-import { toUserFacingError } from '../utils/userFacingError'
-import { openExternalUrl } from '../utils/openExternalUrl'
+import {
+  disableInitializationTestMode,
+  fetchInitializationReport,
+  fetchInitializationStatus,
+  initializationIsReady,
+  startInitialization,
+  type InitializationStage,
+  type InitializationStatus,
+} from '../utils/initialization'
+import './OnboardingWizard.css'
 
-const SIDECAR = 'http://localhost:7071'
-const OLLAMA_MACOS_DOWNLOAD_URL = 'https://ollama.com/download/mac'
+const STATUS_POLL_MS = 1_000
+const SIDECAR_RETRY_MS = 1_500
+const MAX_SIDECAR_RETRIES = 12
+const ESTIMATED_INITIALIZATION_MS = 20 * 60 * 1_000
+const MAX_ESTIMATED_REMAINING_MS = 30 * 60 * 1_000
 
-type OllamaSetupDetail = {
-  message?: string
-  is_macos?: boolean
-  system_version?: string
-  arch?: string
-  version_compatible?: boolean
-  ollama_installed?: boolean
-  ollama_running?: boolean
-  brew_available?: boolean
-  can_auto_install?: boolean
-  minimum_macos_major?: number
-  official_download_url?: string
-  recommended_install_method?: string
+interface OnboardingWizardProps {
+  onStatusValidated?: (ready: boolean) => void
 }
 
-// ── 硬件档次颜色 ──────────────────────────────────────────────────────────────
-const TIER_COLOR = { low: '#FF9500', mid: '#007AFF', high: '#34C759' }
-const TIER_LABEL = { low: '入门配置', mid: '标准配置', high: '高性能配置' }
-
-const LOCAL_ANALYSIS_IDS = new Set(['mbem-v1-local', 'qwen3.5-4b'])
-const LOCAL_VECTOR_IDS = new Set(['bge-small-zh'])
-const isModelReady = (model?: ModelEntry) => model?.status === 'installed' || model?.status === 'active'
-
-function normalizeSetupModels(models: ModelEntry[], category: 'llm' | 'embedding'): ModelEntry[] {
-  const matchingIds = category === 'llm' ? LOCAL_ANALYSIS_IDS : LOCAL_VECTOR_IDS
-  const model = models.find(item => matchingIds.has(item.id) && !item.requires_api_key)
-  if (!model) return []
-
-  if (category === 'llm') {
-    return [{
-      ...model,
-      name: 'MBEM v1.0',
-      description: '在本机完成内容理解、知识提炼和问答分析。',
-      tags: ['推荐', '本地运行', '内容分析'],
-    }]
-  }
-
-  return [{
-    ...model,
-    id: 'bge-small-zh',
-    name: '本地语义索引',
-    description: '在本机建立语义索引，帮助更准确地找回相关内容。',
-    tags: ['本地运行', '语义检索'],
-  }]
+function stageMark(stage: InitializationStage) {
+  if (stage.status === 'succeeded' || stage.status === 'skipped') return '✓'
+  if (stage.status === 'failed') return '!'
+  if (stage.status === 'running') return '•'
+  return ''
 }
 
-// ── 模型卡片 ──────────────────────────────────────────────────────────────────
-const ModelCard: React.FC<{
-  model: ModelEntry
-  selected: boolean
-  onSelect: () => void
-}> = ({ model, selected, onSelect }) => {
-  return (
-    <div
-      onClick={onSelect}
-      onKeyDown={event => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault()
-          onSelect()
-        }
-      }}
-      role="radio"
-      aria-checked={selected}
-      tabIndex={0}
-      style={{
-        border: `2px solid ${selected ? '#007AFF' : 'rgba(0,0,0,0.08)'}`,
-        borderRadius: 12, padding: '12px 14px', cursor: 'pointer',
-        background: selected ? 'rgba(0,122,255,0.04)' : 'white',
-        transition: 'border-color 0.15s',
-        position: 'relative',
-      }}
-    >
-      {model.recommended && (
-        <span style={{
-          position: 'absolute', top: 8, right: 8, fontSize: 10, fontWeight: 600,
-          background: '#34C759', color: 'white', padding: '2px 6px', borderRadius: 6,
-        }}>推荐</span>
-      )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-        <div style={{
-          width: 16, height: 16, borderRadius: '50%', flexShrink: 0,
-          border: `2px solid ${selected ? '#007AFF' : '#C7C7CC'}`,
-          background: selected ? '#007AFF' : 'white',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
-          {selected && <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'white' }} />}
-        </div>
-        <span style={{ fontSize: 13, fontWeight: 600 }}>{model.name}</span>
-        {model.size_gb > 0 && (
-          <span style={{ fontSize: 11, color: '#AEAEB2' }}>{model.size_gb}GB</span>
-        )}
-      </div>
-      <div style={{ fontSize: 12, color: '#6E6E73', marginLeft: 24 }}>{model.description}</div>
-      {model.tags && model.tags.length > 0 && (
-        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 6, marginLeft: 24 }}>
-          {model.tags.slice(0, 3).map(t => (
-            <span key={t} style={{
-              fontSize: 10, padding: '1px 6px', borderRadius: 4,
-              background: 'rgba(0,122,255,0.08)', color: '#007AFF',
-            }}>{t}</span>
-          ))}
-        </div>
-      )}
-    </div>
-  )
+function stageStatusLabel(stage: InitializationStage) {
+  if (stage.status === 'skipped') return '已存在'
+  if (stage.status === 'succeeded') return '已完成'
+  if (stage.status === 'failed') return '失败'
+  if (stage.status === 'running') return `${Math.max(0, Math.min(100, stage.progress || 0))}%`
+  return '等待'
 }
 
-// ── 主组件 ────────────────────────────────────────────────────────────────────
-const OnboardingWizard: React.FC = () => {
-  const { setHasCompletedSetup, setSetupSkipped, setWindowMode } = useAppStore()
+function timestampMs(value?: string | null) {
+  if (!value) return null
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
 
-  const [step, setStep] = useState(0)                          // 0=欢迎 1=LLM 2=Embedding
-  const [hardware, setHardware] = useState<HardwareInfo | null>(null)
-  const [hwTier, setHwTier] = useState<'low' | 'mid' | 'high'>('mid')
-  const [hwReason, setHwReason] = useState('')
-  const [hwLoading, setHwLoading] = useState(false)
+function formatElapsedTime(durationMs: number) {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1_000))
+  const hours = Math.floor(totalSeconds / 3_600)
+  const minutes = Math.floor((totalSeconds % 3_600) / 60)
+  const seconds = totalSeconds % 60
+  const clock = [minutes, seconds].map(value => String(value).padStart(2, '0')).join(':')
+  return hours > 0 ? `${String(hours).padStart(2, '0')}:${clock}` : clock
+}
 
-  const [llmModels, setLlmModels] = useState<ModelEntry[]>([])
-  const [embModels, setEmbModels] = useState<ModelEntry[]>([])
-  const [selectedLlm, setSelectedLlm] = useState('')
-  const [selectedEmb, setSelectedEmb] = useState('')
+function estimateRemainingTime(progress: number, elapsedMs: number) {
+  if (progress >= 100) return 0
+  const remainingRatio = Math.max(0, 100 - progress) / 100
+  const baseline = ESTIMATED_INITIALIZATION_MS * remainingRatio
+  const observed = progress > 0 && elapsedMs >= 30_000
+    ? elapsedMs * (100 - progress) / progress
+    : 0
+  return Math.min(MAX_ESTIMATED_REMAINING_MS, Math.max(baseline, observed))
+}
 
-  const [downloadingId, setDownloadingId] = useState<string | null>(null)
-  const [downloadProgress, setDownloadProgress] = useState(0)
-  const [error, setError] = useState('')
+function formatRemainingTime(durationMs: number) {
+  if (durationMs <= 0) return '即将完成'
+  const minutes = Math.ceil(durationMs / 60_000)
+  if (minutes <= 1) return '不足 1 分钟'
+  if (minutes < 60) return `约 ${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  const remainder = minutes % 60
+  return remainder > 0 ? `约 ${hours} 小时 ${remainder} 分钟` : `约 ${hours} 小时`
+}
 
-  const [ollamaSetup, setOllamaSetup] = useState<OllamaSetupDetail | null>(null)
-  const [ollamaChecking, setOllamaChecking] = useState(false)
-  const [ollamaInstalling, setOllamaInstalling] = useState(false)
-  const [activatingId, setActivatingId] = useState<string | null>(null)
-
-  // 检测硬件
-  useEffect(() => {
-    setHwLoading(true)
-    fetch(`${SIDECAR}/api/models/hardware`)
-      .then(r => r.json())
-      .then(d => {
-        if (d.status === 'ok') {
-          setHardware(d.hardware)
-          setHwTier(d.recommendation.tier)
-          setHwReason(d.recommendation.reason)
-        }
+function notifyInitializationComplete() {
+  if (typeof Notification === 'undefined') return
+  const show = () => new Notification('记忆面包初始化完成', {
+    body: '本地 AI、记忆库与核心功能均已通过质检，可以开始使用。',
+  })
+  try {
+    if (Notification.permission === 'granted') {
+      show()
+    } else if (Notification.permission === 'default') {
+      void Notification.requestPermission().then(permission => {
+        if (permission === 'granted') show()
       })
-      .catch(() => {})
-      .finally(() => setHwLoading(false))
-  }, [])
-
-  const refreshOllamaSetup = async () => {
-    setOllamaChecking(true)
-    try {
-      const r = await fetch(`${SIDECAR}/api/ollama/setup-status`)
-      const d = await r.json()
-      if (!r.ok || d.status !== 'ok') throw new Error(d.message || `HTTP ${r.status}`)
-      setOllamaSetup(d.detail || null)
-      return Boolean(d.detail)
-    } catch {
-      setOllamaSetup(null)
-      return false
-    } finally {
-      setOllamaChecking(false)
     }
+  } catch {
+    // 系统通知是完成后的附加能力，不影响已经通过的初始化结果。
   }
-
-  // DMG 冷启动时内置 sidecar 通常比 WebView 晚几秒就绪，自动重试避免用户手动刷新。
-  useEffect(() => {
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    let attempts = 0
-    const checkUntilReady = async () => {
-      attempts += 1
-      const ready = await refreshOllamaSetup()
-      if (!ready && !cancelled && attempts < 10) {
-        timer = setTimeout(checkUntilReady, 1500)
-      }
-    }
-    checkUntilReady()
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-    }
-  }, [])
-
-  const loadSetupModels = async (category: 'llm' | 'embedding'): Promise<boolean> => {
-    try {
-      const response = await fetch(`${SIDECAR}/api/models?category=${category}`)
-      const data = await response.json()
-      if (!response.ok || data.status !== 'ok') return false
-      const models = normalizeSetupModels(data.models || [], category)
-      if (category === 'llm') setLlmModels(models)
-      else setEmbModels(models)
-      return models.length > 0
-    } catch {
-      return false
-    }
-  }
-
-  useEffect(() => {
-    if (step !== 1 && step !== 2) return
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    let attempts = 0
-    const category = step === 1 ? 'llm' : 'embedding'
-    const loadUntilReady = async () => {
-      attempts += 1
-      if (category === 'llm') await refreshOllamaSetup()
-      const ready = await loadSetupModels(category)
-      if (!ready && !cancelled && attempts < 10) {
-        timer = setTimeout(loadUntilReady, 1500)
-      }
-    }
-    loadUntilReady()
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-    }
-  }, [step])
-
-  const refreshCurrentStep = async () => {
-    await refreshOllamaSetup()
-    if (step === 1) await loadSetupModels('llm')
-    if (step === 2) await loadSetupModels('embedding')
-  }
-
-  // 轮询下载进度
-  useEffect(() => {
-    if (!downloadingId) return
-    const timer = setInterval(async () => {
-      try {
-        const r = await fetch(`${SIDECAR}/api/models/${downloadingId}/status`)
-        const d = await r.json()
-        setDownloadProgress(d.download_progress || 0)
-        if (d.status === 'error' || d.error) {
-          setDownloadingId(null)
-          setError(toUserFacingError(d.error || d.message, '下载失败，请稍后重试'))
-        } else if (d.status === 'installed' || d.status === 'active') {
-          setDownloadingId(null)
-          setDownloadProgress(100)
-          const category = llmModels.some(model => model.id === downloadingId) ? 'llm' : 'embedding'
-          const listResponse = await fetch(`${SIDECAR}/api/models?category=${category}`)
-          const listData = await listResponse.json()
-          if (listData.status === 'ok') {
-            const models = normalizeSetupModels(listData.models || [], category)
-            if (category === 'llm') setLlmModels(models)
-            else setEmbModels(models)
-          }
-        }
-      } catch {}
-    }, 2000)
-    return () => clearInterval(timer)
-  }, [downloadingId, embModels, llmModels])
-
-  const handleSkip = () => {
-    setSetupSkipped(true)
-    setWindowMode('rag')
-  }
-
-  const handleComplete = () => {
-    setHasCompletedSetup(true)
-    setWindowMode('rag')
-  }
-
-  const handleInstallOllama = async () => {
-    if (ollamaSetup && !ollamaSetup.ollama_installed && !ollamaSetup.can_auto_install) {
-      await openExternalUrl(ollamaSetup.official_download_url || OLLAMA_MACOS_DOWNLOAD_URL)
-      return
-    }
-
-    setError('')
-    setOllamaInstalling(true)
-    try {
-      const installResp = await fetch(`${SIDECAR}/api/ollama/install`, { method: 'POST' })
-      const installData = await installResp.json()
-      if (installData.status !== 'ok') {
-        setError(toUserFacingError(installData.message, '本地运行环境安装失败，请稍后重试'))
-        await refreshOllamaSetup()
-        return
-      }
-
-      const startResp = await fetch(`${SIDECAR}/api/ollama/start`, { method: 'POST' })
-      const startData = await startResp.json()
-      if (startData.status !== 'ok') {
-        setError(toUserFacingError(startData.message, '本地运行环境启动失败，请稍后重试'))
-      }
-
-      await refreshOllamaSetup()
-      if (step === 1) {
-        await loadSetupModels('llm')
-      }
-    } catch (cause) {
-      setError(toUserFacingError(cause, '暂时无法准备本地运行环境，请稍后重试'))
-    } finally {
-      setOllamaInstalling(false)
-    }
-  }
-
-  const handleDownload = async (modelId: string) => {
-    setError('')
-
-    const model = [...llmModels, ...embModels].find(m => m.id === modelId)
-    if (model?.provider === 'ollama' && !ollamaSetup?.ollama_running) {
-      setError('请先准备本地运行环境，再下载分析模型')
-      return
-    }
-
-    try {
-      const r = await fetch(`${SIDECAR}/api/models/${modelId}/download`, { method: 'POST' })
-      const d = await r.json()
-      if (d.status === 'ok') {
-        setDownloadingId(modelId)
-        setDownloadProgress(0)
-      } else {
-        setError(toUserFacingError(d.message, '下载失败，请稍后重试'))
-      }
-    } catch (cause) {
-      setError(toUserFacingError(cause, '暂时无法连接本地服务，请稍后重试'))
-    }
-  }
-
-  const handleActivate = async (modelId: string): Promise<boolean> => {
-    setError('')
-    setActivatingId(modelId)
-    try {
-      const response = await fetch(`${SIDECAR}/api/models/${modelId}/activate`, { method: 'POST' })
-      const data = await response.json()
-      if (!response.ok || data.status !== 'ok') {
-        setError(toUserFacingError(data.message, '模型启用失败，请稍后重试'))
-        return false
-      }
-      return true
-    } catch (cause) {
-      setError(toUserFacingError(cause, '模型启用失败，请稍后重试'))
-      return false
-    } finally {
-      setActivatingId(null)
-    }
-  }
-
-  const selectedLlmModel = llmModels.find(m => m.id === selectedLlm)
-  const selectedEmbModel = embModels.find(m => m.id === selectedEmb)
-  const canProceedLlm = Boolean(
-    selectedLlm &&
-    ollamaSetup?.ollama_running &&
-    isModelReady(selectedLlmModel) &&
-    downloadingId !== selectedLlm &&
-    activatingId !== selectedLlm,
-  )
-  const canCompleteEmbedding = Boolean(
-    selectedEmb &&
-    isModelReady(selectedEmbModel) &&
-    downloadingId !== selectedEmb &&
-    activatingId !== selectedEmb,
-  )
-  const needsDownloadLlm = selectedLlmModel && !selectedLlmModel.requires_api_key &&
-    (selectedLlmModel.status === 'not_installed' || selectedLlmModel.status === 'error')
-  const needsManualOllamaInstall = Boolean(
-    ollamaSetup &&
-    !ollamaSetup.ollama_installed &&
-    !ollamaSetup.can_auto_install,
-  )
-
-  // ── 渲染 ──────────────────────────────────────────────────────────────────
-
-  return (
-    <div style={{
-      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      zIndex: 1000,
-    }}>
-      <div style={{
-        background: '#F5F5F7', borderRadius: 20, width: 520, maxHeight: '85vh',
-        overflow: 'hidden', display: 'flex', flexDirection: 'column',
-        boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
-      }}>
-
-        {/* 进度条 */}
-        <div style={{ height: 3, background: '#E5E5EA' }}>
-          <div style={{
-            height: '100%', background: '#007AFF', borderRadius: 2,
-            width: `${((step + 1) / 3) * 100}%`, transition: 'width 0.3s',
-          }} />
-        </div>
-
-        <div style={{ overflow: 'auto', flex: 1, padding: '28px 28px 20px' }}>
-
-          {/* ── Step 0: 欢迎 ─────────────────────────────────────────────── */}
-          {step === 0 && (
-            <>
-              <div style={{ textAlign: 'center', marginBottom: 24 }}>
-                <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 8 }}>欢迎使用记忆面包</div>
-                <div style={{ fontSize: 13, color: '#8E8E93', marginBottom: 10 }}>
-                  让看过的内容，在下一次工作中继续发挥作用
-                </div>
-                <div style={{ fontSize: 13, color: '#6E6E73', lineHeight: 1.6 }}>
-                  记忆面包帮助你整理知识、回答问题和完成重复工作。<br />
-                  先准备本地 AI 能力，即可开始使用。
-                </div>
-              </div>
-
-              {/* 硬件检测 */}
-              <div style={{ background: 'white', borderRadius: 12, padding: 16, marginBottom: 16 }}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: '#333', marginBottom: 10 }}>本机配置检测</div>
-                {hwLoading ? (
-                  <div style={{ fontSize: 12, color: '#AEAEB2' }}>检测中...</div>
-                ) : hardware ? (
-                  <>
-                    <div style={{ display: 'flex', gap: 16, marginBottom: 10 }}>
-                      {[
-                        { label: '内存', value: `${hardware.memory_gb} GB` },
-                        { label: 'CPU', value: `${hardware.cpu_cores} 核` },
-                        { label: '可用磁盘', value: `${hardware.disk_free_gb} GB` },
-                      ].map(item => (
-                        <div key={item.label} style={{ flex: 1, textAlign: 'center' }}>
-                          <div style={{ fontSize: 16, fontWeight: 700 }}>{item.value}</div>
-                          <div style={{ fontSize: 11, color: '#AEAEB2' }}>{item.label}</div>
-                        </div>
-                      ))}
-                    </div>
-                    <div style={{
-                      fontSize: 12, padding: '6px 10px', borderRadius: 8,
-                      background: `${TIER_COLOR[hwTier]}18`, color: TIER_COLOR[hwTier],
-                      fontWeight: 500,
-                    }}>
-                      {TIER_LABEL[hwTier]}：{hwReason}
-                    </div>
-                  </>
-                ) : (
-                  <div style={{ fontSize: 12, color: '#AEAEB2' }}>暂时无法读取本机配置，可继续手动选择</div>
-                )}
-              </div>
-            </>
-          )}
-
-          {/* ── Step 1: 选择 LLM ─────────────────────────────────────────── */}
-          {step === 1 && (
-            <>
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>选择本地分析模型</div>
-                <div style={{ fontSize: 12, color: '#6E6E73' }}>用于内容理解、知识提炼和问答，需要选择一个。</div>
-              </div>
-
-              <div style={{ background: 'white', borderRadius: 12, padding: 12, marginBottom: 12, border: '1px solid rgba(0,0,0,0.08)' }}>
-                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>本地运行环境</div>
-                {ollamaChecking ? (
-                  <div style={{ fontSize: 12, color: '#AEAEB2' }}>检测中...</div>
-                ) : (
-                  <>
-                    <div style={{ fontSize: 12, color: ollamaSetup?.ollama_running ? '#34C759' : '#6E6E73', marginBottom: 4 }}>
-                      {ollamaSetup?.ollama_running
-                        ? '本地运行环境已就绪'
-                        : ollamaSetup?.version_compatible === false
-                          ? `当前系统版本不兼容，需要 macOS ${ollamaSetup.minimum_macos_major || 14} 或更高版本`
-                          : ollamaSetup
-                            ? '本地运行环境尚未就绪'
-                            : '本地 AI 服务正在启动或暂时无法连接'}
-                    </div>
-                    <div style={{ display: 'flex', gap: 8 }}>
-                      <button onClick={refreshCurrentStep} style={btnStyle('#F2F2F7', '#333', 12)}>重新检测</button>
-                      {!ollamaSetup?.ollama_running && ollamaSetup && ollamaSetup.version_compatible !== false && (
-                        <button
-                          onClick={handleInstallOllama}
-                          disabled={ollamaInstalling}
-                          style={btnStyle('#007AFF', 'white', 12)}
-                        >
-                          {ollamaInstalling
-                            ? '准备中...'
-                            : needsManualOllamaInstall
-                              ? '打开官方下载页'
-                              : ollamaSetup.ollama_installed
-                                ? '启动本地运行环境'
-                                : '自动安装并启动'}
-                        </button>
-                      )}
-                    </div>
-                    {needsManualOllamaInstall && (
-                      <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 7, lineHeight: 1.5 }}>
-                        下载并打开本地运行环境后，返回这里点击“重新检测”。
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-
-              {/* 分析模型 */}
-              <div style={{ fontSize: 12, fontWeight: 600, color: '#6E6E73', marginBottom: 8 }}>
-                分析模型
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
-                {llmModels.map(m => (
-                  <ModelCard key={m.id} model={m} selected={selectedLlm === m.id}
-                    onSelect={() => setSelectedLlm(m.id)}
-                  />
-                ))}
-                {llmModels.length === 0 && (
-                  <div style={{ padding: 12, borderRadius: 10, background: 'white', color: '#8E8E93', fontSize: 12 }}>
-                    暂时无法读取可用模型，请确认本地运行环境已就绪后重新检测。
-                  </div>
-                )}
-              </div>
-
-              {/* 下载进度 */}
-              {downloadingId && (
-                <div style={{ background: 'white', borderRadius: 10, padding: 12, marginBottom: 12 }}>
-                  <div style={{ fontSize: 12, marginBottom: 6 }}>
-                    正在下载 {[...llmModels, ...embModels].find(model => model.id === downloadingId)?.name || '本地模型'}...
-                  </div>
-                  <div style={{ height: 6, background: '#E5E5EA', borderRadius: 3 }}>
-                    <div style={{ height: '100%', background: '#007AFF', borderRadius: 3,
-                      width: `${downloadProgress}%`, transition: 'width 0.5s' }} />
-                  </div>
-                  <div style={{ fontSize: 11, color: '#AEAEB2', marginTop: 4 }}>{downloadProgress}%</div>
-                </div>
-              )}
-
-              {/* 下载按钮（分析模型未安装时） */}
-              {needsDownloadLlm && !downloadingId && (
-                <button
-                  onClick={() => handleDownload(selectedLlm)}
-                  style={{ ...btnStyle('#007AFF', 'white'), width: '100%', marginBottom: 8 }}
-                >
-                  下载 {selectedLlmModel?.name}（{selectedLlmModel?.size_gb}GB）
-                </button>
-              )}
-
-              {selectedLlmModel && !isModelReady(selectedLlmModel) && !downloadingId && (
-                <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 8 }}>
-                  完成模型下载后才能进入下一步。
-                </div>
-              )}
-
-              {error && <div role="alert" style={{ fontSize: 12, color: '#FF3B30', marginBottom: 8 }}>{error}</div>}
-            </>
-          )}
-
-          {/* ── Step 2: 选择 Embedding ───────────────────────────────────── */}
-          {step === 2 && (
-            <>
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>选择本地语义索引</div>
-                <div style={{ fontSize: 12, color: '#6E6E73' }}>用于找回与问题相关的内容，建议现在配置，也可以稍后完成。</div>
-              </div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
-                {embModels.map(m => (
-                  <ModelCard key={m.id} model={m} selected={selectedEmb === m.id}
-                    onSelect={() => setSelectedEmb(m.id)}
-                  />
-                ))}
-              </div>
-
-              {downloadingId && (
-                <div style={{ background: 'white', borderRadius: 10, padding: 12, marginBottom: 12 }}>
-                  <div style={{ fontSize: 12, marginBottom: 6 }}>
-                    正在下载 {embModels.find(model => model.id === downloadingId)?.name || '本地语义索引'}...
-                  </div>
-                  <div style={{ height: 6, background: '#E5E5EA', borderRadius: 3 }}>
-                    <div style={{ height: '100%', background: '#34C759', borderRadius: 3,
-                      width: `${downloadProgress}%`, transition: 'width 0.5s' }} />
-                  </div>
-                </div>
-              )}
-
-              {selectedEmb && selectedEmbModel &&
-                (selectedEmbModel.status === 'not_installed' || selectedEmbModel.status === 'error') &&
-                !downloadingId && (
-                <button
-                  onClick={() => handleDownload(selectedEmb)}
-                  style={{ ...btnStyle('#34C759', 'white'), width: '100%', marginBottom: 8 }}
-                >
-                  下载 {selectedEmbModel.name}
-                </button>
-              )}
-
-              {embModels.length === 0 && (
-                <div style={{ padding: 12, borderRadius: 10, background: 'white', color: '#8E8E93', fontSize: 12, marginBottom: 12 }}>
-                  暂时无法读取本地语义索引，请返回上一步确认本地运行环境后重试。
-                </div>
-              )}
-
-              {error && <div role="alert" style={{ fontSize: 12, color: '#FF3B30', marginBottom: 8 }}>{error}</div>}
-            </>
-          )}
-
-        </div>
-
-        {/* 底部按钮 */}
-        <div style={{
-          padding: '16px 28px', borderTop: '1px solid rgba(0,0,0,0.06)',
-          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-          background: 'white',
-        }}>
-          <button onClick={handleSkip} style={{ fontSize: 12, color: '#AEAEB2', background: 'none',
-            border: 'none', cursor: 'pointer', padding: '6px 0' }}>
-            跳过，稍后配置
-          </button>
-
-          <div style={{ display: 'flex', gap: 8 }}>
-            {step > 0 && (
-              <button onClick={() => setStep(s => s - 1)} style={btnStyle('#F2F2F7', '#333')}>
-                上一步
-              </button>
-            )}
-            {step === 0 && (
-              <button onClick={() => setStep(1)} style={btnStyle('#007AFF', 'white')}>
-                开始配置
-              </button>
-            )}
-            {step === 1 && (
-              <button
-                onClick={async () => {
-                  if (selectedLlm && await handleActivate(selectedLlm)) setStep(2)
-                }}
-                disabled={!canProceedLlm}
-                style={btnStyle(canProceedLlm ? '#007AFF' : '#C7C7CC', 'white')}
-              >
-                {activatingId === selectedLlm ? '正在启用...' : '下一步'}
-              </button>
-            )}
-            {step === 2 && (
-              <button
-                onClick={async () => {
-                  if (selectedEmb && await handleActivate(selectedEmb)) handleComplete()
-                }}
-                disabled={!canCompleteEmbedding}
-                style={btnStyle(canCompleteEmbedding ? '#34C759' : '#C7C7CC', 'white')}
-              >
-                {activatingId === selectedEmb ? '正在启用...' : '完成配置'}
-              </button>
-            )}
-          </div>
-        </div>
-
-      </div>
-    </div>
-  )
 }
 
-function btnStyle(bg: string, color: string, fontSize = 13): React.CSSProperties {
-  return {
-    background: bg, color, fontSize, fontWeight: 500,
-    padding: '7px 16px', borderRadius: 8, border: 'none', cursor: 'pointer',
+const OnboardingWizard: React.FC<OnboardingWizardProps> = ({ onStatusValidated }) => {
+  const {
+    adminApiBaseUrl,
+    authToken,
+    serviceEnvironment,
+    setHasCompletedSetup,
+    setWindowMode,
+  } = useAppStore()
+  const [status, setStatus] = useState<InitializationStatus | null>(null)
+  const [connecting, setConnecting] = useState(true)
+  const [connectionError, setConnectionError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [starting, setStarting] = useState(false)
+  const [reporting, setReporting] = useState(false)
+  const [reportId, setReportId] = useState('')
+  const [leavingSandbox, setLeavingSandbox] = useState(false)
+  const [sandboxExitConfirming, setSandboxExitConfirming] = useState(false)
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  const completedRunRef = useRef<string | null>(null)
+  const previousStateRef = useRef<string | null>(null)
+
+  const applyStatus = useCallback((next: InitializationStatus) => {
+    setStatus(next)
+    setConnecting(false)
+    setConnectionError('')
+    const ready = initializationIsReady(next)
+    onStatusValidated?.(ready)
+    if (ready) {
+      setHasCompletedSetup(true)
+      if (previousStateRef.current === 'running') setWindowMode('rag')
+    } else if (next.test_mode_enabled || next.state !== 'completed') {
+      setHasCompletedSetup(false)
+    }
+    if (
+      next.state === 'completed'
+      && previousStateRef.current === 'running'
+      && completedRunRef.current !== next.run_id
+    ) {
+      completedRunRef.current = next.run_id || 'completed'
+      notifyInitializationComplete()
+    }
+    previousStateRef.current = next.state
+  }, [onStatusValidated, setHasCompletedSetup, setWindowMode])
+
+  useEffect(() => {
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let attempts = 0
+
+    const refresh = async () => {
+      try {
+        const next = await fetchInitializationStatus()
+        if (cancelled) return
+        applyStatus(next)
+        attempts = 0
+      } catch (error) {
+        if (cancelled) return
+        attempts += 1
+        const errorCode = error && typeof error === 'object' && 'code' in error
+          ? String(error.code || '')
+          : ''
+        if (attempts < MAX_SIDECAR_RETRIES) {
+          if (errorCode === 'INITIALIZATION_API_UNAVAILABLE') {
+            setConnecting(false)
+            setConnectionError(error instanceof Error ? error.message : '本地初始化服务版本较旧')
+          } else {
+            setConnecting(true)
+          }
+          timer = setTimeout(refresh, SIDECAR_RETRY_MS)
+        } else {
+          setConnecting(false)
+          setConnectionError(error instanceof Error ? error.message : '本地初始化服务暂时不可用')
+        }
+      }
+    }
+
+    void refresh()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [applyStatus])
+
+  useEffect(() => {
+    if (!status || leavingSandbox) return
+    const timer = window.setInterval(() => {
+      void fetchInitializationStatus().then(applyStatus).catch(() => {})
+    }, STATUS_POLL_MS)
+    return () => window.clearInterval(timer)
+  }, [applyStatus, leavingSandbox, status?.run_id, status?.state])
+
+  useEffect(() => {
+    if (status?.state !== 'running') return
+    setNowMs(Date.now())
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [status?.run_id, status?.state])
+
+  useEffect(() => {
+    if (!sandboxExitConfirming) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !leavingSandbox) setSandboxExitConfirming(false)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [leavingSandbox, sandboxExitConfirming])
+
+  const begin = async () => {
+    setStarting(true)
+    setActionError('')
+    setReportId('')
+    try {
+      const next = await startInitialization(status?.test_mode_enabled ? 'sandbox' : 'normal')
+      applyStatus(next)
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '初始化任务启动失败')
+    } finally {
+      setStarting(false)
+    }
   }
+
+  const report = async () => {
+    const confirmed = window.confirm(
+      '将上报应用版本、系统版本、硬件档位、失败阶段和稳定错误码。不会上报截图、知识内容、提示词、回答、文件路径或密钥。确认上报吗？',
+    )
+    if (!confirmed) return
+    setReporting(true)
+    setActionError('')
+    try {
+      const bundle = await fetchInitializationReport()
+      const runId = String(bundle.run_id || status?.run_id || Date.now())
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': runId,
+        'X-MemoryBread-Environment': serviceEnvironment,
+      }
+      if (authToken) headers.Authorization = `Bearer ${authToken}`
+      const response = await fetch(`${adminApiBaseUrl}/v1/initialization-reports`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(bundle),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data?.error?.message || '诊断上报失败')
+      setReportId(data?.data?.report_id || '已接收')
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '诊断上报失败')
+    } finally {
+      setReporting(false)
+    }
+  }
+
+  const leaveSandbox = async () => {
+    setLeavingSandbox(true)
+    setActionError('')
+    try {
+      const normal = await disableInitializationTestMode()
+      setSandboxExitConfirming(false)
+      setHasCompletedSetup(initializationIsReady(normal))
+      onStatusValidated?.(initializationIsReady(normal))
+      setWindowMode('debug')
+      setStatus(normal)
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '关闭初始化测试模式失败')
+    } finally {
+      setLeavingSandbox(false)
+    }
+  }
+
+  const retryConnection = () => {
+    setConnecting(true)
+    setConnectionError('')
+    void fetchInitializationStatus().then(applyStatus).catch(error => {
+      setConnecting(false)
+      setConnectionError(error instanceof Error ? error.message : '本地初始化服务暂时不可用')
+    })
+  }
+
+  const running = status?.state === 'running'
+  const failed = status?.state === 'failed' || status?.state === 'interrupted'
+  const sandboxFinished = status?.test_mode_enabled && ['completed', 'failed'].includes(status.state)
+  const showPreparationGuide = !failed && !connectionError && status?.state !== 'completed'
+  const progress = Math.max(0, Math.min(100, status?.progress || 0))
+  const currentStage = status?.stages.find(stage => stage.id === status.current_stage)
+  const startedAtMs = timestampMs(status?.started_at)
+  const finishedAtMs = timestampMs(status?.finished_at)
+  const recordedDurationMs = (status?.stages || []).reduce(
+    (total, stage) => total + Math.max(0, stage.duration_ms || 0),
+    0,
+  )
+  const elapsedMs = startedAtMs === null
+    ? recordedDurationMs
+    : Math.max(0, (running ? nowMs : finishedAtMs || nowMs) - startedAtMs)
+  const remainingMs = running ? estimateRemainingTime(progress, elapsedMs) : 0
+
+  return (
+    <main className="initialization-gate" data-testid="initialization-gate">
+      <div className="initialization-grain" aria-hidden />
+      <section
+        className="initialization-card"
+        aria-labelledby="initialization-title"
+        data-testid="initialization-card"
+      >
+        <header className="initialization-header">
+          <div className="brand-lockup">
+            <span className="brand-loaf" aria-hidden><i /><i /><i /></span>
+            <span>
+              <strong>记忆面包</strong>
+              <small>首次使用准备</small>
+            </span>
+          </div>
+          {running && <span className="background-note">可以最小化，初始化会在后台继续</span>}
+        </header>
+
+        <div className="initialization-body">
+          <section className="initialization-story">
+            <p className="initialization-eyebrow">ONE-CLICK LOCAL SETUP</p>
+            <h1 id="initialization-title">
+              {running
+                ? '面包烘焙中'
+                : failed
+                  ? '有一项准备没有完成'
+                  : status?.state === 'completed'
+                    ? '面包烘焙完成'
+                    : '烤面包'}
+            </h1>
+            <p className="initialization-copy">
+              {running
+                ? currentStage?.detail || status?.message
+                : failed
+                  ? status?.suggestion || '可以重试，已经安装好的内容会自动跳过。'
+                  : '将自动准备本地 AI、采集提炼模型、语义检索、记忆库、技能与工具，并完成采集、提炼、咨询和创作测试。'}
+            </p>
+
+            {showPreparationGuide && (
+              <section className="initialization-preparation" aria-label="初始化预计用时与资源占用">
+                <p>
+                  {running
+                    ? '烘焙时间较长，请耐心等待。可以最小化软件，请保持网络畅通。'
+                    : '可以最小化软件等待初始化完成，请保持网络畅通。'}
+                </p>
+                <dl>
+                  <div>
+                    <dt>预计用时</dt>
+                    <dd>10–30 分钟</dd>
+                  </div>
+                  <div>
+                    <dt>新增硬盘占用</dt>
+                    <dd>约 4 GB</dd>
+                  </div>
+                  <div>
+                    <dt>运行内存</dt>
+                    <dd>约 6 GB</dd>
+                  </div>
+                </dl>
+                <small>请至少预留 6 GB 磁盘空间；实际用时与占用受网络、设备配置和本机已有组件影响。</small>
+              </section>
+            )}
+
+            {connecting && (
+              <div className="initialization-connection" role="status">
+                <span className="connection-pulse" aria-hidden />
+                正在连接本地初始化服务…
+              </div>
+            )}
+            {connectionError && (
+              <div className="initialization-error" role="alert">
+                <strong>本地服务尚未就绪</strong>
+                <span>{connectionError}</span>
+                <button type="button" onClick={retryConnection}>重新连接</button>
+              </div>
+            )}
+
+            {!connecting && !connectionError && !running && !failed && status?.state !== 'completed' && (
+              <button className="initialization-primary" type="button" disabled={starting} onClick={() => void begin()}>
+                <span>{starting ? '正在启动…' : failed ? '重新初始化' : '初始化'}</span>
+                <small>已存在的组件不会重复安装</small>
+              </button>
+            )}
+
+            {failed && status?.can_retry && (
+              <div className="initialization-actions">
+                <button className="initialization-primary" type="button" disabled={starting} onClick={() => void begin()}>
+                  {starting ? '正在启动…' : status.state === 'interrupted' ? '恢复初始化' : '重试失败阶段'}
+                </button>
+                {status.can_report && (
+                  <button className="initialization-secondary" type="button" disabled={reporting} onClick={() => void report()}>
+                    {reporting ? '正在上报…' : '上报诊断'}
+                  </button>
+                )}
+              </div>
+            )}
+            {failed && status?.error_code && (
+              <p className="initialization-error-code">
+                错误码 <code>{status.error_code}</code>
+              </p>
+            )}
+            {reportId && <p className="report-success" role="status">上报成功，编号 {reportId}</p>}
+            {actionError && <p className="action-error" role="alert">{actionError}</p>}
+          </section>
+
+          <section className="initialization-progress-panel" aria-label="初始化进度">
+            <div
+              className={`loaf-progress ${running ? 'loaf-progress--active' : ''}`}
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={progress}
+              aria-label={`初始化进度 ${progress}%`}
+              style={{ '--progress': `${progress * 3.6}deg` } as React.CSSProperties}
+            >
+              <div className="loaf-progress__center">
+                <strong>{progress}</strong>
+                <span>%</span>
+              </div>
+              <i className="loaf-score loaf-score--one" aria-hidden />
+              <i className="loaf-score loaf-score--two" aria-hidden />
+              <i className="loaf-score loaf-score--three" aria-hidden />
+            </div>
+            <div className="current-stage">
+              <span>{running ? '当前阶段' : status?.state === 'completed' ? '质检结果' : '准备状态'}</span>
+              <strong>{currentStage?.label || status?.message || '等待初始化'}</strong>
+            </div>
+            {(running || status?.state === 'completed') && (
+              <dl className="initialization-runtime" aria-label="初始化时间" aria-live="polite">
+                <div>
+                  <dt>执行时长</dt>
+                  <dd>{formatElapsedTime(elapsedMs)}</dd>
+                </div>
+                {running && (
+                  <div>
+                    <dt>预计剩余时间</dt>
+                    <dd>{formatRemainingTime(remainingMs)}</dd>
+                  </div>
+                )}
+              </dl>
+            )}
+            <ol className="stage-list">
+              {(status?.stages || []).map(stage => (
+                <li className={`stage-item stage-item--${stage.status}`} key={stage.id}>
+                  <span className="stage-mark" aria-hidden>{stageMark(stage)}</span>
+                  <span className="stage-copy">
+                    <strong>{stage.label}</strong>
+                    {stage.status === 'running' && <small>{stage.detail}</small>}
+                  </span>
+                  <span className="stage-status">{stageStatusLabel(stage)}</span>
+                </li>
+              ))}
+            </ol>
+          </section>
+        </div>
+      </section>
+      {sandboxFinished && (
+        <aside className="initialization-test-controls" aria-label="初始化测试模式控制">
+          <span>模拟初始化已结束</span>
+          <button type="button" disabled={leavingSandbox} onClick={() => setSandboxExitConfirming(true)}>
+            关闭初始化测试模式
+          </button>
+        </aside>
+      )}
+      {sandboxExitConfirming && (
+        <div
+          className="initialization-exit-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="initialization-exit-title"
+          aria-describedby="initialization-exit-description"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !leavingSandbox) {
+              setSandboxExitConfirming(false)
+            }
+          }}
+        >
+          <section className="initialization-exit-dialog">
+            <h2 id="initialization-exit-title">关闭初始化测试模式</h2>
+            <p id="initialization-exit-description">
+              将停止隔离测试进程并清理临时运行时、模型和数据库，真实工作环境不会被修改。
+            </p>
+            {actionError && <p className="initialization-exit-error" role="alert">{actionError}</p>}
+            <div className="initialization-exit-actions">
+              <button
+                type="button"
+                disabled={leavingSandbox}
+                onClick={() => setSandboxExitConfirming(false)}
+                autoFocus
+              >
+                取消
+              </button>
+              <button
+                className="initialization-exit-confirm"
+                type="button"
+                disabled={leavingSandbox}
+                aria-busy={leavingSandbox}
+                onClick={() => void leaveSandbox()}
+              >
+                {leavingSandbox ? '正在清理沙箱…' : '确认关闭'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+    </main>
+  )
 }
 
 export default OnboardingWizard

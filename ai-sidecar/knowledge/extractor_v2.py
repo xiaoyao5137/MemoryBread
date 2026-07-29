@@ -16,7 +16,19 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-BAKE_NUM_PREDICT = 65536
+# 烘焙统一保留模型完整的 32K 上下文窗口；输出预算独立限制为 8K。
+# 现网正常 bundle 输出最大约 4.7K，8K 留足余量，同时阻止重复字段把
+# completion 撑满整个上下文窗口。
+BAKE_CONTEXT_WINDOW_TOKENS = 32768
+BAKE_NUM_PREDICT = 8192
+BAKE_PROMPT_SAFETY_TOKENS = 1024
+BAKE_INPUT_TOKEN_BUDGET = (
+    BAKE_CONTEXT_WINDOW_TOKENS - BAKE_NUM_PREDICT - BAKE_PROMPT_SAFETY_TOKENS
+)
+BAKE_RETRY_INPUT_TOKEN_BUDGET = 18_000
+# estimate_tokens 对中文结构化 prompt 会低估约 20%-30%；预算判断使用保守倍率，
+# 实际用量仍以 Ollama 返回的 prompt_eval_count 为准。
+BAKE_TOKEN_ESTIMATE_SAFETY_FACTOR = 1.35
 BAKE_CAPTURE_AX_MAX_CHARS = 16_000
 BAKE_CAPTURE_CONTEXT_MAX_CHARS = 20_000
 BAKE_DOCUMENT_MERGE_EXISTING_CONTEXT_MAX_CHARS = 24_000
@@ -26,6 +38,15 @@ BAKE_ERROR_LOG_PATH = Path.home() / ".memory-bread" / "logs" / "bake_extract_err
 # RAG 查询优先锁:model_api_server 在 RAG 调用期间持有此文件锁。
 # 时间线提炼在调 LLM 前非阻塞 acquire；拿不到则跳过本轮，让 RAG 优先完成。
 _RAG_LOCK_FILE = "/tmp/memory-bread-rag.lock"
+
+
+class BakeOutputError(RuntimeError):
+    code = "BAKE_OUTPUT_INVALID"
+    retryable = False
+
+
+class BakeOutputTruncatedError(BakeOutputError):
+    code = "BAKE_OUTPUT_TRUNCATED"
 
 
 def _rag_is_active() -> bool:
@@ -805,7 +826,7 @@ class KnowledgeExtractorV2:
         self.model = model
         # Ollama 推理 HTTP 超时：4B 模型在 M 系 Mac 上对 ~10k token prompt 的 P50 ≈ 135s、
         # P95 ≈ 342s，原先 90s 的设置导致 ~66% 请求被错杀。1200s 给冷启动 + 大 prompt 留余量。
-        # 必须 ≤ core-engine BAKE_SIDECAR_TIMEOUT_SECS（当前 1200s），否则会先在 core 那层断开。
+        # 必须 ≥ model_api_server 的 300s 长输入预算；Core 外层当前为 310s。
         self.timeout = 1200
 
         # 测试 Ollama 是否可用
@@ -1241,6 +1262,8 @@ class KnowledgeExtractorV2:
         system_prompt: str,
         user_prompt: str,
         response_schema: Dict[str, Any] = BAKE_RESPONSE_SCHEMA,
+        *,
+        num_predict: int = BAKE_NUM_PREDICT,
     ) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         from monitor.llm_tracker import LLMCallTracker, estimate_tokens
 
@@ -1257,7 +1280,11 @@ class KnowledgeExtractorV2:
                     {"role": "user", "content": user_prompt},
                 ],
                 format=response_schema,
-                options={"temperature": 0.0, "num_predict": BAKE_NUM_PREDICT},
+                options={
+                    "temperature": 0.0,
+                    "num_ctx": BAKE_CONTEXT_WINDOW_TOKENS,
+                    "num_predict": num_predict,
+                },
             )
             raw_content = _extract_ollama_response_text(response)
             tracker.set_response(response)
@@ -1279,7 +1306,7 @@ class KnowledgeExtractorV2:
                 "bake LLM output exceeded num_predict",
                 caller_id=caller_id,
                 model=self.model,
-                num_predict=BAKE_NUM_PREDICT,
+                num_predict=num_predict,
                 prompt_chars=len(system_prompt) + len(user_prompt),
                 raw_len=len(raw_content),
                 prompt_tokens=(response.get("usage") or {}).get("prompt_tokens") or response.get("prompt_eval_count"),
@@ -1293,7 +1320,7 @@ class KnowledgeExtractorV2:
             logger.error(
                 "bake LLM output exceeded num_predict caller=%s num_predict=%s raw_len=%s",
                 caller_id,
-                BAKE_NUM_PREDICT,
+                num_predict,
                 len(raw_content),
             )
         logger.info(
@@ -1594,6 +1621,131 @@ class KnowledgeExtractorV2:
     def extract_bake_sop(self, candidate: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
         return self._extract_bake_artifact(candidate, 'sop', BAKE_SOP_PROMPT)
 
+    def _bundle_prompt_token_estimate(self, candidate: Dict[str, Any]) -> int:
+        from monitor.llm_tracker import estimate_tokens
+
+        candidate_text = self._build_bake_candidate_text(candidate)
+        schema_text = json.dumps(BAKE_BUNDLE_RESPONSE_SCHEMA, ensure_ascii=False)
+        raw_estimate = estimate_tokens(
+            f"{BAKE_BUNDLE_PROMPT}\n候选输入如下:\n\n{candidate_text}\n{schema_text}"
+        )
+        return int(raw_estimate * BAKE_TOKEN_ESTIMATE_SAFETY_FACTOR + 0.999)
+
+    def _candidate_with_context_budget(
+        self,
+        candidate: Dict[str, Any],
+        context_char_budget: int,
+    ) -> Dict[str, Any]:
+        """按一个共享字符预算裁剪 capture 与 URL 聚合正文，避免两份上下文叠加失控。"""
+        adjusted = dict(candidate)
+        total_budget = max(0, int(context_char_budget))
+        url_text = str(candidate.get('url_aggregated_text') or '').strip()
+
+        if url_text:
+            # 聚合正文通常已经包含主 capture；只保留少量主 capture 作为定位上下文，
+            # 把大部分预算留给去重后的累计文档正文。
+            capture_budget = min(3_000, total_budget // 5)
+            url_budget = max(0, total_budget - capture_budget)
+            adjusted['url_aggregated_text'] = self._head_tail_context(
+                url_text,
+                url_budget,
+            )
+        else:
+            capture_budget = total_budget
+
+        capture_fields = (
+            ('capture_ax_text', 0.70),
+            ('capture_ocr_text', 0.15),
+            ('capture_input_text', 0.10),
+            ('capture_audio_text', 0.05),
+        )
+        allocated = 0
+        for index, (field, share) in enumerate(capture_fields):
+            field_budget = (
+                max(0, capture_budget - allocated)
+                if index == len(capture_fields) - 1
+                else max(0, int(capture_budget * share))
+            )
+            allocated += field_budget
+            adjusted[field] = self._head_tail_context(
+                candidate.get(field),
+                field_budget,
+            )
+        return adjusted
+
+    def _prepare_bake_bundle_candidate(
+        self,
+        candidate: Dict[str, Any],
+        input_token_budget: int = BAKE_INPUT_TOKEN_BUDGET,
+    ) -> Dict[str, Any]:
+        """把 bundle prompt 压进输入预算，为完整 JSON 输出预留固定空间。"""
+        original = dict(candidate)
+        original_estimate = self._bundle_prompt_token_estimate(original)
+        if original_estimate <= input_token_budget:
+            return original
+
+        context_fields = (
+            'url_aggregated_text',
+            'capture_ax_text',
+            'capture_ocr_text',
+            'capture_input_text',
+            'capture_audio_text',
+        )
+        high = sum(len(str(candidate.get(field) or '')) for field in context_fields)
+        low = 0
+        best = self._candidate_with_context_budget(candidate, 0)
+        while low <= high:
+            middle = (low + high) // 2
+            current = self._candidate_with_context_budget(candidate, middle)
+            if self._bundle_prompt_token_estimate(current) <= input_token_budget:
+                best = current
+                low = middle + 1
+            else:
+                high = middle - 1
+
+        fitted_estimate = self._bundle_prompt_token_estimate(best)
+        logger.info(
+            "bake bundle prompt fitted source_timeline_id=%s estimated_tokens=%s->%s budget=%s context_chars=%s",
+            candidate.get('source_timeline_id'),
+            original_estimate,
+            fitted_estimate,
+            input_token_budget,
+            sum(len(str(best.get(field) or '')) for field in context_fields),
+        )
+        return best
+
+    def estimate_bake_bundle_prompt_tokens(self, candidate: Dict[str, Any]) -> int:
+        """在入队前估算 bundle 的完整输入规模，用于选择运行时熔断档位。"""
+        return self._bundle_prompt_token_estimate(candidate)
+
+    def estimate_merge_document_prompt_tokens(
+        self,
+        existing_document: Dict[str, Any],
+        candidate: Dict[str, Any],
+    ) -> int:
+        """估算文档合并输入；与实际调用保持相同的首尾截断上限。"""
+        from monitor.llm_tracker import estimate_tokens
+
+        existing_content = self._head_tail_context(
+            existing_document.get('full_content'),
+            BAKE_DOCUMENT_MERGE_EXISTING_CONTEXT_MAX_CHARS,
+        )
+        candidate_content = self._head_tail_context(
+            self._build_bake_candidate_text(candidate),
+            BAKE_DOCUMENT_MERGE_CANDIDATE_CONTEXT_MAX_CHARS,
+        )
+        schema_text = json.dumps(BAKE_MERGE_DOCUMENT_SCHEMA, ensure_ascii=False)
+        prompt_payload = {
+            'title': existing_document.get('title'),
+            'summary': existing_document.get('summary'),
+            'sections_json': existing_document.get('sections_json'),
+            'existing_content_context': existing_content,
+            'new_capture_context': candidate_content,
+        }
+        return estimate_tokens(
+            json.dumps(prompt_payload, ensure_ascii=False) + schema_text
+        ) + 900
+
     def merge_bake_document(self, existing_document: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
         """将新的 candidate capture 内容合并到已有文档，返回更新后的字段。
 
@@ -1651,7 +1803,7 @@ class KnowledgeExtractorV2:
             sections = []
 
         section_structure = "\n".join(
-            f"{i+1}. {s.get('title', '未命名章节')}: {s.get('notes', '')[:60]}"
+            f"{i+1}. {s.get('title', '未命名章节')}: {str(s.get('notes') or '')[:60]}"
             for i, s in enumerate(sections)
         ) if sections else "（文档无章节结构）"
 
@@ -1753,14 +1905,19 @@ class KnowledgeExtractorV2:
     @staticmethod
     def _head_tail_context(value: Any, limit: int) -> str:
         """长文本保留首尾用于模型查重；该窗口从不参与最终正文覆盖。"""
+        if limit <= 0:
+            return ''
         text = str(value or '').strip()
         if len(text) <= limit:
             return text
         marker = "\n\n...(中间内容仅在查重上下文中省略，存储原文保持完整)...\n\n"
+        if limit <= len(marker):
+            return text[:limit]
         available = max(0, limit - len(marker))
         head_chars = available * 2 // 3
         tail_chars = available - head_chars
-        return text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
+        tail = text[-tail_chars:].lstrip() if tail_chars > 0 else ''
+        return text[:head_chars].rstrip() + marker + tail
 
     @staticmethod
     def _content_preserves_existing(existing_content: str, merged_content: str) -> bool:
@@ -1795,18 +1952,11 @@ class KnowledgeExtractorV2:
         # 检查抢占信号
         if preempt_check and preempt_check():
             logger.info("bake bundle 收到抢占信号，中断提炼 source_timeline_id=%s", source_timeline_id)
-            return {
-                'knowledge': {'accepted': False, 'reason': 'preempted', 'payload': None},
-                'design': {'accepted': False, 'reason': 'preempted', 'payload': None},
-                'sop': {'accepted': False, 'reason': 'preempted', 'payload': None},
-                'usage': None,
-                'model': self.model,
-                'degraded': True,
-                'stage_elapsed_ms': {},
-                'total_elapsed_ms': int((time.time() - bundle_started_at) * 1000),
-            }
+            from inference_queue import QueueEvictedError
+            raise QueueEvictedError("后台推理已让出在线咨询或创作任务")
 
-        candidate_text = self._build_bake_candidate_text(candidate)
+        prepared_candidate = self._prepare_bake_bundle_candidate(candidate)
+        candidate_text = self._build_bake_candidate_text(prepared_candidate)
         user_prompt = f"候选输入如下:\n\n{candidate_text}"
         caller_id = f"bundle:{source_timeline_id}"
         try:
@@ -1816,6 +1966,25 @@ class KnowledgeExtractorV2:
                 user_prompt,
                 response_schema=BAKE_BUNDLE_RESPONSE_SCHEMA,
             )
+            if not isinstance(parsed, dict) and meta.get('done_reason') == 'length':
+                retry_candidate = self._prepare_bake_bundle_candidate(
+                    candidate,
+                    BAKE_RETRY_INPUT_TOKEN_BUDGET,
+                )
+                retry_candidate_text = self._build_bake_candidate_text(retry_candidate)
+                if retry_candidate_text != candidate_text:
+                    logger.warning(
+                        "bake bundle output truncated; retrying once with smaller context caller=%s prompt_chars=%s->%s",
+                        caller_id,
+                        len(candidate_text),
+                        len(retry_candidate_text),
+                    )
+                    parsed, meta = self._call_bake_llm(
+                        caller_id,
+                        BAKE_BUNDLE_PROMPT,
+                        f"候选输入如下:\n\n{retry_candidate_text}",
+                        response_schema=BAKE_BUNDLE_RESPONSE_SCHEMA,
+                    )
         except Exception as exc:
             elapsed_ms = int((time.time() - bundle_started_at) * 1000)
             logger.error(
@@ -1824,29 +1993,18 @@ class KnowledgeExtractorV2:
                 elapsed_ms,
                 exc,
             )
-            rejected = {
-                'accepted': False,
-                'reason': f'llm_error: {exc}',
-                'payload': None,
-            }
-            return {
-                'knowledge': rejected,
-                'design': dict(rejected),
-                'sop': dict(rejected),
-                'usage': None,
-                'model': self.model,
-                'degraded': True,
-                'stage_elapsed_ms': {'bundle': elapsed_ms},
-                'total_elapsed_ms': elapsed_ms,
-            }
+            raise
 
-        parse_failure_reason = None
         if not isinstance(parsed, dict):
             parse_failure_reason = 'empty_content' if meta.get('empty_content') else (
                 'truncated_json' if meta.get('done_reason') == 'length' else 'invalid_json'
             )
-            meta = {**meta, 'parse_failure_reason': parse_failure_reason}
-            parsed = {}
+            error_type = (
+                BakeOutputTruncatedError
+                if parse_failure_reason == 'truncated_json'
+                else BakeOutputError
+            )
+            raise error_type(f"bake bundle output invalid: {parse_failure_reason}")
 
         results: Dict[str, Dict[str, Any]] = {}
         result_meta: Dict[str, Dict[str, Any]] = {}
@@ -1861,7 +2019,7 @@ class KnowledgeExtractorV2:
             results[artifact_type] = artifact
             result_meta[artifact_type] = artifact_meta
 
-        degraded = bool(parse_failure_reason) or any(
+        degraded = any(
             bool(item.get('degraded')) for item in result_meta.values()
         )
         total_elapsed_ms = int((time.time() - bundle_started_at) * 1000)

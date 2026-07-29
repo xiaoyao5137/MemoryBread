@@ -11,29 +11,32 @@
 
 ## 🚀 启动方式
 
-### 方式 1: 一键全组件重启（联调测试推荐）
+### 方式 1: 完整工作区一键重启（登录与云服务联调推荐）
 
 ```bash
-cd /Users/xianjiaqi/Documents/mygit/cy/gzdz
+cd /Users/xianjiaqi/Documents/mygit/mb-all
 ./start.sh restart
 ```
 
 联调、重启后验证、启动应用测试时，默认优先使用 `./start.sh restart`。
-这样会先完整停止并清理旧进程，再按顺序重启所有必要组件，避免因为某个组件没重启或处于脏状态而影响测试结论。
+这样会先完整停止并清理旧进程，再按顺序重启账户服务、模型网关、运营台和
+MemoryBread 客户端，避免因为账户服务未启动而让客户端登录显示网络错误。
 
-### 方式 2: 一键启动
+在完整 `mb-all` 工作区中直接执行 `MemoryBread/start.sh` 的公开管理命令时，脚本也会自动
+委派给上述总启动器。只有明确不需要账户登录与云能力时，才使用
+`MEMORYBREAD_LOCAL_ONLY=1 ./start.sh` 仅启动客户端本地组件。
 
-```bash
-cd /Users/xianjiaqi/Documents/mygit/cy/gzdz
-./start.sh
-```
+### 方式 2: 客户端单仓启动
 
-这将按顺序启动所有服务：
+当 `MemoryBread` 独立检出，或显式设置 `MEMORYBREAD_LOCAL_ONLY=1` 时，将按顺序启动：
 1. AI Sidecar（后台）
-2. Core Engine（后台）
-3. Desktop UI（后台启动 dev server / Tauri）
+2. Model API 与 Creation Service（后台）
+3. Core Engine（后台）
+4. Desktop UI（后台启动 dev server / Tauri）
 
-### 方式 2: 手动分步启动
+该模式不启动 `mb-admin`，因此本地 `127.0.0.1:8080` 没有另行启动时，账户登录不可用。
+
+### 方式 3: 手动分步启动
 
 ```bash
 # 终端 1: AI Sidecar

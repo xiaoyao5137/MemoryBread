@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memorybread.local/contracts/memory-retrieval-output.v1.schema.json",
+  "title": "MemoryBread memory retrieval tool output",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["schema_version", "query", "result_count", "contexts"],
+      "properties": {
+        "schema_version": { "const": "memorybread.recall.v1" },
+        "query": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "result_count": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "contexts": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "required": ["source_type", "text", "truncated"],
+            "properties": {
+              "memory_id": { "type": "string" },
+              "source_type": { "type": "string", "minLength": 1 },
+              "title": { "type": "string" },
+              "text": { "type": "string" },
+              "truncated": { "type": "boolean" },
+              "score": { "type": "number" },
+              "time": {},
+              "app_name": { "type": "string" },
+              "window_title": { "type": "string" },
+              "url": { "type": "string" },
+              "category": { "type": "string" },
+              "activity_type": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["schema_version", "status", "service_url"],
+      "properties": {
+        "schema_version": { "const": "memorybread.recall.health.v1" },
+        "status": { "enum": ["ready", "reachable"] },
+        "service_url": {
+          "type": "string",
+          "pattern": "^http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(?::[0-9]+)?$"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["schema_version", "error"],
+      "properties": {
+        "schema_version": { "const": "memorybread.recall.error.v1" },
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "hint"],
+          "properties": {
+            "code": {
+              "enum": [
+                "INVALID_ARGUMENT",
+                "REMOTE_ENDPOINT_REJECTED",
+                "SERVICE_UNAVAILABLE",
+                "MODEL_NOT_READY",
+                "TIMEOUT",
+                "INVALID_RESPONSE",
+                "SERVICE_ERROR",
+                "UNEXPECTED_ERROR"
+              ]
+            },
+            "message": { "type": "string", "minLength": 1 },
+            "hint": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

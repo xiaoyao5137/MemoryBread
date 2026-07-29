@@ -4,6 +4,7 @@ import {
   AlertCircle,
   BatteryLow,
   Award,
+  Bell,
   BookOpen,
   Briefcase,
   Building2,
@@ -40,12 +41,23 @@ import {
   updateUserProfile,
 } from '../utils/authApi'
 import { toUserFacingError } from '../utils/userFacingError'
+import { useAppMetadata } from '../utils/appMetadata'
 import {
+  fetchWorkProfileDay,
+  hasWorkProfileDayDetails,
   toLocalDateKey,
   type InferredWorkMood,
   type WorkProfileSummary,
 } from '../utils/workProfile'
-import { synchronizeWorkProfile } from '../utils/workProfileCloud'
+import {
+  loadCachedWorkProfile,
+  mergeWorkProfiles,
+  synchronizeWorkProfile,
+  WORK_PROFILE_SYNCED_EVENT,
+  type SyncWorkProfileEventDetail,
+} from '../utils/workProfileCloud'
+import MessagePanel from './MessagePanel'
+import { useAppStore } from '../store/useAppStore'
 import './AccountProfile.css'
 
 interface AccountProfileProps {
@@ -70,6 +82,7 @@ const TABS: Array<{
   icon: LucideIcon
 }> = [
   { id: 'personal', label: '个人信息', icon: UserRound },
+  { id: 'messages', label: '消息', icon: Bell },
   { id: 'achievements', label: '标签卡片', icon: Award },
   { id: 'investment', label: '工作投入', icon: Clock },
   { id: 'mood', label: '工作心情', icon: Smile },
@@ -235,6 +248,7 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
   onUserChange,
   onLogout,
 }) => {
+  const appMetadata = useAppMetadata()
   const [workProfile, setWorkProfile] = useState<WorkProfileSummary | null>(null)
   const [achievements, setAchievements] = useState<AchievementProfile | null>(null)
   const [achievementsError, setAchievementsError] = useState<string | null>(null)
@@ -242,9 +256,13 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
   const [achievementRetryKey, setAchievementRetryKey] = useState(0)
   const [equippingSurface, setEquippingSurface] = useState<AchievementSurface | null>(null)
   const [achievementMessage, setAchievementMessage] = useState<string | null>(null)
+  const [expandedAchievementId, setExpandedAchievementId] = useState<string | null>(null)
   const [workProfileError, setWorkProfileError] = useState<string | null>(null)
   const [workProfileLoading, setWorkProfileLoading] = useState(true)
   const [retryKey, setRetryKey] = useState(0)
+  const [workDayDetailLoading, setWorkDayDetailLoading] = useState(false)
+  const [workDayDetailError, setWorkDayDetailError] = useState<string | null>(null)
+  const [workDayDetailRetryKey, setWorkDayDetailRetryKey] = useState(0)
   const [activeSection, setActiveSection] = useState<AccountProfileSection>('personal')
   const [highlightedAchievementKeys, setHighlightedAchievementKeys] = useState<string[]>([])
   const [pinnedHeatmapDate, setPinnedHeatmapDate] = useState<string | null>(null)
@@ -262,6 +280,12 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
   const logoutCancelRef = useRef<HTMLButtonElement>(null)
   const logoutDialogRef = useRef<HTMLElement>(null)
   const highlightedBadgeRef = useRef<HTMLElement>(null)
+  const achievementDialogRef = useRef<HTMLElement>(null)
+  const achievementDialogCloseRef = useRef<HTMLButtonElement>(null)
+  const achievementDialogTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const expandedAchievement = achievements?.badges.find(
+    ({ badge }) => badge.id === expandedAchievementId,
+  ) ?? null
 
   useEffect(() => {
     if (profileEditing) return
@@ -283,24 +307,49 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
 
   useEffect(() => {
     let cancelled = false
-    setWorkProfileLoading(true)
+    let hasProfile = false
+    const applyProfile = (profile: WorkProfileSummary) => {
+      if (cancelled) return
+      hasProfile = true
+      setWorkProfile((current) => current ? mergeWorkProfiles(current, profile) : profile)
+      setWorkProfileLoading(false)
+      setWorkProfileError(null)
+    }
+    const handleSyncedProfile = (event: Event) => {
+      const detail = (event as CustomEvent<SyncWorkProfileEventDetail>).detail
+      if (detail.userId === user.id) applyProfile(detail.profile)
+    }
+
+    const cached = loadCachedWorkProfile(user.id)
+    if (cached) {
+      applyProfile(cached)
+    } else {
+      setWorkProfile(null)
+      setWorkProfileLoading(true)
+    }
     setWorkProfileError(null)
-    synchronizeWorkProfile({
-      apiBaseUrl,
-      adminApiBaseUrl,
-      authToken,
-      userId: user.id,
-    })
-      .then((profile) => {
-        if (!cancelled) setWorkProfile(profile)
+    window.addEventListener(WORK_PROFILE_SYNCED_EVENT, handleSyncedProfile)
+    if (!cached || retryKey > 0) {
+      synchronizeWorkProfile({
+        apiBaseUrl,
+        adminApiBaseUrl,
+        authToken,
+        userId: user.id,
       })
-      .catch((error) => {
-        if (!cancelled) setWorkProfileError(toUserFacingError(error, '工作画像读取失败'))
-      })
-      .finally(() => {
-        if (!cancelled) setWorkProfileLoading(false)
-      })
-    return () => { cancelled = true }
+        .then((profile) => {
+          applyProfile(profile)
+        })
+        .catch((error) => {
+          if (!cancelled && !hasProfile) {
+            setWorkProfileError(toUserFacingError(error, '工作画像读取失败'))
+            setWorkProfileLoading(false)
+          }
+        })
+    }
+    return () => {
+      cancelled = true
+      window.removeEventListener(WORK_PROFILE_SYNCED_EVENT, handleSyncedProfile)
+    }
   }, [adminApiBaseUrl, apiBaseUrl, authToken, retryKey, user.id])
 
   useEffect(() => {
@@ -378,6 +427,42 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
       logoutTriggerRef.current?.focus()
     }
   }, [logoutConfirmOpen])
+
+  useEffect(() => {
+    if (!expandedAchievementId) return undefined
+    const focusFrame = window.requestAnimationFrame(() => achievementDialogCloseRef.current?.focus())
+    const previousOverflow = document.body.style.overflow
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setExpandedAchievementId(null)
+        return
+      }
+      if (event.key !== 'Tab') return
+      const focusable = Array.from(
+        achievementDialogRef.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? [],
+      )
+      if (focusable.length < 2) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+
+    document.body.style.overflow = 'hidden'
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.cancelAnimationFrame(focusFrame)
+      document.body.style.overflow = previousOverflow
+      document.removeEventListener('keydown', handleKeyDown)
+      achievementDialogTriggerRef.current?.focus()
+    }
+  }, [expandedAchievementId])
 
   const heatmap = useMemo(() => {
     const workByDate = new Map(workProfile?.days.map((day) => [day.date, day]) ?? [])
@@ -511,8 +596,106 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
     </div>
   )
 
-  const totalToday = workProfile?.today.total_minutes ?? 0
-  const totalAppMinutes = Math.max(1, workProfile?.today.apps.reduce((sum, app) => sum + app.minutes, 0) ?? 0)
+  const selectedDate = pinnedHeatmapDate ?? workProfile?.today.date ?? null
+  const selectedDay = workProfile?.days.find((day) => day.date === selectedDate)
+  const selectedDateIsToday = Boolean(workProfile && selectedDate === workProfile.today.date)
+  const selectedDayNeedsDetails = Boolean(
+    pinnedHeatmapDate
+    && selectedDay
+    && selectedDay.capture_count > 0
+    && !selectedDateIsToday
+    && !hasWorkProfileDayDetails(selectedDay),
+  )
+
+  useEffect(() => {
+    if (!pinnedHeatmapDate || !selectedDayNeedsDetails) {
+      setWorkDayDetailLoading(false)
+      setWorkDayDetailError(null)
+      return undefined
+    }
+
+    const controller = new AbortController()
+    setWorkDayDetailLoading(true)
+    setWorkDayDetailError(null)
+    fetchWorkProfileDay(apiBaseUrl, pinnedHeatmapDate, controller.signal)
+      .then((detail) => {
+        if (controller.signal.aborted) return
+        setWorkProfile((current) => current && ({
+          ...current,
+          days: current.days.map((day) => (
+            day.date === detail.date ? { ...day, ...detail } : day
+          )),
+        }))
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setWorkDayDetailError(toUserFacingError(error, '当天工作明细读取失败'))
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setWorkDayDetailLoading(false)
+      })
+
+    return () => controller.abort()
+  }, [
+    apiBaseUrl,
+    pinnedHeatmapDate,
+    selectedDayNeedsDetails,
+    workDayDetailRetryKey,
+  ])
+
+  const selectedWorkDay = workProfile && selectedDate
+    ? {
+        date: selectedDate,
+        totalMinutes: selectedDateIsToday
+          ? workProfile.today.total_minutes
+          : selectedDay?.minutes ?? 0,
+        captureCount: selectedDateIsToday
+          ? workProfile.today.capture_count
+          : selectedDay?.capture_count ?? 0,
+        activePeriodCount: selectedDateIsToday
+          ? workProfile.today.active_period_count ?? 0
+          : selectedDay?.active_period_count ?? 0,
+        firstCaptureAt: selectedDateIsToday
+          ? workProfile.today.first_capture_at
+          : selectedDay?.first_capture_at ?? null,
+        lastCaptureAt: selectedDateIsToday
+          ? workProfile.today.last_capture_at
+          : selectedDay?.last_capture_at ?? null,
+        apps: selectedDateIsToday
+          ? workProfile.today.apps
+          : selectedDay?.apps ?? [],
+      }
+    : null
+  const selectedHeatmapCell = heatmap.cells.find((cell) => cell.dateKey === selectedDate)
+  const selectedDateLabel = selectedHeatmapCell?.dateLabel ?? selectedDate ?? ''
+  const totalAppMinutes = Math.max(
+    1,
+    selectedWorkDay?.apps.reduce((sum, app) => sum + app.minutes, 0) ?? 0,
+  )
+  const selectedWorkDayHasTimeRange = (
+    selectedWorkDay?.firstCaptureAt != null
+    && selectedWorkDay.lastCaptureAt != null
+  )
+  const selectedDayDetailPending = selectedDayNeedsDetails && !workDayDetailError
+  const selectedDayDetailBusy = selectedDayDetailPending || workDayDetailLoading
+  const openSelectedDayCaptures = () => {
+    if (!selectedWorkDay || selectedWorkDay.captureCount <= 0) return
+    useAppStore.setState({
+      windowMode: 'knowledge',
+      repositoryTab: 'capture',
+      selectedMemoryId: null,
+      selectedCaptureId: null,
+      repositoryMemoryFocusId: null,
+      repositoryCaptureQuery: '',
+      repositoryCaptureFrom: selectedWorkDay.date,
+      repositoryCaptureTo: selectedWorkDay.date,
+      repositoryCaptureSourceCaptureId: null,
+      bakeCaptureOffset: 0,
+      bakeNavigationStack: [],
+      captureBackTarget: null,
+    })
+  }
   const inferredMood = workProfile?.today.mood.mood
     ? MOOD_PRESENTATION[workProfile.today.mood.mood]
     : null
@@ -566,6 +749,17 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
         </nav>
 
         <div className="account-profile__content">
+          <MessagePanel
+            adminApiBaseUrl={adminApiBaseUrl}
+            authToken={authToken}
+            currentUser={user}
+            embedded
+            hidden={activeSection !== 'messages'}
+            id="account-profile-panel-messages"
+            key={`${user.id}:${adminApiBaseUrl}`}
+            labelledBy="account-profile-tab-messages"
+          />
+
           {activeSection === 'personal' && (
             <section
               aria-labelledby="account-profile-tab-personal"
@@ -630,6 +824,7 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
                 <div><dt>昵称</dt><dd>{user.nickname ?? user.username ?? '未设置'}</dd></div>
                 <div><dt>公司名称</dt><dd>{user.company_name ?? '未填写'}</dd></div>
                 <div><dt>运行模式</dt><dd>{runModeLabel}</dd></div>
+                <div><dt>软件版本</dt><dd>v{appMetadata.version}</dd></div>
                 <div><dt>账户状态</dt><dd>{user.status === 'active' ? '正常' : user.status}</dd></div>
                 <div><dt>登录方式</dt><dd>{user.email ? '邮箱账号' : '手机号账号'}</dd></div>
                 <div><dt>区域</dt><dd>{user.locale}</dd></div>
@@ -667,7 +862,7 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
               <div className="account-profile__panel-heading account-profile__panel-heading--achievements">
                 <div>
                   <h2>标签卡片</h2>
-                  <p>完成任务后卡片会持续累积，可分别佩戴到个人头像和悬浮球。</p>
+                  <p>卡片会持续累积，点击可放大查看并选择佩戴位置。</p>
                 </div>
                 {achievements && achievements.badges.length > 0 && (
                   <div className="account-profile__achievement-total" aria-label="标签卡片统计">
@@ -697,8 +892,6 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
                   {achievements.badges.map((item) => {
                     const badge = item.badge
                     const Icon = BADGE_ICONS[badge.icon_key] ?? Briefcase
-                    const onProfile = achievements.equipped.profile_avatar?.id === badge.id
-                    const onFloating = achievements.equipped.floating_avatar?.id === badge.id
                     const isNew = highlightedAchievementKeys.includes(badge.badge_key)
                     return (
                       <article
@@ -708,51 +901,34 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
                         ref={isNew ? highlightedBadgeRef : undefined}
                       >
                         {isNew && <span className="account-profile__achievement-new-label">刚刚获得</span>}
-                        <div className="account-profile__achievement-card-top">
-                          <span className="account-profile__achievement-icon" aria-hidden="true"><Icon size={26} strokeWidth={2.2} /></span>
-                          <span className="account-profile__achievement-rarity">{RARITY_LABELS[badge.rarity]}</span>
-                          <span className="account-profile__achievement-quantity">×{item.quantity}</span>
-                        </div>
-                        <div className="account-profile__achievement-copy">
-                          <strong>{badge.name}</strong>
-                          <span>{badge.tagline}</span>
-                          <p>{badge.description}</p>
-                        </div>
-                        <div className="account-profile__achievement-meta">
-                          <span>累计奖励 <strong>{formatCredit(item.total_credit_earned)}</strong> Credit</span>
-                          <span>最近获得 {new Date(item.last_earned_at).toLocaleDateString('zh-CN')}</span>
-                        </div>
-                        {BADGE_WELLNESS_NOTES[badge.badge_key] && (
-                          <div className="account-profile__achievement-rest-note">{BADGE_WELLNESS_NOTES[badge.badge_key]}</div>
-                        )}
-                        <div className="account-profile__achievement-actions">
-                          <button
-                            aria-pressed={onProfile}
-                            className={onProfile ? 'is-equipped' : ''}
-                            disabled={equippingSurface !== null}
-                            onClick={() => void toggleBadge('profile_avatar', badge)}
-                            type="button"
-                          >
-                            <UserRound size={14} aria-hidden />
-                            {onProfile ? '从头像取下' : '佩戴到头像'}
-                          </button>
-                          <button
-                            aria-pressed={onFloating}
-                            className={onFloating ? 'is-equipped' : ''}
-                            disabled={equippingSurface !== null}
-                            onClick={() => void toggleBadge('floating_avatar', badge)}
-                            type="button"
-                          >
-                            <Briefcase size={14} aria-hidden />
-                            {onFloating ? '从悬浮球取下' : '佩戴到悬浮球'}
-                          </button>
-                        </div>
+                        <button
+                          aria-haspopup="dialog"
+                          aria-label={`查看「${badge.name}」卡片详情`}
+                          className="account-profile__achievement-card-trigger"
+                          onClick={(event) => {
+                            achievementDialogTriggerRef.current = event.currentTarget
+                            setAchievementMessage(null)
+                            setExpandedAchievementId(badge.id)
+                          }}
+                          type="button"
+                        >
+                          <div className="account-profile__achievement-card-top">
+                            <span className="account-profile__achievement-icon" aria-hidden="true"><Icon size={22} strokeWidth={2.2} /></span>
+                            <span className="account-profile__achievement-rarity">{RARITY_LABELS[badge.rarity]}</span>
+                            <span className="account-profile__achievement-quantity">×{item.quantity}</span>
+                          </div>
+                          <div className="account-profile__achievement-copy">
+                            <strong>{badge.name}</strong>
+                            <span>{badge.tagline}</span>
+                          </div>
+                          <span className="account-profile__achievement-open-hint" aria-hidden="true">查看详情</span>
+                        </button>
                       </article>
                     )
                   })}
                 </div>
               )}
-              {achievementMessage && (
+              {achievementMessage && !expandedAchievementId && (
                 <div className="account-profile__achievement-message" role="status">{achievementMessage}</div>
               )}
             </section>
@@ -778,22 +954,76 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
               {!workProfileLoading && workProfileError && renderWorkError()}
               {!workProfileLoading && !workProfileError && workProfile && (
                 <>
-                  <div className="account-profile__investment-grid">
+                  <div className="account-profile__investment-grid" aria-live="polite">
                     <div className="account-profile__today-total">
-                      <span>今日工作时长</span>
-                      <strong>{formatDuration(totalToday)}</strong>
-                      <p><Clock size={16} aria-hidden /> {formatClock(workProfile.today.first_capture_at)} 至 {formatClock(workProfile.today.last_capture_at)}</p>
-                      <small>{workProfile.today.capture_count > 0 ? `${workProfile.today.capture_count} 条工作记录` : '今天还没有可统计的工作记录'}</small>
+                      <span>{selectedDateIsToday ? '今日工作时长' : `${selectedDateLabel} · 工作时长`}</span>
+                      <strong>{formatDuration(selectedWorkDay?.totalMinutes ?? 0)}</strong>
+                      <p className="account-profile__active-periods">
+                        <Clock size={16} aria-hidden />
+                        {selectedDayDetailBusy
+                          ? '正在读取当天工作时段…'
+                          : workDayDetailError
+                            ? '当天工作时段读取失败'
+                            : selectedWorkDayHasTimeRange
+                          ? selectedWorkDay.activePeriodCount > 0
+                            ? `${selectedWorkDay.activePeriodCount} 段活跃 · 首次 ${formatClock(selectedWorkDay.firstCaptureAt)} · 最后 ${formatClock(selectedWorkDay.lastCaptureAt)}`
+                            : `记录分布于 ${formatClock(selectedWorkDay.firstCaptureAt)} 至 ${formatClock(selectedWorkDay.lastCaptureAt)}（含间歇）`
+                          : (selectedWorkDay?.captureCount ?? 0) > 0
+                            ? '当天没有可用的工作时段明细'
+                            : '暂无工作时段'}
+                      </p>
+                      {(selectedWorkDay?.captureCount ?? 0) > 0 ? (
+                        <button
+                          aria-label={`查看${selectedDateLabel}的${selectedWorkDay?.captureCount}条工作记录`}
+                          className="account-profile__capture-link"
+                          onClick={openSelectedDayCaptures}
+                          type="button"
+                        >
+                          <BookOpen size={14} aria-hidden />
+                          查看 {selectedWorkDay?.captureCount} 条工作记录
+                        </button>
+                      ) : (
+                        <small>
+                          {selectedDateIsToday
+                            ? '今天还没有可统计的工作记录'
+                            : '这一天还没有可统计的工作记录'}
+                        </small>
+                      )}
                     </div>
                     <div className="account-profile__distribution">
                       <div className="account-profile__distribution-head">
                         <h3>应用分布</h3>
-                        <span>{workProfile.today.apps.length > 0 ? `${workProfile.today.apps.length} 个主要应用` : '等待采集'}</span>
+                        <span>
+                          {selectedDayDetailBusy
+                            ? '正在读取'
+                            : workDayDetailError
+                              ? '读取失败'
+                              : (selectedWorkDay?.apps.length ?? 0) > 0
+                            ? `${selectedWorkDay?.apps.length} 个主要应用`
+                            : selectedDateIsToday ? '等待采集' : '暂无明细'}
+                        </span>
                       </div>
-                      {workProfile.today.apps.length > 0 ? (
+                      {selectedDayDetailBusy || workDayDetailError ? (
+                        <div className="account-profile__empty">
+                          <Activity size={25} aria-hidden />
+                          <span>
+                            {selectedDayDetailBusy
+                              ? '正在读取这一天的应用分布…'
+                              : '当天工作明细读取失败，请稍后重试。'}
+                          </span>
+                          {workDayDetailError && (
+                            <button
+                              onClick={() => setWorkDayDetailRetryKey((value) => value + 1)}
+                              type="button"
+                            >
+                              重新读取
+                            </button>
+                          )}
+                        </div>
+                      ) : (selectedWorkDay?.apps.length ?? 0) > 0 ? (
                         <>
-                          <div className="account-profile__distribution-bar" aria-label="今日应用时长分布">
-                            {workProfile.today.apps.map((app, index) => (
+                          <div className="account-profile__distribution-bar" aria-label={`${selectedDateLabel}应用时长分布`}>
+                            {selectedWorkDay?.apps.map((app, index) => (
                               <span
                                 key={app.name}
                                 style={{
@@ -805,7 +1035,7 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
                             ))}
                           </div>
                           <ul>
-                            {workProfile.today.apps.map((app, index) => (
+                            {selectedWorkDay?.apps.map((app, index) => (
                               <li key={app.name}>
                                 <i style={{ background: APP_COLORS[index % APP_COLORS.length] }} aria-hidden="true" />
                                 <span>{app.name}</span>
@@ -817,7 +1047,11 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
                       ) : (
                         <div className="account-profile__empty">
                           <Activity size={25} aria-hidden />
-                          <span>开始工作后，这里会显示应用时长分布。</span>
+                          <span>
+                            {selectedDateIsToday
+                              ? '开始工作后，这里会显示应用时长分布。'
+                              : '这一天暂无可展示的应用分布。'}
+                          </span>
                         </div>
                       )}
                     </div>
@@ -851,7 +1085,7 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
                               />
                             ) : (
                               <button
-                                aria-label={`${cell.dateLabel}，工作时长 ${formatDuration(cell.minutes)}，${cell.captureCount} 条工作记录`}
+                                aria-label={`查看${cell.dateLabel}工作数据，工作时长 ${formatDuration(cell.minutes)}，${cell.captureCount} 条工作记录`}
                                 aria-pressed={pinnedHeatmapDate === cell.dateKey}
                                 className={`account-profile__heatmap-cell account-profile__heatmap-cell--${cell.level}${cell.week < 4 ? ' account-profile__heatmap-cell--tooltip-start' : ''}${cell.week > 48 ? ' account-profile__heatmap-cell--tooltip-end' : ''}${pinnedHeatmapDate === cell.dateKey ? ' account-profile__heatmap-cell--pinned' : ''}`}
                                 key={cell.dateKey}
@@ -919,6 +1153,84 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
           )}
         </div>
       </div>
+
+      {expandedAchievement && achievements && (() => {
+        const badge = expandedAchievement.badge
+        const Icon = BADGE_ICONS[badge.icon_key] ?? Briefcase
+        const onProfile = achievements.equipped.profile_avatar?.id === badge.id
+        const onFloating = achievements.equipped.floating_avatar?.id === badge.id
+        return (
+          <div
+            className="account-profile__achievement-dialog-backdrop"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) setExpandedAchievementId(null)
+            }}
+          >
+            <section
+              aria-describedby={`achievement-detail-description-${badge.id}`}
+              aria-labelledby={`achievement-detail-title-${badge.id}`}
+              aria-modal="true"
+              className={`account-profile__achievement-dialog account-profile__achievement-dialog--${badge.palette_key}`}
+              ref={achievementDialogRef}
+              role="dialog"
+            >
+              <button
+                aria-label={`关闭「${badge.name}」卡片详情`}
+                className="account-profile__achievement-dialog-close"
+                onClick={() => setExpandedAchievementId(null)}
+                ref={achievementDialogCloseRef}
+                type="button"
+              >
+                <X size={18} aria-hidden />
+              </button>
+              <div className="account-profile__achievement-dialog-top">
+                <span className="account-profile__achievement-dialog-icon" aria-hidden="true">
+                  <Icon size={34} strokeWidth={2.1} />
+                </span>
+                <span className="account-profile__achievement-rarity">{RARITY_LABELS[badge.rarity]}</span>
+                <span className="account-profile__achievement-quantity">×{expandedAchievement.quantity}</span>
+              </div>
+              <div className="account-profile__achievement-dialog-copy">
+                <h2 id={`achievement-detail-title-${badge.id}`}>{badge.name}</h2>
+                <span>{badge.tagline}</span>
+                <p id={`achievement-detail-description-${badge.id}`}>{badge.description}</p>
+              </div>
+              <div className="account-profile__achievement-meta">
+                <span>累计奖励 <strong>{formatCredit(expandedAchievement.total_credit_earned)}</strong> Credit</span>
+                <span>最近获得 {new Date(expandedAchievement.last_earned_at).toLocaleDateString('zh-CN')}</span>
+              </div>
+              {BADGE_WELLNESS_NOTES[badge.badge_key] && (
+                <div className="account-profile__achievement-rest-note">{BADGE_WELLNESS_NOTES[badge.badge_key]}</div>
+              )}
+              <div className="account-profile__achievement-actions">
+                <button
+                  aria-pressed={onProfile}
+                  className={onProfile ? 'is-equipped' : ''}
+                  disabled={equippingSurface !== null}
+                  onClick={() => void toggleBadge('profile_avatar', badge)}
+                  type="button"
+                >
+                  <UserRound size={15} aria-hidden />
+                  {onProfile ? '从头像取下' : '佩戴到头像'}
+                </button>
+                <button
+                  aria-pressed={onFloating}
+                  className={onFloating ? 'is-equipped' : ''}
+                  disabled={equippingSurface !== null}
+                  onClick={() => void toggleBadge('floating_avatar', badge)}
+                  type="button"
+                >
+                  <Briefcase size={15} aria-hidden />
+                  {onFloating ? '从悬浮球取下' : '佩戴到悬浮球'}
+                </button>
+              </div>
+              {achievementMessage && (
+                <div className="account-profile__achievement-message" role="status">{achievementMessage}</div>
+              )}
+            </section>
+          </div>
+        )
+      })()}
 
       {logoutConfirmOpen && (
         <div

@@ -71,16 +71,6 @@
   flex: 1;
 }
 
-.admin-env-switch {
-  padding: 10px;
-  border: 1px solid rgba(180, 111, 42, 0.22);
-  border-radius: 16px;
-  background: linear-gradient(180deg, rgba(255, 248, 235, 0.96), rgba(255, 255, 255, 0.88));
-  box-shadow: 0 10px 24px rgba(180, 111, 42, 0.08);
-  display: grid;
-  gap: 10px;
-}
-
 .buddy-sidebar-footer {
   flex: 0 0 auto;
   margin: 0 -12px;
@@ -170,54 +160,6 @@
 .buddy-account-entry:focus-visible {
   outline: 2px solid rgba(198, 95, 47, 0.34);
   outline-offset: -2px;
-}
-
-.admin-env-switch__eyebrow {
-  display: block;
-  margin-bottom: 2px;
-  color: #9A6A31;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-}
-
-.admin-env-switch strong {
-  color: #3A2414;
-  font-size: 14px;
-}
-
-.admin-env-switch__actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6px;
-}
-
-.admin-env-switch__button {
-  min-height: 32px;
-  border: 1px solid rgba(154, 106, 49, 0.2);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.76);
-  color: #6B4A25;
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-}
-
-.admin-env-switch__button:hover {
-  border-color: rgba(154, 106, 49, 0.42);
-  background: #FFF7E8;
-}
-
-.admin-env-switch__button:focus-visible {
-  outline: 3px solid rgba(245, 158, 11, 0.28);
-  outline-offset: 2px;
-}
-
-.admin-env-switch__button--active {
-  background: #B46F2A;
-  color: white;
-  border-color: #B46F2A;
-  box-shadow: 0 8px 18px rgba(180, 111, 42, 0.22);
 }
 
 /* 菜单分组 */
@@ -350,35 +292,6 @@
     --bread-icon-glass-highlight: rgba(255, 255, 255, 0.18);
     --bread-icon-line: #f6d6a8;
     --bread-icon-accent: #d98c38;
-  }
-
-  .admin-env-switch {
-    border-color: rgba(245, 158, 11, 0.24);
-    background: linear-gradient(180deg, rgba(65, 45, 24, 0.92), rgba(37, 37, 38, 0.9));
-  }
-
-  .admin-env-switch__eyebrow {
-    color: #F4C177;
-  }
-
-  .admin-env-switch strong {
-    color: #FFF7E8;
-  }
-
-  .admin-env-switch__button {
-    border-color: rgba(244, 193, 119, 0.22);
-    background: rgba(255, 255, 255, 0.06);
-    color: #F6D6A8;
-  }
-
-  .admin-env-switch__button:hover {
-    background: rgba(244, 193, 119, 0.12);
-  }
-
-  .admin-env-switch__button--active {
-    background: #D98C38;
-    color: #1F1308;
-    border-color: #D98C38;
   }
 
   .buddy-sidebar-footer {

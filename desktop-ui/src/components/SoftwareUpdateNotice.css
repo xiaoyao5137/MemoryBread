@@ -1,0 +1,162 @@
+.software-update-notice {
+  position: fixed;
+  inset: 0;
+  z-index: 2600;
+  padding: 28px;
+  background: rgba(48, 34, 25, .34);
+  backdrop-filter: blur(8px);
+  display: grid;
+  place-items: center;
+}
+
+.software-update-notice__dialog {
+  position: relative;
+  width: min(520px, 100%);
+  max-height: min(720px, calc(100vh - 48px));
+  padding: 30px;
+  box-sizing: border-box;
+  border: 1px solid rgba(133, 78, 42, .22);
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at 90% 0, rgba(224, 150, 86, .18), transparent 36%),
+    #fffaf3;
+  color: #3f2b20;
+  box-shadow: 0 30px 80px rgba(66, 39, 23, .28);
+  overflow: auto;
+}
+
+.software-update-notice__mark {
+  width: 62px;
+  height: 62px;
+  border-radius: 20px 20px 20px 8px;
+  color: #fff8ef;
+  background: linear-gradient(145deg, #d97a3d, #a84822);
+  box-shadow: 0 12px 24px rgba(164, 70, 31, .2);
+  display: grid;
+  place-items: center;
+}
+
+.software-update-notice__close {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 50%;
+  color: #745c4d;
+  background: rgba(126, 84, 55, .08);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.software-update-notice__eyebrow {
+  margin-top: 22px;
+  color: #a34d27;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .1em;
+}
+
+.software-update-notice h2 {
+  margin: 8px 0 10px;
+  font-size: clamp(24px, 4vw, 34px);
+  line-height: 1.12;
+  letter-spacing: -.03em;
+}
+
+.software-update-notice p {
+  margin: 0;
+  color: #765e4e;
+  line-height: 1.6;
+}
+
+.software-update-notice code {
+  color: #7f351d;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: .92em;
+}
+
+.software-update-notice__notes {
+  margin-top: 20px;
+  padding: 16px 18px;
+  border: 1px solid rgba(145, 93, 55, .16);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, .58);
+  color: #554236;
+  font-size: 14px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.software-update-notice details {
+  margin-top: 14px;
+  color: #715d50;
+  font-size: 12px;
+}
+
+.software-update-notice details code {
+  margin-top: 8px;
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.software-update-notice__error {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid #e6af99;
+  border-radius: 10px;
+  background: #fff0e8;
+  color: #8b3522;
+  font-size: 13px;
+}
+
+.software-update-notice__actions {
+  margin-top: 22px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.software-update-notice__actions button {
+  min-height: 42px;
+  padding: 0 17px;
+  border: 1px solid rgba(119, 76, 48, .18);
+  border-radius: 12px;
+  color: #654d3e;
+  background: rgba(255, 255, 255, .7);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.software-update-notice__actions .software-update-notice__download {
+  border-color: #a64a25;
+  color: #fffaf5;
+  background: #a94c25;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.software-update-notice button:focus-visible {
+  outline: 3px solid rgba(194, 99, 51, .35);
+  outline-offset: 3px;
+}
+
+.software-update-notice button:disabled {
+  cursor: wait;
+  opacity: .68;
+}
+
+@media (max-width: 560px) {
+  .software-update-notice { padding: 14px; }
+  .software-update-notice__dialog { padding: 24px 20px; border-radius: 18px; }
+  .software-update-notice__actions { align-items: stretch; flex-direction: column-reverse; }
+  .software-update-notice__actions button { justify-content: center; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .software-update-notice { backdrop-filter: none; }
+}

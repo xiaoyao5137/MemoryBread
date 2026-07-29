@@ -1,4 +1,4 @@
-import type { AchievementBadge, RewardTask } from '../types'
+import type { AchievementAward, RewardTask } from '../types'
 import { claimRewardTask, fetchRewardTasks, notifyAchievementsChanged } from './authApi'
 import { fetchWorkProfileRange, type WorkAchievementMetrics } from './workProfile'
 
@@ -61,7 +61,7 @@ export const syncEligibleAchievementTasks = async ({
   authToken,
   now = new Date(),
   signal,
-}: SyncAchievementTasksOptions): Promise<AchievementBadge[]> => {
+}: SyncAchievementTasksOptions): Promise<AchievementAward[]> => {
   const period = getCurrentWeeklyRewardPeriod(now)
   const [tasks, workProfile] = await Promise.all([
     fetchRewardTasks(adminApiBaseUrl, authToken, signal),
@@ -70,7 +70,10 @@ export const syncEligibleAchievementTasks = async ({
   const metrics = workProfile.achievement_metrics
   if (!metrics) return []
 
-  const claimedBadges: AchievementBadge[] = []
+  // 每轮检测使用新的幂等键，避免服务端重放历史成功响应时再次触发庆祝弹窗。
+  const syncAttemptId = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
+  const awardsByBadgeId = new Map<string, AchievementAward>()
   for (const task of tasks) {
     const observedValue = observedValueForTask(task, metrics)
     const threshold = Number(task.threshold)
@@ -82,11 +85,22 @@ export const syncEligibleAchievementTasks = async ({
       task.id,
       period.periodKey,
       observedValue,
-      `auto_${task.task_key}_${period.periodKey.replace(/-/g, '_')}`.slice(0, 80),
+      `auto_${syncAttemptId}_${task.id}`.slice(0, 80),
       signal,
     )
-    if (result) claimedBadges.push(result.badge)
+    if (!result) continue
+
+    const previous = awardsByBadgeId.get(result.badge.id)
+    awardsByBadgeId.set(result.badge.id, {
+      badge: result.badge,
+      badge_quantity: (previous?.badge_quantity ?? 0) + result.badge_quantity,
+      total_badge_quantity: Math.max(
+        previous?.total_badge_quantity ?? 0,
+        result.total_badge_quantity,
+      ),
+    })
   }
-  if (claimedBadges.length > 0) notifyAchievementsChanged()
-  return claimedBadges
+  const awards = Array.from(awardsByBadgeId.values())
+  if (awards.length > 0) notifyAchievementsChanged()
+  return awards
 }

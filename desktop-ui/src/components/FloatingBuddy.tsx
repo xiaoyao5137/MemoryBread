@@ -14,7 +14,6 @@ import { ChevronRight, LogIn } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { type WindowMode } from '../types'
 import { getRunModeLabel, getUserDisplayName } from '../utils/accountDisplay'
-import EnvironmentSwitch from './admin/EnvironmentSwitch'
 import { BreadAppIcon, type BreadAppIconName } from './icons/BreadIcons'
 import './FloatingBuddy.v2.css'
 
@@ -55,7 +54,7 @@ const MENU_GROUPS: MenuGroup[] = [
         label: '任务',
         testId: 'tasks-btn',
         icon: 'tasks'
-      },
+      }
     ]
   },
   {
@@ -156,8 +155,6 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
         </div>
       </div>
 
-      <EnvironmentSwitch />
-
       <nav className="buddy-actions" aria-label="主菜单">
         {MENU_GROUPS.map((group) => (
           <div key={group.groupLabel} className="buddy-menu-group">
@@ -187,10 +184,10 @@ const FloatingBuddy: React.FC<FloatingBuddyProps> = ({ className = '' }) => {
 
       <footer className="buddy-sidebar-footer">
         <button
-          className={`buddy-account-entry ${windowMode === 'account' ? 'buddy-account-entry--active' : ''}`}
+          className={`buddy-account-entry ${windowMode === 'account' || windowMode === 'messages' ? 'buddy-account-entry--active' : ''}`}
           data-testid="account-entry"
           type="button"
-          aria-current={windowMode === 'account' ? 'page' : undefined}
+          aria-current={windowMode === 'account' || windowMode === 'messages' ? 'page' : undefined}
           aria-label={currentUser ? `打开${accountLabel}的用户账户` : '未登录，打开登录'}
           onClick={() => handleNavigate('account')}
         >

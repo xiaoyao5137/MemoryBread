@@ -2,7 +2,7 @@ import { fetchWithLocalhostFallback } from '../hooks/useApi'
 import { serviceEnvironmentHeaders } from '../store/useAppStore'
 import { OFFLINE_CREATION_SKILL_CATEGORIES } from '../data/creationSkillCategories'
 
-export type CreationSkillSourceKind = 'creation_history' | 'bake_document' | 'market'
+export type CreationSkillSourceKind = 'creation_history' | 'bake_document' | 'market' | 'imported'
 
 export interface CreationSkillSource {
   kind: CreationSkillSourceKind
@@ -13,15 +13,43 @@ export interface CreationSkillSource {
 }
 
 export interface CreationSkillContent {
+  skillDescription: CreationSkillDescription
+  executionSteps: CreationSkillExecutionStep[]
   commonTitles: string[]
   titleStyle: string
   textStyle: string
   diagramStyle: string
   structurePattern: string[]
   writingGuidelines: string[]
+  distinctiveSections?: CreationSkillDistinctiveSection[]
   sectionHeadings: CreationSkillSectionHeadings
   fieldExamples: CreationSkillFieldExamples
   exampleDocument: string
+}
+
+export interface CreationSkillDescription {
+  purpose: string
+  documentTypes: string[]
+  problems: string[]
+  domains: string[]
+  deliverables: string[]
+}
+
+export interface CreationSkillExecutionStep {
+  id: string
+  title: string
+  objective: string
+  output: string
+  agents: string[]
+  skills: string[]
+  tools: string[]
+}
+
+export interface CreationSkillDistinctiveSection {
+  title: string
+  description: string
+  guidance: string
+  examples: string[]
 }
 
 export interface CreationSkillSectionHeadings {
@@ -42,11 +70,25 @@ export interface CreationSkillFieldExamples {
   writingGuidelines: string[]
 }
 
+export interface CreationSkillPackageFile {
+  path: string
+  mediaType: string
+  contentBase64: string
+  sizeBytes: number
+}
+
+export interface CodexSkillMetadata {
+  name: string
+  description: string
+  instructions: string
+}
+
 export interface CreationSkillAnalysis extends CreationSkillContent {
   title: string
   summary: string
   suggestedCategoryKeywords: string[]
   analysisMode: 'local_model' | 'heuristic_fallback' | string
+  fallbackReason?: string
 }
 
 export interface LocalCreationSkill extends CreationSkillContent {
@@ -61,6 +103,7 @@ export interface LocalCreationSkill extends CreationSkillContent {
   status: 'draft' | 'saved'
   installed: boolean
   published: boolean
+  packageFiles?: CreationSkillPackageFile[]
   createdAt: number
   updatedAt: number
 }
@@ -99,6 +142,7 @@ export interface CreationSkillMarketItem extends CreationSkillContent {
   id: string
   title: string
   summary: string
+  isOfficial?: boolean
   categoryId: string
   categoryPath: CreationSkillCategory[]
   author: CreationSkillMarketAuthor
@@ -126,42 +170,741 @@ const parseError = async (response: Response, fallback: string) => {
 }
 
 export const DEFAULT_CREATION_SKILL_SECTION_HEADINGS: CreationSkillSectionHeadings = {
-  commonTitles: '这类文档标题通常怎么命名',
-  titleStyle: '标题如何传递重点',
-  textStyle: '正文怎样组织和表达',
-  diagramStyle: '图示怎样服务于内容',
-  structurePattern: '从开篇到结论的章节骨架',
-  writingGuidelines: '保持这份风格的关键约束',
+  commonTitles: '标题设计风格',
+  titleStyle: '标题设计风格',
+  textStyle: '行文设计思路',
+  diagramStyle: '图片生成方式',
+  structurePattern: '内部章节推进信息',
+  writingGuidelines: '话术表达风格',
 }
 
 export const DEFAULT_CREATION_SKILL_FIELD_EXAMPLES: CreationSkillFieldExamples = {
-  commonTitles: ['协作流程优化方案', '阶段复盘与后续行动报告'],
-  titleStyle: ['协作流程优化方案：明确目标、范围与交付边界'],
-  textStyle: ['本方案先明确适用范围，再说明关键步骤、责任边界与验收方式。'],
-  diagramStyle: ['用泳道图展示提出、处理、复核三个阶段，并用统一图例标注责任角色。'],
+  commonTitles: ['现状与约束', '方案如何落到执行'],
+  titleStyle: ['现状与约束', '方案如何落到执行'],
+  textStyle: ['先界定适用范围，再沿“现状 → 判断 → 动作 → 验证”逐层收束。'],
+  diagramStyle: ['PlantUML 活动图：主流程纵向排列，跨角色动作放入对应泳道。'],
   structurePattern: ['背景与目标 → 现状与约束 → 方案设计 → 实施计划 → 风险与验证'],
-  writingGuidelines: ['把“提升效率”改写为“减少交接步骤，并设置可核验的完成标准”'],
+  writingGuidelines: ['需要说明的是，目标对象只覆盖已经确认的适用范围。'],
 }
 
-export const DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT = `# 跨团队知识交接优化方案
+export const CREATION_SKILL_AGENT_OPTIONS = [
+  { id: 'industry_research_agent', label: '行业调研 Agent' },
+  { id: 'data_analysis_agent', label: '数据分析 Agent' },
+  { id: 'solution_design_agent', label: '方案设计 Agent' },
+  { id: 'document_writer_agent', label: '文档撰写 Agent' },
+  { id: 'quality_review_agent', label: '质量审校 Agent' },
+] as const
+
+export const CREATION_SKILL_TOOL_OPTIONS = [
+  { id: 'memory_search', label: '记忆搜索 Tool' },
+  { id: 'internet_search', label: '互联网检索 Tool' },
+  { id: 'github_search', label: 'GitHub 检索 Tool' },
+  { id: 'plantuml_diagram', label: 'PlantUML 画图 Tool' },
+] as const
+
+export const DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT = `# 共享评审空间：预约流程与协作边界优化方案
 
 ## 摘要
 
-本示例围绕通用的知识交接场景，说明如何明确范围、责任角色、执行步骤与验收方式。
+本文围绕一个完全虚构的共享评审空间场景，讨论预约信息分散、资源状态不透明和异常处理依赖口头协调的问题。方案的重点不是增加审批，而是让每次申请都能回答三个问题：当前由谁使用、下一步由谁处理、完成后凭什么确认资源已经释放。
 
-## 背景与目标
+全文先界定问题和适用范围，再把目标拆成可观察状态，随后给出角色分工、核心流程、异常保障与验证方式。所有判断都落到动作和证据，不使用真实组织、项目或业务数据。
 
-相关团队需要在任务变化时稳定传递必要信息，目标是减少遗漏并让接手者能够独立完成后续工作。
+## 背景与问题：一次冲突暴露出的状态断点
 
-## 方案设计
+共享评审空间同时服务准备材料、集中讨论和结果确认等活动。现有做法只记录“有人预约”，却没有说明准备是否完成、临时变更是否被接收、使用结束后资源是否已经恢复。信息看似存在，真正执行时仍要逐人询问。
 
-建立“准备、讲解、确认、复核”四个阶段；每个阶段明确输入、责任角色、输出和完成标准。
+问题的核心不是缺少一张登记表，而是状态、动作和责任没有对应关系。申请角色关心能否使用，维护角色关心是否满足开放条件，后续使用者关心资源何时重新可用；如果这些问题混在一个备注框里，任何变更都会重新触发人工确认。
 
-## 风险与验证
+## 目标与范围：先明确要解决什么
 
-重点检查资料缺失、理解偏差和权限不当三类风险，并以清单完成情况作为验收依据。`
+本次优化只处理预约发起、冲突确认、使用准备、完成释放和异常复核。目标是让相关角色不依赖额外询问，也能从同一处判断当前状态、待办动作和完成证据。界面样式、空间硬件和人员排班不在本次方案范围内。
+
+需要明确的是，范围约束不是附注，而是后续取舍的依据。凡是不能改变状态判断、责任归属或验证结果的信息，都不进入主流程；确需保留的补充说明放在对应动作之后，避免重要条件被长段背景淹没。
+
+## 方案设计：让状态、责任与动作相互对应
+
+方案把一次预约拆成“申请、确认、准备、使用、释放、复核”几个连续状态。每个状态都绑定进入条件、责任角色、应执行动作和完成证据；只有证据满足要求，状态才向后流转。这样既能保持流程简洁，也能避免角色凭经验猜测。
+
+角色分工遵循“谁产生信息，谁负责首次更新；谁消费结果，谁负责确认可用”的原则：
+
+- 申请角色说明使用目的、期望范围和必要准备，并对变更及时更新。
+- 维护角色检查冲突与开放条件，只对自己能够验证的状态作确认。
+- 使用角色在开始前确认资源状态，在结束后提交释放结果和遗留事项。
+- 复核角色只处理异常和争议，不重复参与每一次正常流转。
+
+## 核心流程：从提出申请到完成释放
+
+流程从申请角色提交用途和范围开始。系统先检查同一时段是否存在冲突；没有冲突时进入准备状态，有冲突时返回可调整的条件，而不是只给出“失败”结果。申请角色据此修改范围或撤回请求，避免维护角色在多个沟通渠道间转述。
+
+随后，准备完成后由使用角色确认接手。确认动作意味着必要材料、访问边界和现场状态已经可用，而不是简单点击按钮。使用结束后，使用角色提交释放结果；若仍有遗留事项，则同时标明影响范围和下一位处理角色，流程不会把“已结束”误写成“已恢复”。
+
+## 风险与保障：异常不能重新回到人工猜测
+
+主要风险来自三类断点：状态被更新但相关角色没有接收、异常被记录却没有明确下一步、完成结果缺少可复核证据。对应保障也不应写成宽泛口号，而要直接嵌入流程。
+
+- 关键状态变化只保留一个正式入口，其他渠道只发送提醒，不形成第二份事实。
+- 异常记录必须同时包含影响范围、临时处理和下一位责任角色。
+- 释放动作必须附带可观察结果；无法确认时回到复核状态，不直接标记完成。
+- 长时间没有推进的事项进入待复核列表，由相关角色判断继续、调整或关闭。
+
+## 验证与复盘：用可观察结果收束判断
+
+验证分为流程可执行性和结果可判断性。前者关注相关角色能否只凭当前记录完成下一步，后者关注状态变化是否都有对应证据。试运行期间不追求覆盖所有例外，而是优先验证主流程是否连续、异常是否能回到明确责任人。
+
+复盘时按“现象、判断、动作、结果”记录，不把意见数量当作效果。若某个节点仍需要反复口头确认，应先检查进入条件是否含糊；若不同角色对完成状态理解不一，应先修正证据定义，而不是继续增加提醒。
+
+## 结论与后续：把临时协调变成稳定机制
+
+这套方案把一次临时协调转化为可以被读取、执行和复核的状态链路。它保留必要的人为判断，但让判断发生在边界明确的位置；它减少重复询问，但不以隐藏异常为代价。
+
+后续优化应继续围绕同一目标展开：让每位相关角色在进入流程时知道自己为什么接手、需要完成什么、完成后留下什么证据。只要这三个问题能够稳定回答，共享资源的协作就不再依赖某位熟悉情况的人持续兜底。`
+
+function defaultCreationSkillDescription(
+  title: string,
+  summary: string,
+  docType = '',
+  domains: string[] = [],
+): CreationSkillDescription {
+  const documentType = docType.trim() || title.trim() || '专业文档'
+  const evidence = `${title}\n${summary}\n${docType}`
+  const problem = /研究|调研|分析|报告/.test(evidence)
+    ? '把分散资料和证据转化为有依据、可比较、可形成结论的分析'
+    : /方案|架构|设计|规划|建设/.test(evidence)
+      ? '把目标、约束和关键取舍转化为可评审、可执行、可验证的方案'
+      : /复盘|总结|纪要/.test(evidence)
+        ? '从过程记录中提炼事实、判断、行动项和后续验证方式'
+        : '把零散需求与事实组织成结构清晰、可直接使用的专业文档'
+  return {
+    purpose: summary.trim() || `用于在需要创作${documentType}时，复用这枚 Skill 的分析、组织和写作方法。`,
+    documentTypes: [documentType],
+    problems: [problem],
+    domains: distinctCreationSkillItems(domains, 12),
+    deliverables: [`一份结构完整、依据清楚并包含后续动作的${documentType}`],
+  }
+}
+
+function defaultCreationSkillExecutionSteps(
+  title: string,
+  evidence = '',
+): CreationSkillExecutionStep[] {
+  const text = `${title}\n${evidence}`
+  const steps: CreationSkillExecutionStep[] = [{
+    id: 'collect-context',
+    title: '收集需求与事实',
+    objective: '明确创作目标、读者、范围、已有资料和不能推断的事实边界。',
+    output: '需求清单、事实材料和待核验项',
+    agents: [],
+    skills: [],
+    tools: ['memory_search'],
+  }]
+  if (/行业|市场|竞品|研究|调研|政策|趋势/.test(text)) {
+    steps.push({
+      id: 'research-industry',
+      title: '开展行业调研',
+      objective: '补充外部环境、通行做法和来源可追溯的行业证据。',
+      output: '带来源的行业事实、趋势与可比较案例',
+      agents: ['industry_research_agent'],
+      skills: [],
+      tools: ['internet_search'],
+    })
+  }
+  if (/数据|指标|统计|趋势|成本|收益|测算|分析/.test(text)) {
+    steps.push({
+      id: 'analyze-data',
+      title: '分析数据与证据',
+      objective: '核对数据口径，识别关键关系、差异和支撑结论的证据。',
+      output: '数据判断、口径说明和证据缺口',
+      agents: ['data_analysis_agent'],
+      skills: [],
+      tools: [],
+    })
+  }
+  if (/方案|架构|设计|规划|建设|实施/.test(text)) {
+    steps.push({
+      id: 'design-solution',
+      title: '设计方案',
+      objective: '把目标、约束和证据转化为有边界、有取舍、有验证方式的方案。',
+      output: '方案结构、关键设计、实施路径和风险控制',
+      agents: ['solution_design_agent'],
+      skills: [],
+      tools: /架构|流程|链路|交互|模块/.test(text) ? ['plantuml_diagram'] : [],
+    })
+  }
+  steps.push(
+    {
+      id: 'draft-document',
+      title: '撰写完整文档',
+      objective: '依据前序产出和 Skill 的风格指纹完成全文，不补造事实。',
+      output: '可继续编辑的完整 Markdown 文档',
+      agents: ['document_writer_agent'],
+      skills: [],
+      tools: [],
+    },
+    {
+      id: 'review-delivery',
+      title: '审校并交付',
+      objective: '检查目标回应、事实依据、结构完整、术语一致和行动可执行性。',
+      output: '通过质量检查的最终文档与待核验项',
+      agents: ['quality_review_agent'],
+      skills: [],
+      tools: [],
+    },
+  )
+  return steps
+}
+
+function mapSkillDescription(
+  value: any,
+  title: string,
+  summary: string,
+  docType = '',
+  domains: string[] = [],
+): CreationSkillDescription {
+  const fallback = defaultCreationSkillDescription(title, summary, docType, domains)
+  const list = (camel: string, snake: string, defaultItems: string[]) => {
+    const raw = value?.[camel] ?? value?.[snake]
+    return Array.isArray(raw)
+      ? distinctCreationSkillItems(raw, 12)
+      : [...defaultItems]
+  }
+  return {
+    purpose: String(value?.purpose || fallback.purpose).trim(),
+    documentTypes: list('documentTypes', 'document_types', fallback.documentTypes),
+    problems: list('problems', 'problems', fallback.problems),
+    domains: list('domains', 'domains', fallback.domains),
+    deliverables: list('deliverables', 'deliverables', fallback.deliverables),
+  }
+}
+
+function mapExecutionSteps(
+  value: unknown,
+  title: string,
+  evidence = '',
+): CreationSkillExecutionStep[] {
+  const allowedAgents = new Set(CREATION_SKILL_AGENT_OPTIONS.map(option => option.id))
+  const allowedTools = new Set(CREATION_SKILL_TOOL_OPTIONS.map(option => option.id))
+  const resources = (raw: unknown, allowed?: Set<string>) => (
+    Array.isArray(raw)
+      ? distinctCreationSkillItems(raw, 8).filter(item => !allowed || allowed.has(item))
+      : []
+  )
+  const steps = Array.isArray(value)
+    ? value.map((item: any, index) => {
+      const id = String(item?.id || `step-${index + 1}`)
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, '-')
+        .replace(/^-|-$/g, '')
+        .slice(0, 80)
+      const step = {
+        id: id || `step-${index + 1}`,
+        title: String(item?.title || '').trim(),
+        objective: String(item?.objective || '').trim(),
+        output: String(item?.output || '').trim(),
+        agents: resources(item?.agents, allowedAgents),
+        skills: resources(item?.skills),
+        tools: resources(item?.tools, allowedTools),
+      }
+      return step.title && step.objective && step.output ? step : null
+    }).filter((step): step is CreationSkillExecutionStep => Boolean(step))
+    : []
+  return steps.length ? steps.slice(0, 12) : defaultCreationSkillExecutionSteps(title, evidence)
+}
+
+const MAX_SKILL_PACKAGE_FILES = 128
+const MAX_SKILL_PACKAGE_FILE_BYTES = 5 * 1024 * 1024
+const MAX_SKILL_PACKAGE_BYTES = 10 * 1024 * 1024
+const MAX_SKILL_MARKDOWN_BYTES = 512 * 1024
+const MAX_IMPORTED_SKILL_CONTEXT_CHARS = 120_000
+
+export function parseCodexSkillMarkdown(content: string): CodexSkillMetadata {
+  const normalized = content.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n')
+  const match = normalized.match(/^---[ \t]*\n([\s\S]*?)\n---[ \t]*(?:\n|$)([\s\S]*)$/)
+  if (!match) throw new Error('SKILL.md 必须以 YAML frontmatter 开头')
+  const name = readFrontmatterValue(match[1], 'name')
+  const description = readFrontmatterValue(match[1], 'description')
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || name.length > 64) {
+    throw new Error('SKILL.md 的 name 必须是 1 到 64 位小写字母、数字或连字符')
+  }
+  if (!description || description.length > 1_024) {
+    throw new Error('SKILL.md 的 description 需要在 1 到 1024 个字符之间')
+  }
+  return { name, description, instructions: match[2].trim() }
+}
+
+function readFrontmatterValue(frontmatter: string, key: string) {
+  const lines = frontmatter.split('\n')
+  const prefix = `${key}:`
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trimStart()
+    if (!line.startsWith(prefix)) continue
+    const raw = line.slice(prefix.length).trim()
+    if (/^[|>][+-]?$/.test(raw)) {
+      const values: string[] = []
+      for (let next = index + 1; next < lines.length; next += 1) {
+        if (!/^[ \t]/.test(lines[next])) break
+        values.push(lines[next].trim())
+      }
+      return (raw.startsWith('>') ? values.join(' ') : values.join('\n')).trim()
+    }
+    if (
+      (raw.startsWith('"') && raw.endsWith('"'))
+      || (raw.startsWith('\'') && raw.endsWith('\''))
+    ) {
+      return raw.slice(1, -1).trim()
+    }
+    return raw.replace(/\s+#.*$/, '').trim()
+  }
+  return ''
+}
+
+export async function importCodexSkillPackage(
+  files: File[] | FileList,
+): Promise<Omit<LocalCreationSkill, 'id' | 'createdAt' | 'updatedAt'>> {
+  const selectedFiles = Array.from(files).filter(file => file.name !== '.DS_Store')
+  if (selectedFiles.length === 0) throw new Error('请选择一个包含 SKILL.md 的技能文件夹')
+  if (selectedFiles.length > MAX_SKILL_PACKAGE_FILES) {
+    throw new Error(`技能包文件数量不能超过 ${MAX_SKILL_PACKAGE_FILES} 个`)
+  }
+  const totalBytes = selectedFiles.reduce((sum, file) => sum + file.size, 0)
+  if (totalBytes > MAX_SKILL_PACKAGE_BYTES) throw new Error('技能包总大小不能超过 10 MB')
+
+  const rawPaths = selectedFiles.map(file => {
+    const relativePath = String((file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name)
+      .replace(/\\/g, '/')
+      .replace(/^\/+/, '')
+    validateSkillFilePath(relativePath)
+    return relativePath
+  })
+  const rootNames = new Set(rawPaths.filter(path => path.includes('/')).map(path => path.split('/')[0]))
+  if (rootNames.size > 1 || (rootNames.size === 1 && rawPaths.some(path => !path.includes('/')))) {
+    throw new Error('请一次只选择一个技能文件夹')
+  }
+  const rootName = rootNames.size === 1 ? [...rootNames][0] : ''
+  const normalizedPaths = rawPaths.map(path => rootName ? path.slice(rootName.length + 1) : path)
+  normalizedPaths.forEach(validateSkillFilePath)
+  if (new Set(normalizedPaths).size !== normalizedPaths.length) {
+    throw new Error('技能包包含重复文件路径')
+  }
+
+  const markdownIndex = normalizedPaths.findIndex(path => path === 'SKILL.md')
+  if (markdownIndex < 0) throw new Error('技能包根目录缺少 SKILL.md')
+  if (selectedFiles[markdownIndex].size > MAX_SKILL_MARKDOWN_BYTES) {
+    throw new Error('SKILL.md 不能超过 512 KB')
+  }
+  let skillMarkdown: string
+  try {
+    skillMarkdown = new TextDecoder('utf-8', { fatal: true })
+      .decode(await readBrowserFileBytes(selectedFiles[markdownIndex]))
+  } catch {
+    throw new Error('SKILL.md 必须是 UTF-8 文本文件')
+  }
+  const metadata = parseCodexSkillMarkdown(skillMarkdown)
+  if (rootName && metadata.name !== rootName) {
+    throw new Error(`SKILL.md 的 name 必须与文件夹名称一致（当前文件夹为 ${rootName}）`)
+  }
+
+  const packageFiles = await Promise.all(selectedFiles.map(async (file, index) => {
+    if (file.size > MAX_SKILL_PACKAGE_FILE_BYTES) {
+      throw new Error(`${normalizedPaths[index]} 不能超过 5 MB`)
+    }
+    const bytes = await readBrowserFileBytes(file)
+    return {
+      path: normalizedPaths[index],
+      mediaType: file.type || inferSkillFileMediaType(normalizedPaths[index]),
+      contentBase64: bytesToBase64(bytes),
+      sizeBytes: bytes.byteLength,
+    }
+  }))
+  packageFiles.sort((left, right) => (
+    left.path === 'SKILL.md' ? -1 : right.path === 'SKILL.md' ? 1 : left.path.localeCompare(right.path)
+  ))
+
+  const suffix = Date.now().toString(36)
+  return {
+    clientSkillKey: `imported-${metadata.name.slice(0, 48)}-${suffix}`,
+    cloudSkillId: null,
+    sourceKind: 'imported',
+    sourceId: metadata.name,
+    title: metadata.name,
+    summary: metadata.description,
+    categoryId: null,
+    skillDescription: {
+      purpose: metadata.description,
+      documentTypes: ['SKILL.md 定义的文档或交付物'],
+      problems: ['按技能包中的专业工作流和输出要求完成创作任务'],
+      domains: [],
+      deliverables: ['符合 SKILL.md 验收要求的完整交付物'],
+    },
+    executionSteps: [
+      {
+        id: 'read-skill',
+        title: '读取技能说明',
+        objective: '读取 SKILL.md，并识别触发条件、输入、约束与输出要求。',
+        output: '可执行的技能要求清单',
+        agents: [],
+        skills: [metadata.name],
+        tools: [],
+      },
+      {
+        id: 'load-resources',
+        title: '按需加载资源',
+        objective: '只读取当前任务需要的引用、资产和脚本说明。',
+        output: '任务所需的技能上下文与可用资源',
+        agents: [],
+        skills: [metadata.name],
+        tools: [],
+      },
+      {
+        id: 'execute-workflow',
+        title: '执行技能工作流',
+        objective: '按照 SKILL.md 的先后顺序完成分析、创作和必要的工具调用。',
+        output: '符合技能要求的完整草稿',
+        agents: ['document_writer_agent'],
+        skills: [metadata.name],
+        tools: [],
+      },
+      {
+        id: 'review-output',
+        title: '核对输出要求',
+        objective: '对照 SKILL.md 检查完整性、格式与使用边界。',
+        output: '通过技能验收条件的最终交付物',
+        agents: ['quality_review_agent'],
+        skills: [metadata.name],
+        tools: [],
+      },
+    ],
+    commonTitles: [metadata.name],
+    titleStyle: '遵循 SKILL.md 中的标题与输出要求。',
+    textStyle: metadata.instructions || '严格遵循 SKILL.md 中定义的工作流与输出要求。',
+    diagramStyle: '仅在 SKILL.md 或引用文件明确要求时生成图示。',
+    structurePattern: ['读取 SKILL.md', '按需读取引用文件', '执行技能工作流', '核对输出要求'],
+    writingGuidelines: ['优先遵循 SKILL.md；引用其他文件时使用技能根目录相对路径。'],
+    distinctiveSections: [],
+    sectionHeadings: { ...DEFAULT_CREATION_SKILL_SECTION_HEADINGS },
+    fieldExamples: cloneFieldExamples(DEFAULT_CREATION_SKILL_FIELD_EXAMPLES),
+    exampleDocument: DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
+    status: 'saved',
+    installed: true,
+    published: false,
+    packageFiles,
+  }
+}
+
+async function readBrowserFileBytes(file: File): Promise<Uint8Array> {
+  const fileWithArrayBuffer = file as File & { arrayBuffer?: () => Promise<ArrayBuffer> }
+  if (typeof fileWithArrayBuffer.arrayBuffer === 'function') {
+    return new Uint8Array(await fileWithArrayBuffer.arrayBuffer())
+  }
+
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error(`读取 ${file.name} 失败`))
+    reader.onload = () => {
+      if (reader.result instanceof ArrayBuffer) {
+        resolve(new Uint8Array(reader.result))
+      } else {
+        reject(new Error(`读取 ${file.name} 失败`))
+      }
+    }
+    reader.readAsArrayBuffer(file)
+  })
+}
+
+function validateSkillFilePath(path: string) {
+  const parts = path.split('/')
+  if (
+    !path
+    || path.length > 240
+    || path.startsWith('/')
+    || path.includes('\\')
+    || /[\u0000-\u001f\u007f]/.test(path)
+    || parts.some(part => !part || part === '.' || part === '..')
+  ) {
+    throw new Error(`技能包包含无效文件路径：${path || '空路径'}`)
+  }
+}
+
+function inferSkillFileMediaType(path: string) {
+  const extension = path.split('.').pop()?.toLowerCase()
+  if (extension === 'md' || extension === 'mdx') return 'text/markdown'
+  if (['txt', 'py', 'sh', 'js', 'ts', 'tsx', 'jsx', 'json', 'yaml', 'yml', 'toml', 'csv', 'svg', 'html', 'css'].includes(extension || '')) {
+    return extension === 'json'
+      ? 'application/json'
+      : extension === 'svg'
+        ? 'image/svg+xml'
+        : 'text/plain'
+  }
+  if (extension === 'png') return 'image/png'
+  if (extension === 'jpg' || extension === 'jpeg') return 'image/jpeg'
+  if (extension === 'gif') return 'image/gif'
+  if (extension === 'pdf') return 'application/pdf'
+  return 'application/octet-stream'
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = ''
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+  }
+  return btoa(binary)
+}
+
+export function skillFileBytes(file: CreationSkillPackageFile) {
+  const binary = atob(file.contentBase64)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+  return bytes
+}
+
+export function skillFileText(file: CreationSkillPackageFile) {
+  if (!isTextSkillFile(file)) return null
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(skillFileBytes(file))
+  } catch {
+    return null
+  }
+}
+
+export function isTextSkillFile(file: CreationSkillPackageFile) {
+  return file.mediaType.startsWith('text/')
+    || ['application/json', 'application/yaml', 'application/x-yaml', 'image/svg+xml'].includes(file.mediaType)
+    || /\.(?:md|mdx|txt|py|sh|js|jsx|ts|tsx|json|ya?ml|toml|csv|svg|html|css)$/i.test(file.path)
+}
+
+export function codexSkillPackageFiles(
+  skill: CreationSkillContent & {
+    id: string | number
+    clientSkillKey?: string
+    title: string
+    summary: string
+    packageFiles?: CreationSkillPackageFile[]
+  },
+): CreationSkillPackageFile[] {
+  if (skill.packageFiles?.length) return [...skill.packageFiles]
+  const name = codexSkillName(skill.clientSkillKey || skill.title, skill.id)
+  const description = [
+    skill.skillDescription.purpose,
+    skill.skillDescription.documentTypes.length
+      ? `用于创作：${skill.skillDescription.documentTypes.join('、')}。`
+      : '',
+    skill.skillDescription.problems.length
+      ? `适合解决：${skill.skillDescription.problems.join('；')}。`
+      : '',
+  ].filter(Boolean).join(' ').slice(0, 1_024)
+  const markdown = `---
+name: ${name}
+description: ${JSON.stringify(description)}
+---
+
+# ${skill.title}
+
+## 能力描述
+
+${skill.skillDescription.purpose}
+
+- 适用文档：${skill.skillDescription.documentTypes.join('；') || '由任务上下文确定'}
+- 解决问题：${skill.skillDescription.problems.join('；') || '由任务上下文确定'}
+- 涉及领域：${skill.skillDescription.domains.join('；') || '不限特定领域'}
+- 目标产物：${skill.skillDescription.deliverables.join('；') || skill.summary}
+
+## 执行工作流
+
+${skill.executionSteps.map((step, index) => `### ${index + 1}. ${step.title}
+
+${step.objective}
+
+- 产出：${step.output}
+- Agent：${step.agents.join('、') || '无'}
+- Skill：${step.skills.join('、') || '无'}
+- Tool：${step.tools.join('、') || '无'}`).join('\n\n')}
+
+## 标题设计风格
+
+${skill.commonTitles.map(item => `- ${item}`).join('\n')}
+
+## 行文设计思路
+
+${skill.textStyle}
+
+## 图片生成方式
+
+${skill.diagramStyle}
+
+## 话术表达风格
+
+${skill.writingGuidelines.length
+    ? skill.writingGuidelines.map(item => `- ${item}`).join('\n')
+    : '- 没有额外话术约束。'}
+
+${(skill.distinctiveSections || []).map(section => `## 特色亮点：${section.title}
+
+${section.description}
+
+复刻指引：${section.guidance}
+
+示例：
+${section.examples.map(example => `- ${example}`).join('\n')}`).join('\n\n')}
+
+## 示例
+
+${skill.exampleDocument}
+`
+  const bytes = new TextEncoder().encode(markdown)
+  return [{
+    path: 'SKILL.md',
+    mediaType: 'text/markdown',
+    contentBase64: bytesToBase64(bytes),
+    sizeBytes: bytes.byteLength,
+  }]
+}
+
+function codexSkillName(value: string, id: string | number) {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 64)
+    .replace(/-$/g, '')
+  return normalized || `memorybread-skill-${id}`
+}
 
 const inFlightCreationSkillAnalyses = new Map<string, Promise<CreationSkillAnalysis>>()
+
+function distinctCreationSkillItems(values: unknown[], maximum: number) {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const value of values) {
+    const text = coerceCreationSkillStringItem(value)
+    const fingerprint = text.replace(/[^\p{L}\p{N}]+/gu, '')
+    if (!fingerprint || seen.has(fingerprint)) continue
+    seen.add(fingerprint)
+    result.push(text)
+    if (result.length >= maximum) break
+  }
+  return result
+}
+
+function coerceCreationSkillStringItem(value: unknown, key = '') {
+  if (typeof value === 'string') {
+    const text = value.trim()
+    if (/^\{[\s\S]*\}$/.test(text)) {
+      const read = (name: string) => text.match(
+        new RegExp(`['"]${name}['"]\\s*:\\s*['"]([^'"]+)['"]`, 'i'),
+      )?.[1]?.trim() || ''
+      if (key === 'common_titles' || key === 'title_style') {
+        const level = read('level')
+        const pattern = read('pattern')
+        if (pattern) return `${level ? `${level}：` : ''}采用“${pattern}”的标题骨架`
+      }
+      if (key === 'structure_pattern') {
+        const role = read('role') || read('section') || read('title')
+        if (role) return role
+      }
+    }
+    return text
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const item = value as Record<string, unknown>
+  const first = (...keys: string[]) => {
+    for (const candidateKey of keys) {
+      const candidate = item[candidateKey]
+      if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+    }
+    return ''
+  }
+  if (key === 'common_titles' || key === 'title_style') {
+    const level = first('level', '层级', 'position', '位置')
+    const pattern = first('pattern', '骨架', 'rule', '规则', 'title', '标题')
+    const boundary = first('boundary', 'usage', '适用位置', '说明')
+    return pattern
+      ? `${level ? `${level}：` : ''}采用“${pattern}”的标题骨架${boundary ? `；${boundary}` : ''}`
+      : ''
+  }
+  if (key === 'structure_pattern') return first('role', 'section', 'title', 'name', '章节角色', '内容')
+  if (key === 'writing_guidelines') {
+    const phrase = first('phrase', 'term', 'wording', '短语', '话术')
+    const usage = first('role', 'usage', 'effect', '作用', '说明')
+    return phrase && usage ? `习惯用“${phrase}”${usage}` : phrase || usage
+  }
+  return first('example', 'text', 'content', 'value', '示例')
+}
+
+function compactCreationSkillPlaceholders(value: unknown) {
+  return String(value || '')
+    .replace(/(?:目标对象[\s·—_:：/\\-]*){2,}/gu, '目标对象')
+    .replace(/(?:相关角色[\s·—_:：/\\-]*){2,}/gu, '相关角色')
+    .replace(/(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])/gu, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^[\s：:·—_\/\\-]+|[\s：:·—_\/\\-]+$/g, '')
+}
+
+function repairCreationSkillHeadingExamples(values: unknown[], fallback: string[]) {
+  const repaired = values
+    .map(value => fictionalizeCreationSkillHeadingExample(
+      coerceCreationSkillStringItem(value, 'common_titles'),
+    ))
+    .filter(isCompleteCreationSkillHeadingExample)
+  return distinctCreationSkillItems([...fallback, ...repaired], 6)
+}
+
+function fictionalizeCreationSkillHeadingExample(value: unknown) {
+  let text = compactCreationSkillPlaceholders(value)
+    .replace(/目标对象/gu, '协作工作台')
+    .replace(/相关团队/gu, '协作团队')
+  if (/^从.{1,12}(?:视角|角度|层面)看[，,:：]?协作工作台$/u.test(text)) {
+    text = `${text}的角色与边界`
+  }
+  if (/^[A-Za-z][A-Za-z0-9_-]*\s*[：:]\s*协作工作台$/u.test(text)) {
+    text = `${text}的调度边界`
+  }
+  return text
+}
+
+function isCompleteCreationSkillHeadingExample(value: string) {
+  const text = value.trim()
+  if (text.replace(/[^\p{L}\p{N}]+/gu, '').length < 4) return false
+  if (/(?:目标对象|相关角色|相关团队)[的之]?$/u.test(text)) return false
+  if (/(?:看|关于|针对|面向)[，,:：]?$/u.test(text)) return false
+  return !/^(?:目标对象|相关角色|相关团队|协作工作台)+$/u.test(text)
+}
+
+function mergeCreationSkillTextStyle(primary: unknown, fallback: string) {
+  const text = String(primary || '').trim()
+  if (!text) return fallback
+  if (text.length >= 400 || text.includes(fallback)) return text
+  return `${text}\n\n执行配方：${fallback}`
+}
+
+function mergeCreationSkillDiagramStyle(primary: unknown, fallback: string) {
+  const text = String(primary || '').trim()
+  if (!text) return fallback
+  if (text.length >= 400 || text.includes(fallback)) return text
+  return `${text}\n\n完整配图配方：${fallback}`
+}
+
+function mergeCreationSkillWritingGuidelines(primary: unknown, fallback: string[]) {
+  const modelItems = Array.isArray(primary)
+    ? primary
+      .map(item => coerceCreationSkillStringItem(item, 'writing_guidelines'))
+      .filter(Boolean)
+      .slice(0, 5)
+    : []
+  return distinctCreationSkillItems([...modelItems, ...fallback], 8)
+}
+
+function isCompleteCreationSkillExampleDocument(value: unknown) {
+  const text = String(value || '').trim()
+  if (text.length < 1000) return false
+  if ((text.match(/^#\s+\S/gm) || []).length !== 1) return false
+  if ((text.match(/^##\s+\S/gm) || []).length < 6) return false
+  const bodyBlocks = text
+    .split(/\n\s*\n/)
+    .map(block => block.trim())
+    .filter(block => block && !block.startsWith('#') && block.length >= 40)
+  return bodyBlocks.length >= 8
+}
 
 async function requestCreationSkillAnalysis(
   apiBaseUrl: string,
@@ -179,28 +922,70 @@ async function requestCreationSkillAnalysis(
         doc_type: source.docType,
       }),
     })
-    if (!response.ok) throw new Error(await parseError(response, '沉淀 Skill 失败'))
+    if (!response.ok) throw new Error(await parseError(response, '沉淀技能失败'))
     const data = await response.json()
     if (!data.section_headings || !data.field_examples || !String(data.example_document || '').trim()) {
-      return buildClientCreationSkillFallback(source)
+      return buildClientCreationSkillFallback(source, 'invalid_service_response')
     }
+    const fallback = buildClientCreationSkillFallback(source)
+    const fieldExamples = mapFieldExamples(data.field_examples)
+    const headingExamples = repairCreationSkillHeadingExamples(
+      fieldExamples.commonTitles,
+      fallback.fieldExamples.commonTitles,
+    )
+    fieldExamples.commonTitles = headingExamples
+    fieldExamples.titleStyle = [...headingExamples]
+    const commonTitles = distinctCreationSkillItems([
+      ...(Array.isArray(data.common_titles)
+        ? data.common_titles.map((item: unknown) => coerceCreationSkillStringItem(item, 'common_titles'))
+        : []),
+      ...fallback.commonTitles,
+    ], 8)
     return {
       title: normalizeCreationSkillTitle(data.title, source),
       summary: data.summary,
-      commonTitles: data.common_titles || [],
-      titleStyle: data.title_style || '',
-      textStyle: data.text_style || '',
-      diagramStyle: data.diagram_style || '',
-      structurePattern: data.structure_pattern || [],
-      writingGuidelines: data.writing_guidelines || [],
+      skillDescription: mapSkillDescription(
+        data.skill_description,
+        normalizeCreationSkillTitle(data.title, source),
+        String(data.summary || fallback.summary),
+        source.docType,
+        fallback.skillDescription.domains,
+      ),
+      executionSteps: mapExecutionSteps(
+        data.execution_steps,
+        normalizeCreationSkillTitle(data.title, source),
+        `${source.docType}\n${source.title}\n${source.content.slice(0, 8_000)}`,
+      ),
+      commonTitles,
+      titleStyle: commonTitles.join('；'),
+      textStyle: mergeCreationSkillTextStyle(data.text_style, fallback.textStyle),
+      diagramStyle: mergeCreationSkillDiagramStyle(data.diagram_style, fallback.diagramStyle),
+      structurePattern: Array.isArray(data.structure_pattern)
+        ? data.structure_pattern
+          .map((item: unknown) => coerceCreationSkillStringItem(item, 'structure_pattern'))
+          .filter(Boolean)
+        : fallback.structurePattern,
+      writingGuidelines: mergeCreationSkillWritingGuidelines(
+        data.writing_guidelines,
+        fallback.writingGuidelines,
+      ),
+      distinctiveSections: mapDistinctiveSections(
+        data.distinctive_sections,
+        fallback.distinctiveSections || [],
+      ),
       sectionHeadings: mapSectionHeadings(data.section_headings),
-      fieldExamples: mapFieldExamples(data.field_examples),
-      exampleDocument: data.example_document?.trim() || DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
+      fieldExamples,
+      exampleDocument: isCompleteCreationSkillExampleDocument(data.example_document)
+        ? data.example_document.trim()
+        : fallback.exampleDocument,
       suggestedCategoryKeywords: data.suggested_category_keywords || [],
       analysisMode: data.analysis_mode || 'local_model',
+      fallbackReason: typeof data.fallback_reason === 'string'
+        ? data.fallback_reason
+        : undefined,
     }
   } catch {
-    return buildClientCreationSkillFallback(source)
+    return buildClientCreationSkillFallback(source, 'analysis_request_failed')
   }
 }
 
@@ -241,7 +1026,7 @@ export async function listLocalCreationSkills(
   if (query.installed !== undefined) search.set('installed', String(query.installed))
   const suffix = search.toString()
   const response = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/skills${suffix ? `?${suffix}` : ''}`)
-  if (!response.ok) throw new Error(await parseError(response, '读取创作 Skill 失败'))
+  if (!response.ok) throw new Error(await parseError(response, '读取技能失败'))
   return (await response.json()).map(mapLocalSkill)
 }
 
@@ -258,13 +1043,13 @@ export async function saveLocalCreationSkill(
       body: JSON.stringify(serializeLocalSkill(input)),
     },
   )
-  if (!response.ok) throw new Error(await parseError(response, '保存创作 Skill 失败'))
+  if (!response.ok) throw new Error(await parseError(response, '保存技能失败'))
   return mapLocalSkill(await response.json())
 }
 
 export async function deleteLocalCreationSkill(apiBaseUrl: string, id: number): Promise<void> {
   const response = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/skills/${id}`, { method: 'DELETE' })
-  if (!response.ok && response.status !== 204) throw new Error(await parseError(response, '删除创作 Skill 失败'))
+  if (!response.ok && response.status !== 204) throw new Error(await parseError(response, '删除技能失败'))
 }
 
 export async function fetchCreationSkillCategories(adminApiBaseUrl: string): Promise<CreationSkillCategory[]> {
@@ -307,7 +1092,7 @@ export async function searchCreationSkillMarket(
   const response = await fetch(`${adminApiBaseUrl}/v1/creation-skills?${search}`, {
     headers: serviceEnvironmentHeaders(),
   })
-  if (!response.ok) throw new Error(await parseError(response, '读取创作 Skill 市场失败'))
+  if (!response.ok) throw new Error(await parseError(response, '读取技能市场失败'))
   const payload = await response.json()
   return {
     items: Array.isArray(payload?.data?.items)
@@ -330,18 +1115,36 @@ export function marketCreationSkillToLocalInput(
     title: skill.title,
     summary: skill.summary,
     categoryId: skill.categoryId,
+    skillDescription: {
+      ...skill.skillDescription,
+      documentTypes: [...skill.skillDescription.documentTypes],
+      problems: [...skill.skillDescription.problems],
+      domains: [...skill.skillDescription.domains],
+      deliverables: [...skill.skillDescription.deliverables],
+    },
+    executionSteps: skill.executionSteps.map(step => ({
+      ...step,
+      agents: [...step.agents],
+      skills: [...step.skills],
+      tools: [...step.tools],
+    })),
     commonTitles: [...skill.commonTitles],
     titleStyle: skill.titleStyle,
     textStyle: skill.textStyle,
     diagramStyle: skill.diagramStyle,
     structurePattern: [...skill.structurePattern],
     writingGuidelines: [...skill.writingGuidelines],
+    distinctiveSections: [...(skill.distinctiveSections || [])].map(section => ({
+      ...section,
+      examples: [...section.examples],
+    })),
     sectionHeadings: { ...skill.sectionHeadings },
     fieldExamples: cloneFieldExamples(skill.fieldExamples),
     exampleDocument: skill.exampleDocument,
     status: 'saved',
     installed: true,
     published: false,
+    packageFiles: [],
   }
 }
 
@@ -352,7 +1155,7 @@ export async function publishCreationSkill(
   published: boolean,
 ): Promise<{ id: string; published: boolean }> {
   if (!skill.categoryId) throw new Error('请选择第四级具体文档类型')
-  if (!published && !skill.cloudSkillId) throw new Error('未发布的本地 Skill 草稿不会上传')
+  if (!published && !skill.cloudSkillId) throw new Error('未发布的本地技能草稿不会上传')
   const response = await fetch(
     `${adminApiBaseUrl}/v1/creation-skills${skill.cloudSkillId ? `/${skill.cloudSkillId}` : ''}`,
     {
@@ -368,19 +1171,28 @@ export async function publishCreationSkill(
         summary: skill.summary,
         category_id: skill.categoryId,
         content: {
+          skill_description: {
+            purpose: skill.skillDescription.purpose,
+            document_types: skill.skillDescription.documentTypes,
+            problems: skill.skillDescription.problems,
+            domains: skill.skillDescription.domains,
+            deliverables: skill.skillDescription.deliverables,
+          },
+          execution_steps: skill.executionSteps,
           common_titles: skill.commonTitles,
           title_style: skill.titleStyle,
           text_style: skill.textStyle,
           diagram_style: skill.diagramStyle,
           structure_pattern: skill.structurePattern,
           writing_guidelines: skill.writingGuidelines,
+          distinctive_sections: skill.distinctiveSections || [],
           section_headings: {
-            common_titles: '这类文档标题通常怎么命名',
-            title_style: skill.sectionHeadings.titleStyle,
-            text_style: skill.sectionHeadings.textStyle,
-            diagram_style: skill.sectionHeadings.diagramStyle,
-            structure_pattern: skill.sectionHeadings.structurePattern,
-            writing_guidelines: skill.sectionHeadings.writingGuidelines,
+            common_titles: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.commonTitles,
+            title_style: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.titleStyle,
+            text_style: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.textStyle,
+            diagram_style: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.diagramStyle,
+            structure_pattern: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.structurePattern,
+            writing_guidelines: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.writingGuidelines,
           },
           field_examples: {
             common_titles: skill.fieldExamples.commonTitles,
@@ -396,7 +1208,7 @@ export async function publishCreationSkill(
       }),
     },
   )
-  if (!response.ok) throw new Error(await parseError(response, published ? '发布 Skill 失败' : '下架 Skill 失败'))
+  if (!response.ok) throw new Error(await parseError(response, published ? '发布技能失败' : '下架技能失败'))
   const payload = await response.json()
   return { id: payload.data.id, published: payload.data.published }
 }
@@ -558,6 +1370,13 @@ export function matchCreationSkills(
       }
       score += overlapScore(promptGrams, meaningfulNgrams(skill.title), 5, 40)
       score += overlapScore(promptGrams, meaningfulNgrams(skill.summary), 3, 36)
+      score += overlapScore(promptGrams, meaningfulNgrams([
+        skill.skillDescription.purpose,
+        ...skill.skillDescription.documentTypes,
+        ...skill.skillDescription.problems,
+        ...skill.skillDescription.domains,
+        ...skill.skillDescription.deliverables,
+      ].join('\n')), 4, 72)
       score += overlapScore(promptGrams, meaningfulNgrams(skill.commonTitles.join('\n')), 2, 24)
       return { skill, reason: mentioned ? 'mentioned' as const : 'automatic' as const, score }
     })
@@ -569,6 +1388,46 @@ export function matchCreationSkills(
   return [...explicit, ...automatic].slice(0, Math.max(1, limit))
 }
 
+export function resolveCreationSkillDependencies(
+  primarySkills: LocalCreationSkill[],
+  installedSkills: LocalCreationSkill[],
+  limit = 4,
+): LocalCreationSkill[] {
+  const maximum = Math.max(1, limit)
+  const result: LocalCreationSkill[] = []
+  const seen = new Set<number>()
+  const dependencyIndex = new Map<string, LocalCreationSkill>()
+  const normalizeReference = (value: string | number) => String(value).trim().toLowerCase()
+
+  installedSkills
+    .filter(skill => skill.status === 'saved' && skill.installed)
+    .forEach(skill => {
+      for (const reference of [skill.id, skill.clientSkillKey, skill.title]) {
+        const key = normalizeReference(reference)
+        if (key && !dependencyIndex.has(key)) dependencyIndex.set(key, skill)
+      }
+    })
+
+  const append = (skill: LocalCreationSkill) => {
+    if (seen.has(skill.id) || result.length >= maximum) return
+    seen.add(skill.id)
+    result.push(skill)
+  }
+  primarySkills.forEach(append)
+
+  for (let cursor = 0; cursor < result.length && result.length < maximum; cursor += 1) {
+    for (const step of result[cursor].executionSteps) {
+      for (const reference of step.skills) {
+        const dependency = dependencyIndex.get(normalizeReference(reference))
+        if (dependency) append(dependency)
+        if (result.length >= maximum) break
+      }
+      if (result.length >= maximum) break
+    }
+  }
+  return result
+}
+
 export function buildCreationSkillInstruction(
   matches: MatchedCreationSkill[],
   categories: CreationSkillCategory[] = OFFLINE_CREATION_SKILL_CATEGORIES,
@@ -576,66 +1435,464 @@ export function buildCreationSkillInstruction(
   if (matches.length === 0) return ''
   const recipes = matches.map(({ skill, reason }, index) => {
     const category = categoryPathFor(categories, skill.categoryId).map(item => item.name).join(' / ')
+    const descriptionContext = [
+      `能力目标：${skill.skillDescription.purpose}`,
+      `适用文档：${skill.skillDescription.documentTypes.join('；')}`,
+      `解决问题：${skill.skillDescription.problems.join('；')}`,
+      skill.skillDescription.domains.length ? `涉及领域：${skill.skillDescription.domains.join('；')}` : '',
+      `目标产物：${skill.skillDescription.deliverables.join('；')}`,
+    ].filter(Boolean).join('\n')
+    const workflowContext = skill.executionSteps.map((step, stepIndex) => [
+      `步骤 ${stepIndex + 1}｜${step.title}：${step.objective}`,
+      `产出：${step.output}`,
+      step.agents.length ? `可调用 Agent：${step.agents.join('、')}` : '',
+      step.skills.length ? `可调用 Skill：${step.skills.join('、')}` : '',
+      step.tools.length ? `可调用 Tool：${step.tools.join('、')}` : '',
+    ].filter(Boolean).join('；')).join('\n')
+    const importedSkillContext = skill.sourceKind === 'imported'
+      ? buildImportedSkillContext(skill)
+      : ''
+    if (importedSkillContext) {
+      return [
+        `S#${index + 1} ${skill.title}（${reason === 'mentioned' ? '用户明确选择' : '根据需求自动匹配'}）`,
+        `适用场景与目标：${skill.summary}`,
+        category ? `创作类目：${category}` : '',
+        descriptionContext,
+        `执行工作流：\n${workflowContext}`,
+        importedSkillContext,
+      ].filter(Boolean).join('\n')
+    }
     return [
       `S#${index + 1} ${skill.title}（${reason === 'mentioned' ? '用户明确选择' : '根据需求自动匹配'}）`,
       `适用场景与目标：${skill.summary}`,
       category ? `创作类目：${category}` : '',
-      `常见标题｜这类文档标题通常怎么命名：${skill.commonTitles.join('；')}`,
-      `常见标题示例：${skill.fieldExamples.commonTitles.join('；')}`,
-      `标题风格｜${skill.sectionHeadings.titleStyle}：${skill.titleStyle}`,
-      `标题风格示例：${skill.fieldExamples.titleStyle.join('；')}`,
-      `内容文本风格｜${skill.sectionHeadings.textStyle}：${skill.textStyle}`,
-      `内容文本风格示例：${skill.fieldExamples.textStyle.join('；')}`,
-      `画图风格｜${skill.sectionHeadings.diagramStyle}：${skill.diagramStyle}`,
-      `画图风格示例：${skill.fieldExamples.diagramStyle.join('；')}`,
-      `常用结构｜${skill.sectionHeadings.structurePattern}：${skill.structurePattern.join(' → ')}`,
-      `常用结构示例：${skill.fieldExamples.structurePattern.join('；')}`,
-      skill.writingGuidelines.length ? `写作规则｜${skill.sectionHeadings.writingGuidelines}：${skill.writingGuidelines.join('；')}` : '',
-      `写作规则示例：${skill.fieldExamples.writingGuidelines.join('；')}`,
+      descriptionContext,
+      `执行工作流：\n${workflowContext}`,
+      `标题设计风格：${skill.commonTitles.join('；')}`,
+      `源标题脱敏仿写：${skill.fieldExamples.commonTitles.join('；')}`,
+      `行文设计思路：${skill.textStyle}`,
+      `行文仿写示例：${skill.fieldExamples.textStyle.join('；')}`,
+      `图片生成方式：${skill.diagramStyle}`,
+      `代码生图示例：${skill.fieldExamples.diagramStyle.join('；')}`,
+      skill.writingGuidelines.length ? `话术表达风格：${skill.writingGuidelines.join('；')}` : '',
+      `话术仿写示例：${skill.fieldExamples.writingGuidelines.join('；')}`,
+      ...(skill.distinctiveSections || []).map(section => [
+        `特色亮点｜${section.title}`,
+        `特征说明：${section.description}`,
+        `复刻指引：${section.guidance}`,
+        `仿写示例：${section.examples.join('；')}`,
+      ].join('\n')),
       `完全脱离源文档的 few-shot 示例文档：\n${skill.exampleDocument}`,
     ].filter(Boolean).join('\n')
   })
-  return `\n\n已安装并匹配的创作 Skill：\n${recipes.join('\n\n')}\n请结合本次具体需求采用这些写法；示例只作为 few-shot 学习结构与表达，不得照抄其中主题；Skill 只约束表达与结构，不要虚构业务事实。`
+  return `\n\n已安装并匹配的技能：\n${recipes.join('\n\n')}\n上传的 Codex 技能优先遵循其 SKILL.md 和引用文件；脚本内容只可作为说明阅读，不得声称已经执行脚本。其余技能优先复刻可识别的标题句式、行文推进、惯用话术和图片生成方式。只替换本次主题和业务对象，不要把鲜明风格稀释成通用公文。示例只作为 few-shot 学习结构与表达，不得照抄其中主题；技能只约束表达与结构，不要虚构业务事实。`
 }
 
-export function buildClientCreationSkillFallback(source: CreationSkillSource): CreationSkillAnalysis {
-  const title = source.title.trim() || '未命名文档'
-  const docType = source.docType.trim() || inferDocumentType(source.content, title)
-  const structure = extractDocumentStructure(source.content)
-  const genericType = docType.replace(/(?:文档|报告)$/, '')
-  const commonTitles = Array.from(new Set([
-    `${genericType}方案`,
-    `${genericType}设计与实施说明`,
-    `${genericType}复盘与后续行动`,
-  ])).slice(0, 6)
-  return {
-    title: inferAbstractSkillTitle(source, docType),
-    summary: `提炼这类${docType}的标题组织、正文表达、章节结构与图示规范，可作为下一次创作的本地草稿。`,
-    commonTitles,
-    titleStyle: '标题先说明业务或设计对象，再用副标题限定范围、阶段或关键约束；章节标题保持简短并使用一致的名词结构。',
-    textStyle: '正文采用结论先行的短段落，先交代背景和约束，再说明方案、取舍与验证方式；关键术语保持一致。',
-    diagramStyle: '优先使用结构图、流程图或时序图表达关系；统一配色和图例，明确系统边界、数据流向及关键节点，避免无信息装饰。',
-    structurePattern: structure.length > 0 ? structure : defaultStructureFor(docType),
-    writingGuidelines: [
-      '每个关键结论都补充依据、约束或适用范围。',
-      '方案描述同时写明取舍、风险和验证标准。',
-      '图示与正文使用相同术语，并在正文中解释图的阅读顺序。',
-      '公开前删除业务敏感事实，用抽象角色或占位符替代。',
-    ],
-    sectionHeadings: { ...DEFAULT_CREATION_SKILL_SECTION_HEADINGS },
-    fieldExamples: cloneFieldExamples(DEFAULT_CREATION_SKILL_FIELD_EXAMPLES),
-    exampleDocument: DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
-    suggestedCategoryKeywords: detectCategoryKeywords(`${title}\n${docType}\n${source.content.slice(0, 8_000)}`),
-    analysisMode: 'client_heuristic_fallback',
+function buildImportedSkillContext(skill: LocalCreationSkill) {
+  const sections: string[] = []
+  let remaining = MAX_IMPORTED_SKILL_CONTEXT_CHARS
+  for (const file of codexSkillPackageFiles(skill)) {
+    const text = skillFileText(file)
+    if (text === null || !text.trim()) continue
+    const heading = `[技能文件：${file.path}]\n`
+    if (remaining <= heading.length) break
+    const content = text.slice(0, remaining - heading.length)
+    sections.push(`${heading}${content}`)
+    remaining -= heading.length + content.length
+    if (content.length < text.length) {
+      sections.push('[技能文件内容已按上下文上限截断]')
+      break
+    }
   }
+  return sections.length ? `Codex 技能目录内容：\n${sections.join('\n\n')}` : ''
+}
+
+export function buildClientCreationSkillFallback(
+  source: CreationSkillSource,
+  fallbackReason = 'analysis_request_failed',
+): CreationSkillAnalysis {
+  const title = source.title.trim() || '未命名文档'
+  const styleContent = selectCreationSkillStyleContent(title, source.content)
+  const docType = source.docType.trim() || inferDocumentType(styleContent, title)
+  const rawHeadings = extractRawDocumentHeadings(styleContent, title)
+  const structure = extractDocumentStructure(styleContent)
+  const resolvedStructure = structure.length > 0 ? structure : defaultStructureFor(docType)
+  const commonTitles = describeClientHeadingStyle(rawHeadings)
+  const headingExamples = sanitizeClientHeadingExamples(rawHeadings, resolvedStructure, title)
+  const writingGuidelines = extractClientVoiceStyle(styleContent)
+  const phraseExamples = clientVoiceExamples(styleContent)
+  const diagramStyle = describeClientDiagramGeneration(styleContent)
+  const abstractTitle = inferAbstractSkillTitle(source, docType)
+  const categoryKeywords = detectCategoryKeywords(`${title}\n${docType}\n${source.content.slice(0, 8_000)}`)
+  return {
+    title: abstractTitle,
+    summary: `直接复刻这类${docType}的子标题句式、章节推进、惯用话术和代码生图方式，可作为下一次创作的本地风格草稿。`,
+    skillDescription: defaultCreationSkillDescription(
+      abstractTitle,
+      `用于复用${docType}形成事实、分析、方案和交付结论的方法。`,
+      docType,
+      categoryKeywords.slice(0, 3),
+    ),
+    executionSteps: defaultCreationSkillExecutionSteps(
+      abstractTitle,
+      `${title}\n${docType}\n${styleContent}`,
+    ),
+    commonTitles,
+    titleStyle: commonTitles.join('；'),
+    textStyle: describeClientWritingFlow(resolvedStructure, styleContent),
+    diagramStyle,
+    structurePattern: resolvedStructure,
+    writingGuidelines,
+    distinctiveSections: clientDistinctiveSections(styleContent),
+    sectionHeadings: { ...DEFAULT_CREATION_SKILL_SECTION_HEADINGS },
+    fieldExamples: {
+      commonTitles: headingExamples,
+      titleStyle: [...headingExamples],
+      textStyle: [clientFlowExample(resolvedStructure, styleContent)],
+      diagramStyle: [clientDiagramExample(diagramStyle)],
+      structurePattern: [resolvedStructure.join(' → ')],
+      writingGuidelines: phraseExamples,
+    },
+    exampleDocument: clientFallbackExampleDocument(rawHeadings),
+    suggestedCategoryKeywords: categoryKeywords,
+    analysisMode: 'client_heuristic_fallback',
+    fallbackReason,
+  }
+}
+
+function selectCreationSkillStyleContent(documentTitle: string, documentContent: string) {
+  const content = String(documentContent || '').trim()
+  const matches = Array.from(content.matchAll(/^\s{0,3}#\s+(.+?)\s*$/gm))
+  if (matches.length === 0) return content.slice(0, 30_000)
+  const normalizedTitle = documentTitle.replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase()
+  const titleCore = normalizedTitle.replace(/(?:整体)?(?:技术)?(?:方案|文档|报告|设计|规划|说明|手册|指南)$/u, '')
+  const anchors = new Set(
+    (documentTitle.match(/[A-Za-z][A-Za-z0-9_-]{2,}/g) || [])
+      .map(token => token.toLowerCase())
+      .filter(token => !['the', 'and', 'for', 'with'].includes(token)),
+  )
+  let start = matches.findIndex(match => (
+    String(match[1] || '').replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase() === normalizedTitle
+  ))
+  if (start < 0) start = 0
+  const blocks: string[] = []
+  for (let index = start; index < matches.length; index += 1) {
+    const match = matches[index]
+    const heading = String(match[1] || '').trim()
+    const normalizedHeading = heading.replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase()
+    const headingTokens = new Set((heading.match(/[A-Za-z][A-Za-z0-9_-]{2,}/g) || []).map(token => token.toLowerCase()))
+    const related = index === start
+      || [...anchors].some(token => headingTokens.has(token))
+      || (titleCore.length >= 3 && (normalizedHeading.includes(titleCore) || titleCore.includes(normalizedHeading)))
+    const looksLikeAppendix = /近期|补充|更新版|最新调研|浏览(?:记录|快照)|页面快照|历史版本|专项资源|用户行为|^\s*20\d{2}[年/-]/u.test(heading)
+    if (!related && looksLikeAppendix) break
+    const blockStart = match.index || 0
+    const blockEnd = index + 1 < matches.length ? matches[index + 1].index || content.length : content.length
+    blocks.push(content.slice(blockStart, blockEnd).trim())
+  }
+  return (blocks.join('\n\n') || content.slice(matches[start].index || 0)).slice(0, 30_000)
+}
+
+function extractRawDocumentHeadings(content: string, documentTitle: string) {
+  const markdown = content
+    .split(/\r?\n/)
+    .map(line => {
+      const match = line.match(/^\s*(#{1,6})\s+(.+?)\s*$/)
+      return match ? { level: match[1].length, text: match[2].replace(/[*_`#]/g, '').trim().replace(/[：:]$/, '') } : null
+    })
+    .filter((item): item is { level: number; text: string } => Boolean(item?.text))
+  const candidates = markdown.map(item => item.text)
+  if (candidates.length === 0) {
+    candidates.push(...content
+      .split(/\r?\n/)
+      .map(line => line.match(/^\s*(?:[一二三四五六七八九十]+、|\d+(?:\.\d+)*[.、]\s*)(.{2,80})\s*$/)?.[1]?.trim() || '')
+      .filter(Boolean))
+  }
+  const normalizedTitle = documentTitle.replace(/[^\p{L}\p{N}]+/gu, '')
+  return distinctCreationSkillItems(candidates, 24)
+    .filter(item => item.replace(/[^\p{L}\p{N}]+/gu, '') !== normalizedTitle)
+    .filter(item => item.length >= 2 && item.length <= 120)
+}
+
+function describeClientHeadingStyle(headings: string[]) {
+  if (headings.length === 0) {
+    return [
+      '层级边界：源文档没有可识别的独立子标题；仿写时只在话题明确切换处增加标题',
+      '句式骨架：新增标题用“内容对象＋章节动作”的短名词结构，不写完整结论句',
+      '使用边界：连续论述优先靠段落承接，不为了显得完整而强行拆成多层目录',
+      '措辞选择：标题直接概括下一段承担的职责，不使用宣传口号或空泛形容词',
+    ]
+  }
+  const joined = headings.join('\n')
+  const average = headings.reduce((sum, item) => sum + item.replace(/\s+/g, '').length, 0) / headings.length
+  const result = [
+    average <= 8
+      ? '长度节奏：子标题以四到八字的短名词结构为主；同层标题保持相近长度，便于扫读'
+      : '长度节奏：子标题多为带限定语的中等长度短句；先限定对象或范围，再落到章节动作',
+  ]
+  if (/[与及和]/.test(joined)) result.push('并列骨架：使用“名词或动作＋与/及＋名词或结果”；只并列同一章节内同层级的两个重点')
+  if (/[：:]/.test(joined)) result.push('冒号骨架：使用“主题＋冒号＋具体判断或动作”；冒号前定位话题，冒号后给阅读重点')
+  if (/[？?]|为什么|为何|如何|怎么/.test(joined)) result.push('问句骨架：把待回答的问题直接写入标题；正文首段必须紧接着给出判断或方案')
+  if (/从.{1,12}(?:视角|角度|层面).{0,4}看/.test(joined)) result.push('视角骨架：使用“从某一视角看，目标对象”；只在切换分析立场时使用，不当通用前缀')
+  if (/建设|设计|实现|落地|优化|验证|复盘|说明|分析/.test(joined)) result.push('动作标记：保留“设计、实现、验证、复盘”等任务词；用动作说明章节职责，不用抽象形容词')
+  if (/背景|目标|现状|方案|风险|验证|结论|后续/.test(joined)) result.push('路线标题：直接使用背景、目标、方案、风险、验证、后续等内容角色词，让目录呈现推进顺序')
+  if (/[A-Za-z]{2,}/.test(joined)) result.push('术语嵌入：英文技术词作为精确对象嵌入中文标题；保留必要术语，不把整句改成英文口号')
+  if (result.length < 4) result.push('层级一致：同层标题保持相同语法结构，不在名词短语、问句和完整结论句之间随意切换')
+  return Array.from(new Set(result)).slice(0, 8)
+}
+
+function sanitizeClientHeadingExamples(headings: string[], structure: string[], documentTitle: string) {
+  const preservedTerms = new Set(['api', 'sdk', 'os', 'runtime', 'agent', 'ai', 'ui', 'ux', 'http', 'https'])
+  const titleFragments = (documentTitle.match(/[A-Za-z][A-Za-z0-9_-]{2,}/g) || [])
+    .filter(item => !preservedTerms.has(item.toLowerCase()))
+  const chineseCore = documentTitle
+    .replace(/[A-Za-z0-9_\-\s]+/g, '')
+    .replace(/(?:整体)?(?:技术)?(?:方案|文档|报告|设计|规划|说明|手册|指南)$/u, '')
+    .trim()
+  if (chineseCore.length >= 2) titleFragments.push(chineseCore)
+  const examples = [documentTitle, ...headings].map(heading => {
+    let value = heading
+      .replace(/`[^`]+`|“[^”]+”|「[^」]+」/g, '目标对象')
+      .replace(/\d+(?:\.\d+)*/g, '阶段')
+      .replace(/[\p{L}\p{N}·_-]{1,16}?(?:事业群|事业部|研发中心|产品部|项目组|工作组)/gu, '相关团队')
+    for (const fragment of [...titleFragments].sort((left, right) => right.length - left.length)) {
+      value = value.replace(new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '协作工作台')
+    }
+    value = value
+      .replace(/\b[A-Z][A-Za-z0-9_-]{2,}\b/g, term => (
+        preservedTerms.has(term.toLowerCase()) ? term : '协作工作台'
+      ))
+    value = compactCreationSkillPlaceholders(value)
+    value = value.replace(
+      /^(.{2,16}?)(迁移方案|优化方案|实施方案|设计方案|架构设计|流程设计|复盘报告|分析报告)$/u,
+      (matched, prefix: string, suffix: string) => /^(?:总体|核心|背景|现状|目标|范围|风险|结论|后续)/.test(prefix)
+        ? matched
+        : `协作工作台${suffix}`,
+    )
+    if (/^从.{1,12}(?:视角|角度|层面)看[，,:：]?(?:协作工作台|目标对象)$/u.test(value)) {
+      value = `${value}的角色与边界`
+    }
+    if (/^[A-Za-z][A-Za-z0-9_-]*\s*[：:]\s*(?:协作工作台|目标对象)$/u.test(value)) {
+      value = `${value}的调度边界`
+    }
+    return compactCreationSkillPlaceholders(value).slice(0, 80)
+  }).filter(isCompleteCreationSkillHeadingExample)
+  return distinctCreationSkillItems(examples, 6).length
+    ? distinctCreationSkillItems(examples, 6)
+    : structure.slice(0, 3)
+}
+
+function clientDistinctiveSections(content: string): CreationSkillDistinctiveSection[] {
+  const sections: CreationSkillDistinctiveSection[] = []
+  const add = (section: CreationSkillDistinctiveSection) => {
+    if (sections.length < 4) sections.push(section)
+  }
+  if (/定义|可以理解为|核心目标|换言之/.test(content.slice(0, 4_000))) {
+    add({
+      title: '定义先行的概念建立',
+      description: '源文档在展开方案前先解释核心对象是什么、解决什么问题，再用核心目标限定后续讨论，定义本身承担阅读入口。',
+      guidance: '核心对象首次出现时，先用一句通俗类比降低理解门槛，再补一句职责边界；随后列出目标或非目标。仅在术语可能被不同角色误解时使用。',
+      examples: [
+        '协作工作台可以理解为任务流转的统一入口：它连接请求、处理角色与结果证据，但不替代各环节的专业判断。',
+        '核心目标是让接手者在不额外询问的情况下，判断当前状态、下一步动作与完成依据。',
+      ],
+    })
+  }
+  if ((content.match(/(?:\*\*)?[^。\n：:]{2,18}(?:\*\*)?[：:]/g) || []).length >= 3) {
+    add({
+      title: '短标签驱动的信息展开',
+      description: '源文档反复用短标签加冒号定位信息角色，再在同一行或后续短段中补充解释，使高密度内容仍能快速扫描。',
+      guidance: '标签控制在一个概念或动作内，并让同组标签保持同一语法类型；冒号后先给结论，再补条件。连续论证不要强行拆成标签。',
+      examples: [
+        '职责边界：维护角色只确认自己能够验证的资源状态，不代替申请角色补写用途。',
+        '完成证据：释放动作必须留下可观察结果，无法确认时回到复核状态。',
+      ],
+    })
+  }
+  if (/```(?:plantuml|mermaid)/i.test(content)) {
+    add({
+      title: '代码图示与正文同词复现',
+      description: '源文档把可执行图示代码放在解释之后，并让节点、分组和连线继续使用正文已经建立的术语，图不是独立装饰。',
+      guidance: '先用正文说明阅读顺序和关键关系，再给 PlantUML 或 Mermaid 代码；图中只保留正文已有对象，连线使用动作词，图后补充异常或边界。',
+      examples: ['正文先说明申请、确认与释放的主链路，再用 PlantUML 活动图纵向排列动作，并把跨角色步骤放入对应泳道。'],
+    })
+  }
+  if ((content.match(/^\s*---+\s*$/gm) || []).length >= 2) {
+    add({
+      title: '分隔线控制议题切换',
+      description: '源文档用独立分隔线标记较大的议题或文档入口切换，让读者在长内容中明确感知上下文已经重置。',
+      guidance: '只在讨论对象或交付目标发生明显变化时使用分隔线；分隔线后重新给出标题或一句入口判断，不把它当作普通段落装饰。',
+      examples: ['完成总体方案说明后使用分隔线，下一部分以“评测接入：先明确入口与返回结果”重新建立阅读上下文。'],
+    })
+  }
+  return sections
+}
+
+function clientFallbackExampleDocument(sourceHeadings: string[]) {
+  const joined = sourceHeadings.join('\n')
+  let document = DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT
+  if (/从.{1,12}(?:视角|角度|层面).{0,4}看/.test(joined)) {
+    document = document.replace(
+      '## 背景与问题：一次冲突暴露出的状态断点',
+      '## 从使用视角看，预约冲突的来源',
+    )
+  }
+  if (/[？?]|为什么|为何|如何|怎么/.test(joined)) {
+    const questions: Array<[string, string]> = [
+      ['## 背景与问题：一次冲突暴露出的状态断点', '## 为什么现有预约方式需要调整'],
+      ['## 目标与范围：先明确要解决什么', '## 这次要解决什么，不解决什么'],
+      ['## 方案设计：让状态、责任与动作相互对应', '## 方案如何落到执行'],
+      ['## 核心流程：从提出申请到完成释放', '## 一次预约如何走完整个流程'],
+      ['## 风险与保障：异常不能重新回到人工猜测', '## 出现异常时如何保持边界清楚'],
+      ['## 验证与复盘：用可观察结果收束判断', '## 怎样判断这套方案真正有效'],
+      ['## 结论与后续：把临时协调变成稳定机制', '## 最终要形成什么结果'],
+    ]
+    for (const [from, to] of questions) document = document.replace(from, to)
+    return document
+  }
+  if (!/[：:]/.test(joined)) {
+    document = document
+      .replace('# 共享评审空间：预约流程与协作边界优化方案', /[与及]/.test(joined)
+        ? '# 共享评审空间预约流程与协作边界优化方案'
+        : '# 共享评审空间预约流程优化方案')
+      .replace(/^## ([^：\n]+)：.*$/gm, '## $1')
+  }
+  return document
+}
+
+function describeClientWritingFlow(structure: string[], content: string) {
+  const paragraphs = content.split(/\n\s*\n/).map(item => item.trim()).filter(Boolean)
+  const average = paragraphs.reduce((sum, item) => sum + item.length, 0) / Math.max(1, paragraphs.length)
+  const paragraphStyle = average > 120
+    ? '段内通常先给判断，再连续补充原因、边界和落法'
+    : '用短段落推进，一个段落只承担一个判断、动作或补充说明'
+  const listStyle = /^\s*(?:[-*+]|\d+[.、])\s+/m.test(content)
+    ? '遇到并列动作或条件时切成列表，列表项保持同一语法起点'
+    : '主要依靠连续段落推进，段与段之间用因果或递进关系承接'
+  const opener = /定义|可以理解为|核心目标|总体来看/.test(content.slice(0, 1200))
+    ? '开篇先给定义或核心判断，再补适用范围，读者无需读完背景才知道文档要解决什么'
+    : '开篇先交代问题角色、适用范围和目标，再进入分析，不用口号或宽泛行业背景铺垫'
+  const labelStyle = (content.match(/\*\*[^*\n]{2,20}\*\*[：:]/g) || []).length >= 2
+    ? '信息展开时大量使用“短标签＋冒号＋解释”，标签定位信息类型，冒号后补依据或动作'
+    : '信息展开以完整判断句为主，只在同层信息需要快速扫描时切换为标签或列表'
+  const transitions = ['需要说明的是', '具体而言', '基于此', '同时', '此外', '因此', '最后']
+    .filter(phrase => content.includes(phrase))
+  const transitionStyle = transitions.length
+    ? `章节与段落之间沿用“${transitions.slice(0, 4).join('、')}”等连接词，分别承担补充、递进或收束`
+    : '章节之间靠标题角色和前后因果自然承接，不额外堆叠模板连接词'
+  return `章节路线：全文沿“${structure.join(' → ')}”推进，标题本身承担阅读导航；中段展开分析、方案或取舍，末段必须落到验证和后续动作。开篇配方：${opener}。段内配方：${paragraphStyle}，通常先写本段判断，再补原因、边界和落法。列表条件：${listStyle}，不要把相互依赖的论证拆成彼此孤立的要点。信息密度：${labelStyle}。衔接方式：${transitionStyle}。段落节奏：定义、判断、依据和动作分别承担清晰职责；同一段出现多个转折时应拆段，但不要把一句完整论证切成口号。收束要求：结尾回看目标、给出可验证结果和下一步，不重复摘要，也不新增未经前文论证的判断。不可迁移项：只复刻标题句法、信息顺序和语气，不复制源文档的专名、事实、结论、日期或指标；源文档缺少证据的图示、列表和结论句也不能为了形式完整而补造。交付前自检：逐节确认标题是否预告正文职责、首段是否立即回应标题、并列项是否同构、结尾是否留下可执行动作与验证依据。`
+}
+
+const CLIENT_VOICE_PHRASES: Array<[string, string]> = [
+  ['需要说明的是', '引出边界、例外或容易误解的前提'],
+  ['值得注意的是', '提示风险或需要读者停顿关注的信息'],
+  ['具体而言', '把上一层判断拆成可执行细节'],
+  ['基于此', '承接前文依据并转入结论或方案'],
+  ['换言之', '用更直接的说法重述复杂判断'],
+  ['总体来看', '在段落或章节末收束判断'],
+  ['首先', '开启有顺序的论述或动作清单'],
+  ['其次', '延续同层级的下一个论点'],
+  ['最后', '收束一组论点并转入结论'],
+  ['同时', '补充并行条件或同步动作'],
+  ['此外', '增加独立但相关的补充信息'],
+  ['因此', '从原因过渡到判断、动作或结果'],
+  ['建议', '用克制语气提出行动'],
+  ['需要', '直接声明必要动作或约束'],
+  ['应当', '以规范性语气提出要求'],
+  ['必须', '标记不可让步的硬约束'],
+  ['优先', '表达取舍顺序而不使用夸张措辞'],
+  ['避免', '用负向动作明确禁止项'],
+  ['确保', '把动作落到预期结果'],
+  ['明确', '要求把模糊对象、边界或责任说具体'],
+]
+
+function extractClientVoiceStyle(content: string) {
+  const matched = CLIENT_VOICE_PHRASES
+    .filter(([phrase]) => content.includes(phrase))
+  const styles = matched.slice(0, 5).map(([phrase, role]) =>
+    `证据话术“${phrase}”：源文档用它${role}；复刻时把它放在承担同类职责的句首，后面紧接完整判断、条件或动作，不让短语单独成句；同一段只使用一次，没有对应逻辑关系时不要把它当作装饰性连接词。`,
+  )
+  if (content.includes('：')) {
+    styles.push('标点句式“短标签＋冒号＋解释”：源文档用冒号把信息角色和具体内容分开；复刻时标签保持短而同构，冒号后先写核心判断再补依据，适合定义、约束和并列说明；连续论证或因果链不要硬拆成标签。')
+  }
+  if (content.includes('；')) {
+    styles.push('长句节奏“分号切分同层判断”：源文档用分号承载彼此并列且各自完整的信息；复刻时让分号两侧保持相同语法起点和相近粒度，读完仍是一组判断；存在先后、因果或转折时应拆句，不用分号掩盖关系。')
+  }
+  if (/^\s*[-*+]\s+/m.test(content)) {
+    styles.push('列表话术“动作词先行”：源文档把可并列扫描的动作、条件或结果写成列表；复刻时每项先用同类动词或名词短语点明职责，再补对象与边界，语气直接克制；相互依赖的论证仍保留连续段落。')
+  }
+  const modalWords = ['建议', '需要', '应当', '必须', '优先', '避免', '确保', '明确']
+    .filter(word => content.includes(word))
+  if (modalWords.length) {
+    styles.push(`动作语气“${modalWords.slice(0, 4).join('、')}”：源文档用这些词区分建议、必要动作、优先级与禁止项；复刻时把动作主体、作用对象和预期结果写全，强弱程度沿用原文证据；没有硬约束依据时不得把“建议”擅自升级为“必须”。`)
+  }
+  if (!matched.length) {
+    styles.unshift('话术证据边界：源文档没有识别出稳定反复出现的标志性短语，复刻时以原有句法、标点和动作词为准，不额外植入“首先、其次、综上”等模板过渡语；需要承接时直接写清前后判断的因果、递进或范围变化。')
+  }
+  styles.push(
+    '句式节奏复刻：源文档以能够独立成立的陈述句承载判断，复刻时先写清谁对什么采取何种动作，再用后句补原因、条件或结果；一个句子只保留一条主逻辑，出现多次转折时拆句，但不把完整论证切成缺少主谓的口号。',
+    '术语与指代控制：从源文档提取可公开复用的专业称呼后，为同一概念固定一种叫法，后文只在指代对象明确时使用“该对象”“这一过程”等代词；不得为了显得专业堆叠近义词，也不得把来源专名带入新的虚构主题。',
+    '段落语气迁移：延续源文档先判断、再补依据与适用边界的完整陈述，主语和动作保持明确，专业词首次出现时给出足够上下文；只迁移表达顺序与语气，不复制来源中的专名、事实、指标和业务结论。',
+    '话术交付自检：逐段检查连接词是否真的对应补充、递进、因果或收束，动作词是否带清楚的执行对象与结果，列表项是否同构，强制语气是否有依据；删去不承担信息作用的套话，并统一同一概念的称呼。',
+  )
+  const unique = Array.from(new Set(styles))
+  const recipe = unique.length > 8
+    ? [...unique.slice(0, 6), ...unique.slice(-2)]
+    : unique
+  while (recipe.join('').length > 700 && recipe.length > 5) recipe.splice(-3, 1)
+  return recipe
+}
+
+function clientVoiceExamples(content: string) {
+  const phrases = CLIENT_VOICE_PHRASES.filter(([phrase]) => content.includes(phrase)).map(([phrase]) => phrase).slice(0, 3)
+  return phrases.length
+    ? phrases.map(phrase => `${phrase}，相关角色先确认适用边界，再推进后续动作。`)
+    : ['源文档没有稳定的惯用短语，仿写时不额外植入模板化套话。']
+}
+
+function describeClientDiagramGeneration(content: string) {
+  let choice = ''
+  if (/```plantuml|@startuml/i.test(content)) {
+    choice = '源文档存在 PlantUML 代码图示，继续使用 PlantUML，并根据正文实际关系选择组件图、时序图或活动图；默认保留源图从左到右的主阅读方向，用 package 或 rectangle 表达边界。'
+  } else if (/```mermaid/i.test(content)) {
+    choice = '源文档存在 Mermaid 代码图示，继续使用 Mermaid，并沿用 flowchart 或 sequenceDiagram 的表达方式；节点使用短名词，连线使用动作词，分组边界与正文层级对应。'
+  } else if (/时序图|调用链|交互顺序/.test(content)) {
+    choice = '源文档以时间顺序解释交互，推荐 PlantUML sequence diagram；参与者按正文首次出现顺序排列，消息箭头使用动作词，异常或条件链路放入 alt 分组。'
+  } else if (/架构图|组件图|分层|模块关系/.test(content)) {
+    choice = '源文档存在分层、模块或依赖关系，推荐 PlantUML component diagram；同层对象横向对齐，使用 package 分组边界，只保留正文重点讨论的关键依赖。'
+  } else if (/流程图|步骤|流转|审批/.test(content)) {
+    choice = '源文档存在步骤、流转或审批关系，推荐 PlantUML activity diagram；主流程从上到下排列，判断节点写成问题，角色发生切换时使用泳道。'
+  } else {
+    choice = '源文档未识别到图示代码或图片说明，默认不生成图片；只有当对象关系、时间交互或条件流程仅靠连续文字难以准确理解时，才使用 PlantUML 补充组件图、时序图或活动图。'
+  }
+  return `证据与启用条件：${choice}选型判断：稳定依赖或分层关系用组件图，跨角色的先后消息用时序图，带判断与回退的动作链用活动图；同一张图只回答一个核心问题，无法明确图要解释什么时继续使用文字。信息筛选：先从正文提取已经定义的对象、边界、动作、条件和结果，再删去背景铺垫、评价性形容词、未被正文解释的内部细节与敏感事实；图中不得新增来源没有支持的节点、关系或结论。布局与阅读路径：主链路保持单一方向，核心对象放在视觉主轴，同层元素对齐，跨层关系通过分组边界表达；分支从触发点就近展开，避免箭头交叉和读者来回跳读。元素与标注：节点名称沿用正文中的短名词，箭头使用可执行的关系动词，条件写在分支或消息上，边界用 package、rectangle、subgraph 或泳道表示；同类元素必须采用同一种形状和命名粒度。视觉规则：使用暖灰、深棕与低饱和强调色区分层级，颜色只承担分组、状态或重点提示，不用渐变、阴影、装饰图标和无意义图例；正文术语、图中术语与标题保持完全一致。图文衔接：在图前先用一段话说明阅读方向、图要回答的问题和暂不覆盖的边界，图后只解释关键关系、异常分支及其对方案的影响，不逐节点复述图面。禁用边界与自检：不把大段正文塞进节点，不用一张图同时承载架构、时序和流程，不用图替代必要的决策依据；交付前检查代码能否渲染、方向是否唯一、连线是否有语义、术语是否一致、每个元素是否都能回指正文。`
+}
+
+function clientDiagramExample(style: string) {
+  if (style.includes('Mermaid')) return 'Mermaid flowchart：主流程沿同一方向排列，分支只表达正文已经解释的判断条件。'
+  if (style.includes('sequence diagram')) return 'PlantUML 时序图：参与者按出现顺序排列，主链路使用实线箭头，条件分支放入 alt 区块。'
+  if (style.includes('component diagram')) return 'PlantUML 组件图：用 package 表示层级，用 component 表示模块，依赖箭头标注正文中的关系动词。'
+  if (style.includes('activity diagram')) return 'PlantUML 活动图：主流程纵向排列，判断使用条件分支，跨角色动作放入对应泳道。'
+  return '默认不生成图片；确需补图时使用 PlantUML，并只画正文已经说明的对象、边界和关系。'
+}
+
+function clientFlowExample(structure: string[], content: string) {
+  const opener = content.includes('首先') ? '首先，' : ''
+  const connector = content.includes('基于此') ? '基于此，' : '随后，'
+  const closer = content.includes('因此') ? '因此，' : '最后，'
+  return `${opener}先界定示例事项的目标与适用范围。${connector}按“${structure.slice(0, 4).join(' → ')}”展开可选方案与约束。${closer}用验证结果收束判断，并明确后续动作。`
 }
 
 export function normalizeCreationSkillTitle(candidate: unknown, source: CreationSkillSource): string {
   const docType = source.docType.trim() || inferDocumentType(source.content, source.title)
-  const sourceText = `${source.title}\n${source.content.slice(0, 6_000)}`
+  const sourceText = `${source.title}\n${docType}`
   if (/(?:跨部门|跨团队|多团队)/.test(sourceText) && /(?:技术|架构|研发|系统)/.test(sourceText) && /(?:会议|沟通|评审|纪要)/.test(sourceText)) {
     return '跨部门技术沟通会文档'
   }
+  if (/整体技术方案/.test(sourceText)) return '运行平台整体技术方案'
+  if (/技术架构|架构设计/.test(sourceText)) return '技术架构设计文档'
+  if (/技术方案/.test(sourceText)) return '技术方案文档'
+  if (/评测接入/.test(sourceText)) return '评测接入文档'
   let title = String(candidate || '').trim()
   const organizationNames = (source.title.match(/[\p{L}\p{N}·_-]{1,12}?(?:事业群|事业部|委员会|项目组|工作组|部门|团队|小组|中心|部)/gu) || [])
     .filter(name => !/^(?:跨|多|各|相关)(?:部门|团队|小组)$/.test(name))
@@ -648,7 +1905,11 @@ export function normalizeCreationSkillTitle(candidate: unknown, source: Creation
     .replace(/沟通会(?:会议)?纪要$/u, '沟通会文档')
     .replace(/会议纪要$/u, '会议文档')
     .replace(/^[\s·—_:：-]+|[\s·—_:：-]+$/g, '')
-  if (title.length < 4 || organizationNames.some(name => title.includes(name))) {
+  if (
+    title.length < 4
+    || organizationNames.some(name => title.includes(name))
+    || (/复盘|总结/.test(title) && !/复盘|总结/.test(sourceText))
+  ) {
     return inferAbstractSkillTitle(source, docType)
   }
   return title.slice(0, 80)
@@ -666,9 +1927,11 @@ function extractDocumentStructure(content: string): string[] {
 function canonicalSkillHeading(heading: string) {
   const mappings: Array<[RegExp, string]> = [
     [/背景|现状|概述/, '背景与目标'],
+    [/为什么|为何|原因|必要性|问题/, '问题与原因'],
     [/目标|范围/, '目标与范围'],
     [/约束|原则/, '约束与设计原则'],
     [/架构|总体设计/, '总体方案'],
+    [/方案|策略|路径|落地/, '方案设计'],
     [/流程|步骤/, '核心流程'],
     [/功能|模块/, '核心设计'],
     [/接口|数据/, '接口与数据'],
@@ -693,7 +1956,9 @@ function inferDocumentType(content: string, title: string) {
 }
 
 function inferAbstractSkillTitle(source: CreationSkillSource, docType: string) {
-  const text = `${source.title}\n${source.content.slice(0, 6_000)}`
+  // 正文可能包含案例、引用或 Bake 追加片段，用途特判只依据标题和文档类型，
+  // 避免一次“案例复盘”把技术方案错误命名为复盘总结。
+  const text = `${source.title}\n${docType}`
   if (/跨部门|跨团队|多团队/.test(text) && /技术|架构|研发|系统/.test(text) && /会议|沟通|评审|纪要/.test(text)) {
     return '跨部门技术沟通会文档'
   }
@@ -701,6 +1966,10 @@ function inferAbstractSkillTitle(source: CreationSkillSource, docType: string) {
   if (/架构评审|技术评审|方案评审/.test(text)) return '技术方案评审文档'
   if (/复盘|总结会/.test(text)) return '项目复盘总结文档'
   if (/客户|交付|实施/.test(text) && /沟通|汇报|会议/.test(text)) return '客户交付沟通文档'
+  if (/整体技术方案/.test(text)) return '运行平台整体技术方案'
+  if (/技术架构|架构设计/.test(text)) return '技术架构设计文档'
+  if (/技术方案/.test(text)) return '技术方案文档'
+  if (/评测接入/.test(text)) return '评测接入文档'
   const purposeByType: Array<[RegExp, string]> = [
     [/技术架构|系统架构/, '技术架构设计文档'],
     [/接口设计/, '系统接口设计文档'],
@@ -799,19 +2068,41 @@ function serializeLocalSkill(skill: Omit<LocalCreationSkill, 'id' | 'createdAt' 
     title: skill.title,
     summary: skill.summary,
     category_id: skill.categoryId || null,
+    skill_description: {
+      purpose: skill.skillDescription.purpose,
+      document_types: skill.skillDescription.documentTypes,
+      problems: skill.skillDescription.problems,
+      domains: skill.skillDescription.domains,
+      deliverables: skill.skillDescription.deliverables,
+    },
+    execution_steps: skill.executionSteps.map(step => ({
+      id: step.id,
+      title: step.title,
+      objective: step.objective,
+      output: step.output,
+      agents: step.agents,
+      skills: step.skills,
+      tools: step.tools,
+    })),
     common_titles: skill.commonTitles,
     title_style: skill.titleStyle,
     text_style: skill.textStyle,
     diagram_style: skill.diagramStyle,
     structure_pattern: skill.structurePattern,
     writing_guidelines: skill.writingGuidelines,
+    distinctive_sections: (skill.distinctiveSections || []).map(section => ({
+      title: section.title,
+      description: section.description,
+      guidance: section.guidance,
+      examples: section.examples,
+    })),
     section_headings: {
-      common_titles: '这类文档标题通常怎么命名',
-      title_style: skill.sectionHeadings.titleStyle,
-      text_style: skill.sectionHeadings.textStyle,
-      diagram_style: skill.sectionHeadings.diagramStyle,
-      structure_pattern: skill.sectionHeadings.structurePattern,
-      writing_guidelines: skill.sectionHeadings.writingGuidelines,
+      common_titles: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.commonTitles,
+      title_style: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.titleStyle,
+      text_style: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.textStyle,
+      diagram_style: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.diagramStyle,
+      structure_pattern: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.structurePattern,
+      writing_guidelines: DEFAULT_CREATION_SKILL_SECTION_HEADINGS.writingGuidelines,
     },
     field_examples: {
       common_titles: skill.fieldExamples.commonTitles,
@@ -822,6 +2113,12 @@ function serializeLocalSkill(skill: Omit<LocalCreationSkill, 'id' | 'createdAt' 
       writing_guidelines: skill.fieldExamples.writingGuidelines,
     },
     example_document: skill.exampleDocument,
+    package_files: (skill.packageFiles || []).map(file => ({
+      path: file.path,
+      media_type: file.mediaType,
+      content_base64: file.contentBase64,
+      size_bytes: file.sizeBytes,
+    })),
     status: skill.status,
     installed: skill.installed,
     published: skill.published,
@@ -830,25 +2127,77 @@ function serializeLocalSkill(skill: Omit<LocalCreationSkill, 'id' | 'createdAt' 
 
 function mapLocalSkill(item: any): LocalCreationSkill {
   const legacyContent = !item.section_headings || !item.field_examples || !String(item.example_document || '').trim()
+  const legacyTitleFields = item?.section_headings?.common_titles === '这类文档标题通常怎么命名'
+    || item?.section_headings?.title_style === '标题如何传递重点'
   const legacyDefaults = buildLegacyGeneralizedContent(String(item.title || ''))
+  const title = repairStoredCreationSkillTitle(item)
+  const summary = String(item.summary || '')
+  const legacyTitleExamples = Array.from(new Set([
+    ...(Array.isArray(item.common_titles) ? item.common_titles : []),
+    ...(Array.isArray(item?.field_examples?.common_titles) ? item.field_examples.common_titles : []),
+    ...(Array.isArray(item?.field_examples?.title_style) ? item.field_examples.title_style : []),
+  ].map(value => String(value).trim()).filter(Boolean))).slice(0, 6)
   return {
     id: Number(item.id),
     clientSkillKey: item.client_skill_key,
     cloudSkillId: item.cloud_skill_id,
     sourceKind: item.source_kind,
     sourceId: item.source_id,
-    title: item.title,
-    summary: item.summary,
+    title,
+    summary,
     categoryId: item.category_id,
-    commonTitles: legacyContent ? legacyDefaults.commonTitles : item.common_titles || [],
+    skillDescription: mapSkillDescription(item.skill_description, title, summary),
+    executionSteps: mapExecutionSteps(item.execution_steps, title, summary),
+    commonTitles: legacyContent
+      ? legacyDefaults.commonTitles
+      : legacyTitleFields && String(item.title_style || '').trim()
+        ? [String(item.title_style).trim()]
+        : distinctCreationSkillItems(
+          (Array.isArray(item.common_titles) ? item.common_titles : [])
+            .map((value: unknown) => coerceCreationSkillStringItem(value, 'common_titles')),
+          12,
+        ),
     titleStyle: legacyContent ? legacyDefaults.titleStyle : item.title_style || '',
-    textStyle: legacyContent ? legacyDefaults.textStyle : item.text_style || '',
-    diagramStyle: legacyContent ? legacyDefaults.diagramStyle : item.diagram_style || '',
-    structurePattern: legacyContent ? legacyDefaults.structurePattern : item.structure_pattern || [],
-    writingGuidelines: legacyContent ? legacyDefaults.writingGuidelines : item.writing_guidelines || [],
+    textStyle: legacyContent
+      ? legacyDefaults.textStyle
+      : hasSerializedSkillObjectItems(item)
+        ? repairStoredCreationSkillTextStyle(item.text_style, item.structure_pattern)
+        : item.text_style || '',
+    diagramStyle: legacyContent
+      ? legacyDefaults.diagramStyle
+      : hasSerializedSkillObjectItems(item)
+        ? repairStoredCreationSkillDiagramStyle(item.diagram_style)
+        : item.diagram_style || '',
+    structurePattern: legacyContent
+      ? legacyDefaults.structurePattern
+      : (Array.isArray(item.structure_pattern) ? item.structure_pattern : [])
+        .map((value: unknown) => coerceCreationSkillStringItem(value, 'structure_pattern'))
+        .filter(Boolean),
+    writingGuidelines: legacyContent
+      ? legacyDefaults.writingGuidelines
+      : hasSerializedSkillObjectItems(item)
+        ? repairStoredCreationSkillWritingGuidelines(item.writing_guidelines)
+        : (Array.isArray(item.writing_guidelines) ? item.writing_guidelines : [])
+          .map((value: unknown) => coerceCreationSkillStringItem(value, 'writing_guidelines'))
+          .filter(Boolean),
+    distinctiveSections: mapDistinctiveSections(item.distinctive_sections),
     sectionHeadings: mapSectionHeadings(item.section_headings),
-    fieldExamples: mapFieldExamples(item.field_examples),
+    fieldExamples: legacyTitleFields && legacyTitleExamples.length
+      ? {
+        ...mapFieldExamples(item.field_examples),
+        commonTitles: legacyTitleExamples,
+        titleStyle: legacyTitleExamples,
+      }
+      : mapFieldExamples(item.field_examples),
     exampleDocument: item.example_document?.trim() || DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
+    packageFiles: Array.isArray(item.package_files)
+      ? item.package_files.map((file: any) => ({
+        path: String(file.path || ''),
+        mediaType: String(file.media_type || 'application/octet-stream'),
+        contentBase64: String(file.content_base64 || ''),
+        sizeBytes: Number(file.size_bytes || 0),
+      })).filter((file: CreationSkillPackageFile) => file.path && file.contentBase64)
+      : [],
     status: item.status === 'draft' ? 'draft' : 'saved',
     installed: Boolean(item.installed),
     published: Boolean(item.published),
@@ -857,12 +2206,67 @@ function mapLocalSkill(item: any): LocalCreationSkill {
   }
 }
 
+function repairStoredCreationSkillTitle(item: any) {
+  const title = String(item?.title || '').trim()
+  const styleEvidence = JSON.stringify([
+    ...(Array.isArray(item?.common_titles) ? item.common_titles : []),
+    ...(Array.isArray(item?.field_examples?.common_titles) ? item.field_examples.common_titles : []),
+  ])
+  if (/复盘|总结/.test(title) && /整体技术方案|OS\s*[/+＋]?整体技术方案/i.test(styleEvidence)) {
+    return '运行平台整体技术方案'
+  }
+  return title
+}
+
+function hasSerializedSkillObjectItems(item: any) {
+  return [
+    ...(Array.isArray(item?.common_titles) ? item.common_titles : []),
+    ...(Array.isArray(item?.structure_pattern) ? item.structure_pattern : []),
+    ...(Array.isArray(item?.field_examples?.common_titles) ? item.field_examples.common_titles : []),
+  ].some(value => typeof value === 'string' && /^\{\s*['"][^'"]+['"]\s*:/u.test(value.trim()))
+}
+
+function repairStoredCreationSkillTextStyle(value: unknown, rawStructure: unknown) {
+  const text = String(value || '').trim()
+  if (text.length >= 400) return text
+  const structure = (Array.isArray(rawStructure) ? rawStructure : [])
+    .map(item => coerceCreationSkillStringItem(item, 'structure_pattern'))
+    .filter(Boolean)
+  const route = structure.length
+    ? structure.slice(0, 6).join(' → ')
+    : '目标与范围 → 核心判断 → 方案展开 → 验证与后续'
+  const supplement = `执行配方：开篇先界定核心对象、适用范围与目标，让读者在进入细节前知道文档要解决什么。章节沿“${route}”推进，标题直接预告下一节承担的内容职责。段内先给判断，再补形成判断的依据、影响边界和具体落法；只有并列动作、条件或结果需要快速比较时才切成列表，并让列表项保持同一语法起点。章节之间依靠因果、递进或范围变化自然承接，不堆叠模板连接词。阅读密度上，一个段落只承担一个主判断；定义、例外和行动要求分别成段，避免把多个逻辑转折压进同一句。结尾回看开篇目标，以可观察结果、责任边界和下一步动作收束，不重复摘要，也不新增前文没有论证的结论。不可迁移项：只复刻标题句法、信息顺序和语气，不复制来源中的专名、事实、日期、指标或业务判断；缺少证据的图示和结论也不能为了形式完整而补造。交付前逐节检查标题是否回应正文、判断是否带依据、并列项是否同构、后续动作是否可执行，并检查术语前后一致。`
+  return text ? `${text}\n\n${supplement}` : supplement
+}
+
+function repairStoredCreationSkillDiagramStyle(value: unknown) {
+  const text = String(value || '').trim()
+  return mergeCreationSkillDiagramStyle(text, describeClientDiagramGeneration(text))
+}
+
+function repairStoredCreationSkillWritingGuidelines(value: unknown) {
+  const items = (Array.isArray(value) ? value : [])
+    .map(entry => coerceCreationSkillStringItem(entry, 'writing_guidelines'))
+    .filter(Boolean)
+  return mergeCreationSkillWritingGuidelines(items, extractClientVoiceStyle(items.join('\n')))
+}
+
 function mapMarketSkill(item: any): CreationSkillMarketItem {
   const content = item?.content || {}
+  const title = String(item.title || '')
+  const summary = String(item.summary || '')
+  const legacyTitleFields = content?.section_headings?.common_titles === '这类文档标题通常怎么命名'
+    || content?.section_headings?.title_style === '标题如何传递重点'
+  const legacyTitleExamples = Array.from(new Set([
+    ...(Array.isArray(content.common_titles) ? content.common_titles : []),
+    ...(Array.isArray(content?.field_examples?.common_titles) ? content.field_examples.common_titles : []),
+    ...(Array.isArray(content?.field_examples?.title_style) ? content.field_examples.title_style : []),
+  ].map(value => String(value).trim()).filter(Boolean))).slice(0, 6)
   return {
     id: String(item.id || ''),
-    title: String(item.title || ''),
-    summary: String(item.summary || ''),
+    title,
+    summary,
+    isOfficial: Boolean(item.is_official),
     categoryId: String(item.category_id || ''),
     categoryPath: Array.isArray(item.category_path)
       ? item.category_path.map((category: any) => ({
@@ -878,14 +2282,45 @@ function mapMarketSkill(item: any): CreationSkillMarketItem {
       id: String(item?.author?.id || ''),
       nickname: String(item?.author?.nickname || '匿名面包师'),
     },
-    commonTitles: Array.isArray(content.common_titles) ? content.common_titles : [],
+    skillDescription: mapSkillDescription(
+      content.skill_description,
+      title,
+      summary,
+      '',
+      Array.isArray(item.category_path)
+        ? item.category_path.map((category: any) => String(category.name || '')).filter(Boolean)
+        : [],
+    ),
+    executionSteps: mapExecutionSteps(content.execution_steps, title, summary),
+    commonTitles: legacyTitleFields && String(content.title_style || '').trim()
+      ? [String(content.title_style).trim()]
+      : (Array.isArray(content.common_titles) ? content.common_titles : [])
+        .map((value: unknown) => coerceCreationSkillStringItem(value, 'common_titles'))
+        .filter(Boolean),
     titleStyle: String(content.title_style || ''),
-    textStyle: String(content.text_style || ''),
-    diagramStyle: String(content.diagram_style || ''),
-    structurePattern: Array.isArray(content.structure_pattern) ? content.structure_pattern : [],
-    writingGuidelines: Array.isArray(content.writing_guidelines) ? content.writing_guidelines : [],
+    textStyle: hasSerializedSkillObjectItems(content)
+      ? repairStoredCreationSkillTextStyle(content.text_style, content.structure_pattern)
+      : String(content.text_style || ''),
+    diagramStyle: hasSerializedSkillObjectItems(content)
+      ? repairStoredCreationSkillDiagramStyle(content.diagram_style)
+      : String(content.diagram_style || ''),
+    structurePattern: (Array.isArray(content.structure_pattern) ? content.structure_pattern : [])
+      .map((value: unknown) => coerceCreationSkillStringItem(value, 'structure_pattern'))
+      .filter(Boolean),
+    writingGuidelines: hasSerializedSkillObjectItems(content)
+      ? repairStoredCreationSkillWritingGuidelines(content.writing_guidelines)
+      : (Array.isArray(content.writing_guidelines) ? content.writing_guidelines : [])
+        .map((value: unknown) => coerceCreationSkillStringItem(value, 'writing_guidelines'))
+        .filter(Boolean),
+    distinctiveSections: mapDistinctiveSections(content.distinctive_sections),
     sectionHeadings: mapSectionHeadings(content.section_headings),
-    fieldExamples: mapFieldExamples(content.field_examples),
+    fieldExamples: legacyTitleFields && legacyTitleExamples.length
+      ? {
+        ...mapFieldExamples(content.field_examples),
+        commonTitles: legacyTitleExamples,
+        titleStyle: legacyTitleExamples,
+      }
+      : mapFieldExamples(content.field_examples),
     exampleDocument: String(content.example_document || '').trim() || DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
     publishedAt: item.published_at || null,
     updatedAt: String(item.updated_at || ''),
@@ -901,44 +2336,73 @@ function buildLegacyGeneralizedContent(title: string) {
         ? '运营方案'
         : '专业协作'
   return {
-    commonTitles: [`${kind}说明`, `${kind}设计与实施方案`, `${kind}复盘与后续行动`],
-    titleStyle: '主标题说明交付物，副标题只限定通用范围、阶段或关键约束；避免真实组织、项目、产品、日期和指标。',
-    textStyle: '正文采用结论先行的短段落，先说明目标与约束，再给出方案、依据、风险和验证方式；所有角色与事实均使用通用表达。',
-    diagramStyle: '只在结构或流程需要快速理解时绘图，优先使用分层图、流程图或对比表，并以抽象角色标注边界与流向。',
+    commonTitles: [
+      `子标题优先使用“对象或章节角色＋${kind}动作”的短名词结构`,
+      '同层级标题保持相同词序和相近长度，用动作词区分分析、设计、实施与复盘',
+      '需要同时表达两个重点时使用“名词＋与＋名词”的并列结构',
+    ],
+    titleStyle: '子标题采用短名词结构，同层级保持相同词序和相近长度。',
+    textStyle: '沿“目标与约束 → 方案与依据 → 风险与验证”推进；短段落先给判断，再补充适用范围和落法。',
+    diagramStyle: '源记录没有保留图示证据，默认不生成图片；确需补图时使用 PlantUML，并只画正文已说明的对象、边界与关系。',
     structurePattern: ['背景与目标', '约束与设计原则', '总体方案', '实施计划', '风险与验证', '结论与后续'],
     writingGuidelines: [
-      '使用抽象角色和虚构场景，不保留真实组织或业务名称。',
-      '每个关键结论补充依据、适用范围或验证方式。',
-      '避免源文档中的日期、指标、金额和专有术语组合。',
-      '图示与正文使用一致的通用术语。',
+      '习惯用“需要”直接声明必要动作或约束。',
+      '习惯用“明确”要求把对象、范围和责任说具体。',
+      '习惯用“确保”把动作落到预期结果。',
     ],
   }
 }
 
-function mapSectionHeadings(item: any): CreationSkillSectionHeadings {
+function mapSectionHeadings(_item: any): CreationSkillSectionHeadings {
   return {
-    commonTitles: '这类文档标题通常怎么命名',
-    titleStyle: item?.title_style?.trim() || DEFAULT_CREATION_SKILL_SECTION_HEADINGS.titleStyle,
-    textStyle: item?.text_style?.trim() || DEFAULT_CREATION_SKILL_SECTION_HEADINGS.textStyle,
-    diagramStyle: item?.diagram_style?.trim() || DEFAULT_CREATION_SKILL_SECTION_HEADINGS.diagramStyle,
-    structurePattern: item?.structure_pattern?.trim() || DEFAULT_CREATION_SKILL_SECTION_HEADINGS.structurePattern,
-    writingGuidelines: item?.writing_guidelines?.trim() || DEFAULT_CREATION_SKILL_SECTION_HEADINGS.writingGuidelines,
+    ...DEFAULT_CREATION_SKILL_SECTION_HEADINGS,
   }
 }
 
 function mapFieldExamples(item: any): CreationSkillFieldExamples {
-  const normalize = (value: unknown, fallback: string[]) =>
-    Array.isArray(value) && value.some(entry => String(entry).trim())
-      ? value.map(entry => String(entry).trim()).filter(Boolean)
-      : [...fallback]
-  return {
-    commonTitles: normalize(item?.common_titles, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.commonTitles),
-    titleStyle: normalize(item?.title_style, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.titleStyle),
-    textStyle: normalize(item?.text_style, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.textStyle),
-    diagramStyle: normalize(item?.diagram_style, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.diagramStyle),
-    structurePattern: normalize(item?.structure_pattern, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.structurePattern),
-    writingGuidelines: normalize(item?.writing_guidelines, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.writingGuidelines),
+  const normalize = (value: unknown, fallback: string[], key: string) => {
+    const mapped = Array.isArray(value)
+      ? value.map(entry => coerceCreationSkillStringItem(entry, key)).filter(Boolean)
+      : []
+    if (key === 'common_titles' || key === 'title_style') {
+      const repaired = mapped.map(fictionalizeCreationSkillHeadingExample)
+        .filter(isCompleteCreationSkillHeadingExample)
+      return repaired.length ? repaired : [...fallback]
+    }
+    return mapped.length ? mapped : [...fallback]
   }
+  return {
+    commonTitles: normalize(item?.common_titles, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.commonTitles, 'common_titles'),
+    titleStyle: normalize(item?.title_style, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.titleStyle, 'title_style'),
+    textStyle: normalize(item?.text_style, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.textStyle, 'text_style'),
+    diagramStyle: normalize(item?.diagram_style, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.diagramStyle, 'diagram_style'),
+    structurePattern: normalize(item?.structure_pattern, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.structurePattern, 'structure_pattern'),
+    writingGuidelines: normalize(item?.writing_guidelines, DEFAULT_CREATION_SKILL_FIELD_EXAMPLES.writingGuidelines, 'writing_guidelines'),
+  }
+}
+
+function mapDistinctiveSections(
+  value: unknown,
+  fallback: CreationSkillDistinctiveSection[] = [],
+): CreationSkillDistinctiveSection[] {
+  if (!Array.isArray(value)) return fallback.map(section => ({ ...section, examples: [...section.examples] }))
+  const sections = value.map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+    const source = item as Record<string, unknown>
+    const examples = Array.isArray(source.examples)
+      ? distinctCreationSkillItems(source.examples, 6)
+      : []
+    const section = {
+      title: String(source.title || '').trim(),
+      description: String(source.description || '').trim(),
+      guidance: String(source.guidance || '').trim(),
+      examples,
+    }
+    return section.title && section.description && section.guidance && section.examples.length
+      ? section
+      : null
+  }).filter((section): section is CreationSkillDistinctiveSection => Boolean(section))
+  return (sections.length ? sections : fallback).slice(0, 6)
 }
 
 function cloneFieldExamples(examples: CreationSkillFieldExamples): CreationSkillFieldExamples {

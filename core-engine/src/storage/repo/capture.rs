@@ -7,7 +7,7 @@ use rusqlite::{params, Connection};
 use crate::storage::{
     db::current_ts_ms,
     error::StorageError,
-    models::{CaptureActivityAggregate, CaptureRecord, NewCapture, WorkImExpression},
+    models::{CaptureActivityAggregate, CaptureRecord, NewCapture, WorkImCaptureSample},
     StorageManager,
 };
 
@@ -28,6 +28,40 @@ impl StorageManager {
     /// 插入一条采集记录，返回新行的 id。
     pub fn insert_capture(&self, c: &NewCapture) -> Result<i64, StorageError> {
         self.with_conn(|conn| insert_capture_inner(conn, c))
+    }
+
+    /// 删除一条采集记录及其 SQLite 向量元数据。
+    ///
+    /// 时间线属于已经提炼出的上层资产，因此不会随原始采集记录一起删除。历史
+    /// schema 中 `timelines.capture_id` 仍保留外键约束，这里与保留期清理保持同一
+    /// 语义，临时关闭外键检查后删除原始记录。
+    pub fn delete_capture(&self, id: i64) -> Result<bool, StorageError> {
+        self.with_conn(|conn| {
+            let exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM captures WHERE id = ?1)",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
+
+            conn.execute(
+                "DELETE FROM vector_index
+                 WHERE capture_id = ?1 AND source_type = 'capture'",
+                params![id],
+            )?;
+
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+            let delete_result = conn.execute("DELETE FROM captures WHERE id = ?1", params![id]);
+            let restore_result = conn.execute_batch("PRAGMA foreign_keys = ON;");
+
+            match (delete_result, restore_result) {
+                (Ok(affected), Ok(())) => Ok(affected > 0),
+                (Err(error), _) => Err(StorageError::Sqlite(error)),
+                (Ok(_), Err(error)) => Err(StorageError::Sqlite(error)),
+            }
+        })
     }
 
     /// 异步版本（在 spawn_blocking 中执行，不阻塞 tokio 运行时）。
@@ -126,6 +160,8 @@ pub struct CaptureFilter {
     pub capture_id: Option<i64>,
     /// 是否过滤掉隐私记录（默认 true）
     pub exclude_sensitive: bool,
+    /// 是否过滤 macOS 登录/锁屏等非工作系统会话（默认 true）
+    pub exclude_system_session_apps: bool,
     /// 最多返回条数
     pub limit: usize,
     /// 偏移
@@ -136,6 +172,7 @@ impl CaptureFilter {
     pub fn new() -> Self {
         Self {
             exclude_sensitive: true,
+            exclude_system_session_apps: true,
             limit: 100,
             ..Default::default()
         }
@@ -145,6 +182,7 @@ impl CaptureFilter {
         Self {
             from_ts: Some(now - 86_400_000),
             exclude_sensitive: true,
+            exclude_system_session_apps: true,
             limit: 500,
             ..Default::default()
         }
@@ -226,6 +264,13 @@ impl StorageManager {
             if filter.app_name.is_some() { wheres.push("c.app_name = ?".into()); }
             if filter.capture_id.is_some() { wheres.push("c.id = ?".into()); }
             if filter.exclude_sensitive { wheres.push("c.is_sensitive = 0".into()); }
+            if filter.exclude_system_session_apps {
+                wheres.push(
+                    "LOWER(TRIM(COALESCE(c.app_bundle_id, ''))) != 'com.apple.loginwindow'
+                     AND LOWER(TRIM(COALESCE(c.app_name, ''))) != 'loginwindow'"
+                        .into(),
+                );
+            }
 
             let where_clause = if wheres.is_empty() { "1=1".to_string() } else { wheres.join(" AND ") };
             sql.push_str(&where_clause);
@@ -275,6 +320,13 @@ impl StorageManager {
             if filter.app_name.is_some() { wheres.push("c.app_name = ?".into()); }
             if filter.capture_id.is_some() { wheres.push("c.id = ?".into()); }
             if filter.exclude_sensitive { wheres.push("c.is_sensitive = 0".into()); }
+            if filter.exclude_system_session_apps {
+                wheres.push(
+                    "LOWER(TRIM(COALESCE(c.app_bundle_id, ''))) != 'com.apple.loginwindow'
+                     AND LOWER(TRIM(COALESCE(c.app_name, ''))) != 'loginwindow'"
+                        .into(),
+                );
+            }
 
             let where_clause = if wheres.is_empty() { "1=1".to_string() } else { wheres.join(" AND ") };
             sql.push_str(&where_clause);
@@ -334,9 +386,20 @@ impl StorageManager {
                         id,
                         ts,
                         COALESCE(NULLIF(TRIM(app_name), ''), '其他') AS app_name,
+                        app_bundle_id,
                         LEAD(ts) OVER (ORDER BY ts, id) AS next_ts
                     FROM captures
                     WHERE ts >= ?1 AND ts < ?2 AND is_sensitive = 0
+                ), eligible AS (
+                    SELECT
+                        id,
+                        ts,
+                        app_name,
+                        next_ts,
+                        LAG(ts) OVER (ORDER BY ts, id) AS previous_work_ts
+                    FROM ordered
+                    WHERE LOWER(TRIM(COALESCE(app_bundle_id, ''))) != 'com.apple.loginwindow'
+                      AND LOWER(TRIM(app_name)) != 'loginwindow'
                 ), apportioned AS (
                     SELECT
                         CAST((ts + ?3) / 86400000 AS INTEGER) AS day_index,
@@ -347,14 +410,22 @@ impl StorageManager {
                             WHEN next_ts <= ts THEN 0
                             WHEN next_ts - ts > ?4 THEN ?4
                             ELSE next_ts - ts
-                        END AS duration_ms
-                    FROM ordered
+                        END AS duration_ms,
+                        CASE
+                            WHEN previous_work_ts IS NULL THEN 1
+                            WHEN CAST((previous_work_ts + ?3) / 86400000 AS INTEGER)
+                                 != CAST((ts + ?3) / 86400000 AS INTEGER) THEN 1
+                            WHEN ts - previous_work_ts > ?4 THEN 1
+                            ELSE 0
+                        END AS starts_active_period
+                    FROM eligible
                 )
                 SELECT
                     day_index,
                     app_name,
                     SUM(duration_ms) AS duration_ms,
                     COUNT(*) AS capture_count,
+                    SUM(starts_active_period) AS active_period_count,
                     MIN(ts) AS first_ts,
                     MAX(ts) AS last_ts
                 FROM apportioned
@@ -370,8 +441,9 @@ impl StorageManager {
                         app_name: row.get(1)?,
                         duration_ms: row.get(2)?,
                         capture_count: row.get(3)?,
-                        first_ts: row.get(4)?,
-                        last_ts: row.get(5)?,
+                        active_period_count: row.get(4)?,
+                        first_ts: row.get(5)?,
+                        last_ts: row.get(6)?,
                     })
                 },
             )?;
@@ -394,7 +466,11 @@ impl StorageManager {
             let mut stmt = conn.prepare(
                 "SELECT ts
                  FROM captures
-                 WHERE ts >= ?1 AND ts < ?2 AND is_sensitive = 0
+                 WHERE ts >= ?1
+                   AND ts < ?2
+                   AND is_sensitive = 0
+                   AND LOWER(TRIM(COALESCE(app_bundle_id, ''))) != 'com.apple.loginwindow'
+                   AND LOWER(TRIM(COALESCE(app_name, ''))) != 'loginwindow'
                  ORDER BY ts ASC, id ASC",
             )?;
             let rows = stmt.query_map(params![from_ts, to_ts], |row| row.get(0))?;
@@ -403,64 +479,86 @@ impl StorageManager {
         })
     }
 
-    /// 读取指定时段内用户在工作 IM 中主动输入的文本，用于本地心情推断。
+    /// 读取指定时段内已经落库的企业 IM 采集文本，用于本地心情推断。
     ///
-    /// 只读取 `input_text`，不使用聊天窗口全文或他人消息；敏感记录与已过滤占位文本会被排除。
-    pub fn list_work_im_expressions(
+    /// 不发起任何额外采集，只复用已经经过采集隐私门禁和内容脱敏的 `ax_text/ocr_text`。
+    /// 查询时还会再次应用当前应用黑名单，因此用户后来关闭某个企业 IM 的采集后，
+    /// 该应用的历史记录也不会继续参与分析。
+    pub fn list_enabled_company_im_capture_samples(
         &self,
         from_ts: i64,
         to_ts: i64,
         limit: usize,
-    ) -> Result<Vec<WorkImExpression>, StorageError> {
+    ) -> Result<Vec<WorkImCaptureSample>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT
-                    COALESCE(NULLIF(TRIM(app_name), ''), '工作 IM') AS app_name,
-                    SUBSTR(TRIM(input_text), 1, 500) AS input_text
-                 FROM captures
-                 WHERE ts >= ?1
-                   AND ts < ?2
-                   AND is_sensitive = 0
-                   AND input_text IS NOT NULL
-                   AND TRIM(input_text) != ''
-                   AND TRIM(input_text) != '[已过滤]'
+                "WITH eligible AS (
+                    SELECT
+                        id,
+                        ts,
+                        COALESCE(NULLIF(TRIM(app_name), ''), '企业 IM') AS app_name,
+                        app_bundle_id,
+                        COALESCE(
+                            NULLIF(TRIM(ax_text), ''),
+                            NULLIF(TRIM(ocr_text), '')
+                        ) AS sample_text
+                    FROM captures
+                    WHERE ts >= ?1
+                      AND ts < ?2
+                      AND is_sensitive = 0
+                 )
+                 SELECT
+                    c.app_name,
+                    SUBSTR(c.sample_text, 1, 500) AS sample_text
+                 FROM eligible c
+                 WHERE c.sample_text IS NOT NULL
+                   AND c.sample_text != '[已过滤]'
                    AND (
-                       LOWER(COALESCE(app_name, '')) LIKE '%feishu%'
-                       OR COALESCE(app_name, '') LIKE '%飞书%'
-                       OR LOWER(COALESCE(app_name, '')) LIKE '%lark%'
-                       OR LOWER(COALESCE(app_name, '')) LIKE '%dingtalk%'
-                       OR COALESCE(app_name, '') LIKE '%钉钉%'
-                       OR LOWER(COALESCE(app_name, '')) LIKE '%wecom%'
-                       OR LOWER(COALESCE(app_name, '')) LIKE '%wework%'
-                       OR COALESCE(app_name, '') LIKE '%企业微信%'
-                       OR LOWER(COALESCE(app_name, '')) LIKE '%slack%'
-                       OR LOWER(COALESCE(app_name, '')) LIKE '%teams%'
-                       OR LOWER(COALESCE(app_name, '')) LIKE '%discord%'
-                       OR LOWER(COALESCE(app_name, '')) LIKE '%telegram%'
-                       OR LOWER(COALESCE(app_name, '')) LIKE '%wechat%'
-                       OR COALESCE(app_name, '') LIKE '%微信%'
-                       OR LOWER(TRIM(COALESCE(app_name, ''))) IN ('qq', 'tim')
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%lark%'
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%dingtalk%'
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%wework%'
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%slack%'
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%teams%'
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%discord%'
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%telegram%'
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%wechat%'
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%tencent.qq%'
-                       OR LOWER(COALESCE(app_bundle_id, '')) LIKE '%mobilesms%'
+                       LOWER(c.app_name) LIKE '%feishu%'
+                       OR c.app_name LIKE '%飞书%'
+                       OR LOWER(c.app_name) LIKE '%lark%'
+                       OR LOWER(c.app_name) LIKE '%dingtalk%'
+                       OR c.app_name LIKE '%钉钉%'
+                       OR LOWER(c.app_name) LIKE '%wecom%'
+                       OR LOWER(c.app_name) LIKE '%wework%'
+                       OR c.app_name LIKE '%企业微信%'
+                       OR LOWER(c.app_name) LIKE '%slack%'
+                       OR LOWER(c.app_name) LIKE '%teams%'
+                       OR LOWER(COALESCE(c.app_bundle_id, '')) LIKE '%feishu%'
+                       OR LOWER(COALESCE(c.app_bundle_id, '')) LIKE '%lark%'
+                       OR LOWER(COALESCE(c.app_bundle_id, '')) LIKE '%dingtalk%'
+                       OR LOWER(COALESCE(c.app_bundle_id, '')) LIKE '%wecom%'
+                       OR LOWER(COALESCE(c.app_bundle_id, '')) LIKE '%wework%'
+                       OR LOWER(COALESCE(c.app_bundle_id, '')) LIKE '%slack%'
+                       OR LOWER(COALESCE(c.app_bundle_id, '')) LIKE '%teams%'
                    )
-                 ORDER BY ts ASC, id ASC
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM app_blacklist blocked
+                       WHERE blocked.enabled = 1
+                         AND (
+                             (
+                                 TRIM(blocked.bundle_id) != ''
+                                 AND LOWER(TRIM(blocked.bundle_id)) =
+                                     LOWER(TRIM(COALESCE(c.app_bundle_id, '')))
+                             )
+                             OR (
+                                 TRIM(blocked.app_name) != ''
+                                 AND LOWER(TRIM(blocked.app_name)) =
+                                     LOWER(TRIM(c.app_name))
+                             )
+                         )
+                   )
+                 ORDER BY c.ts ASC, c.id ASC
                  LIMIT ?3",
             )?;
 
             let rows = stmt.query_map(
                 params![from_ts, to_ts, i64::try_from(limit.min(500)).unwrap_or(500)],
                 |row| {
-                    Ok(WorkImExpression {
+                    Ok(WorkImCaptureSample {
                         app_name: row.get(0)?,
-                        input_text: row.get(1)?,
+                        text: row.get(1)?,
                     })
                 },
             )?;
@@ -725,6 +823,55 @@ mod tests {
     }
 
     #[test]
+    fn test_work_activity_and_capture_list_exclude_loginwindow() {
+        let mgr = make_mgr();
+        let base = 1_700_000_000_000_i64;
+
+        let mut editor = sample_capture();
+        editor.ts = base;
+        editor.app_name = Some("Code".into());
+        editor.app_bundle_id = Some("com.microsoft.VSCode".into());
+        mgr.insert_capture(&editor).unwrap();
+
+        let mut locked = sample_capture();
+        locked.ts = base + 60_000;
+        locked.app_name = Some("loginwindow".into());
+        locked.app_bundle_id = Some("com.apple.loginwindow".into());
+        mgr.insert_capture(&locked).unwrap();
+
+        let mut locked_again = locked.clone();
+        locked_again.ts = base + 4 * 60_000;
+        mgr.insert_capture(&locked_again).unwrap();
+
+        let mut browser = sample_capture();
+        browser.ts = base + 10 * 60_000;
+        browser.app_name = Some("Browser".into());
+        browser.app_bundle_id = Some("com.example.browser".into());
+        mgr.insert_capture(&browser).unwrap();
+
+        let rows = mgr
+            .summarize_capture_activity(base, base + 20 * 60_000, 0, 5 * 60_000)
+            .unwrap();
+
+        assert_eq!(rows.iter().map(|row| row.capture_count).sum::<i64>(), 2);
+        assert_eq!(
+            rows.iter().map(|row| row.duration_ms).sum::<i64>(),
+            2 * 60_000
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.active_period_count).sum::<i64>(),
+            2
+        );
+        assert!(!rows.iter().any(|row| row.app_name == "loginwindow"));
+
+        let listed = mgr.list_captures(&CaptureFilter::new()).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(!listed
+            .iter()
+            .any(|capture| { capture.app_bundle_id.as_deref() == Some("com.apple.loginwindow") }));
+    }
+
+    #[test]
     fn test_list_capture_activity_timestamps_returns_only_non_sensitive_rows() {
         let mgr = make_mgr();
         let base = 1_700_000_000_000_i64;
@@ -750,37 +897,94 @@ mod tests {
     }
 
     #[test]
-    fn test_list_work_im_expressions_uses_only_non_sensitive_user_input() {
+    fn test_company_im_samples_reuse_existing_filtered_captures_and_current_blacklist() {
         let mgr = make_mgr();
         let base = 1_700_000_000_000_i64;
 
         let mut feishu = sample_capture();
         feishu.ts = base;
         feishu.app_name = Some("飞书".into());
-        feishu.input_text = Some("我正在处理，稍后同步结果".into());
-        feishu.ax_text = Some("同事：这个问题什么时候能完成？".into());
+        feishu.ax_text = Some("正在处理，稍后同步结果".into());
+        feishu.input_text = Some("不应依赖专用输入字段".into());
         mgr.insert_capture(&feishu).unwrap();
 
+        let mut slack = sample_capture();
+        slack.ts = base + 1;
+        slack.app_name = Some("Slack".into());
+        slack.app_bundle_id = Some("com.tinyspeck.slackmacgap".into());
+        slack.ax_text = None;
+        slack.ocr_text = Some("发布已经完成".into());
+        mgr.insert_capture(&slack).unwrap();
+
+        let mut teams = sample_capture();
+        teams.ts = base + 2;
+        teams.app_name = Some("Microsoft Teams".into());
+        teams.app_bundle_id = Some("com.microsoft.teams2".into());
+        teams.ax_text = Some("Teams 中的工作消息".into());
+        mgr.insert_capture(&teams).unwrap();
+
+        mgr.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO app_blacklist (bundle_id, app_name, enabled, reason)
+                 VALUES ('com.microsoft.teams2', 'Microsoft Teams', 1, '用户关闭采集')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
         let mut editor = sample_capture();
-        editor.ts = base + 1;
+        editor.ts = base + 3;
         editor.app_name = Some("Code".into());
-        editor.input_text = Some("这段代码太难了".into());
+        editor.app_bundle_id = Some("com.microsoft.VSCode".into());
+        editor.ax_text = Some("非 IM 内容".into());
         mgr.insert_capture(&editor).unwrap();
 
+        let mut personal_im = sample_capture();
+        personal_im.ts = base + 4;
+        personal_im.app_name = Some("Discord".into());
+        personal_im.app_bundle_id = Some("com.hnc.Discord".into());
+        personal_im.ax_text = Some("不属于企业 IM 范围".into());
+        mgr.insert_capture(&personal_im).unwrap();
+
         let mut sensitive = sample_capture();
-        sensitive.ts = base + 2;
-        sensitive.app_name = Some("Slack".into());
-        sensitive.input_text = Some("我压力很大".into());
+        sensitive.ts = base + 5;
+        sensitive.app_name = Some("企业微信".into());
+        sensitive.app_bundle_id = Some("com.tencent.WeWorkMac".into());
+        sensitive.ax_text = Some("敏感内容".into());
         sensitive.is_sensitive = true;
         mgr.insert_capture(&sensitive).unwrap();
 
-        let expressions = mgr
-            .list_work_im_expressions(base - 1, base + 10, 200)
+        let samples = mgr
+            .list_enabled_company_im_capture_samples(base - 1, base + 10, 200)
             .unwrap();
 
-        assert_eq!(expressions.len(), 1);
-        assert_eq!(expressions[0].app_name, "飞书");
-        assert_eq!(expressions[0].input_text, "我正在处理，稍后同步结果");
-        assert!(!expressions[0].input_text.contains("同事"));
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].app_name, "飞书");
+        assert_eq!(samples[0].text, "正在处理，稍后同步结果");
+        assert_eq!(samples[1].app_name, "Slack");
+        assert_eq!(samples[1].text, "发布已经完成");
+        assert!(!samples
+            .iter()
+            .any(|sample| sample.text.contains("专用输入")));
+        assert!(!samples
+            .iter()
+            .any(|sample| sample.app_name == "Microsoft Teams"));
+
+        mgr.with_conn(|conn| {
+            conn.execute(
+                "UPDATE app_blacklist SET enabled = 0
+                 WHERE bundle_id = 'com.microsoft.teams2'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let enabled_samples = mgr
+            .list_enabled_company_im_capture_samples(base - 1, base + 10, 200)
+            .unwrap();
+        assert!(enabled_samples
+            .iter()
+            .any(|sample| sample.app_name == "Microsoft Teams"));
     }
 }

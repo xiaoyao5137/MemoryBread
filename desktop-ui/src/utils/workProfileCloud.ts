@@ -2,6 +2,7 @@ import { serviceEnvironmentHeaders, useAppStore } from '../store/useAppStore'
 import {
   fetchWorkProfile,
   getWorkProfileRange,
+  sanitizeWorkProfile,
   toLocalDateKey,
   type InferredWorkMood,
   type WorkProfileApp,
@@ -13,8 +14,9 @@ export const WORK_PROFILE_SYNCED_EVENT = 'memorybread:work-profile-synced'
 
 const SOURCE_DEVICE_ID_KEY = 'memory-bread_work_profile_source_device_id'
 const SYNC_REVISION_KEY = 'memory-bread_work_profile_sync_revision'
-const CACHE_KEY_PREFIX = 'memory-bread_work_profile_cloud_cache'
-const UPLOADED_DAYS_KEY_PREFIX = 'memory-bread_work_profile_uploaded_days'
+// v2 会丢弃曾包含 loginwindow 的旧本地缓存，并强制把清理后的日汇总重新同步。
+const CACHE_KEY_PREFIX = 'memory-bread_work_profile_cloud_cache_v2'
+const UPLOADED_DAYS_KEY_PREFIX = 'memory-bread_work_profile_uploaded_days_v2'
 const DAY_MS = 86_400_000
 
 interface CloudWorkProfileDay {
@@ -86,7 +88,7 @@ export const loadCachedWorkProfile = (userId: string): WorkProfileSummary | null
     if (!profile.today || !Array.isArray(profile.days) || !Array.isArray(profile.today.apps)) {
       return null
     }
-    return profile
+    return sanitizeWorkProfile(profile)
   } catch {
     return null
   }
@@ -255,7 +257,10 @@ const preferMood = (
 
 const buildSummary = (
   days: WorkProfileDay[],
-  todayDetails: Omit<WorkProfileSummary['today'], 'total_minutes' | 'capture_count'>,
+  todayDetails: Omit<
+    WorkProfileSummary['today'],
+    'total_minutes' | 'capture_count'
+  >,
   rangeStart: number,
   rangeEnd: number,
   achievementMetrics?: WorkProfileSummary['achievement_metrics'],
@@ -279,6 +284,7 @@ const buildSummary = (
       ...todayDetails,
       total_minutes: todayDay?.minutes ?? 0,
       capture_count: todayDay?.capture_count ?? 0,
+      active_period_count: todayDay?.active_period_count ?? todayDetails.active_period_count ?? 0,
     },
     days: orderedDays,
   }
@@ -292,35 +298,55 @@ const cloudToWorkProfile = (cloud: CloudWorkProfile): WorkProfileSummary => {
     date: day.date,
     minutes: Math.max(0, Math.round(Number(day.minutes) || 0)),
     capture_count: Math.max(0, Math.round(Number(day.capture_count) || 0)),
+    first_capture_at: Number.isFinite(day.first_capture_at) ? day.first_capture_at : null,
+    last_capture_at: Number.isFinite(day.last_capture_at) ? day.last_capture_at : null,
+    apps: Array.isArray(day.apps) ? mergeApps([], day.apps) : [],
   }))
   const today = cloud.days.find(day => day.date === todayDate)
-  return buildSummary(normalizedDays, {
+  return sanitizeWorkProfile(buildSummary(normalizedDays, {
     date: todayDate,
     first_capture_at: Number.isFinite(today?.first_capture_at) ? today!.first_capture_at : null,
     last_capture_at: Number.isFinite(today?.last_capture_at) ? today!.last_capture_at : null,
     apps: Array.isArray(today?.apps) ? mergeApps([], today!.apps) : [],
     mood: normalizeMood(today?.mood),
-  }, range.from, range.to)
+  }, range.from, range.to))
 }
 
 export const mergeWorkProfiles = (
   local: WorkProfileSummary,
   cloud: WorkProfileSummary,
 ): WorkProfileSummary => {
+  const sanitizedLocal = sanitizeWorkProfile(local)
+  const sanitizedCloud = sanitizeWorkProfile(cloud)
   const days = new Map<string, WorkProfileDay>()
-  for (const day of [...cloud.days, ...local.days]) {
+  for (const day of [...sanitizedCloud.days, ...sanitizedLocal.days]) {
     const current = days.get(day.date)
+    const currentHasDetails = Boolean(
+      current?.first_capture_at
+      || current?.last_capture_at
+      || current?.apps?.length,
+    )
+    const dayHasDetails = Boolean(
+      day.first_capture_at
+      || day.last_capture_at
+      || day.apps?.length,
+    )
     if (
       !current
       || day.minutes > current.minutes
-      || (day.minutes === current.minutes && day.capture_count >= current.capture_count)
+      || (day.minutes === current.minutes && day.capture_count > current.capture_count)
+      || (
+        day.minutes === current.minutes
+        && day.capture_count === current.capture_count
+        && (dayHasDetails || !currentHasDetails)
+      )
     ) {
       days.set(day.date, { ...day })
     }
   }
   const todayDate = toLocalDateKey(new Date())
-  const localTodayDay = local.days.find(day => day.date === todayDate)
-  const cloudTodayDay = cloud.days.find(day => day.date === todayDate)
+  const localTodayDay = sanitizedLocal.days.find(day => day.date === todayDate)
+  const cloudTodayDay = sanitizedCloud.days.find(day => day.date === todayDate)
   const preferLocalToday = Boolean(localTodayDay) && (
     !cloudTodayDay
     || localTodayDay!.minutes > cloudTodayDay.minutes
@@ -329,42 +355,50 @@ export const mergeWorkProfiles = (
       && localTodayDay!.capture_count >= cloudTodayDay.capture_count
     )
   )
-  const todayDetails = preferLocalToday ? local.today : cloud.today
+  const todayDetails = preferLocalToday ? sanitizedLocal.today : sanitizedCloud.today
   return buildSummary(Array.from(days.values()), {
     date: todayDate,
+    active_period_count: todayDetails.active_period_count,
     first_capture_at: todayDetails.first_capture_at,
     last_capture_at: todayDetails.last_capture_at,
     apps: todayDetails.apps,
-    mood: preferMood(cloud.today.mood, local.today.mood),
-  }, Math.min(local.range_start, cloud.range_start), Math.max(local.range_end, cloud.range_end), local.achievement_metrics)
+    mood: preferMood(sanitizedCloud.today.mood, sanitizedLocal.today.mood),
+  }, Math.min(
+    sanitizedLocal.range_start,
+    sanitizedCloud.range_start,
+  ), Math.max(
+    sanitizedLocal.range_end,
+    sanitizedCloud.range_end,
+  ), sanitizedLocal.achievement_metrics)
 }
 
 export const buildSyncWorkProfileRequest = (profile: WorkProfileSummary) => {
-  const range = rangeDateKeys(profile)
-  const days = profile.days.map(day => {
-    const isToday = day.date === profile.today.date
+  const sanitizedProfile = sanitizeWorkProfile(profile)
+  const range = rangeDateKeys(sanitizedProfile)
+  const days = sanitizedProfile.days.map(day => {
+    const isToday = day.date === sanitizedProfile.today.date
     return {
       date: day.date,
       minutes: Math.max(0, Math.round(day.minutes)),
       capture_count: Math.max(0, Math.round(day.capture_count)),
-      first_capture_at: isToday ? profile.today.first_capture_at : undefined,
-      last_capture_at: isToday ? profile.today.last_capture_at : undefined,
-      apps: isToday ? profile.today.apps : undefined,
-      mood: isToday ? profile.today.mood : undefined,
+      first_capture_at: day.first_capture_at ?? (isToday ? sanitizedProfile.today.first_capture_at : undefined),
+      last_capture_at: day.last_capture_at ?? (isToday ? sanitizedProfile.today.last_capture_at : undefined),
+      apps: day.apps ?? (isToday ? sanitizedProfile.today.apps : undefined),
+      mood: isToday ? sanitizedProfile.today.mood : undefined,
     }
   })
   if (
-    !days.some(day => day.date === profile.today.date)
-    && (profile.today.capture_count > 0 || profile.today.mood.inferred)
+    !days.some(day => day.date === sanitizedProfile.today.date)
+    && (sanitizedProfile.today.capture_count > 0 || sanitizedProfile.today.mood.inferred)
   ) {
     days.push({
-      date: profile.today.date,
-      minutes: Math.max(0, Math.round(profile.today.total_minutes)),
-      capture_count: Math.max(0, Math.round(profile.today.capture_count)),
-      first_capture_at: profile.today.first_capture_at ?? undefined,
-      last_capture_at: profile.today.last_capture_at ?? undefined,
-      apps: profile.today.apps,
-      mood: profile.today.mood,
+      date: sanitizedProfile.today.date,
+      minutes: Math.max(0, Math.round(sanitizedProfile.today.total_minutes)),
+      capture_count: Math.max(0, Math.round(sanitizedProfile.today.capture_count)),
+      first_capture_at: sanitizedProfile.today.first_capture_at ?? undefined,
+      last_capture_at: sanitizedProfile.today.last_capture_at ?? undefined,
+      apps: sanitizedProfile.today.apps,
+      mood: sanitizedProfile.today.mood,
     })
   }
   return {
@@ -428,9 +462,16 @@ const notifyWorkProfileSynced = (userId: string, profile: WorkProfileSummary) =>
 const runSync = async (options: SyncWorkProfileOptions): Promise<WorkProfileSummary> => {
   const cached = loadCachedWorkProfile(options.userId)
   let local: WorkProfileSummary | null = null
+  let displayProfile: WorkProfileSummary | null = cached
   let localError: unknown = null
+  if (cached) {
+    notifyWorkProfileSynced(options.userId, cached)
+  }
   try {
     local = await fetchWorkProfile(options.apiBaseUrl)
+    displayProfile = cached ? mergeWorkProfiles(local, cached) : local
+    cacheWorkProfile(options.userId, displayProfile)
+    notifyWorkProfileSynced(options.userId, displayProfile)
   } catch (error) {
     localError = error
   }
@@ -442,20 +483,12 @@ const runSync = async (options: SyncWorkProfileOptions): Promise<WorkProfileSumm
       options.userId,
       local ?? undefined,
     )
-    const profile = local ? mergeWorkProfiles(local, cloud) : cloud
+    const profile = displayProfile ? mergeWorkProfiles(displayProfile, cloud) : cloud
     cacheWorkProfile(options.userId, profile)
     notifyWorkProfileSynced(options.userId, profile)
     return profile
   } catch (cloudError) {
-    if (local) {
-      const profile = cached ? mergeWorkProfiles(local, cached) : local
-      notifyWorkProfileSynced(options.userId, profile)
-      return profile
-    }
-    if (cached) {
-      notifyWorkProfileSynced(options.userId, cached)
-      return cached
-    }
+    if (displayProfile) return displayProfile
     throw localError ?? cloudError
   }
 }

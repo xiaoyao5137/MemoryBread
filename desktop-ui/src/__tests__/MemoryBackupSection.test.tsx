@@ -9,8 +9,10 @@ import { useAppStore } from '../store/useAppStore'
 const mocks = vi.hoisted(() => ({
   fetchMemories: vi.fn(),
   fetchMemory: vi.fn(),
+  deleteMemory: vi.fn(),
   fetchCaptures: vi.fn(),
   fetchCaptureDetail: vi.fn(),
+  deleteCapture: vi.fn(),
   fetchCapturesRaw: vi.fn(),
   fetchTemplates: vi.fn(),
   fetchKnowledge: vi.fn(),
@@ -32,8 +34,10 @@ vi.mock('@tauri-apps/api/core', () => ({
 vi.mock('../hooks/useApi', () => ({
   useFetchBakeMemories: () => mocks.fetchMemories,
   useFetchBakeMemory: () => mocks.fetchMemory,
+  useDeleteBakeMemory: () => mocks.deleteMemory,
   useFetchBakeCaptures: () => mocks.fetchCaptures,
   useFetchBakeCaptureDetail: () => mocks.fetchCaptureDetail,
+  useDeleteBakeCapture: () => mocks.deleteCapture,
   useFetchCaptures: () => mocks.fetchCapturesRaw,
   useFetchBakeTemplates: () => mocks.fetchTemplates,
   useFetchBakeKnowledge: () => mocks.fetchKnowledge,

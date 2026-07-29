@@ -473,6 +473,27 @@
   background: #0051D5;
 }
 
+.bake-btn--danger {
+  color: #B42318;
+  border-color: rgba(180, 35, 24, 0.3);
+  background: #FFF8F7;
+}
+
+.bake-btn--danger:hover {
+  color: #912018;
+  border-color: rgba(180, 35, 24, 0.48);
+  background: #FEEDEC;
+}
+
+.bake-btn:focus-visible {
+  outline: 3px solid rgba(0, 122, 255, 0.28);
+  outline-offset: 2px;
+}
+
+.bake-btn--danger:focus-visible {
+  outline-color: rgba(180, 35, 24, 0.28);
+}
+
 .bake-grid-2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2055,6 +2076,10 @@ button.bake-list-item.bake-list-item--active {
   flex-direction: column;
 }
 
+.bake-modal--confirm {
+  max-width: 440px;
+}
+
 .bake-modal__header {
   padding: 20px 24px;
   border-bottom: 1px solid rgba(0, 0, 0, 0.08);
@@ -2103,6 +2128,16 @@ button.bake-list-item.bake-list-item--active {
 
 .bake-modal__body .bake-form-field:last-child {
   margin-bottom: 0;
+}
+
+.bake-modal__body--confirm {
+  color: #4A4A4F;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.bake-modal__body--confirm p {
+  margin: 0;
 }
 
 .bake-form-label {

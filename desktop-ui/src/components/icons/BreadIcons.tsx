@@ -4,6 +4,7 @@ export type BreadAppIconName =
   | 'consult'
   | 'creation'
   | 'tasks'
+  | 'messages'
   | 'memory'
   | 'capture'
   | 'profile'
@@ -86,6 +87,13 @@ const renderGlyph = (name: BreadIconName) => {
           <path d="M12 9.55v2.85l1.85 1.02" />
           <path d="M8.8 7.25h6.4" />
           <path d="M9.15 16.7h5.7" />
+        </>
+      )
+    case 'messages':
+      return (
+        <>
+          <path d="M7.55 9.2c0-.88.72-1.6 1.6-1.6h5.7c.88 0 1.6.72 1.6 1.6v4.15c0 .88-.72 1.6-1.6 1.6h-3.3l-2.65 1.7.5-1.7h-.25c-.88 0-1.6-.72-1.6-1.6V9.2Z" />
+          <path d="M9.75 10.25h4.5M9.75 12.3h3.2" />
         </>
       )
     case 'memory':

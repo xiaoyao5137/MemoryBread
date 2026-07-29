@@ -11,7 +11,8 @@ const historyResponse = (url: URL) => {
   return {
     items: [{
       id: offset + 1,
-      prompt: searching ? '年度规划创作' : '最近创作',
+      prompt: searching ? '补充年度预算' : '补充风险说明',
+      root_request: searching ? '年度规划创作' : '最近创作',
       generated_content: searching ? '年度规划正文' : '最近创作正文',
       doc_type: '方案',
       audience: '管理层',
@@ -19,8 +20,10 @@ const historyResponse = (url: URL) => {
       references_json: '[]',
       model: 'mbcd-plus-v1',
       latency_ms: 1800,
+      revision_no: 3,
+      edit_operation: 'append_section',
       created_at: 1_720_000_000_000 + offset,
-      updated_at: 1_720_000_000_000 + offset,
+      updated_at: 1_720_000_100_000 + offset,
     }],
     total: searching ? 23 : 52,
     limit,
@@ -62,6 +65,9 @@ describe('创作记录搜索与分页', () => {
 
     await waitFor(() => {
       expect(screen.getByText('年度规划创作')).toBeInTheDocument()
+      expect(screen.getByText(/完整会话/)).toBeInTheDocument()
+      expect(screen.queryByText(/第 3 版/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/局部新增/)).not.toBeInTheDocument()
       expect(screen.getByText('找到 23 条')).toBeInTheDocument()
       expect(vi.mocked(fetch).mock.calls.some(([input]) => {
         const url = new URL(String(input))

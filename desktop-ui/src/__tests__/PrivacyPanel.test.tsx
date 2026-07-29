@@ -26,15 +26,26 @@ beforeEach(() => {
     return {
       ok: true,
       json: async () => ({
-        data: [{
-          id: 1,
-          filter_type: 'chat',
-          filter_name: '聊天敏感内容',
-          enabled: true,
-          config_json: null,
-          updated_at: '2026-07-18T00:00:00Z',
-          week_blocked: 5,
-        }],
+        data: [
+          {
+            id: 1,
+            filter_type: 'chat',
+            filter_name: '聊天敏感内容',
+            enabled: true,
+            config_json: null,
+            updated_at: '2026-07-18T00:00:00Z',
+            week_blocked: 5,
+          },
+          {
+            id: 2,
+            filter_type: 'other',
+            filter_name: '其它敏感信息过滤',
+            enabled: true,
+            config_json: '{"keywords":["成人信息","色情信息"]}',
+            updated_at: '2026-07-18T00:00:00Z',
+            week_blocked: 2,
+          },
+        ],
       }),
     }
   }))
@@ -53,10 +64,13 @@ describe('PrivacyPanel', () => {
     expect(container.querySelector('.privacy-grid')).toBeInTheDocument()
     expect(container.querySelectorAll('.privacy-section')).toHaveLength(2)
     expect(screen.getByText('聊天敏感内容')).toBeInTheDocument()
+    expect(screen.getByText('其它敏感信息过滤')).toBeInTheDocument()
+    expect(screen.getByText(/其它兜底性质的敏感内容过滤/)).toBeInTheDocument()
     expect(screen.getByText('私密应用')).toBeInTheDocument()
     expect(screen.getByLabelText('Bundle ID')).toBeInTheDocument()
     expect(screen.getByLabelText('应用名称')).toBeInTheDocument()
     expect(screen.getByLabelText(/排除原因/)).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: '聊天敏感内容已开启' })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: '其它敏感信息过滤已开启' })).toBeChecked()
   })
 })

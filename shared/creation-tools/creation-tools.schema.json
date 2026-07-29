@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memorybread.local/contracts/creation-tools.v1.schema.json",
+  "title": "MemoryBread Creation Tools v1",
+  "type": "object",
+  "required": ["enabled_tools"],
+  "properties": {
+    "enabled_tools": {
+      "type": "array",
+      "description": "本次创作允许 Agent 调用的 Tool ID。服务端必须补齐 internet_search 与 memory_search。",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "default": [
+        "internet_search",
+        "memory_search"
+      ]
+    }
+  },
+  "$defs": {
+    "known_tool_id": {
+      "type": "string",
+      "enum": [
+        "internet_search",
+        "memory_search",
+        "plantuml_diagram",
+        "github_search"
+      ]
+    },
+    "tool_event": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "type",
+        "status",
+        "actor",
+        "summary"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "creation.agent.v1"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tool.started",
+            "tool.completed",
+            "tool.failed"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "running",
+            "completed",
+            "failed"
+          ]
+        },
+        "actor": {
+          "type": "object",
+          "required": [
+            "kind",
+            "id",
+            "name"
+          ],
+          "properties": {
+            "kind": {
+              "const": "tool"
+            },
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "summary": {
+          "type": "string"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "result_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "error_code": {
+              "type": "string",
+              "enum": [
+                "TOOL_NOT_INSTALLED",
+                "TOOL_DISABLED",
+                "TOOL_UNAVAILABLE",
+                "TOOL_EXECUTION_FAILED"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -13,11 +13,12 @@ export const BakePill: React.FC<{ text: string }> = ({ text }) => (
 export const BakeButton: React.FC<React.PropsWithChildren<{
   active?: boolean
   primary?: boolean
+  danger?: boolean
   compact?: boolean
   disabled?: boolean
   onClick?: () => void
   type?: 'button' | 'submit' | 'reset'
-}>> = ({ active, primary, compact, disabled, onClick, type = 'button', children }) => {
+}>> = ({ active, primary, danger, compact, disabled, onClick, type = 'button', children }) => {
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation()
     onClick?.()
@@ -28,7 +29,7 @@ export const BakeButton: React.FC<React.PropsWithChildren<{
       type={type}
       onClick={handleClick}
       disabled={disabled}
-      className={`bake-btn ${active ? 'bake-btn--active' : ''} ${primary ? 'bake-btn--primary' : ''} ${compact ? 'bake-btn--compact' : ''}`.trim()}
+      className={`bake-btn ${active ? 'bake-btn--active' : ''} ${primary ? 'bake-btn--primary' : ''} ${danger ? 'bake-btn--danger' : ''} ${compact ? 'bake-btn--compact' : ''}`.trim()}
     >
       {children}
     </button>

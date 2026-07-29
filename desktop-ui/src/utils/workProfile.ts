@@ -2,6 +2,10 @@ export interface WorkProfileDay {
   date: string
   minutes: number
   capture_count: number
+  active_period_count?: number | null
+  first_capture_at?: number | null
+  last_capture_at?: number | null
+  apps?: WorkProfileApp[]
 }
 
 export interface WorkProfileApp {
@@ -34,6 +38,7 @@ export interface WorkProfileSummary {
     date: string
     total_minutes: number
     capture_count: number
+    active_period_count?: number
     first_capture_at: number | null
     last_capture_at: number | null
     apps: WorkProfileApp[]
@@ -73,6 +78,90 @@ export interface WorkProfileRange {
   to: number
   timezoneOffsetMinutes: number
   includeAchievementMetrics?: boolean
+  includeDayDetails?: boolean
+}
+
+const isSystemSessionApp = (app: WorkProfileApp) => (
+  app.name.trim().toLocaleLowerCase() === 'loginwindow'
+)
+
+const sanitizeApps = (apps: WorkProfileApp[]) => {
+  const systemApps = apps.filter(isSystemSessionApp)
+  return {
+    apps: apps.filter(app => !isSystemSessionApp(app)),
+    removedMinutes: systemApps.reduce(
+      (sum, app) => sum + Math.max(0, Math.round(Number(app.minutes) || 0)),
+      0,
+    ),
+    removedCaptures: systemApps.reduce(
+      (sum, app) => sum + Math.max(0, Math.round(Number(app.capture_count) || 0)),
+      0,
+    ),
+  }
+}
+
+/**
+ * 清理旧核心或云端缓存里曾误计入的 macOS 登录/锁屏系统会话。
+ * 一旦移除了系统记录，旧首末时间也不再可信，等待本机日级明细重新补齐。
+ */
+export const sanitizeWorkProfile = (profile: WorkProfileSummary): WorkProfileSummary => {
+  const rawTodayApps = Array.isArray(profile.today.apps) ? profile.today.apps : []
+  const sanitizedTodayApps = sanitizeApps(rawTodayApps)
+  const todayHadSystemSession = sanitizedTodayApps.removedCaptures > 0
+    || sanitizedTodayApps.removedMinutes > 0
+
+  const days = profile.days.map((day) => {
+    const rawApps = Array.isArray(day.apps)
+      ? day.apps
+      : day.date === profile.today.date ? rawTodayApps : []
+    const sanitized = sanitizeApps(rawApps)
+    const removedSystemSession = sanitized.removedCaptures > 0 || sanitized.removedMinutes > 0
+    return {
+      ...day,
+      minutes: Math.max(0, Math.round(Number(day.minutes) || 0) - sanitized.removedMinutes),
+      capture_count: Math.max(
+        0,
+        Math.round(Number(day.capture_count) || 0) - sanitized.removedCaptures,
+      ),
+      active_period_count: removedSystemSession
+        ? 0
+        : day.active_period_count == null
+          ? day.active_period_count
+          : Math.max(0, Math.round(Number(day.active_period_count) || 0)),
+      first_capture_at: removedSystemSession ? null : day.first_capture_at,
+      last_capture_at: removedSystemSession ? null : day.last_capture_at,
+      apps: Array.isArray(day.apps) ? sanitized.apps : day.apps,
+    }
+  })
+  const todayDay = days.find(day => day.date === profile.today.date)
+  const today = {
+    ...profile.today,
+    total_minutes: todayDay?.minutes ?? Math.max(
+      0,
+      Math.round(Number(profile.today.total_minutes) || 0) - sanitizedTodayApps.removedMinutes,
+    ),
+    capture_count: todayDay?.capture_count ?? Math.max(
+      0,
+      Math.round(Number(profile.today.capture_count) || 0) - sanitizedTodayApps.removedCaptures,
+    ),
+    active_period_count: todayDay?.active_period_count ?? (
+      todayHadSystemSession
+        ? 0
+        : Math.max(0, Math.round(Number(profile.today.active_period_count) || 0))
+    ),
+    first_capture_at: todayHadSystemSession ? null : profile.today.first_capture_at,
+    last_capture_at: todayHadSystemSession ? null : profile.today.last_capture_at,
+    apps: sanitizedTodayApps.apps,
+  }
+
+  return {
+    ...profile,
+    total_minutes: days.reduce((sum, day) => sum + day.minutes, 0),
+    active_days: days.filter(day => day.minutes > 0 || day.capture_count > 0).length,
+    longest_day_minutes: days.reduce((maximum, day) => Math.max(maximum, day.minutes), 0),
+    today,
+    days,
+  }
 }
 
 const normalizeWorkProfile = (payload: Partial<WorkProfileSummary>): WorkProfileSummary => {
@@ -120,14 +209,18 @@ const normalizeWorkProfile = (payload: Partial<WorkProfileSummary>): WorkProfile
     ? receivedMetrics
     : undefined
 
-  return {
+  return sanitizeWorkProfile({
     ...payload,
     achievement_metrics: achievementMetrics,
     today: {
       ...payload.today,
+      active_period_count: Math.max(
+        0,
+        Math.round(Number(payload.today.active_period_count) || 0),
+      ),
       mood,
     },
-  } as WorkProfileSummary
+  } as WorkProfileSummary)
 }
 
 export const fetchWorkProfileRange = async (
@@ -142,6 +235,9 @@ export const fetchWorkProfileRange = async (
   if (range.includeAchievementMetrics) {
     url.searchParams.set('include_achievement_metrics', 'true')
   }
+  if (range.includeDayDetails) {
+    url.searchParams.set('include_day_details', 'true')
+  }
 
   const response = await fetch(url.toString(), { signal })
   if (!response.ok) {
@@ -155,4 +251,37 @@ export const fetchWorkProfile = async (
   signal?: AbortSignal,
 ): Promise<WorkProfileSummary> => {
   return fetchWorkProfileRange(apiBaseUrl, getWorkProfileRange(), signal)
+}
+
+export const hasWorkProfileDayDetails = (day: WorkProfileDay) => (
+  day.capture_count <= 0
+  || (
+    day.first_capture_at != null
+    && day.last_capture_at != null
+    && Array.isArray(day.apps)
+    && day.apps.length > 0
+  )
+)
+
+export const fetchWorkProfileDay = async (
+  apiBaseUrl: string,
+  dateKey: string,
+  signal?: AbortSignal,
+): Promise<WorkProfileDay> => {
+  const [year, month, day] = dateKey.split('-').map(Number)
+  if (!year || !month || !day) throw new Error('工作日期格式不正确')
+
+  const start = new Date(year, month - 1, day)
+  const end = new Date(year, month - 1, day + 1)
+  const profile = await fetchWorkProfileRange(apiBaseUrl, {
+    from: start.getTime(),
+    to: end.getTime(),
+    timezoneOffsetMinutes: -start.getTimezoneOffset(),
+    includeDayDetails: true,
+  }, signal)
+  const workDay = profile.days.find(item => item.date === dateKey)
+  if (!workDay || !hasWorkProfileDayDetails(workDay)) {
+    throw new Error('当天工作明细暂不可用')
+  }
+  return workDay
 }

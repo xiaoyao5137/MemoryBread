@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import type { ModelEntry } from '../types'
-import { CREATION_MODEL_PREFERENCE_KEY, useAppStore } from '../store/useAppStore'
+import { CREATION_MODEL_PREFERENCE_KEY, serviceEnvironmentHeaders, useAppStore } from '../store/useAppStore'
 import type { CreationModelConfig } from '../store/useAppStore'
 import { fetchBillingBalance } from '../utils/authApi'
 import { REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel } from '../utils/modelSelection'
@@ -88,7 +88,8 @@ function normalizeVisibleModels(items: ModelEntry[]): ModelEntry[] {
       normalized.push({
         ...model,
         id: 'bge-small-zh',
-        name: 'BGE-Small-ZH-Q4',
+        name: 'MBEMB V1.0',
+        description: 'MemoryBread向量模型',
       })
       hasVectorModel = true
       continue
@@ -204,7 +205,7 @@ const ModelChatDialog: React.FC<{
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' })
   }
   useEffect(scrollToBottom, [messages])
 
@@ -483,9 +484,6 @@ const ModelCard: React.FC<{
             )}
             {isInstalled && !isActive && !isLoading && !isInferenceEngine && (
               <button onClick={onActivate} style={btn('#34C759', 'white', 11)}>启用</button>
-            )}
-            {isActive && (
-              <span style={{ fontSize: 11, color: '#007AFF', fontWeight: 600 }}>使用中</span>
             )}
             {/* 体验入口：LLM 模型已可用时显示 */}
             {(isActive || (isApi && isInstalled)) && !isInferenceEngine && onChat && (
@@ -989,6 +987,7 @@ const CREATION_MODEL_DEFS = [
     description: 'MemoryBread Create Document Plus 1.0，适合更长文本和更高质量的云端创作',
     provider: 'gateway',
     hasBaseUrl: false,
+    sizeGb: 0,
   },
   {
     id: 'mbcd-std-v1',
@@ -996,6 +995,7 @@ const CREATION_MODEL_DEFS = [
     description: 'MemoryBread Create Document Standard 1.0，文本创作模型 v1',
     provider: 'ollama',
     hasBaseUrl: true,
+    sizeGb: 3.4,
   },
 ] as const
 
@@ -1010,14 +1010,15 @@ const LOCAL_CREATION_MODEL_ID = 'mbcd-std-v1'
 type CreationChatEntry = { def: typeof CREATION_MODEL_DEFS[number]; cfg: { id: string; apiKey: string; baseUrl?: string } }
 
 const CreationModelChatDialog: React.FC<{ entry: CreationChatEntry; onClose: () => void }> = ({ entry, onClose }) => {
-  const { def, cfg } = entry
-  const modelName = CREATION_MODEL_ID_TO_NAME[def.id] || def.id
+  const { def } = entry
+  const gatewayApiBaseUrl = useAppStore(s => s.gatewayApiBaseUrl)
+  const currentUser = useAppStore(s => s.currentUser)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [chatError, setChatError] = useState('')
   const endRef = useRef<HTMLDivElement>(null)
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  useEffect(() => { endRef.current?.scrollIntoView?.({ behavior: 'smooth' }) }, [messages])
 
   const handleSend = async () => {
     const q = input.trim()
@@ -1029,15 +1030,35 @@ const CreationModelChatDialog: React.FC<{ entry: CreationChatEntry; onClose: () 
     setLoading(true)
     try {
       const allMsgs = [...messages, userMsg].map(m => ({ role: m.role, content: m.content }))
-      const resp = await fetch(`${CREATION_SVC}/creation/chat`, {
+      const isGatewayModel = def.provider === 'gateway'
+      const resp = await fetch(isGatewayModel
+        ? `${gatewayApiBaseUrl.replace(/\/+$/, '')}/v1/gateway/chat`
+        : `${SIDECAR}/api/models/mbem-v1-local/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelName, api_key: cfg.apiKey, base_url: cfg.baseUrl || undefined, messages: allMsgs }),
+        headers: {
+          ...(isGatewayModel ? serviceEnvironmentHeaders() : {}),
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(isGatewayModel ? {
+          request_id: `creation-experience-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          user_id: currentUser?.id || null,
+          brand_model_id: def.id,
+          caller: 'creation',
+          messages: allMsgs,
+          stream: false,
+          privacy: { content_logging: false, client_scrubbed: true },
+          limits: { max_output_tokens: 2048, max_credit: '30.0000' },
+        } : { messages: allMsgs }),
       })
       if (!resp.ok) {
-        const d = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }))
-        setChatError(toUserFacingError(d.detail, '模型响应失败，请稍后重试'))
-        setLoading(false)
+        const d = await resp.json().catch(() => ({ message: `HTTP ${resp.status}` }))
+        throw new Error(d.message || d.detail || `HTTP ${resp.status}`)
+      }
+      if (isGatewayModel) {
+        const data = await resp.json()
+        const content = String(data.content || '').trim()
+        if (!content) throw new Error('模型没有返回内容')
+        setMessages(prev => [...prev, { role: 'assistant', content }])
         return
       }
       const reader = resp.body?.getReader()
@@ -1164,7 +1185,12 @@ const CreationModelPanel: React.FC<{
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ width: 8, height: 8, borderRadius: '50%', background: PROVIDER_COLOR[def.provider] || '#AEAEB2', flexShrink: 0 }} />
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#1D1D1F' }}>{def.name}</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: '#1D1D1F' }}>{def.name}</span>
+                  {def.sizeGb > 0 && (
+                    <span style={{ fontSize: 11, color: '#AEAEB2' }}>{def.sizeGb}GB</span>
+                  )}
+                </div>
                 <div style={{ fontSize: 11, color: '#8E8E93', marginTop: 2 }}>{def.description}</div>
               </div>
               {!isLocalModel && !isGatewayModel && cfg.apiKey && (
@@ -1172,8 +1198,8 @@ const CreationModelPanel: React.FC<{
                   {ts?.loading ? '验证中…' : ts?.result ? '已通' : ts?.error ? '失败' : '验证'}
                 </button>
               )}
-              {!isLocalModel && !isGatewayModel && cfg.apiKey && (
-                <button onClick={() => setChattingModel({ def, cfg })} style={btn('#AF52DE18', '#AF52DE', 11)}>试用</button>
+              {!disabled && (
+                <button onClick={() => setChattingModel({ def, cfg })} style={btn('#AF52DE18', '#AF52DE', 11)}>体验</button>
               )}
               <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: disabled ? 'not-allowed' : 'pointer' }}>
                 <input type="checkbox" checked={cfg.enabled && !disabled} disabled={disabled} onChange={() => onChange(def.id, { enabled: !cfg.enabled })} />

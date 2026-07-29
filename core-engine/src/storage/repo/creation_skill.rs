@@ -6,8 +6,9 @@ use crate::storage::{db::current_ts_ms, StorageError, StorageManager};
 const SELECT_COLUMNS: &str =
     "id, client_skill_key, cloud_skill_id, source_kind, source_id, title, summary,
      category_id, common_titles, title_style, text_style, diagram_style,
-     structure_pattern, writing_guidelines, section_headings, field_examples,
-     example_document, status, installed, published, created_at, updated_at";
+     structure_pattern, writing_guidelines, distinctive_sections, section_headings, field_examples,
+     example_document, skill_description, execution_steps, package_files,
+     status, installed, published, created_at, updated_at";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreationSkillSectionHeadings {
@@ -68,46 +69,43 @@ impl Default for CreationSkillFieldExamples {
 }
 
 fn default_common_titles_heading() -> String {
-    "这类文档标题通常怎么命名".to_string()
+    "标题设计风格".to_string()
 }
 
 fn default_title_style_heading() -> String {
-    "标题如何传递重点".to_string()
+    "标题设计风格".to_string()
 }
 
 fn default_text_style_heading() -> String {
-    "正文怎样组织和表达".to_string()
+    "行文设计思路".to_string()
 }
 
 fn default_diagram_style_heading() -> String {
-    "图示怎样服务于内容".to_string()
+    "图片生成方式".to_string()
 }
 
 fn default_structure_pattern_heading() -> String {
-    "从开篇到结论的章节骨架".to_string()
+    "章节组织骨架".to_string()
 }
 
 fn default_writing_guidelines_heading() -> String {
-    "保持这份风格的关键约束".to_string()
+    "话术表达风格".to_string()
 }
 
 fn default_common_title_examples() -> Vec<String> {
-    vec![
-        "协作流程优化方案".to_string(),
-        "阶段复盘与后续行动报告".to_string(),
-    ]
+    vec!["现状与约束".to_string(), "方案如何落到执行".to_string()]
 }
 
 fn default_title_style_examples() -> Vec<String> {
-    vec!["协作流程优化方案：明确目标、范围与交付边界".to_string()]
+    default_common_title_examples()
 }
 
 fn default_text_style_examples() -> Vec<String> {
-    vec!["本方案先明确适用范围，再说明关键步骤、责任边界与验收方式。".to_string()]
+    vec!["先界定适用范围，再沿“现状 → 判断 → 动作 → 验证”逐层收束。".to_string()]
 }
 
 fn default_diagram_style_examples() -> Vec<String> {
-    vec!["用泳道图展示提出、处理、复核三个阶段，并用统一图例标注责任角色。".to_string()]
+    vec!["PlantUML 活动图：主流程纵向排列，跨角色动作放入对应泳道。".to_string()]
 }
 
 fn default_structure_pattern_examples() -> Vec<String> {
@@ -115,11 +113,56 @@ fn default_structure_pattern_examples() -> Vec<String> {
 }
 
 fn default_writing_guideline_examples() -> Vec<String> {
-    vec!["把“提升效率”改写为“减少交接步骤，并设置可核验的完成标准”。".to_string()]
+    vec!["需要说明的是，目标对象只覆盖已经确认的适用范围。".to_string()]
 }
 
 fn default_example_document() -> String {
     "# 跨团队知识交接优化方案\n\n## 摘要\n\n本示例围绕通用的知识交接场景，说明如何明确范围、责任角色、执行步骤与验收方式。\n\n## 背景与目标\n\n相关团队需要在任务变化时稳定传递必要信息，目标是减少遗漏并让接手者能够独立完成后续工作。\n\n## 方案设计\n\n建立“准备、讲解、确认、复核”四个阶段；每个阶段明确输入、责任角色、输出和完成标准。\n\n## 风险与验证\n\n重点检查资料缺失、理解偏差和权限不当三类风险，并以清单完成情况作为验收依据。".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreationSkillPackageFile {
+    pub path: String,
+    pub media_type: String,
+    pub content_base64: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreationSkillDistinctiveSection {
+    pub title: String,
+    pub description: String,
+    pub guidance: String,
+    #[serde(default)]
+    pub examples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreationSkillDescription {
+    #[serde(default)]
+    pub purpose: String,
+    #[serde(default)]
+    pub document_types: Vec<String>,
+    #[serde(default)]
+    pub problems: Vec<String>,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub deliverables: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreationSkillExecutionStep {
+    pub id: String,
+    pub title: String,
+    pub objective: String,
+    pub output: String,
+    #[serde(default)]
+    pub agents: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,9 +181,17 @@ pub struct CreationSkillRecord {
     pub diagram_style: String,
     pub structure_pattern: Vec<String>,
     pub writing_guidelines: Vec<String>,
+    #[serde(default)]
+    pub distinctive_sections: Vec<CreationSkillDistinctiveSection>,
     pub section_headings: CreationSkillSectionHeadings,
     pub field_examples: CreationSkillFieldExamples,
     pub example_document: String,
+    #[serde(default)]
+    pub skill_description: CreationSkillDescription,
+    #[serde(default)]
+    pub execution_steps: Vec<CreationSkillExecutionStep>,
+    #[serde(default)]
+    pub package_files: Vec<CreationSkillPackageFile>,
     pub status: String,
     pub installed: bool,
     pub published: bool,
@@ -164,11 +215,19 @@ pub struct UpsertCreationSkill {
     pub structure_pattern: Vec<String>,
     pub writing_guidelines: Vec<String>,
     #[serde(default)]
+    pub distinctive_sections: Vec<CreationSkillDistinctiveSection>,
+    #[serde(default)]
     pub section_headings: CreationSkillSectionHeadings,
     #[serde(default)]
     pub field_examples: CreationSkillFieldExamples,
     #[serde(default = "default_example_document")]
     pub example_document: String,
+    #[serde(default)]
+    pub skill_description: CreationSkillDescription,
+    #[serde(default)]
+    pub execution_steps: Vec<CreationSkillExecutionStep>,
+    #[serde(default)]
+    pub package_files: Vec<CreationSkillPackageFile>,
     pub status: String,
     pub installed: bool,
     pub published: bool,
@@ -228,16 +287,21 @@ impl StorageManager {
         let common_titles = serde_json::to_string(&skill.common_titles)?;
         let structure_pattern = serde_json::to_string(&skill.structure_pattern)?;
         let writing_guidelines = serde_json::to_string(&skill.writing_guidelines)?;
+        let distinctive_sections = serde_json::to_string(&skill.distinctive_sections)?;
         let section_headings = serde_json::to_string(&skill.section_headings)?;
         let field_examples = serde_json::to_string(&skill.field_examples)?;
+        let skill_description = serde_json::to_string(&skill.skill_description)?;
+        let execution_steps = serde_json::to_string(&skill.execution_steps)?;
+        let package_files = serde_json::to_string(&skill.package_files)?;
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO creation_skills (
                     client_skill_key, cloud_skill_id, source_kind, source_id, title, summary,
                     category_id, common_titles, title_style, text_style, diagram_style,
-                    structure_pattern, writing_guidelines, section_headings, field_examples,
-                    example_document, status, installed, published, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)
+                    structure_pattern, writing_guidelines, distinctive_sections, section_headings,
+                    field_examples, example_document, skill_description, execution_steps,
+                    package_files, status, installed, published, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?24)
                  ON CONFLICT(client_skill_key) DO UPDATE SET
                     cloud_skill_id = excluded.cloud_skill_id,
                     source_kind = excluded.source_kind,
@@ -251,9 +315,13 @@ impl StorageManager {
                     diagram_style = excluded.diagram_style,
                     structure_pattern = excluded.structure_pattern,
                     writing_guidelines = excluded.writing_guidelines,
+                    distinctive_sections = excluded.distinctive_sections,
                     section_headings = excluded.section_headings,
                     field_examples = excluded.field_examples,
                     example_document = excluded.example_document,
+                    skill_description = excluded.skill_description,
+                    execution_steps = excluded.execution_steps,
+                    package_files = excluded.package_files,
                     status = excluded.status,
                     installed = excluded.installed,
                     published = excluded.published,
@@ -273,9 +341,13 @@ impl StorageManager {
                     skill.diagram_style,
                     structure_pattern,
                     writing_guidelines,
+                    distinctive_sections,
                     section_headings,
                     field_examples,
                     skill.example_document,
+                    skill_description,
+                    execution_steps,
+                    package_files,
                     skill.status,
                     i64::from(skill.installed),
                     i64::from(skill.published),
@@ -309,7 +381,7 @@ fn validate_skill(skill: &UpsertCreationSkill) -> Result<(), StorageError> {
     if skill.client_skill_key.trim().is_empty()
         || !matches!(
             skill.source_kind.as_str(),
-            "creation_history" | "bake_document" | "market"
+            "creation_history" | "bake_document" | "market" | "imported"
         )
         || skill.source_id.trim().is_empty()
         || skill.title.trim().is_empty()
@@ -332,12 +404,15 @@ fn validate_skill(skill: &UpsertCreationSkill) -> Result<(), StorageError> {
         || skill.field_examples.structure_pattern.is_empty()
         || skill.field_examples.writing_guidelines.is_empty()
         || skill.example_document.trim().is_empty()
+        || !valid_skill_description(&skill.skill_description)
+        || !valid_execution_steps(&skill.execution_steps)
+        || (skill.source_kind == "imported" && skill.package_files.is_empty())
         || !matches!(skill.status.as_str(), "draft" | "saved")
         || (skill.installed && skill.status != "saved")
     {
         return Err(StorageError::MigrationFailed {
             version: "creation_skill_validation",
-            reason: "创作 Skill 内容不完整".to_string(),
+            reason: "技能内容不完整".to_string(),
         });
     }
     Ok(())
@@ -359,6 +434,7 @@ fn row_to_skill(row: &rusqlite::Row<'_>) -> rusqlite::Result<CreationSkillRecord
         diagram_style: row.get("diagram_style")?,
         structure_pattern: parse_json(row.get::<_, String>("structure_pattern")?),
         writing_guidelines: parse_json(row.get::<_, String>("writing_guidelines")?),
+        distinctive_sections: parse_json_object(row.get::<_, String>("distinctive_sections")?),
         section_headings: parse_json_object(row.get::<_, String>("section_headings")?),
         field_examples: parse_json_object(row.get::<_, String>("field_examples")?),
         example_document: {
@@ -369,12 +445,39 @@ fn row_to_skill(row: &rusqlite::Row<'_>) -> rusqlite::Result<CreationSkillRecord
                 value
             }
         },
+        skill_description: parse_json_object(row.get::<_, String>("skill_description")?),
+        execution_steps: parse_json_object(row.get::<_, String>("execution_steps")?),
+        package_files: parse_json_object(row.get::<_, String>("package_files")?),
         status: row.get("status")?,
         installed: row.get::<_, i64>("installed")? != 0,
         published: row.get::<_, i64>("published")? != 0,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
+}
+
+fn valid_skill_description(description: &CreationSkillDescription) -> bool {
+    let legacy_empty = description.purpose.trim().is_empty()
+        && description.document_types.is_empty()
+        && description.problems.is_empty()
+        && description.domains.is_empty()
+        && description.deliverables.is_empty();
+    legacy_empty
+        || (!description.purpose.trim().is_empty()
+            && !description.document_types.is_empty()
+            && !description.problems.is_empty()
+            && !description.deliverables.is_empty())
+}
+
+fn valid_execution_steps(steps: &[CreationSkillExecutionStep]) -> bool {
+    steps.is_empty()
+        || steps.iter().all(|step| {
+            !step.id.trim().is_empty()
+                && !step.title.trim().is_empty()
+                && !step.objective.trim().is_empty()
+                && !step.output.trim().is_empty()
+                && step.agents.len() + step.tools.len() <= 4
+        })
 }
 
 fn parse_json(value: String) -> Vec<String> {
@@ -407,9 +510,32 @@ mod tests {
             diagram_style: "分层架构图。".into(),
             structure_pattern: vec!["背景".into(), "总体架构".into()],
             writing_guidelines: vec!["说明取舍。".into()],
+            distinctive_sections: vec![CreationSkillDistinctiveSection {
+                title: "定义先行".into(),
+                description: "先建立共同概念，再进入方案展开。".into(),
+                guidance: "在首次出现核心对象时，用一句通俗解释和一句边界说明完成定义。".into(),
+                examples: vec!["协作工作台可以理解为连接任务、角色与结果证据的统一入口。".into()],
+            }],
             section_headings: CreationSkillSectionHeadings::default(),
             field_examples: CreationSkillFieldExamples::default(),
             example_document: default_example_document(),
+            skill_description: CreationSkillDescription {
+                purpose: "用于把已确认的技术事实组织成可评审、可实施的架构文档。".into(),
+                document_types: vec!["技术架构设计文档".into()],
+                problems: vec!["澄清系统边界、关键取舍和实施路径".into()],
+                domains: vec!["软件架构".into()],
+                deliverables: vec!["包含架构、链路、风险和验证方式的 Markdown 文档".into()],
+            },
+            execution_steps: vec![CreationSkillExecutionStep {
+                id: "design-solution".into(),
+                title: "设计总体方案".into(),
+                objective: "把约束和证据转化为结构化架构方案。".into(),
+                output: "总体方案与关键设计".into(),
+                agents: vec!["solution_design_agent".into()],
+                skills: vec![],
+                tools: vec!["plantuml_diagram".into()],
+            }],
+            package_files: vec![],
             status: "saved".into(),
             installed: false,
             published: false,
@@ -425,6 +551,17 @@ mod tests {
         let second = storage.upsert_creation_skill(&updated).unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(second.title, "更新后的架构文档 Skill");
+        assert_eq!(second.distinctive_sections.len(), 1);
+        assert_eq!(second.distinctive_sections[0].title, "定义先行");
+        assert_eq!(
+            second.skill_description.document_types,
+            vec!["技术架构设计文档"]
+        );
+        assert_eq!(second.execution_steps[0].id, "design-solution");
+        assert_eq!(
+            second.execution_steps[0].agents,
+            vec!["solution_design_agent"]
+        );
         assert_eq!(storage.list_creation_skills().unwrap().len(), 1);
     }
 
@@ -462,5 +599,25 @@ mod tests {
         assert_eq!(saved.source_kind, "market");
         assert!(saved.installed);
         assert!(!saved.published);
+    }
+
+    #[test]
+    fn stores_imported_codex_skill_files() {
+        let storage = StorageManager::open_in_memory().unwrap();
+        let mut imported = sample_skill();
+        imported.client_skill_key = "imported-review-notes".into();
+        imported.source_kind = "imported".into();
+        imported.source_id = "review-notes".into();
+        imported.package_files = vec![CreationSkillPackageFile {
+            path: "SKILL.md".into(),
+            media_type: "text/markdown".into(),
+            content_base64: "IyBTa2lsbA==".into(),
+            size_bytes: 7,
+        }];
+
+        let saved = storage.upsert_creation_skill(&imported).unwrap();
+
+        assert_eq!(saved.source_kind, "imported");
+        assert_eq!(saved.package_files, imported.package_files);
     }
 }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import AccountProfile from '../components/AccountProfile'
 
 afterEach(() => {
@@ -33,6 +33,28 @@ describe('AccountProfile achievements', () => {
                 last_earned_at: '2026-07-21T00:00:00Z',
               }],
               equipped: {},
+            },
+          }),
+        }
+      }
+      if (url.includes('/v1/messages')) {
+        return {
+          ok: true,
+          json: async () => ({
+            data: {
+              items: [{
+                id: 'message-1',
+                title: '系统维护完成',
+                body: '服务已经恢复。',
+                category: 'system',
+                priority: 'normal',
+                read_at: null,
+                published_at: '2026-07-24T08:00:00Z',
+              }],
+              page: 1,
+              page_size: 50,
+              total: 1,
+              unread_count: 1,
             },
           }),
         }
@@ -75,6 +97,18 @@ describe('AccountProfile achievements', () => {
     expect(screen.getByRole('article', { name: '通宵赶稿，刚刚获得' })).toBeInTheDocument()
     expect(screen.getByText('刚刚获得')).toBeInTheDocument()
     expect(onInitialSectionHandled).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText('一个自然周内，曾在某个本地夜晚从 0 点到 6 点保持连续有效工作。')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '查看「通宵赶稿」卡片详情' }))
+
+    expect(screen.getByRole('dialog', { name: '通宵赶稿' })).toBeInTheDocument()
+    expect(screen.getByText('一个自然周内，曾在某个本地夜晚从 0 点到 6 点保持连续有效工作。')).toBeInTheDocument()
     expect(screen.getByText('这是一枚通宵纪念卡。完成赶稿后，请尽快补充睡眠。')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭「通宵赶稿」卡片详情' }))
+    fireEvent.click(screen.getByRole('tab', { name: '消息' }))
+
+    expect(screen.getByRole('tab', { name: '消息' })).toHaveAttribute('aria-selected', 'true')
+    expect(await screen.findByText('系统维护完成')).toBeInTheDocument()
   })
 })

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
     Router,
 };
@@ -13,19 +14,22 @@ use super::{
     handlers::{
         action::execute_action,
         bake::{
-            create_bake_document, delete_bake_document, delete_bake_knowledge, delete_bake_sop,
-            get_bake_capture, get_bake_capture_screenshot, get_bake_document, get_bake_knowledge,
-            get_bake_memory_preview, get_bake_overview, get_bake_sop, get_bake_style_config,
-            ignore_bake_memory, initialize_bake_memories, list_bake_captures, list_bake_documents,
-            list_bake_knowledge, list_bake_memories, list_bake_sops,
-            promote_bake_memory_to_document, promote_bake_memory_to_sop, run_bake_pipeline,
-            toggle_bake_document_status, update_bake_document, update_bake_style_config,
+            create_bake_document, delete_bake_capture, delete_bake_document, delete_bake_knowledge,
+            delete_bake_memory, delete_bake_sop, get_bake_capture, get_bake_capture_screenshot,
+            get_bake_document, get_bake_knowledge, get_bake_memory_preview, get_bake_overview,
+            get_bake_sop, get_bake_style_config, ignore_bake_memory, initialize_bake_memories,
+            list_bake_captures, list_bake_documents, list_bake_knowledge, list_bake_memories,
+            list_bake_sops, promote_bake_memory_to_document, promote_bake_memory_to_sop,
+            run_bake_pipeline, toggle_bake_document_status, update_bake_document,
+            update_bake_style_config,
         },
         captures::list_captures,
         config_checks::{
             delete_config_check, install_config_check, list_config_checks, run_config_check,
         },
-        creation::{generate_document, list_history, preview_references, save_history},
+        creation::{
+            generate_document, list_history, preview_references, run_creation_agent, save_history,
+        },
         creation_skill::{
             analyze_creation_skill, delete_creation_skill, get_creation_skill,
             list_creation_skills, save_creation_skill, update_creation_skill,
@@ -40,6 +44,10 @@ use super::{
         },
         monitor::{
             monitor_extraction_live, monitor_overview, monitor_pipeline_dag, monitor_system,
+        },
+        notification_channels::{
+            create_notification_channel, delete_notification_channel, list_notification_channels,
+            update_notification_channel,
         },
         pii::pii_scrub,
         preferences::{
@@ -120,19 +128,23 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/config-checks/:id", delete(delete_config_check))
         .route("/pii/scrub", post(pii_scrub))
         .route("/api/creation/generate", post(generate_document))
+        .route("/api/creation/agent/run", post(run_creation_agent))
         .route("/api/creation/references", post(preview_references))
         .route("/api/creation/history", post(save_history))
         .route("/api/creation/history", get(list_history))
         .route("/api/creation/skills/analyze", post(analyze_creation_skill))
         .route(
             "/api/creation/skills",
-            get(list_creation_skills).post(save_creation_skill),
+            get(list_creation_skills)
+                .post(save_creation_skill)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
             "/api/creation/skills/:id",
             get(get_creation_skill)
                 .put(update_creation_skill)
-                .delete(delete_creation_skill),
+                .delete(delete_creation_skill)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/vector/status", get(vector_status))
         .route("/api/stats", get(system_stats))
@@ -157,6 +169,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/tasks/:id/executions", get(list_executions))
         .route("/api/tasks/:id/trigger", post(trigger_task))
+        .route(
+            "/api/notification-channels",
+            get(list_notification_channels).post(create_notification_channel),
+        )
+        .route(
+            "/api/notification-channels/:id",
+            put(update_notification_channel).delete(delete_notification_channel),
+        )
         // 监控
         .route("/api/monitor/overview", get(monitor_overview))
         .route("/api/monitor/extraction_live", get(monitor_extraction_live))
@@ -220,13 +240,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/bake/articles", get(list_bake_memories))
         .route("/api/bake/memories", get(list_bake_memories))
+        .route("/api/bake/memories/:id", delete(delete_bake_memory))
         .route("/api/bake/knowledge", get(list_bake_knowledge))
         .route(
             "/api/bake/knowledge/:id",
             get(get_bake_knowledge).delete(delete_bake_knowledge),
         )
         .route("/api/bake/captures", get(list_bake_captures))
-        .route("/api/bake/captures/:id", get(get_bake_capture))
+        .route(
+            "/api/bake/captures/:id",
+            get(get_bake_capture).delete(delete_bake_capture),
+        )
         .route(
             "/api/bake/captures/:id/screenshot",
             get(get_bake_capture_screenshot),

@@ -3,10 +3,16 @@ from __future__ import annotations
 import json
 import types
 
+import pytest
+
+from inference_queue import QueueEvictedError
 from knowledge.extractor_v2 import (
     BAKE_BUNDLE_RESPONSE_SCHEMA,
+    BAKE_CONTEXT_WINDOW_TOKENS,
+    BAKE_INPUT_TOKEN_BUDGET,
     BAKE_NUM_PREDICT,
     BAKE_RESPONSE_SCHEMA,
+    BakeOutputTruncatedError,
     KnowledgeExtractorV2,
     _extract_json_object,
     _extract_ollama_response_text,
@@ -88,6 +94,16 @@ class DummyClient:
         return self.response
 
 
+class SequenceClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
 
 def make_extractor() -> KnowledgeExtractorV2:
     extractor = KnowledgeExtractorV2.__new__(KnowledgeExtractorV2)
@@ -158,6 +174,7 @@ def test_call_bake_llm_uses_structured_json_schema():
     assert client.calls[0]["format"] == BAKE_RESPONSE_SCHEMA
     assert client.calls[0]["options"] == {
         "temperature": 0.0,
+        "num_ctx": BAKE_CONTEXT_WINDOW_TOKENS,
         "num_predict": BAKE_NUM_PREDICT,
     }
     assert meta["empty_content"] is False
@@ -253,6 +270,8 @@ def test_extract_bake_bundle_uses_one_llm_call_for_three_artifacts():
 
     assert len(client.calls) == 1
     assert client.calls[0]["format"] == BAKE_BUNDLE_RESPONSE_SCHEMA
+    assert client.calls[0]["options"]["num_ctx"] == 32768
+    assert client.calls[0]["options"]["num_predict"] == 8192
     assert result["knowledge"]["reason"] == "not_a_knowledge"
     assert result["design"]["payload"]["name"] == "周报模板"
     assert result["sop"]["reason"] == "not_a_sop"
@@ -261,6 +280,121 @@ def test_extract_bake_bundle_uses_one_llm_call_for_three_artifacts():
     assert set(result["stage_elapsed_ms"]) == {"bundle"}
     assert isinstance(result["total_elapsed_ms"], int)
     assert result["total_elapsed_ms"] >= 0
+
+
+def test_bake_bundle_prompt_estimate_includes_schema_and_candidate():
+    extractor = make_raw_extractor()
+
+    small = extractor.estimate_bake_bundle_prompt_tokens(SAMPLE_CANDIDATE)
+    large = extractor.estimate_bake_bundle_prompt_tokens({
+        **SAMPLE_CANDIDATE,
+        "capture_ax_text": "长文档内容" * 20_000,
+    })
+
+    assert small > 0
+    assert large > small
+
+
+def test_bake_bundle_candidate_is_fitted_to_shared_input_budget():
+    extractor = make_raw_extractor()
+    candidate = {
+        **SAMPLE_CANDIDATE,
+        "capture_ax_text": "主采集正文" * 4_000,
+        "url_aggregated_text": "累计文档正文" * 8_000,
+        "url_aggregated_capture_count": 8,
+    }
+
+    prepared = extractor._prepare_bake_bundle_candidate(candidate)
+
+    assert extractor._bundle_prompt_token_estimate(prepared) <= BAKE_INPUT_TOKEN_BUDGET
+    assert len(prepared["url_aggregated_text"]) < len(candidate["url_aggregated_text"])
+    assert len(prepared["capture_ax_text"]) < len(candidate["capture_ax_text"])
+    assert candidate["url_aggregated_text"] == "累计文档正文" * 8_000
+
+
+def test_head_tail_context_honors_tiny_budget():
+    extractor = make_raw_extractor()
+    assert extractor._head_tail_context("abcdef", 1) == "a"
+    assert extractor._head_tail_context("abcdef", 0) == ""
+
+
+def test_bake_bundle_retries_truncated_output_once_with_smaller_context():
+    extractor = make_raw_extractor()
+    response_payload = {
+        "knowledge": {"accepted": False, "reason": "not_a_knowledge", "payload": None},
+        "design": {"accepted": False, "reason": "not_a_document", "payload": None},
+        "sop": {"accepted": False, "reason": "not_a_sop", "payload": None},
+    }
+    client = SequenceClient([
+        {
+            "model": "mock-model",
+            "message": {"content": '{"knowledge":'},
+            "prompt_eval_count": 24_000,
+            "eval_count": 8_000,
+            "done_reason": "length",
+        },
+        {
+            "model": "mock-model",
+            "message": {"content": json.dumps(response_payload, ensure_ascii=False)},
+            "prompt_eval_count": 18_000,
+            "eval_count": 100,
+            "done_reason": "stop",
+        },
+    ])
+    extractor._ollama_chat = client.chat
+    candidate = {
+        **SAMPLE_CANDIDATE,
+        "capture_ax_text": "主采集正文" * 4_000,
+        "url_aggregated_text": "累计文档正文" * 8_000,
+        "url_aggregated_capture_count": 8,
+    }
+
+    result = extractor.extract_bake_bundle(candidate)
+
+    assert len(client.calls) == 2
+    assert len(client.calls[1]["messages"][1]["content"]) < len(
+        client.calls[0]["messages"][1]["content"]
+    )
+    assert result["degraded"] is False
+
+
+def test_bake_bundle_initial_preemption_stays_retryable():
+    extractor = make_extractor()
+
+    with pytest.raises(QueueEvictedError, match="在线咨询或创作任务"):
+        extractor.extract_bake_bundle(
+            SAMPLE_CANDIDATE,
+            preempt_check=lambda: True,
+        )
+
+
+def test_extract_bake_bundle_surfaces_invalid_output_as_failure():
+    extractor = make_extractor()
+    extractor._call_bake_llm = types.MethodType(
+        lambda self, caller_id, system_prompt, user_prompt, response_schema: (
+            None,
+            {
+                "empty_content": False,
+                "done_reason": "length",
+            },
+        ),
+        extractor,
+    )
+
+    with pytest.raises(BakeOutputTruncatedError, match="truncated_json"):
+        extractor.extract_bake_bundle(SAMPLE_CANDIDATE)
+
+
+def test_extract_bake_bundle_does_not_turn_llm_exception_into_success():
+    extractor = make_extractor()
+
+    def fail(*_args, **_kwargs):
+        raise TimeoutError("cancelled")
+
+    extractor._call_bake_llm = fail
+
+    with pytest.raises(TimeoutError, match="cancelled"):
+        extractor.extract_bake_bundle(SAMPLE_CANDIDATE)
 
 
 
@@ -591,6 +725,30 @@ def test_merge_document_no_change_keeps_existing_title_when_model_omits_it():
     )
 
     assert result == {"no_change": True, "title": "已有文档标题"}
+
+
+def test_merge_document_accepts_null_section_notes():
+    extractor = make_raw_extractor()
+    captured_call = {}
+
+    def call_bake_llm(self, caller_id, system_prompt, user_prompt, response_schema):
+        captured_call["user_prompt"] = user_prompt
+        return {"no_change": True}, {}
+
+    extractor._call_bake_llm = types.MethodType(call_bake_llm, extractor)
+
+    result = extractor._merge_with_llm_once(
+        {
+            "title": "已有文档标题",
+            "full_content": "已有正文",
+            "sections_json": '[{"title":"背景","notes":null}]',
+        },
+        SAMPLE_CANDIDATE,
+        "重复的新 capture",
+    )
+
+    assert result == {"no_change": True, "title": "已有文档标题"}
+    assert "1. 背景:" in captured_call["user_prompt"]
 
 
 

@@ -1,364 +1,344 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import OnboardingWizard from '../components/OnboardingWizard'
 import { useAppStore } from '../store/useAppStore'
-import type { ModelEntry } from '../types'
+import type { InitializationStatus } from '../utils/initialization'
 
-const hardware = {
-  memory_gb: 16,
-  cpu_cores: 8,
-  disk_free_gb: 120,
-  has_gpu: true,
+const stageIds = [
+  ['preflight', '检查运行环境'],
+  ['inference_engine', '准备本地 AI 引擎'],
+  ['capture_model', '准备采集提炼能力'],
+  ['vector_model', '准备语义检索能力'],
+  ['database', '准备本地记忆库'],
+  ['skills_tools', '准备技能与工具'],
+  ['quality_gate', '执行完整质检'],
+  ['feature_smoke_tests', '验证核心功能'],
+] as const
+
+function initialization(
+  state: InitializationStatus['state'],
+  patch: Partial<InitializationStatus> = {},
+): InitializationStatus {
+  return {
+    schema_version: 'initialization.v1',
+    run_id: state === 'not_started' ? null : 'init-run-001',
+    mode: 'normal',
+    state,
+    progress: state === 'completed' ? 100 : state === 'running' ? 43 : 0,
+    current_stage: state === 'running' ? 'capture_model' : 'preflight',
+    message: state === 'running' ? '正在下载必要组件' : '需要完成初始化',
+    stages: stageIds.map(([id, label], index) => ({
+      id,
+      label,
+      status: state === 'completed'
+        ? 'succeeded'
+        : state === 'running' && index < 2
+          ? 'succeeded'
+          : state === 'running' && index === 2
+            ? 'running'
+            : 'pending',
+      progress: state === 'completed' || index < 2 ? 100 : index === 2 && state === 'running' ? 61 : 0,
+      detail: index === 2 && state === 'running' ? '正在下载采集提炼能力' : '等待执行',
+      error_code: null,
+      duration_ms: null,
+    })),
+    quality_gate: {
+      passed: state === 'completed',
+      checks: [],
+    },
+    smoke_tests: [],
+    can_retry: state === 'failed',
+    can_report: state === 'failed',
+    test_mode_enabled: false,
+    ...patch,
+  }
 }
 
-const model = (
-  id: 'mbem-v1-local' | 'bge-small-zh',
-  category: 'llm' | 'embedding',
-  status: ModelEntry['status'],
-): ModelEntry => ({
-  id,
-  name: id === 'mbem-v1-local' ? 'MBEM v1.0' : 'BGE Small',
-  category,
-  provider: 'ollama',
-  size_gb: id === 'mbem-v1-local' ? 2.3 : 0.05,
-  description: 'test model',
-  status,
-  is_active: status === 'active',
-  is_default: true,
-  requires_api_key: false,
-  recommended: true,
-})
-
-const response = (body: unknown, ok = true) => ({
-  ok,
-  status: ok ? 200 : 500,
-  json: async () => body,
-}) as Response
-
-const flushPromises = async () => {
-  await act(async () => {
-    await Promise.resolve()
-    await Promise.resolve()
-  })
+function response(body: unknown, ok = true, status = ok ? 200 : 500): Response {
+  return {
+    ok,
+    status,
+    json: async () => body,
+  } as Response
 }
 
 beforeEach(() => {
-  window.localStorage?.clear()
+  window.localStorage.clear()
   useAppStore.getState().reset()
   useAppStore.setState({ hasCompletedSetup: false, setupSkipped: false, windowMode: 'rag' })
 })
 
 afterEach(() => {
   cleanup()
-  vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
 
-describe('首次安装初始化引导', () => {
-  it('DMG 冷启动时本地服务尚未就绪会自动重试检测', async () => {
-    vi.useFakeTimers()
-    let setupCalls = 0
-    let modelCalls = 0
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.endsWith('/api/models/hardware')) {
-        return response({ status: 'ok', hardware, recommendation: { tier: 'high', reason: '配置充足' } })
-      }
-      if (url.endsWith('/api/ollama/setup-status')) {
-        setupCalls += 1
-        if (setupCalls === 1) throw new Error('sidecar is starting')
-        return response({ status: 'ok', detail: { ollama_installed: false, ollama_running: false } })
-      }
-      if (url.includes('/api/models?category=llm')) {
-        modelCalls += 1
-        if (modelCalls === 1) throw new Error('model api is starting')
-        return response({ status: 'ok', models: [model('mbem-v1-local', 'llm', 'not_installed')] })
-      }
-      throw new Error(`unexpected request: ${url}`)
-    }))
+describe('首次启动一键初始化', () => {
+  it('未初始化时只提供一个初始化主操作且不能跳过', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response({
+      status: 'ok',
+      initialization: initialization('not_started'),
+    })))
 
     render(<OnboardingWizard />)
-    await flushPromises()
-    expect(setupCalls).toBe(1)
-    fireEvent.click(screen.getByRole('button', { name: '开始配置' }))
-    await flushPromises()
-    expect(modelCalls).toBe(1)
 
-    await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
-
-    expect(setupCalls).toBeGreaterThanOrEqual(3)
-    expect(modelCalls).toBe(2)
-    expect(screen.getByRole('radio', { name: /MBEM v1\.0/ })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /^初始化/ })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '烤面包' })).toBeInTheDocument()
+    expect(screen.getByText('已存在的组件不会重复安装')).toBeInTheDocument()
+    expect(screen.getByText('可以最小化软件等待初始化完成，请保持网络畅通。')).toBeInTheDocument()
+    expect(screen.getByText('10–30 分钟')).toBeInTheDocument()
+    expect(screen.getByText('约 4 GB')).toBeInTheDocument()
+    expect(screen.getByText('约 6 GB')).toBeInTheDocument()
+    expect(screen.queryByText(/跳过/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/全程在本机完成/)).not.toBeInTheDocument()
+    expect(screen.getByText(/采集、提炼、咨询和创作测试/)).toBeInTheDocument()
   })
 
-  it('没有 Homebrew 和本地运行环境时提供官方下载安装入口', async () => {
-    const open = vi.spyOn(window, 'open').mockReturnValue(null)
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.endsWith('/api/models/hardware')) {
-        return response({ status: 'ok', hardware, recommendation: { tier: 'high', reason: '配置充足' } })
-      }
-      if (url.endsWith('/api/ollama/setup-status')) {
-        return response({
-          status: 'ok',
-          detail: {
-            ollama_installed: false,
-            ollama_running: false,
-            brew_available: false,
-            can_auto_install: false,
-            version_compatible: true,
-            minimum_macos_major: 14,
-            official_download_url: 'https://ollama.com/download/mac',
-          },
-        })
-      }
-      if (url.includes('/api/models?category=llm')) {
-        return response({ status: 'ok', models: [model('mbem-v1-local', 'llm', 'not_installed')] })
-      }
-      throw new Error(`unexpected request: ${url}`)
-    }))
+  it('旧版 sidecar 缺少初始化路由时立即提示重启，而不是显示通用 404', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response({}, false, 404)))
 
     render(<OnboardingWizard />)
-    await flushPromises()
-    fireEvent.click(screen.getByRole('button', { name: '开始配置' }))
-    await flushPromises()
 
-    expect(screen.getByText('本地运行环境尚未就绪')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '打开官方下载页' }))
-
-    expect(open).toHaveBeenCalledWith(
-      'https://ollama.com/download/mac',
-      '_blank',
-      'noopener,noreferrer',
-    )
-    expect(screen.getByText(/返回这里点击“重新检测”/)).toBeInTheDocument()
+    expect(await screen.findByText(/本地初始化服务版本较旧/)).toBeInTheDocument()
+    expect(screen.queryByText(/HTTP 404/)).not.toBeInTheDocument()
   })
 
-  it('有 Homebrew 时可自动安装并启动本地运行环境', async () => {
-    let running = false
+  it('一次点击启动完整后台任务并显示总进度和当前阶段', async () => {
+    const now = Date.now()
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+    const running = initialization('running', {
+      started_at: new Date(now - 125_000).toISOString(),
+    })
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url.endsWith('/api/models/hardware')) {
-        return response({ status: 'ok', hardware, recommendation: { tier: 'high', reason: '配置充足' } })
+      if (url.endsWith('/api/initialization/status')) {
+        return response({ status: 'ok', initialization: initialization('not_started') })
       }
-      if (url.endsWith('/api/ollama/setup-status')) {
-        return response({
-          status: 'ok',
-          detail: {
-            ollama_installed: running,
-            ollama_running: running,
-            brew_available: true,
-            can_auto_install: true,
-            version_compatible: true,
-          },
-        })
-      }
-      if (url.includes('/api/models?category=llm')) {
-        return response({ status: 'ok', models: [model('mbem-v1-local', 'llm', 'not_installed')] })
-      }
-      if (url.endsWith('/api/ollama/install') && init?.method === 'POST') {
-        return response({ status: 'ok' })
-      }
-      if (url.endsWith('/api/ollama/start') && init?.method === 'POST') {
-        running = true
-        return response({ status: 'ok' })
+      if (url.endsWith('/api/initialization/start') && init?.method === 'POST') {
+        return response({ status: 'ok', initialization: running })
       }
       throw new Error(`unexpected request: ${url}`)
     })
     vi.stubGlobal('fetch', fetchMock)
 
     render(<OnboardingWizard />)
-    await flushPromises()
-    fireEvent.click(screen.getByRole('button', { name: '开始配置' }))
-    await flushPromises()
-    fireEvent.click(screen.getByRole('button', { name: '自动安装并启动' }))
-    await flushPromises()
+    fireEvent.click(await screen.findByRole('button', { name: /^初始化/ }))
 
+    expect(await screen.findByRole('progressbar', { name: '初始化进度 43%' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '面包烘焙中' })).toBeInTheDocument()
+    expect(screen.getAllByText('准备采集提炼能力').length).toBeGreaterThan(0)
+    expect(screen.getByText('可以最小化，初始化会在后台继续')).toBeInTheDocument()
+    expect(screen.getByText(/烘焙时间较长，请耐心等待/)).toBeInTheDocument()
+    expect(screen.getByText('执行时长')).toBeInTheDocument()
+    expect(screen.getByText('02:05')).toBeInTheDocument()
+    expect(screen.getByText('预计剩余时间')).toBeInTheDocument()
+    expect(screen.getByText('约 12 分钟')).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://localhost:7071/api/ollama/install',
-      { method: 'POST' },
+      'http://127.0.0.1:7071/api/initialization/start',
+      expect.objectContaining({ method: 'POST' }),
     )
-    expect(fetchMock).toHaveBeenCalledWith(
-      'http://localhost:7071/api/ollama/start',
-      { method: 'POST' },
-    )
-    expect(screen.getByText('本地运行环境已就绪')).toBeInTheDocument()
   })
 
-  it('阻止跳过未安装的文本和向量模型，并在两者下载启用后完成配置', async () => {
-    vi.useFakeTimers()
-    let llmReady = false
-    let embeddingReady = false
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input)
-      const method = init?.method || 'GET'
-      if (url.endsWith('/api/models/hardware')) {
-        return response({ status: 'ok', hardware, recommendation: { tier: 'high', reason: '配置充足' } })
-      }
-      if (url.endsWith('/api/ollama/setup-status')) {
-        return response({
-          status: 'ok',
-          detail: {
-            ollama_installed: true,
-            ollama_running: true,
-            can_auto_install: true,
-            version_compatible: true,
-          },
-        })
-      }
-      if (url.includes('/api/models?category=llm')) {
-        return response({ status: 'ok', models: [model('mbem-v1-local', 'llm', llmReady ? 'active' : 'not_installed')] })
-      }
-      if (url.includes('/api/models?category=embedding')) {
-        return response({ status: 'ok', models: [model('bge-small-zh', 'embedding', embeddingReady ? 'active' : 'not_installed')] })
-      }
-      if (url.endsWith('/api/models/mbem-v1-local/download') && method === 'POST') {
-        return response({ status: 'ok' })
-      }
-      if (url.endsWith('/api/models/mbem-v1-local/status')) {
-        llmReady = true
-        return response({ status: 'active', download_progress: 100 })
-      }
-      if (url.endsWith('/api/models/mbem-v1-local/activate') && method === 'POST') {
-        return response({ status: 'ok' })
-      }
-      if (url.endsWith('/api/models/bge-small-zh/download') && method === 'POST') {
-        return response({ status: 'ok' })
-      }
-      if (url.endsWith('/api/models/bge-small-zh/status')) {
-        embeddingReady = true
-        return response({ status: 'active', download_progress: 100 })
-      }
-      if (url.endsWith('/api/models/bge-small-zh/activate') && method === 'POST') {
-        return response({ status: 'ok' })
-      }
-      throw new Error(`unexpected request: ${method} ${url}`)
-    })
-    vi.stubGlobal('fetch', fetchMock)
+  it('只有正式环境质检通过后才写入完成标记并开放主界面', async () => {
+    const onValidated = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(async () => response({
+      status: 'ok',
+      initialization: initialization('completed'),
+    })))
 
-    render(<OnboardingWizard />)
-    await flushPromises()
-    fireEvent.click(screen.getByRole('button', { name: '开始配置' }))
-    await flushPromises()
-    fireEvent.click(screen.getByRole('radio', { name: /MBEM v1\.0/ }))
+    render(<OnboardingWizard onStatusValidated={onValidated} />)
 
-    expect(screen.getByRole('button', { name: '下一步' })).toBeDisabled()
-    expect(screen.getByText('完成模型下载后才能进入下一步。')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: /下载 MBEM v1\.0/ }))
-    await flushPromises()
-    await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
-
-    expect(screen.getByRole('button', { name: '下一步' })).toBeEnabled()
-    fireEvent.click(screen.getByRole('button', { name: '下一步' }))
-    await flushPromises()
-    fireEvent.click(screen.getByRole('radio', { name: /本地语义索引/ }))
-
-    expect(screen.getByRole('button', { name: '完成配置' })).toBeDisabled()
-    fireEvent.click(screen.getByRole('button', { name: /下载 本地语义索引/ }))
-    await flushPromises()
-    await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
-
-    expect(screen.getByRole('button', { name: '完成配置' })).toBeEnabled()
-    fireEvent.click(screen.getByRole('button', { name: '完成配置' }))
-    await flushPromises()
-
+    await waitFor(() => expect(onValidated).toHaveBeenCalledWith(true))
     expect(useAppStore.getState().hasCompletedSetup).toBe(true)
-    expect(window.localStorage?.getItem('memory-bread_setup_done')).toBe('true')
+    expect(window.localStorage.getItem('memory-bread_initialization_v2_done')).toBe('true')
+  })
+
+  it('失败时支持重试和用户确认后的脱敏诊断上报', async () => {
+    const failed = initialization('failed', {
+      current_stage: 'capture_model',
+      error_code: 'MODEL_DOWNLOAD_FAILED',
+      message: '采集提炼模型下载失败',
+      suggestion: '请检查网络和磁盘空间后重试。',
+    })
+    failed.stages[2] = {
+      ...failed.stages[2],
+      status: 'failed',
+      error_code: 'MODEL_DOWNLOAD_FAILED',
+    }
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/initialization/status')) {
+        return response({ status: 'ok', initialization: failed })
+      }
+      if (url.endsWith('/api/initialization/report-bundle')) {
+        return response({
+          status: 'ok',
+          report: {
+            schema_version: 'initialization.v1',
+            run_id: 'init-run-001',
+            installation_id: 'installation-001',
+            error_code: 'MODEL_DOWNLOAD_FAILED',
+          },
+        })
+      }
+      if (url.endsWith('/v1/initialization-reports') && init?.method === 'POST') {
+        return response({ data: { report_id: 'report-001' }, request_id: 'request-001' })
+      }
+      if (url.endsWith('/api/initialization/start') && init?.method === 'POST') {
+        return response({ status: 'ok', initialization: initialization('running') })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<OnboardingWizard />)
+
+    expect(await screen.findByText(/MODEL_DOWNLOAD_FAILED/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '上报诊断' }))
+
+    expect(confirm).toHaveBeenCalled()
+    expect(await screen.findByText(/report-001/)).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://localhost:7071/api/models/mbem-v1-local/activate',
-      { method: 'POST' },
+      'http://127.0.0.1:8080/v1/initialization-reports',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ 'Idempotency-Key': 'init-run-001' }),
+      }),
     )
+  })
+
+  it('失败页会自动发现外部重新启动的初始化任务', async () => {
+    const failed = initialization('failed', {
+      current_stage: 'database',
+      error_code: 'DATABASE_INITIALIZATION_FAILED',
+      message: '本地记忆库未能完成初始化',
+    })
+    const running = initialization('running', {
+      mode: 'sandbox',
+      test_mode_enabled: true,
+      progress: 50,
+      current_stage: 'capture_model',
+    })
+    let statusRequests = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      statusRequests += 1
+      return response({
+        status: 'ok',
+        initialization: statusRequests === 1 ? failed : running,
+      })
+    }))
+
+    render(<OnboardingWizard />)
+
+    expect(await screen.findByText(/DATABASE_INITIALIZATION_FAILED/)).toBeInTheDocument()
+    expect(
+      await screen.findByRole(
+        'progressbar',
+        { name: '初始化进度 50%' },
+        { timeout: 2_500 },
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('完成后的必需组件缺失时提供恢复操作但不允许误上报', async () => {
+    const interrupted = initialization('interrupted', {
+      error_code: 'INITIALIZATION_COMPONENT_MISSING',
+      suggestion: '检测到本地能力不完整，点击恢复即可。',
+      can_retry: true,
+      can_report: false,
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => response({
+      status: 'ok',
+      initialization: interrupted,
+    })))
+
+    render(<OnboardingWizard />)
+
+    expect(await screen.findByRole('button', { name: '恢复初始化' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '上报诊断' })).not.toBeInTheDocument()
+  })
+
+  it('隔离模拟与真实初始化使用完全相同的主界面', async () => {
+    const normal = initialization('not_started')
+    vi.stubGlobal('fetch', vi.fn(async () => response({
+      status: 'ok',
+      initialization: normal,
+    })))
+
+    const normalView = render(<OnboardingWizard />)
+    await screen.findByRole('button', { name: /^初始化/ })
+    const normalMarkup = screen.getByTestId('initialization-card')
+    const expectedMarkup = normalMarkup.innerHTML
+    normalView.unmount()
+
+    const sandbox = initialization('not_started', {
+      mode: 'sandbox',
+      test_mode_enabled: true,
+      sandbox_isolation: {
+        enforced: true,
+        cold_start: true,
+        normal_runtime_hidden: true,
+        normal_models_hidden: true,
+        normal_database_hidden: true,
+      },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => response({
+      status: 'ok',
+      initialization: sandbox,
+    })))
+
+    render(<OnboardingWizard />)
+
+    await screen.findByRole('button', { name: /^初始化/ })
+    expect(screen.getByTestId('initialization-card').innerHTML).toBe(expectedMarkup)
+    expect(screen.queryByText(/隔离初始化测试|SANDBOX|正式环境已完全隐藏/)).not.toBeInTheDocument()
+  })
+
+  it('隔离测试完成后从门禁关闭模式并恢复真实完成环境', async () => {
+    const sandbox = initialization('completed', {
+      mode: 'sandbox',
+      test_mode_enabled: true,
+      sandbox_isolation: {
+        enforced: true,
+        cold_start: true,
+        normal_runtime_hidden: true,
+        normal_models_hidden: true,
+        normal_database_hidden: true,
+      },
+    })
+    const normal = initialization('completed')
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/initialization/status')) {
+        return response({ status: 'ok', initialization: sandbox })
+      }
+      if (url.endsWith('/api/initialization/test-mode') && init?.method === 'DELETE') {
+        return response({ status: 'ok', initialization: normal })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<OnboardingWizard />)
+    expect(await screen.findByText('面包烘焙完成')).toBeInTheDocument()
+    expect(screen.getByText('模拟初始化已结束')).toBeInTheDocument()
+    expect(screen.queryByText(/隔离初始化测试|SANDBOX|正式环境已完全隐藏/)).not.toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('button', { name: '关闭初始化测试模式' }))
+
+    expect(screen.getByRole('dialog', { name: '关闭初始化测试模式' })).toBeInTheDocument()
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      'http://127.0.0.1:7071/api/initialization/test-mode',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+    fireEvent.click(screen.getByRole('button', { name: '确认关闭' }))
+
+    await waitFor(() => expect(useAppStore.getState().hasCompletedSetup).toBe(true))
+    expect(useAppStore.getState().windowMode).toBe('debug')
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://localhost:7071/api/models/bge-small-zh/activate',
-      { method: 'POST' },
+      'http://127.0.0.1:7071/api/initialization/test-mode',
+      expect.objectContaining({ method: 'DELETE' }),
     )
-  })
-
-  it('下载失败时结束进度轮询并保留在当前步骤供重试', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input)
-      if (url.endsWith('/api/models/hardware')) {
-        return response({ status: 'ok', hardware, recommendation: { tier: 'high', reason: '配置充足' } })
-      }
-      if (url.endsWith('/api/ollama/setup-status')) {
-        return response({ status: 'ok', detail: { ollama_installed: true, ollama_running: true, version_compatible: true } })
-      }
-      if (url.includes('/api/models?category=llm')) {
-        return response({ status: 'ok', models: [model('mbem-v1-local', 'llm', 'not_installed')] })
-      }
-      if (url.endsWith('/api/models/mbem-v1-local/download') && init?.method === 'POST') {
-        return response({ status: 'ok' })
-      }
-      if (url.endsWith('/api/models/mbem-v1-local/status')) {
-        return response({ status: 'error', error: '下载失败，请检查网络和本地运行环境' })
-      }
-      throw new Error(`unexpected request: ${url}`)
-    }))
-
-    render(<OnboardingWizard />)
-    await flushPromises()
-    fireEvent.click(screen.getByRole('button', { name: '开始配置' }))
-    await flushPromises()
-    fireEvent.click(screen.getByRole('radio', { name: /MBEM v1\.0/ }))
-    fireEvent.click(screen.getByRole('button', { name: /下载 MBEM v1\.0/ }))
-    await flushPromises()
-    await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
-
-    expect(screen.getByRole('alert')).toHaveTextContent('下载失败，请检查网络和本地运行环境')
-    expect(screen.getByRole('button', { name: '下一步' })).toBeDisabled()
-    expect(screen.queryByText(/正在下载/)).not.toBeInTheDocument()
-  })
-
-  it('模型启用接口失败时不会越过当前步骤', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input)
-      if (url.endsWith('/api/models/hardware')) {
-        return response({ status: 'ok', hardware, recommendation: { tier: 'high', reason: '配置充足' } })
-      }
-      if (url.endsWith('/api/ollama/setup-status')) {
-        return response({ status: 'ok', detail: { ollama_installed: true, ollama_running: true, version_compatible: true } })
-      }
-      if (url.includes('/api/models?category=llm')) {
-        return response({ status: 'ok', models: [model('mbem-v1-local', 'llm', 'active')] })
-      }
-      if (url.endsWith('/api/models/mbem-v1-local/activate') && init?.method === 'POST') {
-        return response({ status: 'error', message: '模型启用失败' }, false)
-      }
-      throw new Error(`unexpected request: ${url}`)
-    }))
-
-    render(<OnboardingWizard />)
-    await flushPromises()
-    fireEvent.click(screen.getByRole('button', { name: '开始配置' }))
-    await flushPromises()
-    fireEvent.click(screen.getByRole('radio', { name: /MBEM v1\.0/ }))
-    fireEvent.click(screen.getByRole('button', { name: '下一步' }))
-    await flushPromises()
-
-    expect(screen.getByText('选择本地分析模型')).toBeInTheDocument()
-    expect(screen.getByRole('alert')).toHaveTextContent('模型启用失败')
-  })
-
-  it('明确跳过时保存标记并退出初始化引导', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.endsWith('/api/models/hardware')) {
-        return response({ status: 'ok', hardware, recommendation: { tier: 'high', reason: '配置充足' } })
-      }
-      if (url.endsWith('/api/ollama/setup-status')) {
-        return response({ status: 'ok', detail: { ollama_installed: false, ollama_running: false } })
-      }
-      throw new Error(`unexpected request: ${url}`)
-    }))
-
-    render(<OnboardingWizard />)
-    await flushPromises()
-    fireEvent.click(screen.getByRole('button', { name: '跳过，稍后配置' }))
-
-    expect(useAppStore.getState().setupSkipped).toBe(true)
-    expect(window.localStorage?.getItem('memory-bread_setup_skipped')).toBe('true')
-    expect(useAppStore.getState().windowMode).toBe('rag')
   })
 })

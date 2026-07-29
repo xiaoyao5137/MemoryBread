@@ -9,12 +9,10 @@ import {
 } from '../hooks/useApi'
 import { useAppStore } from '../store/useAppStore'
 import type { CloudSnapshot, MemoryPackageImportReport } from '../types'
-import { fetchCloudSnapshots, upsertCloudDevice } from '../utils/authApi'
+import { fetchCloudSnapshots } from '../utils/authApi'
+import { registerCurrentDevice } from '../utils/softwareUpdate'
 import { toUserFacingError } from '../utils/userFacingError'
 import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './bake/BakeShared'
-
-const CLOUD_DEVICE_ID_KEY = 'memory-bread_cloud_device_id'
-const CLOUD_DEVICE_PUBLIC_KEY = 'memory-bread_cloud_device_public_key'
 
 const tableLabels: Record<string, string> = {
   capture_refs: '占位引用',
@@ -292,35 +290,6 @@ export const MemoryBackupCard: React.FC<MemoryBackupCardProps> = ({
   )
 }
 
-const randomUuid = () => {
-  const cryptoApi = typeof crypto !== 'undefined' ? crypto : null
-  if (typeof cryptoApi?.randomUUID === 'function') return cryptoApi.randomUUID()
-  const bytes = new Uint8Array(16)
-  if (cryptoApi) {
-    cryptoApi.getRandomValues(bytes)
-  } else {
-    bytes.forEach((_, index) => {
-      bytes[index] = Math.floor(Math.random() * 256)
-    })
-  }
-  bytes[6] = (bytes[6] & 0x0f) | 0x40
-  bytes[8] = (bytes[8] & 0x3f) | 0x80
-  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
-}
-
-const randomBase64 = () => {
-  const bytes = new Uint8Array(32)
-  if (typeof crypto !== 'undefined') {
-    crypto.getRandomValues(bytes)
-  } else {
-    bytes.forEach((_, index) => {
-      bytes[index] = Math.floor(Math.random() * 256)
-    })
-  }
-  return btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''))
-}
-
 const MemoryBackupSection: React.FC = () => {
   const {
     adminApiBaseUrl,
@@ -329,7 +298,6 @@ const MemoryBackupSection: React.FC = () => {
     currentUser,
     accountType,
     cloudSubscription,
-    sidecarVersion,
     setWindowMode,
     setBakeMemoryOffset,
   } = useAppStore()
@@ -372,26 +340,7 @@ const MemoryBackupSection: React.FC = () => {
 
   const ensureCloudDevice = async () => {
     if (!authToken) throw new Error('请先登录账户')
-    let deviceId = window.localStorage.getItem(CLOUD_DEVICE_ID_KEY)
-    if (!deviceId) {
-      deviceId = randomUuid()
-      window.localStorage.setItem(CLOUD_DEVICE_ID_KEY, deviceId)
-    }
-    let publicKey = window.localStorage.getItem(CLOUD_DEVICE_PUBLIC_KEY)
-    if (!publicKey) {
-      publicKey = randomBase64()
-      window.localStorage.setItem(CLOUD_DEVICE_PUBLIC_KEY, publicKey)
-    }
-    const platform = navigator.platform || 'desktop'
-    const device = await upsertCloudDevice(adminApiBaseUrl, authToken, {
-      device_id: deviceId,
-      name: `MemoryBread ${platform}`,
-      platform,
-      client_version: sidecarVersion || '0.1.0',
-      public_key_base64: publicKey,
-    })
-    window.localStorage.setItem(CLOUD_DEVICE_ID_KEY, device.id)
-    return device.id
+    return (await registerCurrentDevice(adminApiBaseUrl, authToken)).id
   }
 
   const handleExportMemoryPackage = async () => {

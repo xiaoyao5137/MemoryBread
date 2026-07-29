@@ -25,7 +25,7 @@ const rawSkill = {
   updated_at: 1_720_000_000_000,
 }
 
-describe('创作 Skill 安装与使用', () => {
+describe('技能安装与使用', () => {
   beforeEach(() => {
     useAppStore.getState().reset()
     useAppStore.getState().setApiBaseUrl('http://localhost:7070')
@@ -68,34 +68,36 @@ describe('创作 Skill 安装与使用', () => {
 
     render(<CreationPanel />)
 
-    fireEvent.click(await screen.findByRole('button', { name: '创作 Skill (1)' }))
+    fireEvent.click(await screen.findByRole('button', { name: '技能 (1)' }))
     fireEvent.click(screen.getByRole('button', { name: '安装' }))
     await screen.findByRole('button', { name: '卸载' })
 
-    fireEvent.click(screen.getByRole('button', { name: '方案创作' }))
-    const textarea = screen.getByPlaceholderText(/输入 @ 可选择已安装的创作 Skill/)
+    fireEvent.click(screen.getByRole('button', { name: '创作' }))
+    expect(screen.getByRole('region', { name: '生成内容' })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: '创作对话' })).toBeInTheDocument()
+    const textarea = screen.getByPlaceholderText(/输入 @ 可选择已安装的技能/)
     fireEvent.change(textarea, { target: { value: '@' } })
 
-    const picker = await screen.findByRole('listbox', { name: '选择创作 Skill' })
-    expect(within(picker).getByText('选择已安装的 Skill')).toBeInTheDocument()
+    const picker = await screen.findByRole('listbox', { name: '选择技能' })
+    expect(within(picker).getByText('选择已安装的技能')).toBeInTheDocument()
     fireEvent.click(within(picker).getByRole('option', { name: /跨部门技术沟通会文档/ }))
 
     expect(textarea).toHaveValue('@跨部门技术沟通会文档 ')
-    const matched = screen.getByLabelText('本次使用的创作 Skill')
+    const matched = screen.getByLabelText('本次使用的技能')
     expect(within(matched).getByText('@ 已选择')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '开始创作' }))
     await waitFor(() => expect(generationPayload).not.toBeNull())
 
-    expect(generationPayload.user_prompt).toContain('已安装并匹配的创作 Skill')
+    expect(generationPayload.user_prompt).toContain('已安装并匹配的技能')
     expect(generationPayload.user_prompt).toContain('S#1 跨部门技术沟通会文档（用户明确选择）')
     expect(generationPayload.user_prompt).toContain(`适用场景与目标：${rawSkill.summary}`)
     expect(generationPayload.user_prompt).toContain('互联网 / 电商零售')
     expect(generationPayload.user_prompt).toContain(
-      '标题风格｜标题如何传递重点：主标题说明交付物，副标题只限定通用范围、阶段或关键约束',
+      '标题设计风格：子标题优先使用“对象或章节角色＋技术方案动作”的短名词结构',
     )
     expect(generationPayload.user_prompt).toContain(
-      '画图风格｜图示怎样服务于内容：只在结构或流程需要快速理解时绘图',
+      '图片生成方式：源记录没有保留图示证据，默认不生成图片',
     )
     expect(generationPayload.user_prompt).not.toContain(rawSkill.title_style)
     expect(generationPayload.user_prompt).not.toContain(rawSkill.diagram_style)
@@ -139,7 +141,7 @@ describe('创作 Skill 安装与使用', () => {
 
     render(<CreationPanel />)
 
-    fireEvent.click(await screen.findByRole('button', { name: '创作 Skill (1)' }))
+    fireEvent.click(await screen.findByRole('button', { name: '技能 (1)' }))
     fireEvent.click(screen.getByRole('button', { name: '发布' }))
 
     await screen.findByText('已发布')
@@ -190,14 +192,23 @@ describe('创作 Skill 安装与使用', () => {
 
     render(<CreationPanel />)
 
-    fireEvent.click(await screen.findByRole('button', { name: '创作 Skill (1)' }))
+    fireEvent.click(await screen.findByRole('button', { name: '技能 (1)' }))
     fireEvent.click(screen.getByRole('button', { name: '取消发布' }))
 
     await screen.findByText('已保存')
     expect(marketPayload).toMatchObject({ published: false })
   })
 
-  it('在客户端搜索市场、查看详情并安装 Skill', async () => {
+  it('在客户端搜索市场、查看详情、下载文件并安装技能', async () => {
+    const nativeUrl = URL
+    const createObjectUrl = vi.fn(() => 'blob:skill-file')
+    const revokeObjectUrl = vi.fn()
+    class DownloadUrl extends nativeUrl {
+      static createObjectURL = createObjectUrl
+      static revokeObjectURL = revokeObjectUrl
+    }
+    vi.stubGlobal('URL', DownloadUrl)
+    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
     const marketSkill = {
       id: '01900000-0000-7000-8000-000000000021',
       title: '通用架构评审文档',
@@ -215,12 +226,12 @@ describe('创作 Skill 安装与使用', () => {
         structure_pattern: rawSkill.structure_pattern,
         writing_guidelines: rawSkill.writing_guidelines,
         section_headings: {
-          common_titles: '这类文档标题通常怎么命名',
-          title_style: '标题如何传递重点',
-          text_style: '正文怎样组织和表达',
-          diagram_style: '图示怎样服务于内容',
-          structure_pattern: '从开篇到结论的章节骨架',
-          writing_guidelines: '保持这份风格的关键约束',
+          common_titles: '标题设计风格',
+          title_style: '标题设计风格',
+          text_style: '行文设计思路',
+          diagram_style: '图片生成方式',
+          structure_pattern: '章节组织骨架',
+          writing_guidelines: '话术表达风格',
         },
         field_examples: {
           common_titles: ['通用架构评审方案'],
@@ -233,6 +244,7 @@ describe('创作 Skill 安装与使用', () => {
         example_document: '# 通用架构评审方案\n\n## 摘要\n\n本示例说明如何组织一次通用架构评审。\n\n## 背景与目标\n\n明确范围与约束。\n\n## 总体方案\n\n说明系统边界和关键取舍。\n\n## 风险与验证\n\n给出风险及验证方式。\n\n## 结论\n\n形成可复用的评审结论。',
       },
       author: { id: 'author-1', nickname: '面包师小麦' },
+      is_official: true,
       published: true,
       published_at: '2026-07-23T08:00:00Z',
       updated_at: '2026-07-23T08:00:00Z',
@@ -254,6 +266,16 @@ describe('创作 Skill 安装与使用', () => {
           updated_at: rawSkill.updated_at,
         }]
         return Response.json(localSkills[0], { status: 201 })
+      }
+      if (url.pathname === '/api/creation/skills/7' && init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body || '{}'))
+        localSkills = [{
+          id: 7,
+          ...body,
+          created_at: rawSkill.created_at,
+          updated_at: rawSkill.updated_at,
+        }]
+        return Response.json(localSkills[0])
       }
       if (url.pathname === '/v1/creation-skill-categories') {
         return Response.json({
@@ -285,12 +307,15 @@ describe('创作 Skill 安装与使用', () => {
 
     render(<CreationPanel />)
 
-    fireEvent.click(await screen.findByRole('button', { name: '创作 Skill' }))
-    fireEvent.click(screen.getByRole('tab', { name: 'Skill 市场' }))
+    fireEvent.click(await screen.findByRole('button', { name: '技能' }))
+    fireEvent.click(screen.getByRole('tab', { name: '技能市场' }))
     await screen.findByText('通用架构评审文档')
 
-    fireEvent.change(screen.getByLabelText('搜索市场 Skill'), { target: { value: '架构' } })
-    fireEvent.change(screen.getByLabelText('创作类目'), { target: { value: 'segment-1' } })
+    fireEvent.change(screen.getByLabelText('搜索市场技能'), { target: { value: '架构' } })
+    const categoryCombobox = screen.getByRole('combobox', { name: '技能类目' })
+    fireEvent.focus(categoryCombobox)
+    fireEvent.change(categoryCombobox, { target: { value: '互电零' } })
+    fireEvent.click(screen.getByRole('option', { name: /^电商零售/ }))
     fireEvent.click(screen.getByRole('button', { name: '搜索' }))
     await waitFor(() => {
       expect(marketQuery).toBe('架构')
@@ -301,7 +326,12 @@ describe('创作 Skill 安装与使用', () => {
     fireEvent.click(within(marketCard).getByRole('button', { name: '查看详情' }))
     const detail = await screen.findByRole('dialog', { name: '通用架构评审文档' })
     expect(within(detail).getByText('面包师小麦')).toBeInTheDocument()
-    fireEvent.click(within(detail).getByRole('button', { name: '安装 Skill' }))
+    expect(within(detail).getByTitle('SKILL.md')).toBeInTheDocument()
+    fireEvent.click(within(detail).getByRole('button', { name: '下载 SKILL.md' }))
+    expect(createObjectUrl).toHaveBeenCalledOnce()
+    expect(downloadClick).toHaveBeenCalledOnce()
+    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:skill-file')
+    fireEvent.click(within(detail).getByRole('button', { name: '安装技能' }))
 
     await waitFor(() => expect(localSkills[0]).toMatchObject({
       source_kind: 'market',
@@ -310,5 +340,41 @@ describe('创作 Skill 安装与使用', () => {
       published: false,
     }))
     expect(within(detail).getByText('已安装')).toBeInTheDocument()
+    fireEvent.click(within(detail).getByRole('button', { name: '卸载技能' }))
+    await waitFor(() => expect(localSkills[0]).toMatchObject({ installed: false }))
+  })
+
+  it('删除技能前要求二次确认', async () => {
+    let deleteCount = 0
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/creation/skills' && (!init?.method || init.method === 'GET')) {
+        return Response.json([rawSkill])
+      }
+      if (url.pathname === '/api/creation/skills/2' && init?.method === 'DELETE') {
+        deleteCount += 1
+        return new Response(null, { status: 204 })
+      }
+      if (url.pathname === '/api/creation/history') {
+        return Response.json({ items: [], total: 0, limit: 20, offset: 0 })
+      }
+      return new Response('{}', { status: 404 })
+    }))
+
+    render(<CreationPanel />)
+
+    fireEvent.click(await screen.findByRole('button', { name: '技能 (1)' }))
+    fireEvent.click(screen.getByRole('button', { name: '删除' }))
+    const firstDialog = screen.getByRole('alertdialog', { name: '确认删除技能？' })
+    expect(deleteCount).toBe(0)
+    fireEvent.click(within(firstDialog).getByRole('button', { name: '取消' }))
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '删除' }))
+    const secondDialog = screen.getByRole('alertdialog', { name: '确认删除技能？' })
+    fireEvent.click(within(secondDialog).getByRole('button', { name: '确认删除' }))
+
+    await waitFor(() => expect(deleteCount).toBe(1))
+    expect(await screen.findByText('还没有技能')).toBeInTheDocument()
   })
 })

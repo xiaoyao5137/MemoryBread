@@ -3,6 +3,10 @@ import { act, render, screen, waitFor } from '@testing-library/react'
 import App from '../App'
 import { useAppStore } from '../store/useAppStore'
 
+const initializationMocks = vi.hoisted(() => ({
+  fetchInitializationStatus: vi.fn(),
+}))
+
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn(async () => vi.fn()),
 }))
@@ -23,16 +27,43 @@ vi.mock('../components/RepositoryPanel', () => ({
   default: () => <section data-testid="repository-panel" />,
 }))
 
+vi.mock('../components/SystemFloatingAssist', () => ({
+  default: () => <section data-testid="floating-assist" />,
+}))
+
+vi.mock('../utils/initialization', async importOriginal => ({
+  ...(await importOriginal<typeof import('../utils/initialization')>()),
+  fetchInitializationStatus: initializationMocks.fetchInitializationStatus,
+}))
+
+const initializationStatus = (state: 'not_started' | 'completed') => ({
+  schema_version: 'initialization.v1',
+  mode: 'normal' as const,
+  state,
+  progress: state === 'completed' ? 100 : 0,
+  current_stage: state === 'completed' ? 'feature_smoke_tests' : 'preflight',
+  message: state === 'completed' ? '初始化完成' : '等待初始化',
+  stages: [],
+  quality_gate: { passed: state === 'completed', checks: [] },
+  smoke_tests: [],
+  can_retry: false,
+  can_report: false,
+  test_mode_enabled: false,
+})
+
 beforeEach(() => {
+  window.history.replaceState({}, '', '/')
   useAppStore.getState().reset()
   useAppStore.getState().setHasCompletedSetup(true)
   useAppStore.getState().clearAuthSession()
+  initializationMocks.fetchInitializationStatus.mockResolvedValue(initializationStatus('completed'))
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, json: async () => ({}) })))
 })
 
 describe('App auth entry', () => {
-  it('全新安装没有完成或跳过标记时显示首次配置引导', async () => {
+  it('全新安装没有新版质检完成标记时显示强制初始化门禁', async () => {
     useAppStore.setState({ hasCompletedSetup: false, setupSkipped: false })
+    initializationMocks.fetchInitializationStatus.mockResolvedValue(initializationStatus('not_started'))
 
     render(<App />)
     await act(async () => {
@@ -40,16 +71,52 @@ describe('App auth entry', () => {
       await Promise.resolve()
     })
 
-    expect(screen.getByText('欢迎使用记忆面包')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '开始配置' })).toBeInTheDocument()
+    expect(screen.getByText('烤面包')).toBeInTheDocument()
+    expect(screen.queryByText(/跳过/)).not.toBeInTheDocument()
   })
 
   it('未登录也直接进入主界面，并在侧栏显示未登录入口', async () => {
     render(<App />)
 
-    expect(screen.getByTestId('floating-buddy')).toBeInTheDocument()
+    expect(await screen.findByTestId('floating-buddy')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '未登录，打开登录' })).toBeInTheDocument()
     expect(screen.queryByTestId('auth-panel')).not.toBeInTheDocument()
+  })
+
+  it('旧消息页面状态会落到个人页消息 Tab', async () => {
+    const sessionUser = {
+      id: '018f0000-0000-7000-8000-000000000009',
+      username: '消息测试用户',
+      status: 'active',
+      roles: ['user'],
+      locale: 'zh-CN',
+      timezone: 'Asia/Shanghai',
+      created_at: new Date().toISOString(),
+    }
+    useAppStore.getState().setAuthSession({
+      access_token: 'mbs_message_token',
+      expires_at: new Date(Date.now() + 86400_000).toISOString(),
+      user: sessionUser,
+    })
+    useAppStore.getState().setWindowMode('messages')
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/v1/auth/me')) {
+        return { ok: true, json: async () => ({ data: sessionUser }) }
+      }
+      if (url.endsWith('/v1/console/summary')) {
+        return { ok: true, json: async () => ({ data: {} }) }
+      }
+      return { ok: false, status: 404, json: async () => ({}) }
+    }))
+
+    render(<App />)
+
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: '消息' })).toHaveAttribute('aria-selected', 'true')
+    })
+    expect(screen.queryByTestId('messages-btn')).not.toBeInTheDocument()
+    expect(screen.getByTestId('account-entry')).toHaveAttribute('aria-current', 'page')
   })
 
   it('已有登录会话启动后会自动同步工作投入与工作心情', async () => {
@@ -156,8 +223,9 @@ describe('App auth entry', () => {
     })
   })
 
-  it('打开具体 RAG 引用时才生成返回栈', () => {
+  it('打开具体 RAG 引用时才生成返回栈', async () => {
     render(<App />)
+    await screen.findByTestId('rag-panel')
 
     act(() => {
       window.dispatchEvent(new CustomEvent('view-rag-reference', {
@@ -169,9 +237,10 @@ describe('App auth entry', () => {
     expect(useAppStore.getState().bakeNavigationStack).toEqual([{ windowMode: 'rag' }])
   })
 
-  it('无具体目标的引用跳转会清除旧返回栈', () => {
+  it('无具体目标的引用跳转会清除旧返回栈', async () => {
     useAppStore.getState().pushBakeNavigationTarget({ windowMode: 'creation' })
     render(<App />)
+    await screen.findByTestId('rag-panel')
 
     act(() => {
       window.dispatchEvent(new CustomEvent('view-rag-reference', {
@@ -182,5 +251,19 @@ describe('App auth entry', () => {
     expect(screen.getByTestId('bake-panel')).toBeInTheDocument()
     expect(useAppStore.getState().bakeNavigationStack).toHaveLength(0)
     expect(useAppStore.getState().captureBackTarget).toBeNull()
+  })
+
+  it('悬浮助手窗口也必须通过实时初始化质检后才能显示', async () => {
+    window.history.replaceState({}, '', '/?view=floating-assist')
+    initializationMocks.fetchInitializationStatus.mockResolvedValue(initializationStatus('not_started'))
+
+    const first = render(<App />)
+    await waitFor(() => expect(initializationMocks.fetchInitializationStatus).toHaveBeenCalled())
+    expect(screen.queryByTestId('floating-assist')).not.toBeInTheDocument()
+    first.unmount()
+
+    initializationMocks.fetchInitializationStatus.mockResolvedValue(initializationStatus('completed'))
+    render(<App />)
+    expect(await screen.findByTestId('floating-assist')).toBeInTheDocument()
   })
 })

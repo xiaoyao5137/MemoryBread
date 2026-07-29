@@ -20,16 +20,16 @@ const CATEGORY_BAKE_SOP: &str = "bake_sop";
 const CATEGORY_BAKE_KNOWLEDGE: &str = "bake_knowledge";
 const UNIFIED_BAKE_PIPELINE_NAME: &str = "unified";
 const BAKE_GENERATION_VERSION: &str = "bake-v1";
-// sidecar HTTP 调用超时：必须 ≥ ai-sidecar 内 ollama 客户端超时（当前 1200s），
-// 否则会先在 core 这层断开但 sidecar 还在算，浪费一整次 LLM 推理。
-const BAKE_SIDECAR_TIMEOUT_SECS: u64 = 1200;
+// sidecar 对普通输入使用 180 秒、>=20K 长输入使用 300 秒运行时预算。
+// Core 多留 10 秒用于接收 504 和连接收尾，不能先断开后留下幽灵推理。
+const BAKE_SIDECAR_TIMEOUT_SECS: u64 = 310;
 /// 整个 bake run 的最大执行时间（含候选查询、LLM 提炼、数据库写入）。
 /// 超过此时间强制标记为 failed，防止因死锁或无限等待导致 run 永久挂起。
 const BAKE_RUN_MAX_TOTAL_SECS: u64 = 30 * 60;
-/// 单条 timeline 在 bake 流水线里允许的最大失败次数。
-/// 达到该值后，[`StorageManager::list_bake_memory_init_candidates_with_max_failures`]
-/// 会把它过滤掉，避免毒丸候选反复触发整轮失败。
-const MAX_BAKE_RETRY_FAILURES: i64 = 3;
+/// 烘焙候选失败即终态，不自动重试。
+///
+/// `bake_retry_state` 是历史表名；failure_count >= 1 现在表示永久失败。
+const MAX_BAKE_RETRY_FAILURES: i64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakePagedResponse<T> {
@@ -387,6 +387,7 @@ pub struct BakeMergeDocumentResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeKnowledgeArtifactPayload {
+    #[serde(default)]
     pub summary: String,
     pub overview: Option<String>,
     pub details: Option<String>,
@@ -409,7 +410,7 @@ pub struct BakeKnowledgeArtifactPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeDocumentArtifactPayload {
-    #[serde(rename = "name", alias = "title")]
+    #[serde(default, rename = "name", alias = "title")]
     pub title: String,
     #[serde(rename = "category", alias = "doc_type")]
     pub doc_type: Option<String>,
@@ -442,6 +443,7 @@ pub struct BakeDocumentArtifactPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeSopArtifactPayload {
+    #[serde(default)]
     pub summary: String,
     #[serde(default, deserialize_with = "deserialize_optional_string_mixed")]
     pub overview: Option<String>,
@@ -976,6 +978,16 @@ impl BakeService {
         self.update_memory_status(id, "ignored")
     }
 
+    pub fn delete_memory(&self, id: i64) -> Result<(), ApiError> {
+        if self.storage.get_episodic_memory(id)?.is_none() {
+            return Err(ApiError::NotFound(format!("memory {id} not found")));
+        }
+        if !self.storage.delete_episodic_memory(id)? {
+            return Err(ApiError::NotFound(format!("memory {id} not found")));
+        }
+        Ok(())
+    }
+
     fn update_bake_artifact_status(
         &self,
         id: i64,
@@ -1190,19 +1202,28 @@ impl BakeService {
         })?;
 
         let result = self
-            .execute_bake_pipeline(run_id, trigger_reason, started_at, limit, 3)
+            .execute_bake_pipeline(run_id, trigger_reason, started_at, limit, 1)
             .await;
         match result {
             Ok(payload) => Ok(payload),
             Err(err) => {
                 let completed_at = now_ms();
                 let latency_ms = completed_at.saturating_sub(started_at);
-                let _ = self.storage.fail_bake_run_preserving_progress(
-                    run_id,
-                    completed_at,
-                    &err.to_string(),
-                    Some(latency_ms),
-                );
+                if is_transient_bake_error(&err) {
+                    let _ = self.storage.defer_bake_run_preserving_progress(
+                        run_id,
+                        completed_at,
+                        &err.to_string(),
+                        Some(latency_ms),
+                    );
+                } else {
+                    let _ = self.storage.fail_bake_run_preserving_progress(
+                        run_id,
+                        completed_at,
+                        &err.to_string(),
+                        Some(latency_ms),
+                    );
+                }
                 Err(err)
             }
         }
@@ -1271,18 +1292,35 @@ impl BakeService {
                 Ok(Err(err)) => {
                     let completed_at = now_ms();
                     let latency_ms = completed_at.saturating_sub(started_at);
-                    let write_result = self.storage.fail_bake_run_preserving_progress(
-                        run_id,
-                        completed_at,
-                        &err.to_string(),
-                        Some(latency_ms),
-                    );
+                    let deferred = is_transient_bake_error(&err);
+                    let write_result = if deferred {
+                        self.storage.defer_bake_run_preserving_progress(
+                            run_id,
+                            completed_at,
+                            &err.to_string(),
+                            Some(latency_ms),
+                        )
+                    } else {
+                        self.storage.fail_bake_run_preserving_progress(
+                            run_id,
+                            completed_at,
+                            &err.to_string(),
+                            Some(latency_ms),
+                        )
+                    };
                     if let Err(write_err) = write_result {
                         tracing::error!(
-                            "bake run {} failed in background; status write also failed: err={} write_err={}",
+                            "bake run {} terminal status write failed: deferred={} err={} write_err={}",
                             run_id,
+                            deferred,
                             err,
                             write_err
+                        );
+                    } else if deferred {
+                        tracing::warn!(
+                            "bake run {} deferred after transient upstream interruption: {}",
+                            run_id,
+                            err
                         );
                     } else {
                         tracing::error!("bake run {} failed in background: {}", run_id, err);
@@ -1566,35 +1604,21 @@ impl BakeService {
             let extracted = match extract_result {
                 Ok(v) => v,
                 Err(err) => {
+                    // 前台推理抢占、限流和短暂网关故障只会延后本批。
+                    // 不写候选死信，也不推进 watermark，下一批从同一候选继续。
                     if is_transient_bake_error(&err) {
-                        tracing::warn!(
-                            "bake extract deferred without retry penalty: timeline_id={} err={}",
-                            candidate.timeline.id,
-                            err
-                        );
-                        // 502/503/504 与连接超时属于资源竞争或上游短暂不可用。
-                        // 保持 watermark 在当前候选之前，下轮继续处理，但不把它
-                        // 累计成内容“毒点”。
                         return Err(err);
                     }
                     let count = self
                         .storage
                         .bump_bake_retry_failure(candidate.timeline.id, &err.to_string())
                         .unwrap_or(0);
-                    tracing::warn!(
-                        "bake extract failed: timeline_id={} failure_count={} err={}",
-                        candidate.timeline.id,
-                        count,
-                        err
-                    );
-                    if count < MAX_BAKE_RETRY_FAILURES {
-                        // 保持 watermark 在失败候选之前；drop work_stream 会取消后续请求。
-                        return Err(err);
-                    }
                     tracing::error!(
-                        "bake poison candidate exhausted retries: timeline_id={} failure_count={}; advancing watermark",
+                        "bake extract permanently failed without retry: timeline_id={} failure_count={} timeout={} err={}",
                         candidate.timeline.id,
                         count,
+                        is_bake_candidate_timeout(&err),
+                        err
                     );
                     let next = max_processed_ts.max(candidate.timeline.updated_at_ms);
                     if next != max_processed_ts {
@@ -1602,16 +1626,16 @@ impl BakeService {
                         self.storage
                             .upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, next)?;
                     }
+                    discarded_count += 1;
+                    processed_episode_count += 1;
+                    let _ = self.storage.update_bake_run_progress(
+                        run_id,
+                        initial_candidate_count,
+                        processed_episode_count,
+                    );
                     continue;
                 }
             };
-            processed_episode_count += 1;
-            let _ = self.storage.update_bake_run_progress(
-                run_id,
-                initial_candidate_count,
-                processed_episode_count,
-            );
-
             let candidate_result = match self
                 .persist_extracted_candidate(
                     None,
@@ -1627,31 +1651,21 @@ impl BakeService {
             {
                 Ok(r) => r,
                 Err(err) => {
+                    // 文档合并同样会经过 sidecar，可能在持久化阶段被前台任务抢占。
+                    // 此时本地已落盘的部分产物保持幂等，候选留给下一批补齐。
                     if is_transient_bake_error(&err) {
-                        tracing::warn!(
-                            "bake persist deferred without retry penalty: timeline_id={} err={}",
-                            candidate.timeline.id,
-                            err
-                        );
                         return Err(err);
                     }
                     let count = self
                         .storage
                         .bump_bake_retry_failure(candidate.timeline.id, &err.to_string())
                         .unwrap_or(0);
-                    tracing::warn!(
-                        "bake persist failed: timeline_id={} failure_count={} err={}",
-                        candidate.timeline.id,
-                        count,
-                        err
-                    );
-                    if count < MAX_BAKE_RETRY_FAILURES {
-                        return Err(err);
-                    }
                     tracing::error!(
-                        "bake persist poison candidate exhausted retries: timeline_id={} failure_count={}; advancing watermark",
+                        "bake persist permanently failed without retry: timeline_id={} failure_count={} timeout={} err={}",
                         candidate.timeline.id,
                         count,
+                        is_bake_candidate_timeout(&err),
+                        err
                     );
                     let next = max_processed_ts.max(candidate.timeline.updated_at_ms);
                     if next != max_processed_ts {
@@ -1659,6 +1673,13 @@ impl BakeService {
                         self.storage
                             .upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, next)?;
                     }
+                    discarded_count += 1;
+                    processed_episode_count += 1;
+                    let _ = self.storage.update_bake_run_progress(
+                        run_id,
+                        initial_candidate_count,
+                        processed_episode_count,
+                    );
                     continue;
                 }
             };
@@ -1677,6 +1698,14 @@ impl BakeService {
                 self.storage
                     .upsert_bake_watermark(UNIFIED_BAKE_PIPELINE_NAME, next)?;
             }
+            // 只有产物和 watermark 都成功落盘后才计入实时进度。若中途被 P0
+            // 抢占，deferred run 展示的是可从断点继续的真实完成数。
+            processed_episode_count += 1;
+            let _ = self.storage.update_bake_run_progress(
+                run_id,
+                initial_candidate_count,
+                processed_episode_count,
+            );
         }
 
         let completed_at = now_ms();
@@ -1824,10 +1853,7 @@ impl BakeService {
                     "bake sidecar 返回 knowledge.accepted=true 但缺少 payload".to_string(),
                 )
             })?;
-            let payload: BakeKnowledgeArtifactPayload =
-                serde_json::from_value(payload).map_err(|err| {
-                    ApiError::Internal(format!("解析 bake knowledge payload 失败: {err}"))
-                })?;
+            let payload = parse_bake_knowledge_payload(payload, candidate)?;
             if let Some(memory_id) = memory_id {
                 self.update_memory_match_metadata(
                     memory_id,
@@ -1874,10 +1900,7 @@ impl BakeService {
                 "bake sidecar 返回 knowledge.accepted=true 但缺少 payload".to_string(),
             )
         })?;
-        let payload: BakeKnowledgeArtifactPayload =
-            serde_json::from_value(payload).map_err(|err| {
-                ApiError::Internal(format!("解析 bake knowledge payload 失败: {err}"))
-            })?;
+        let payload = parse_bake_knowledge_payload(payload, candidate)?;
         if let Some(memory_id) = memory_id {
             self.update_memory_match_metadata(
                 memory_id,
@@ -2095,8 +2118,7 @@ impl BakeService {
         let payload = extraction.payload.clone().ok_or_else(|| {
             ApiError::Internal("bake sidecar 返回 design.accepted=true 但缺少 payload".to_string())
         })?;
-        let payload: BakeDocumentArtifactPayload = serde_json::from_value(payload)
-            .map_err(|err| ApiError::Internal(format!("解析 bake design payload 失败: {err}")))?;
+        let payload = parse_bake_document_payload(payload, candidate)?;
         if let Some(memory_id) = memory_id {
             self.update_memory_match_metadata(
                 memory_id,
@@ -2167,8 +2189,15 @@ impl BakeService {
                 self.storage
                     .update_bake_document(existing_doc.id, &update)?;
             }
-            // 内容合并失败不阻断来源元数据补齐。
-            return Ok(());
+            // 来源元数据可以先补齐，但内容合并任务本身必须记录为永久失败，
+            // 不能把 504 或其他 sidecar 错误伪装成成功后再次入队。
+            let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let error = map_sidecar_error(status, body, "bake 文档合并服务");
+            return Err(ApiError::Upstream {
+                status: error.status,
+                code: error.code,
+                message: error.message,
+            });
         }
 
         let merged: BakeMergeDocumentResponse = response
@@ -2322,8 +2351,7 @@ impl BakeService {
         let payload = extraction.payload.clone().ok_or_else(|| {
             ApiError::Internal("bake sidecar 返回 sop.accepted=true 但缺少 payload".to_string())
         })?;
-        let payload: BakeSopArtifactPayload = serde_json::from_value(payload)
-            .map_err(|err| ApiError::Internal(format!("解析 bake sop payload 失败: {err}")))?;
+        let payload = parse_bake_sop_payload(payload, candidate)?;
         if let Some(memory_id) = memory_id {
             self.update_memory_match_metadata(
                 memory_id,
@@ -2683,10 +2711,62 @@ fn is_transient_bake_error(error: &ApiError) -> bool {
                 *status,
                 StatusCode::BAD_GATEWAY
                     | StatusCode::SERVICE_UNAVAILABLE
-                    | StatusCode::GATEWAY_TIMEOUT
                     | StatusCode::TOO_MANY_REQUESTS
             )
     )
+}
+
+fn is_bake_candidate_timeout(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::Upstream {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            ..
+        }
+    )
+}
+
+fn parse_bake_knowledge_payload(
+    value: Value,
+    candidate: &BakeMemorySourceRecord,
+) -> Result<BakeKnowledgeArtifactPayload, ApiError> {
+    let mut payload: BakeKnowledgeArtifactPayload = serde_json::from_value(value)
+        .map_err(|err| ApiError::Internal(format!("解析 bake knowledge payload 失败: {err}")))?;
+    if payload.summary.trim().is_empty() {
+        payload.summary = candidate.timeline.summary.clone();
+    }
+    Ok(payload)
+}
+
+fn parse_bake_document_payload(
+    value: Value,
+    candidate: &BakeMemorySourceRecord,
+) -> Result<BakeDocumentArtifactPayload, ApiError> {
+    let mut payload: BakeDocumentArtifactPayload = serde_json::from_value(value)
+        .map_err(|err| ApiError::Internal(format!("解析 bake design payload 失败: {err}")))?;
+    if payload.title.trim().is_empty() {
+        payload.title = candidate
+            .capture_webpage_title
+            .as_deref()
+            .or(candidate.capture_win_title.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(candidate.timeline.summary.as_str())
+            .to_string();
+    }
+    Ok(payload)
+}
+
+fn parse_bake_sop_payload(
+    value: Value,
+    candidate: &BakeMemorySourceRecord,
+) -> Result<BakeSopArtifactPayload, ApiError> {
+    let mut payload: BakeSopArtifactPayload = serde_json::from_value(value)
+        .map_err(|err| ApiError::Internal(format!("解析 bake sop payload 失败: {err}")))?;
+    if payload.summary.trim().is_empty() {
+        payload.summary = candidate.timeline.summary.clone();
+    }
+    Ok(payload)
 }
 
 fn document_merge_preserves_existing(existing: Option<&str>, merged: &str) -> bool {
@@ -2699,13 +2779,27 @@ fn map_sidecar_error(
     body_text: String,
     service_name: &str,
 ) -> BakeSidecarError {
-    let (mapped_status, code) = match status.as_u16() {
-        400 | 422 => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
-        502 => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
-        503 => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
-        504 => (StatusCode::GATEWAY_TIMEOUT, "GATEWAY_TIMEOUT"),
-        code if code >= 500 => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
-        _ => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+    let structured_code = serde_json::from_str::<Value>(&body_text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("code")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+    let (mapped_status, code) = match structured_code.as_deref() {
+        Some("BAKE_OUTPUT_TRUNCATED") => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "BAKE_OUTPUT_TRUNCATED")
+        }
+        Some("BAKE_OUTPUT_INVALID") => (StatusCode::UNPROCESSABLE_ENTITY, "BAKE_OUTPUT_INVALID"),
+        _ => match status.as_u16() {
+            400 | 422 => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+            502 => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            503 => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
+            504 => (StatusCode::GATEWAY_TIMEOUT, "GATEWAY_TIMEOUT"),
+            code if code >= 500 => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            _ => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+        },
     };
 
     let message = if body_text.trim().is_empty() {
@@ -4053,11 +4147,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_transient_upstream_errors_do_not_poison_bake_candidate() {
+    fn test_gateway_timeout_is_not_transient() {
         for status in [
             StatusCode::BAD_GATEWAY,
             StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::GATEWAY_TIMEOUT,
             StatusCode::TOO_MANY_REQUESTS,
         ] {
             assert!(is_transient_bake_error(&ApiError::Upstream {
@@ -4066,9 +4159,50 @@ mod tests {
                 message: "稍后重试".to_string(),
             }));
         }
+        assert!(!is_transient_bake_error(&ApiError::Upstream {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: "INFERENCE_TIMEOUT",
+            message: "任务已取消".to_string(),
+        }));
         assert!(!is_transient_bake_error(&ApiError::Internal(
             "永久 payload 错误".to_string(),
         )));
+        assert_eq!(MAX_BAKE_RETRY_FAILURES, 1);
+    }
+
+    #[test]
+    fn test_gateway_timeout_is_identified_as_terminal_candidate_timeout() {
+        assert!(is_bake_candidate_timeout(&ApiError::Upstream {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: "GATEWAY_TIMEOUT",
+            message: "bake 提炼超时".to_string(),
+        }));
+        assert!(!is_bake_candidate_timeout(&ApiError::Upstream {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "INFERENCE_PREEMPTED",
+            message: "在线任务抢占".to_string(),
+        }));
+    }
+
+    #[test]
+    fn test_structured_truncated_output_is_not_transient() {
+        let mapped = map_sidecar_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({
+                "code": "BAKE_OUTPUT_TRUNCATED",
+                "error": "bake bundle output invalid: truncated_json",
+                "retryable": false,
+            })
+            .to_string(),
+            "bake 提炼服务",
+        );
+        assert_eq!(mapped.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(mapped.code, "BAKE_OUTPUT_TRUNCATED");
+        assert!(!is_transient_bake_error(&ApiError::Upstream {
+            status: mapped.status,
+            code: mapped.code,
+            message: mapped.message,
+        }));
     }
 
     #[test]
@@ -4107,6 +4241,22 @@ mod tests {
         assert_eq!(document.sections[0].title, "背景");
         assert_eq!(document.sections[0].keywords, vec!["潮汐特性".to_string()]);
         assert_eq!(document.sections[0].notes.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_bake_payload_identity_falls_back_to_candidate() {
+        let service = make_service();
+        let capture_id = seed_capture(&service, 1_710_000_000_000, "Google Chrome", "候选文档标题");
+        let timeline_id = seed_knowledge(&service, "文档", capture_id, 4, 1);
+        let candidate = make_candidate(&service, timeline_id);
+
+        let knowledge = parse_bake_knowledge_payload(json!({}), &candidate).unwrap();
+        let document = parse_bake_document_payload(json!({}), &candidate).unwrap();
+        let sop = parse_bake_sop_payload(json!({}), &candidate).unwrap();
+
+        assert_eq!(knowledge.summary, candidate.timeline.summary);
+        assert_eq!(document.title, "知识来源");
+        assert_eq!(sop.summary, candidate.timeline.summary);
     }
 
     #[test]

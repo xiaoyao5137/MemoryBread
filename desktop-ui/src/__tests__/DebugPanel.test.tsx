@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import DebugPanel from '../components/DebugPanel'
 import { useAppStore } from '../store/useAppStore'
 
@@ -73,6 +73,27 @@ beforeEach(() => {
         json: async () => ({ cleared: 3 }),
       }
     }
+    if (input.includes('/api/initialization/test-mode') && init?.method === 'POST') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: 'ok',
+          initialization: {
+            schema_version: 'initialization.v1',
+            mode: 'sandbox',
+            state: 'not_started',
+            progress: 0,
+            stages: [],
+            quality_gate: { passed: false, checks: [] },
+            smoke_tests: [],
+            can_retry: false,
+            can_report: false,
+            test_mode_enabled: true,
+          },
+        }),
+      }
+    }
     throw new Error(`unexpected fetch: ${input}`)
   }))
 })
@@ -116,5 +137,26 @@ describe('DebugPanel', () => {
     expect(await screen.findByText(/当前日志文件尚未生成/)).toBeInTheDocument()
     expect(screen.queryByText(/core log line 1/)).not.toBeInTheDocument()
     expect(mockFetchDebugLogContent).toHaveBeenCalledTimes(1)
+  })
+
+  it('二次确认后开启隔离初始化测试模式并重新启用门禁', async () => {
+    useAppStore.getState().setHasCompletedSetup(true)
+    render(<DebugPanel />)
+
+    fireEvent.click(screen.getByRole('button', { name: '开启初始化测试模式' }))
+
+    expect(screen.getByRole('dialog', { name: '确认开启初始化测试模式' })).toBeInTheDocument()
+    expect(fetch).not.toHaveBeenCalledWith(
+      'http://127.0.0.1:7071/api/initialization/test-mode',
+      expect.objectContaining({ method: 'POST' }),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '确认开启' }))
+
+    await waitFor(() => expect(useAppStore.getState().hasCompletedSetup).toBe(false))
+    expect(fetch).toHaveBeenCalledWith(
+      'http://127.0.0.1:7071/api/initialization/test-mode',
+      expect.objectContaining({ method: 'POST' }),
+    )
   })
 })

@@ -23,6 +23,7 @@ use tauri::{
 };
 #[cfg(not(feature = "app-store"))]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_shell::ShellExt;
 
 #[cfg(target_os = "macos")]
 use objc2::{
@@ -31,14 +32,13 @@ use objc2::{
     msg_send,
     rc::Retained,
     runtime::AnyObject,
-    AllocAnyThread, DeclaredClass, MainThreadMarker, MainThreadOnly,
+    AllocAnyThread, DeclaredClass, MainThreadMarker,
 };
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
-    NSApplication, NSEvent, NSImageView, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWorkspace,
+    NSEvent, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWorkspace,
 };
-use tauri_plugin_shell::ShellExt;
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
 #[cfg(debug_assertions)]
@@ -54,8 +54,6 @@ const FLOATING_ASSIST_DEFAULT_SIZE: i32 = 82;
 const FLOATING_ASSIST_TEMP_KEEP_SECS: u64 = 24 * 60 * 60;
 const FLOATING_ASSIST_TEMP_CLEANUP_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 const TRAY_TEMPLATE_ICON_SIZE: u32 = 64;
-#[cfg(target_os = "macos")]
-const DOCK_ICON_SCALE: f64 = 0.84;
 
 #[cfg(target_os = "macos")]
 static FLOATING_ASSIST_HOVER_OWNER_KEY: u8 = 0;
@@ -193,6 +191,14 @@ struct TrayMenuState {
     autostart: CheckMenuItem<tauri::Wry>,
 }
 
+#[derive(Serialize)]
+struct AppMetadata {
+    product_name: String,
+    version: String,
+    platform: String,
+    architecture: String,
+}
+
 struct BundledBackendProcess {
     name: &'static str,
     child: Child,
@@ -276,36 +282,6 @@ trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
 #[cfg(target_os = "macos")]
-fn configure_macos_dock_icon() {
-    let Some(main_thread_marker) = MainThreadMarker::new() else {
-        eprintln!("无法在主线程配置 macOS Dock 图标");
-        return;
-    };
-    let application = NSApplication::sharedApplication(main_thread_marker);
-    let Some(application_icon) = application.applicationIconImage() else {
-        eprintln!("无法读取 macOS 应用图标");
-        return;
-    };
-    let dock_tile = application.dockTile();
-    let tile_size = dock_tile.size();
-
-    let container = NSView::initWithFrame(NSView::alloc(main_thread_marker), Default::default());
-    container.setFrameSize(tile_size);
-
-    let icon_view = NSImageView::imageViewWithImage(&application_icon, main_thread_marker);
-    let mut icon_frame = icon_view.frame();
-    icon_frame.size.width = tile_size.width * DOCK_ICON_SCALE;
-    icon_frame.size.height = tile_size.height * DOCK_ICON_SCALE;
-    icon_frame.origin.x = (tile_size.width - icon_frame.size.width) / 2.0;
-    icon_frame.origin.y = (tile_size.height - icon_frame.size.height) / 2.0;
-    icon_view.setFrame(icon_frame);
-
-    container.addSubview(&icon_view);
-    dock_tile.setContentView(Some(&container));
-    dock_tile.display();
-}
-
-#[cfg(target_os = "macos")]
 fn set_main_window_background_mode(app: &AppHandle, enabled: bool) {
     let policy = if enabled {
         tauri::ActivationPolicy::Accessory
@@ -314,11 +290,6 @@ fn set_main_window_background_mode(app: &AppHandle, enabled: bool) {
     };
     if let Err(error) = app.set_activation_policy(policy) {
         eprintln!("更新 macOS 应用显示模式失败: {error}");
-    }
-    if !enabled {
-        if let Err(error) = app.run_on_main_thread(configure_macos_dock_icon) {
-            eprintln!("配置 macOS Dock 图标失败: {error}");
-        }
     }
 }
 
@@ -1181,6 +1152,28 @@ fn set_capture_menu_state(app: AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_app_metadata(app: AppHandle) -> AppMetadata {
+    AppMetadata {
+        product_name: "记忆面包".to_string(),
+        version: app.package_info().version.to_string(),
+        platform: std::env::consts::OS.to_string(),
+        architecture: std::env::consts::ARCH.to_string(),
+    }
+}
+
+#[tauri::command]
+#[allow(deprecated)]
+fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !url.starts_with("https://") || url.len() > 2_000 || url.chars().any(char::is_whitespace) {
+        return Err("只能打开有效的 HTTPS 下载地址".to_string());
+    }
+    app.shell()
+        .open(url.to_string(), None)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn set_floating_assist_menu_state(app: AppHandle, enabled: bool) -> Result<(), String> {
     let menu_state = app.state::<TrayMenuState>();
     menu_state
@@ -1427,6 +1420,8 @@ pub fn run() {
         .manage(FloatingAssistWindowState::default())
         .manage(PendingFloatingAssistActionState::default())
         .invoke_handler(tauri::generate_handler![
+            get_app_metadata,
+            open_external_url,
             set_capture_menu_state,
             set_floating_assist_menu_state,
             set_floating_assist_auto_task_menu_state,
@@ -1481,6 +1476,7 @@ pub fn run() {
                 None::<&str>,
             )?;
             let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
+            let about = MenuItem::with_id(app, "about", "关于记忆面包", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let menu = Menu::with_items(
@@ -1492,6 +1488,7 @@ pub fn run() {
                     &floating_assist_auto_task,
                     &autostart,
                     &settings,
+                    &about,
                     &separator,
                     &quit,
                 ],
@@ -1561,6 +1558,10 @@ pub fn run() {
                     "settings" => {
                         show_main_window(app);
                         let _ = app.emit("tray-navigate-settings", ());
+                    }
+                    "about" => {
+                        show_main_window(app);
+                        let _ = app.emit("tray-navigate-about", ());
                     }
                     "quit" => {
                         QUITTING.store(true, Ordering::SeqCst);

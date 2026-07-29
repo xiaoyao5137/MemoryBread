@@ -234,6 +234,10 @@ mod tests {
             "../../../../shared/db-schema/migrations/009_privacy_settings.sql"
         ))
         .unwrap();
+        conn.execute_batch(include_str!(
+            "../../../../shared/db-schema/migrations/059_seed_other_privacy_filter.sql"
+        ))
+        .unwrap();
 
         conn
     }
@@ -280,16 +284,25 @@ mod tests {
 
         // 测试预置数据
         let filters = list_privacy_filters(&conn).unwrap();
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 4);
+        let other_filter = filters
+            .iter()
+            .find(|filter| filter.filter_type == "other")
+            .unwrap();
+        assert_eq!(other_filter.filter_name, "其它敏感信息过滤");
+        assert!(other_filter
+            .config_json
+            .as_deref()
+            .is_some_and(|config| config.contains("色情信息")));
 
         // 测试获取启用的过滤规则
         let enabled = get_enabled_privacy_filters(&conn).unwrap();
-        assert_eq!(enabled.len(), 3);
+        assert_eq!(enabled.len(), 4);
 
         // 测试更新启用状态
         update_privacy_filter_enabled(&conn, "chat", false).unwrap();
         let enabled = get_enabled_privacy_filters(&conn).unwrap();
-        assert_eq!(enabled.len(), 2);
+        assert_eq!(enabled.len(), 3);
 
         // 测试更新配置
         let new_config = r#"{"test": "value"}"#;

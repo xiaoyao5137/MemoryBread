@@ -90,17 +90,19 @@ pub struct CaptureActivityAggregate {
     pub app_name: String,
     pub duration_ms: i64,
     pub capture_count: i64,
+    pub active_period_count: i64,
     pub first_ts: i64,
     pub last_ts: i64,
 }
 
-/// 工作画像内部用于心情推断的用户 IM 输入。
+/// 工作画像内部用于心情推断的企业 IM 采集文本。
 ///
-/// 该结构只在本地聚合流程中使用，API 不返回原始输入文本。
+/// 文本来自已经过采集隐私门禁和内容脱敏的现有记录；该结构只在本地聚合流程中使用，
+/// API 不返回原始文本。
 #[derive(Debug, Clone)]
-pub struct WorkImExpression {
+pub struct WorkImCaptureSample {
     pub app_name: String,
-    pub input_text: String,
+    pub text: String,
 }
 
 impl CaptureRecord {

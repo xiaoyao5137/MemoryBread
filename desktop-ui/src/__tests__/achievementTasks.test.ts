@@ -128,7 +128,8 @@ describe('achievement task sync', () => {
       now: new Date(2026, 6, 21, 12),
     })
 
-    expect(claimed.map((badge) => badge.name)).toEqual(['通宵赶稿', '憋尿达人'])
+    expect(claimed.map(({ badge }) => badge.name)).toEqual(['通宵赶稿', '憋尿达人'])
+    expect(claimed.map(({ badge_quantity: quantity }) => quantity)).toEqual([1, 1])
     expect(achievementsChanged).toHaveBeenCalledTimes(1)
     window.removeEventListener(ACHIEVEMENTS_CHANGED_KEY, achievementsChanged)
     const workProfileCall = fetchMock.mock.calls.find(([input]) => String(input).includes('/api/work-profile'))
@@ -143,6 +144,120 @@ describe('achievement task sync', () => {
       period_key: '2026-W30',
       observed_value: '241',
     })
+  })
+
+  it('uses a fresh idempotency key on later checks so a replay is not celebrated again', async () => {
+    let claimedIdempotencyKey: string | null = null
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/v1/tasks')) {
+        return jsonResponse({ data: [
+          task('session', 'weekly_uninterrupted_four_hours', 'longest_work_session_minutes', '240'),
+        ] })
+      }
+      if (url.includes('/api/work-profile')) return jsonResponse(workProfile())
+      if (url.includes('/claims')) {
+        const { idempotency_key: idempotencyKey } = JSON.parse(String(init?.body)) as {
+          idempotency_key: string
+        }
+        if (claimedIdempotencyKey === null) {
+          claimedIdempotencyKey = idempotencyKey
+        } else if (idempotencyKey !== claimedIdempotencyKey) {
+          return jsonResponse({
+            error: {
+              code: 'TASK_ALREADY_CLAIMED',
+              message: 'task was already claimed for this period',
+            },
+          }, 409)
+        }
+        return jsonResponse({ data: {
+          task_id: 'session',
+          period_key: '2026-W30',
+          observed_value: '241',
+          badge: {
+            id: 'session-badge',
+            badge_key: 'uninterrupted_four_hours',
+            name: '憋尿达人',
+            tagline: '',
+            description: '',
+            icon_key: 'focus',
+            palette_key: 'honey',
+            rarity: 'common',
+          },
+          badge_quantity: 1,
+          total_badge_quantity: 1,
+          credit_granted: '40.0000',
+        } })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const options = {
+      adminApiBaseUrl: 'http://127.0.0.1:8080',
+      apiBaseUrl: 'http://127.0.0.1:7070',
+      authToken: 'mbs_token',
+      now: new Date(2026, 6, 21, 12),
+    }
+
+    await expect(syncEligibleAchievementTasks(options)).resolves.toHaveLength(1)
+    await expect(syncEligibleAchievementTasks(options)).resolves.toEqual([])
+
+    const claimBodies = fetchMock.mock.calls
+      .filter(([input]) => String(input).includes('/claims'))
+      .map(([, init]) => JSON.parse(String(init?.body)) as { idempotency_key: string })
+    expect(claimBodies).toHaveLength(2)
+    expect(claimBodies[1].idempotency_key).not.toBe(claimBodies[0].idempotency_key)
+  })
+
+  it('combines multiple rewards for the same card and keeps the cumulative quantity', async () => {
+    let claimCount = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/v1/tasks')) {
+        return jsonResponse({ data: [
+          task('session-a', 'weekly_session_a', 'longest_work_session_minutes', '240'),
+          task('session-b', 'weekly_session_b', 'longest_work_session_minutes', '240'),
+        ] })
+      }
+      if (url.includes('/api/work-profile')) return jsonResponse(workProfile())
+      if (url.includes('/claims')) {
+        claimCount += 1
+        return jsonResponse({ data: {
+          task_id: claimCount === 1 ? 'session-a' : 'session-b',
+          period_key: '2026-W30',
+          observed_value: '241',
+          badge: {
+            id: 'session-badge',
+            badge_key: 'uninterrupted_four_hours',
+            name: '憋尿达人',
+            tagline: '',
+            description: '',
+            icon_key: 'focus',
+            palette_key: 'honey',
+            rarity: 'common',
+          },
+          badge_quantity: claimCount === 1 ? 2 : 3,
+          total_badge_quantity: claimCount === 1 ? 4 : 7,
+          credit_granted: '40.0000',
+        } })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(syncEligibleAchievementTasks({
+      adminApiBaseUrl: 'http://127.0.0.1:8080',
+      apiBaseUrl: 'http://127.0.0.1:7070',
+      authToken: 'mbs_token',
+      now: new Date(2026, 6, 21, 12),
+    })).resolves.toEqual([{
+      badge: expect.objectContaining({
+        badge_key: 'uninterrupted_four_hours',
+        name: '憋尿达人',
+      }),
+      badge_quantity: 5,
+      total_badge_quantity: 7,
+    }])
   })
 
   it('keeps compatibility with a core process that has no achievement metrics', async () => {

@@ -1,5 +1,7 @@
 /// <reference types="vite/client" />
 
+declare const __APP_VERSION__: string
+
 interface ImportMetaEnv {
   readonly VITE_MEMORYBREAD_DEBUG_MODE?: string
   readonly VITE_MEMORYBREAD_PRODUCTION_ADMIN_API_BASE_URL?: string

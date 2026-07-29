@@ -1,6 +1,6 @@
 import React, { useState } from 'react'
 import type { BakeKnowledgeItem } from '../../types'
-import { BakeButton, BakeCard, BakeMarkdown, BakePill, BakeSectionHeader } from './BakeShared'
+import { BakeButton, BakeCard, BakeMarkdown, BakeSectionHeader } from './BakeShared'
 
 const formatCreatedTime = (item: Pick<BakeKnowledgeItem, 'createdAt' | 'createdAtMs'>) => {
   if (item.createdAtMs > 0) {
@@ -117,7 +117,6 @@ const BakeKnowledgeTab: React.FC<{
       <BakeCard>
         <BakeSectionHeader
           title="知识"
-          subtitle="浏览已提炼的知识条目，并追溯其来源采集记录"
           right={onCreateKnowledge && <BakeButton primary onClick={() => setShowCreateDialog(true)}>新建知识</BakeButton>}
         />
         <form
@@ -169,12 +168,6 @@ const BakeKnowledgeTab: React.FC<{
             </div>
           </div>
         </form>
-        {focusId && (
-          <div className="bake-filter-summary">
-            <BakePill text={`仅看知识 #${focusId}`} />
-            <BakeButton compact onClick={onClearFilters}>查看全部</BakeButton>
-          </div>
-        )}
       </BakeCard>
       <div className="bake-split-list-detail bake-split-list-detail--knowledge">
         <BakeCard className="bake-knowledge-list-card">
@@ -291,7 +284,7 @@ const BakeKnowledgeTab: React.FC<{
             </div>
             <div className="bake-actions--primary">
               <BakeButton onClick={() => onViewSourceTimeline(selected.sourceTimelineId || selected.id)}>关联时间线</BakeButton>
-              <BakeButton onClick={() => onDeleteKnowledge(selected.id)}>删除知识</BakeButton>
+              <BakeButton danger onClick={() => onDeleteKnowledge(selected.id)}>删除知识</BakeButton>
             </div>
             <div className="bake-related-summary">
               <div className="bake-related-row">

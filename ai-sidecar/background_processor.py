@@ -34,6 +34,7 @@ _INFERENCE_QUEUE_STATUS_ENDPOINT = "/api/inference/queue-status"
 _CHARGING_CATCHUP_MAX_BATCH_SIZE = 100
 _CHARGING_CATCHUP_SLEEP_SECS = 1
 _SUBSTANTIVE_DOCUMENT_MIN_CHARS = 200
+_BAKE_DEFERRED_RETRY_BACKOFF_MS = 2 * 60 * 1000
 
 # 全局 embedding 信号量，限制并发数
 _embedding_semaphore = asyncio.Semaphore(2)
@@ -1900,7 +1901,9 @@ class BackgroundProcessor:
                     LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
                     WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
                       AND t.is_self_generated = 0
-                      AND COALESCE(r.failure_count, 0) < 3
+                      -- 与 Core 的“一次终态失败即跳过”口径一致，避免只剩死信时
+                      -- sidecar 仍每 30 秒触发一个实际无候选的空批次。
+                      AND COALESCE(r.failure_count, 0) < 1
                       AND (
                           t.importance >= 4
                           OR t.user_verified = 1
@@ -1958,6 +1961,28 @@ class BackgroundProcessor:
             logger.warning("检查 pending bake timelines 失败: %s", e)
             return False
 
+    def _deferred_bake_backoff_remaining_ms(self) -> int:
+        """最近一批因瞬态错误延后时，限制同一队首候选的立即重放。"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT status, completed_at
+                    FROM bake_runs
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError):
+            return 0
+        if not row or row[0] != 'deferred' or row[1] is None:
+            return 0
+        elapsed_ms = max(0, int(time.time() * 1000) - int(row[1]))
+        return max(0, _BAKE_DEFERRED_RETRY_BACKOFF_MS - elapsed_ms)
+
     async def _maybe_trigger_periodic_bake(
         self,
         *,
@@ -1967,6 +1992,15 @@ class BackgroundProcessor:
         """周期性主动触发 bake，处理因没有新 capture 而积压的 pending timeline。"""
         if not self._has_pending_bake_timelines():
             return {"triggered": False, "reason": "no_pending_bake_timeline"}
+        retry_after_ms = await asyncio.to_thread(
+            self._deferred_bake_backoff_remaining_ms
+        )
+        if retry_after_ms > 0:
+            return {
+                "triggered": False,
+                "reason": "deferred_backoff",
+                "retry_after_ms": retry_after_ms,
+            }
         logger.info("🔁 检测到积压的 pending timeline，主动触发 bake pipeline")
         result = await self._trigger_unified_bake_pipeline(
             processed_count=limit,

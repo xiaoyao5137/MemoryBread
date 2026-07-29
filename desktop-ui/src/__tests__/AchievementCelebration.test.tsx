@@ -19,7 +19,11 @@ describe('AchievementCelebration', () => {
     const onViewCards = vi.fn()
     render(
       <AchievementCelebration
-        badges={[overnightBadge]}
+        awards={[{
+          badge: overnightBadge,
+          badge_quantity: 1,
+          total_badge_quantity: 1,
+        }]}
         onDismiss={onDismiss}
         onViewCards={onViewCards}
       />,
@@ -40,7 +44,11 @@ describe('AchievementCelebration', () => {
     const onViewCards = vi.fn()
     render(
       <AchievementCelebration
-        badges={[overnightBadge]}
+        awards={[{
+          badge: overnightBadge,
+          badge_quantity: 1,
+          total_badge_quantity: 1,
+        }]}
         onDismiss={onDismiss}
         onViewCards={onViewCards}
       />,
@@ -49,5 +57,24 @@ describe('AchievementCelebration', () => {
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(onDismiss).toHaveBeenCalledTimes(1)
     expect(onViewCards).not.toHaveBeenCalled()
+  })
+
+  it('shows one dialog with the earned and cumulative quantities', () => {
+    render(
+      <AchievementCelebration
+        awards={[{
+          badge: overnightBadge,
+          badge_quantity: 3,
+          total_badge_quantity: 7,
+        }]}
+        onDismiss={vi.fn()}
+        onViewCards={vi.fn()}
+      />,
+    )
+
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
+    expect(screen.getByText('获得 3 张新卡片')).toBeInTheDocument()
+    expect(screen.getByText('本次 +3 · 累计 ×7')).toBeInTheDocument()
+    expect(screen.getByText(/「通宵赶稿」 ×3/)).toBeInTheDocument()
   })
 })

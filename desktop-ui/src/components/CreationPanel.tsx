@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { AtSign, CloudOff, CloudUpload, Copy, ExternalLink, Eye, FileText, Image, Library, Loader2, PackageCheck, PackagePlus, Paperclip, Pencil, Search, Sparkles, Square, Store, Trash2, X } from 'lucide-react'
+import { AtSign, Bot, Check, ChevronDown, ChevronRight, CloudOff, CloudUpload, Copy, ExternalLink, Eye, FileText, Image, Library, Loader2, MessageSquarePlus, PackageCheck, PackagePlus, Paperclip, Pencil, Search, Send, Sparkles, Square, Store, Trash2, Upload, Wrench, X } from 'lucide-react'
 import { serviceEnvironmentHeaders, useAppStore } from '../store/useAppStore'
-import type { CreationReferenceItem, CreationReferencePreview } from '../store/useAppStore'
+import type { CreationAgentEvent, CreationChatMessage, CreationReferenceItem, CreationReferencePreview } from '../store/useAppStore'
 import { fetchWithLocalhostFallback } from '../hooks/useApi'
+import { getUserDisplayName } from '../utils/accountDisplay'
 import { fetchBillingBalance } from '../utils/authApi'
 import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
@@ -14,10 +15,12 @@ import {
   creationSkillCategoryOptions,
   deleteLocalCreationSkill,
   fetchCreationSkillCategories,
+  importCodexSkillPackage,
   listLocalCreationSkills,
   marketCreationSkillToLocalInput,
   matchCreationSkills,
   publishCreationSkill,
+  resolveCreationSkillDependencies,
   saveLocalCreationSkill,
   searchCreationSkillMarket,
   type CreationSkillMarketItem,
@@ -27,12 +30,23 @@ import {
 import { OFFLINE_CREATION_SKILL_CATEGORIES } from '../data/creationSkillCategories'
 import ModelSelect from './ModelSelect'
 import CreationSkillEditor from './CreationSkillEditor'
+import CreationSkillCategoryCombobox from './CreationSkillCategoryCombobox'
 import CreationSkillDetail, {
   localSkillDetail,
   marketSkillDetail,
   type CreationSkillDetailData,
 } from './CreationSkillDetail'
+import CreationToolsPanel from './CreationToolsPanel'
 import { HistoryPagination, HistorySearch } from './HistoryBrowserControls'
+import {
+  enabledCreationToolIds,
+  loadCreationTools,
+  saveCreationTools,
+  setCreationToolEnabled,
+  setCreationToolInstalled,
+  type CreationToolId,
+} from '../utils/creationTools'
+import './CreationPanel.css'
 
 interface CreationPanelProps {
   className?: string
@@ -49,19 +63,189 @@ interface CreationHistoryItem {
   docType: string
   audience: string
   references: CreationReferenceItem[]
+  sessionId?: string | null
+  rootRequest: string
+  conversation: CreationChatMessage[]
+  agentEvents: CreationAgentEvent[]
+  revisionNo: number
+  editOperation: string
+  documentPatch: Record<string, unknown> | null
   model?: string | null
   latencyMs?: number | null
 }
 type MarkdownBlock =
-  | { type: 'markdown'; content: string }
-  | { type: 'table'; headers: string[]; alignments: Array<'left' | 'center' | 'right'>; rows: string[][] }
+  | { type: 'markdown'; content: string; startLine: number; endLine: number }
+  | { type: 'table'; headers: string[]; alignments: Array<'left' | 'center' | 'right'>; rows: string[][]; startLine: number; endLine: number }
+interface DocumentChange {
+  changeType: 'added' | 'modified' | 'deleted'
+  sectionTitle: string
+  startLine: number | null
+  endLine: number | null
+  summary: string
+}
+interface AgentPhaseResult {
+  events: CreationAgentEvent[]
+  continuation: Record<string, unknown> | null
+  modelMessages: Array<{ role: string; content: string }> | null
+  completed: boolean
+  pausedForConfirmation: boolean
+  document: string
+  sessionId: string | null
+  runId: string | null
+}
 
 const defaultPrompt = '请生成一份“数据治理平台建设方案”，参考历史项目方案、知识库和操作手册，风格正式，包含总体架构、功能设计、实施计划和后续核验清单。'
 const HISTORY_PAGE_SIZE = 20
 const SKILL_MARKET_PAGE_SIZE = 18
+const MAX_CONVERSATION_MESSAGES = 60
+const createCreationSessionId = () =>
+  `creation-${Date.now()}-${Math.random().toString(16).slice(2)}`
 
 const sanitizeGeneratedContent = (content: string) =>
   content.replace(/<a\s+(?:id|name)=["'][^"']+["']\s*>\s*<\/a>/gi, '')
+
+const retainConversationContext = (messages: CreationChatMessage[]) => {
+  if (messages.length <= MAX_CONVERSATION_MESSAGES) return messages
+  return [...messages.slice(0, 4), ...messages.slice(-(MAX_CONVERSATION_MESSAGES - 4))]
+}
+
+type CreationTimelineItem =
+  | { kind: 'message'; key: string; message: CreationChatMessage }
+  | { kind: 'trace'; key: string; events: CreationAgentEvent[] }
+
+const groupAgentEventsByRun = (events: CreationAgentEvent[]) => {
+  const groups: Array<{ runId: string; events: CreationAgentEvent[] }> = []
+  const groupByRunId = new Map<string, { runId: string; events: CreationAgentEvent[] }>()
+
+  events.forEach((event) => {
+    const runId = event.run_id || 'current'
+    const existing = groupByRunId.get(runId)
+    if (existing) {
+      existing.events.push(event)
+      return
+    }
+    const group = { runId, events: [event] }
+    groupByRunId.set(runId, group)
+    groups.push(group)
+  })
+
+  return groups
+}
+
+const collapseAgentLifecycleEvents = (events: CreationAgentEvent[]) => {
+  const startTypeForTerminal: Record<string, string> = {
+    'agent.completed': 'agent.started',
+    'tool.completed': 'tool.started',
+    'tool.failed': 'tool.started',
+    'skill.completed': 'skill.started',
+  }
+  const visible: CreationAgentEvent[] = []
+
+  events.forEach((event) => {
+    const startType = startTypeForTerminal[event.type]
+    if (startType) {
+      let startIndex = -1
+      for (let index = visible.length - 1; index >= 0; index -= 1) {
+        const candidate = visible[index]
+        if (
+          candidate.type === startType
+          && candidate.run_id === event.run_id
+          && candidate.actor?.id === event.actor?.id
+        ) {
+          startIndex = index
+          break
+        }
+      }
+      if (startIndex >= 0) visible.splice(startIndex, 1)
+    }
+    visible.push(event)
+  })
+
+  return visible
+}
+
+const groupConsecutiveAgentEvents = (events: CreationAgentEvent[]) => {
+  const groups: Array<{ key: string; events: CreationAgentEvent[] }> = []
+
+  events.forEach((event) => {
+    const previous = groups[groups.length - 1]
+    const previousEvent = previous?.events[previous.events.length - 1]
+    const sameAgent = (
+      event.actor?.kind === 'agent'
+      && previousEvent?.actor?.kind === 'agent'
+      && event.actor?.id === previousEvent.actor?.id
+    )
+
+    if (sameAgent) {
+      previous.events.push(event)
+      return
+    }
+
+    groups.push({
+      key: event.event_id || `${event.run_id}-${event.sequence}`,
+      events: [event],
+    })
+  })
+
+  return groups
+}
+
+const buildCreationTimeline = (
+  conversation: CreationChatMessage[],
+  events: CreationAgentEvent[],
+): CreationTimelineItem[] => {
+  const runs = groupAgentEventsByRun(events)
+  const runsById = new Map(runs.map(run => [run.runId, run]))
+  const claimedRunIds = new Set<string>()
+  const timeline: CreationTimelineItem[] = []
+
+  const claimRun = (runId: string | undefined, claimed: typeof runs) => {
+    if (!runId || claimedRunIds.has(runId)) return
+    const run = runsById.get(runId)
+    if (!run) return
+    claimedRunIds.add(runId)
+    claimed.push(run)
+  }
+
+  conversation.forEach((message, messageIndex) => {
+    timeline.push({ kind: 'message', key: `message-${message.id}`, message })
+    if (message.role !== 'user') return
+
+    const instructionRuns: typeof runs = []
+    ;(message.runIds || []).forEach(runId => claimRun(runId, instructionRuns))
+    claimRun(message.runId, instructionRuns)
+
+    for (let index = messageIndex + 1; index < conversation.length; index += 1) {
+      const nextMessage = conversation[index]
+      if (nextMessage.role === 'user') break
+      claimRun(nextMessage.runId, instructionRuns)
+    }
+
+    if (!instructionRuns.length) {
+      const nextUnclaimedRun = runs.find(run => !claimedRunIds.has(run.runId))
+      claimRun(nextUnclaimedRun?.runId, instructionRuns)
+    }
+
+    if (instructionRuns.length) {
+      timeline.push({
+        kind: 'trace',
+        key: `instruction-trace-${message.id}`,
+        events: instructionRuns.flatMap(run => run.events),
+      })
+    }
+  })
+
+  runs.forEach((run, index) => {
+    if (claimedRunIds.has(run.runId)) return
+    timeline.push({
+      kind: 'trace',
+      key: `unclaimed-trace-${run.runId}-${index}`,
+      events: run.events,
+    })
+  })
+
+  return timeline
+}
 
 const readApiErrorMessage = async (response: Response, fallback: string) => {
   try {
@@ -99,6 +283,7 @@ const formatInferenceLatency = (latencyMs?: number | null) => {
 
 const mapCreationHistory = (histories: any[]): CreationHistoryItem[] => histories.map((h: any) => {
   const fullContent = sanitizeGeneratedContent(h.generated_content)
+  const rootRequest = String(h.root_request || '')
   let references: CreationReferenceItem[] = []
   try {
     const parsed = typeof h.references_json === 'string' ? JSON.parse(h.references_json || '[]') : h.references_json
@@ -108,17 +293,33 @@ const mapCreationHistory = (histories: any[]): CreationHistoryItem[] => historie
   }
   return {
     id: Number(h.id),
-    prompt: h.prompt,
-    timestamp: new Date(h.created_at).toLocaleString('zh-CN'),
+    prompt: rootRequest || h.prompt,
+    timestamp: new Date(h.updated_at ?? h.created_at).toLocaleString('zh-CN'),
     preview: fullContent.slice(0, 100) + (fullContent.length > 100 ? '...' : ''),
     fullContent,
     docType: h.doc_type || '',
     audience: h.audience || '',
     references,
+    sessionId: h.session_id || null,
+    rootRequest,
+    conversation: parseHistoryJson<CreationChatMessage[]>(h.conversation_json, []),
+    agentEvents: parseHistoryJson<CreationAgentEvent[]>(h.agent_trace_json, []),
+    revisionNo: Math.max(1, Number(h.revision_no) || 1),
+    editOperation: String(h.edit_operation || 'create_document'),
+    documentPatch: parseHistoryJson<Record<string, unknown> | null>(h.document_patch_json, null),
     model: h.model || null,
     latencyMs: normalizeLatencyMs(h.latency_ms),
   }
 })
+
+const parseHistoryJson = <T,>(value: unknown, fallback: T): T => {
+  try {
+    if (value == null || value === '') return fallback
+    return (typeof value === 'string' ? JSON.parse(value) : value) as T
+  } catch {
+    return fallback
+  }
+}
 
 const splitTableRow = (line: string) => {
   const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '')
@@ -160,11 +361,23 @@ const parseMarkdownBlocks = (content: string): MarkdownBlock[] => {
   const lines = content.split('\n')
   const blocks: MarkdownBlock[] = []
   let markdownBuffer: string[] = []
+  let markdownBufferStart = 0
   let index = 0
 
   const flushMarkdown = () => {
-    const markdown = markdownBuffer.join('\n').trim()
-    if (markdown) blocks.push({ type: 'markdown', content: markdown })
+    let first = 0
+    let last = markdownBuffer.length
+    while (first < last && !markdownBuffer[first].trim()) first += 1
+    while (last > first && !markdownBuffer[last - 1].trim()) last -= 1
+    const markdown = markdownBuffer.slice(first, last).join('\n')
+    if (markdown) {
+      blocks.push({
+        type: 'markdown',
+        content: markdown,
+        startLine: markdownBufferStart + first + 1,
+        endLine: markdownBufferStart + last,
+      })
+    }
     markdownBuffer = []
   }
 
@@ -173,6 +386,7 @@ const parseMarkdownBlocks = (content: string): MarkdownBlock[] => {
     const next = lines[index + 1]
     if (isPotentialTableRow(current) && next && isTableSeparator(next)) {
       flushMarkdown()
+      const tableStart = index
       const headers = splitTableRow(current)
       const alignments = tableAlignments(next)
       const rows: string[][] = []
@@ -181,16 +395,96 @@ const parseMarkdownBlocks = (content: string): MarkdownBlock[] => {
         rows.push(splitTableRow(lines[index]))
         index += 1
       }
-      blocks.push({ type: 'table', headers, alignments, rows })
+      blocks.push({
+        type: 'table',
+        headers,
+        alignments,
+        rows,
+        startLine: tableStart + 1,
+        endLine: index,
+      })
       continue
     }
 
+    if (!markdownBuffer.length) markdownBufferStart = index
     markdownBuffer.push(current)
     index += 1
   }
 
   flushMarkdown()
   return blocks
+}
+
+const normalizeSectionName = (value: string) =>
+  value.replace(/[\s：:、，,。.!！?？（）()《》“”"'`#_-]+/g, '').toLowerCase()
+
+const changeTypeLabel = (changeType: DocumentChange['changeType']) => ({
+  added: '新增',
+  modified: '修改',
+  deleted: '删除',
+}[changeType])
+
+const documentChangesFromPatch = (
+  patch: Record<string, unknown> | undefined,
+  content: string,
+): DocumentChange[] => {
+  if (!patch) return []
+  const rawChanges = Array.isArray(patch.changes) ? patch.changes : []
+  const changes = rawChanges
+    .map((item): DocumentChange | null => {
+      if (!item || typeof item !== 'object') return null
+      const value = item as Record<string, unknown>
+      const rawType = String(value.change_type || value.changeType || '')
+      if (!['added', 'modified', 'deleted'].includes(rawType)) return null
+      const start = Number(value.start_line ?? value.startLine)
+      const end = Number(value.end_line ?? value.endLine)
+      return {
+        changeType: rawType as DocumentChange['changeType'],
+        sectionTitle: String(value.section_title || value.sectionTitle || '标题与导语'),
+        startLine: Number.isFinite(start) && start > 0 ? start : null,
+        endLine: Number.isFinite(end) && end > 0 ? end : null,
+        summary: String(value.summary || ''),
+      }
+    })
+    .filter((item): item is DocumentChange => Boolean(item))
+  if (changes.length) return changes
+
+  const targets = Array.isArray(patch.target_sections)
+    ? patch.target_sections.map(item => String(item)).filter(Boolean)
+    : []
+  if (!targets.length) return []
+  const operation = String(patch.operation || '')
+  const changeType: DocumentChange['changeType'] = operation === 'append_section'
+    ? 'added'
+    : operation === 'delete_section'
+      ? 'deleted'
+      : 'modified'
+  const lines = content.split('\n')
+  return targets.map((target) => {
+    const targetName = normalizeSectionName(target)
+    const startIndex = lines.findIndex(line => {
+      const match = line.match(/^##\s+(.+?)\s*#*\s*$/)
+      return Boolean(match && (
+        normalizeSectionName(match[1]) === targetName
+        || normalizeSectionName(match[1]).includes(targetName)
+        || targetName.includes(normalizeSectionName(match[1]))
+      ))
+    })
+    let endIndex = lines.length - 1
+    if (startIndex >= 0) {
+      const nextHeadingOffset = lines
+        .slice(startIndex + 1)
+        .findIndex(line => /^##\s+/.test(line))
+      if (nextHeadingOffset >= 0) endIndex = startIndex + nextHeadingOffset
+    }
+    return {
+      changeType,
+      sectionTitle: target,
+      startLine: startIndex >= 0 && changeType !== 'deleted' ? startIndex + 1 : null,
+      endLine: startIndex >= 0 && changeType !== 'deleted' ? endIndex + 1 : null,
+      summary: `${changeTypeLabel(changeType)}“${target}”中的内容`,
+    }
+  })
 }
 
 const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
@@ -201,7 +495,6 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const currentUser = useAppStore((s) => s.currentUser)
   const cloudBalance = useAppStore((s) => s.cloudBalance)
   const setCloudBalance = useAppStore((s) => s.setCloudBalance)
-  const localDebugModeEnabled = useAppStore((s) => s.localDebugModeEnabled)
   const draft = useAppStore((s) => s.creationDraft)
   const setCreationDraft = useAppStore((s) => s.setCreationDraft)
   const setWindowMode = useAppStore((s) => s.setWindowMode)
@@ -214,6 +507,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const pushBakeNavigationTarget = useAppStore((s) => s.pushBakeNavigationTarget)
   const creationModelConfigs = useAppStore((s) => s.creationModelConfigs)
   const setCreationModelConfig = useAppStore((s) => s.setCreationModelConfig)
+  const userDisplayName = currentUser ? getUserDisplayName(currentUser) : '用户'
 
   const {
     prompt,
@@ -221,8 +515,6 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     audience,
     generatedContent,
     inheritFormat,
-    enableRag,
-    enableWebSearch,
     enableImageGeneration,
     contentWeight,
     qualityWeight,
@@ -231,6 +523,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     formatWeight,
     freshnessWeight,
     referencePreview,
+    sessionId,
+    rootRequest,
+    conversation,
+    agentEvents,
   } = draft
 
   const setPrompt = (v: string) => setCreationDraft({ prompt: v })
@@ -244,8 +540,6 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     }
   }
   const setInheritFormat = (v: boolean) => setCreationDraft({ inheritFormat: v })
-  const setEnableRag = (v: boolean) => setCreationDraft({ enableRag: v })
-  const setEnableWebSearch = (v: boolean) => setCreationDraft({ enableWebSearch: v })
   const setEnableImageGeneration = (v: boolean) => setCreationDraft({ enableImageGeneration: v })
   const setContentWeight = (v: number) => setCreationDraft({ contentWeight: v })
   const setQualityWeight = (v: number) => setCreationDraft({ qualityWeight: v })
@@ -254,16 +548,21 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const setFormatWeight = (v: number) => setCreationDraft({ formatWeight: v })
   const setFreshnessWeight = (v: number) => setCreationDraft({ freshnessWeight: v })
   const setReferencePreview = (v: ReferencePreview | null) => setCreationDraft({ referencePreview: v })
+  const setSessionId = (v: string | null) => setCreationDraft({ sessionId: v })
+  const setRootRequest = (v: string) => setCreationDraft({ rootRequest: v.slice(0, 12000) })
+  const setConversation = (v: CreationChatMessage[]) => setCreationDraft({ conversation: retainConversationContext(v) })
+  const setAgentEvents = (v: CreationAgentEvent[]) => setCreationDraft({ agentEvents: v.slice(-240) })
 
   const [isGenerating, setIsGenerating] = useState(false)
   const [isPreviewing, setIsPreviewing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copySuccess, setCopySuccess] = useState(false)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
-  const [topTab, setTopTab] = useState<'creation' | 'history' | 'skills'>('creation')
+  const [topTab, setTopTab] = useState<'creation' | 'history' | 'skills' | 'tools'>('creation')
   const [activeBottomTab, setActiveBottomTab] = useState<'reference' | 'config' | null>(null)
   const toggleBottomTab = (tab: 'reference' | 'config') =>
     setActiveBottomTab(prev => prev === tab ? null : tab)
+  const [creationTools, setCreationTools] = useState(loadCreationTools)
   const [creationHistory, setCreationHistory] = useState<CreationHistoryItem[]>([])
   const [historyTotal, setHistoryTotal] = useState(0)
   const [historyPage, setHistoryPage] = useState(1)
@@ -294,14 +593,53 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const [skillEditor, setSkillEditor] = useState<{ source?: CreationSkillSource; initialSkill?: LocalCreationSkill } | null>(null)
   const [skillDetail, setSkillDetail] = useState<CreationSkillDetailData | null>(null)
   const [skillDetailMarketItem, setSkillDetailMarketItem] = useState<CreationSkillMarketItem | null>(null)
+  const [skillPendingDelete, setSkillPendingDelete] = useState<LocalCreationSkill | null>(null)
+  const [deletingSkillId, setDeletingSkillId] = useState<number | null>(null)
+  const [uploadingSkillPackage, setUploadingSkillPackage] = useState(false)
   const [currentDocumentSkills, setCurrentDocumentSkills] = useState<LocalCreationSkill[]>([])
   const [skillPickerOpen, setSkillPickerOpen] = useState(false)
   const [skillQuery, setSkillQuery] = useState('')
+  const [pendingConfirmation, setPendingConfirmation] = useState<{
+    question: string
+    userMessage: string
+    requestId: string
+  } | null>(null)
+  const [workspaceSplit, setWorkspaceSplit] = useState(60)
   const contentRef = useRef<HTMLDivElement>(null)
+  const chatTimelineRef = useRef<HTMLDivElement>(null)
+  const workspaceRef = useRef<HTMLElement>(null)
+  const workspaceResizeCleanupRef = useRef<(() => void) | null>(null)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const skillPackageInputRef = useRef<HTMLInputElement>(null)
   const promptInputRef = useRef<HTMLTextAreaElement>(null)
+  const activeUserMessageRef = useRef('')
+  const activeUserEntryRef = useRef<CreationChatMessage | null>(null)
+  const enabledToolIds = useMemo(
+    () => enabledCreationToolIds(creationTools),
+    [creationTools],
+  )
+  const memorySearchEnabled = enabledToolIds.includes('memory_search')
+  const internetSearchEnabled = enabledToolIds.includes('internet_search')
+
+  const updateCreationTools = (
+    updater: (current: typeof creationTools) => typeof creationTools,
+  ) => {
+    setCreationTools(current => saveCreationTools(updater(current)))
+  }
+
+  const handleInstallTool = (id: CreationToolId) => {
+    updateCreationTools(current => setCreationToolInstalled(current, id, true))
+  }
+
+  const handleUninstallTool = (id: CreationToolId) => {
+    updateCreationTools(current => setCreationToolInstalled(current, id, false))
+  }
+
+  const handleToggleTool = (id: CreationToolId, enabled: boolean) => {
+    updateCreationTools(current => setCreationToolEnabled(current, id, enabled))
+  }
 
   const startTimer = () => {
     setElapsedSeconds(0)
@@ -318,7 +656,73 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     }
   }
 
-  useEffect(() => () => stopTimer(), [])
+  useEffect(() => () => {
+    stopTimer()
+    workspaceResizeCleanupRef.current?.()
+  }, [])
+
+  const workspaceSplitBounds = () => {
+    const width = Math.max(1, workspaceRef.current?.getBoundingClientRect().width || 0)
+    return {
+      min: Math.min(50, (360 / width) * 100),
+      max: Math.max(50, 100 - (310 / width) * 100),
+    }
+  }
+
+  const clampWorkspaceSplit = (value: number) => {
+    const bounds = workspaceSplitBounds()
+    return Math.min(bounds.max, Math.max(bounds.min, value))
+  }
+
+  const updateWorkspaceSplitFromPointer = (clientX: number) => {
+    const rect = workspaceRef.current?.getBoundingClientRect()
+    if (!rect?.width) return
+    setWorkspaceSplit(clampWorkspaceSplit(((clientX - rect.left) / rect.width) * 100))
+  }
+
+  const handleWorkspaceResizeStart = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    workspaceResizeCleanupRef.current?.()
+    const previousCursor = document.body.style.cursor
+    const previousUserSelect = document.body.style.userSelect
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    const handleMove = (pointerEvent: PointerEvent) => {
+      updateWorkspaceSplitFromPointer(pointerEvent.clientX)
+    }
+    const cleanup = () => {
+      window.removeEventListener('pointermove', handleMove)
+      window.removeEventListener('pointerup', cleanup)
+      window.removeEventListener('pointercancel', cleanup)
+      document.body.style.cursor = previousCursor
+      document.body.style.userSelect = previousUserSelect
+      workspaceResizeCleanupRef.current = null
+    }
+    workspaceResizeCleanupRef.current = cleanup
+    window.addEventListener('pointermove', handleMove)
+    window.addEventListener('pointerup', cleanup)
+    window.addEventListener('pointercancel', cleanup)
+    updateWorkspaceSplitFromPointer(event.clientX)
+  }
+
+  const handleWorkspaceResizeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const bounds = workspaceSplitBounds()
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+    event.preventDefault()
+    if (event.key === 'Home') setWorkspaceSplit(bounds.min)
+    else if (event.key === 'End') setWorkspaceSplit(bounds.max)
+    else setWorkspaceSplit(value => clampWorkspaceSplit(value + (event.key === 'ArrowLeft' ? -2 : 2)))
+  }
+
+  useEffect(() => {
+    if (typeof ResizeObserver === 'undefined' || !workspaceRef.current) return
+    const observer = new ResizeObserver(() => {
+      setWorkspaceSplit(value => clampWorkspaceSplit(value))
+    })
+    observer.observe(workspaceRef.current)
+    return () => observer.disconnect()
+  }, [])
 
   const loadCreationHistory = useCallback(async (signal?: AbortSignal) => {
     setHistoryLoading(true)
@@ -376,8 +780,48 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   }
 
   const handleRestoreHistory = (item: typeof creationHistory[0]) => {
-    setPrompt(item.prompt)
+    setPrompt('')
     setGeneratedContent(item.fullContent)
+    setSessionId(item.sessionId || `history-${item.id}`)
+    const restoredConversation: CreationChatMessage[] = item.conversation.length
+      ? item.conversation
+      : [{
+        id: `history-user-${item.id}`,
+        role: 'user',
+        content: item.prompt,
+        createdAt: Date.now(),
+      }]
+    setConversation(restoredConversation)
+    setRootRequest(
+      item.rootRequest
+      || restoredConversation.find(message => message.role === 'user')?.content
+      || item.prompt,
+    )
+    const restoredEvents = [...item.agentEvents]
+    if (
+      item.documentPatch
+      && !restoredEvents.some(event => event.type === 'document.patch.applied')
+    ) {
+      restoredEvents.push({
+        schema_version: 'creation.agent.v1',
+        event_id: `history-patch-${item.id}`,
+        session_id: item.sessionId || `history-${item.id}`,
+        run_id: `history-run-${item.id}`,
+        sequence: restoredEvents.length + 1,
+        timestamp: Date.now(),
+        type: 'document.patch.applied',
+        status: 'completed',
+        actor: {
+          kind: 'agent',
+          id: 'document_writer_agent',
+          name: '文档撰写 Agent',
+        },
+        summary: String(item.documentPatch.summary || '已恢复本轮文档改动'),
+        environment_patch: { document_patch: item.documentPatch },
+        data: { patch: item.documentPatch },
+      })
+    }
+    setAgentEvents(restoredEvents)
     setReferencePreview({
       requirement: {
         topic: item.prompt,
@@ -407,7 +851,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       setLocalSkills(await listLocalCreationSkills(apiBaseUrl))
     } catch (err) {
       setLocalSkills([])
-      setSkillsError(toUserFacingError(err, '创作 Skill 加载失败'))
+      setSkillsError(toUserFacingError(err, '技能加载失败'))
     } finally {
       setSkillsLoading(false)
     }
@@ -432,7 +876,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     } catch (err) {
       setMarketSkills([])
       setMarketTotal(0)
-      setMarketError(toUserFacingError(err, '创作 Skill 市场加载失败'))
+      setMarketError(toUserFacingError(err, '技能市场加载失败'))
     } finally {
       setMarketLoading(false)
     }
@@ -486,9 +930,28 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     }
   }
 
+  const handleSkillPackageSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files
+    event.target.value = ''
+    if (!files?.length) return
+    setUploadingSkillPackage(true)
+    setSkillsError('')
+    try {
+      const input = await importCodexSkillPackage(files)
+      const saved = await saveLocalCreationSkill(apiBaseUrl, input)
+      handleSkillSaved(saved)
+      setSkillLibraryView('mine')
+      showLocalSkillDetail(saved)
+    } catch (err) {
+      setSkillsError(toUserFacingError(err, '上传技能包失败'))
+    } finally {
+      setUploadingSkillPackage(false)
+    }
+  }
+
   const handleToggleSkillInstalled = async (skill: LocalCreationSkill) => {
     if (skill.status !== 'saved') {
-      setSkillsError('请先打开草稿并保存 Skill，再安装使用。')
+      setSkillsError('请先打开草稿并保存技能，再安装使用。')
       return
     }
     setSkillsError('')
@@ -497,17 +960,17 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       const saved = await saveLocalCreationSkill(apiBaseUrl, { ...input, installed: !skill.installed }, id)
       handleSkillSaved(saved)
     } catch (err) {
-      setSkillsError(toUserFacingError(err, skill.installed ? '卸载 Skill 失败' : '安装 Skill 失败'))
+      setSkillsError(toUserFacingError(err, skill.installed ? '卸载技能失败' : '安装技能失败'))
     }
   }
 
   const handlePublishSkill = async (skill: LocalCreationSkill, published: boolean) => {
     if (skill.status !== 'saved') {
-      setSkillsError('请先打开草稿并保存 Skill，再发布到市场。')
+      setSkillsError('请先打开草稿并保存技能，再发布到市场。')
       return
     }
     if (!authToken || !currentUser) {
-      setSkillsError('请先登录 MemoryBread 账户，再发布到创作市场。')
+      setSkillsError('请先登录 MemoryBread 账户，再发布到技能市场。')
       return
     }
     setPublishingSkillId(skill.id)
@@ -522,7 +985,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       }, id)
       handleSkillSaved(saved)
     } catch (err) {
-      setSkillsError(toUserFacingError(err, published ? '发布 Skill 失败' : '取消发布 Skill 失败'))
+      setSkillsError(toUserFacingError(err, published ? '发布技能失败' : '取消发布技能失败'))
     } finally {
       setPublishingSkillId(null)
     }
@@ -532,14 +995,17 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     setInstallingMarketSkillId(marketSkill.id)
     setMarketError('')
     const existing = localSkills.find(skill => skill.cloudSkillId === marketSkill.id)
+    const installing = !existing?.installed
     try {
       const marketInput = marketCreationSkillToLocalInput(marketSkill)
       let input = marketInput
       if (existing) {
         const { id: _id, createdAt: _createdAt, updatedAt: _updatedAt, ...existingInput } = existing
-        input = existing.sourceKind === 'market'
-          ? { ...marketInput, clientSkillKey: existing.clientSkillKey }
-          : { ...existingInput, installed: true }
+        input = installing
+          ? existing.sourceKind === 'market'
+            ? { ...marketInput, clientSkillKey: existing.clientSkillKey }
+            : { ...existingInput, installed: true }
+          : { ...existingInput, installed: false }
       }
       const saved = await saveLocalCreationSkill(
         apiBaseUrl,
@@ -548,10 +1014,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       )
       handleSkillSaved(saved)
       setSkillDetail(current => current?.id === marketSkill.id
-        ? { ...current, installed: true }
+        ? { ...current, installed: installing }
         : current)
     } catch (err) {
-      setMarketError(toUserFacingError(err, '安装市场 Skill 失败'))
+      setMarketError(toUserFacingError(err, installing ? '安装市场技能失败' : '卸载市场技能失败'))
     } finally {
       setInstallingMarketSkillId(null)
     }
@@ -577,16 +1043,37 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     setSkillDetailMarketItem(null)
   }, [])
 
-  const handleDeleteSkill = async (skill: LocalCreationSkill) => {
+  useEffect(() => {
+    if (!skillPendingDelete || deletingSkillId !== null) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSkillPendingDelete(null)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [deletingSkillId, skillPendingDelete])
+
+  const handleDeleteSkill = (skill: LocalCreationSkill) => {
     if (skill.published) {
-      setSkillsError('已发布的 Skill 暂不能删除。')
+      setSkillsError('已发布的技能暂不能删除。')
       return
     }
+    setSkillPendingDelete(skill)
+  }
+
+  const confirmDeleteSkill = async () => {
+    const skill = skillPendingDelete
+    if (!skill) return
+    setDeletingSkillId(skill.id)
+    setSkillsError('')
     try {
       await deleteLocalCreationSkill(apiBaseUrl, skill.id)
       setLocalSkills(prev => prev.filter(item => item.id !== skill.id))
+      setCurrentDocumentSkills(prev => prev.filter(item => item.id !== skill.id))
+      setSkillPendingDelete(null)
     } catch (err) {
-      setSkillsError(toUserFacingError(err, '删除创作 Skill 失败'))
+      setSkillsError(toUserFacingError(err, '删除技能失败'))
+    } finally {
+      setDeletingSkillId(null)
     }
   }
 
@@ -619,9 +1106,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       .filter(skill => !query || `${skill.title}\n${skill.summary}`.toLowerCase().includes(query))
       .slice(0, 8)
   }, [installedSkills, skillQuery])
-  const promptWithAttachments = () => {
+  const messageWithAttachments = (message = prompt) => {
     const attachmentPrompt = buildAttachmentPrompt(attachments)
-    const basePrompt = attachmentPrompt ? `${prompt.trim()}\n\n${attachmentPrompt}` : prompt.trim()
+    return attachmentPrompt ? `${message.trim()}\n\n${attachmentPrompt}` : message.trim()
+  }
+  const promptWithAttachments = () => {
+    const basePrompt = messageWithAttachments()
     return `${basePrompt}${buildCreationSkillInstruction(matchedSkills)}`
   }
 
@@ -690,10 +1180,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     }
   }, [creationModelConfigs, remoteModelAllowed, setCreationModelConfig])
 
-  const buildPayload = () => {
+  const buildPayload = (message = prompt) => {
     const activeModel = creationModelConfigs.find(c => c.id === LOCAL_CREATION_MODEL_ID)
     return {
-      user_prompt: promptWithAttachments(),
+      user_prompt: `${messageWithAttachments(message)}${buildCreationSkillInstruction(matchedSkills)}`,
       design_templates: [],
       design_ids: [],
       timeline_ids: [],
@@ -702,8 +1192,9 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       audience,
       output_format: 'markdown',
       inherit_format: inheritFormat,
-      enable_rag: enableRag,
-      enable_web_search: enableWebSearch,
+      enable_rag: memorySearchEnabled,
+      enable_web_search: internetSearchEnabled,
+      enabled_tools: enabledToolIds,
       enable_image_generation: enableImageGeneration,
       content_weight: contentWeight / 100,
       quality_weight: qualityWeight / 100,
@@ -737,7 +1228,8 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       `文档类型：${docType || '建设方案'}`,
       `目标读者：${audience || '客户'}`,
       `继承历史格式：${inheritFormat ? '是' : '否'}`,
-      `启用 RAG 参考：${enableRag ? '是' : '否'}，参考数量：${references.length}`,
+      `启用记忆搜索：${memorySearchEnabled ? '是' : '否'}，参考数量：${references.length}`,
+      `启用工具：${enabledToolIds.join(', ')}`,
       `权重：内容 ${contentWeight}%，质量 ${qualityWeight}%，完整性 ${completenessWeight}%，热度 ${usageWeight}%，格式 ${formatWeight}%，时效 ${freshnessWeight}%`,
     ].join('\n')
     return [
@@ -766,6 +1258,34 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       throw new Error(await readApiErrorMessage(response, `生成失败: ${response.status}`))
     }
     return response.json()
+  }
+
+  const postGatewayAgentCall = async (
+    messages: Array<{ role: string; content: string }>,
+    signal?: AbortSignal,
+  ) => {
+    const response = await fetch(`${gatewayApiBaseUrl.replace(/\/+$/, '')}/v1/gateway/chat`, {
+      method: 'POST',
+      headers: { ...serviceEnvironmentHeaders(), 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({
+        request_id: `creation-agent-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        user_id: currentUser?.id || null,
+        brand_model_id: 'mbcd-plus-v1',
+        caller: 'creation_agent',
+        messages,
+        stream: false,
+        privacy: { content_logging: false, client_scrubbed: true },
+        limits: { max_output_tokens: 8192, max_credit: '100.0000' },
+      }),
+    })
+    if (!response.ok) {
+      throw new Error(await readApiErrorMessage(response, `Agent 推理失败: ${response.status}`))
+    }
+    const data = await response.json()
+    const content = sanitizeGeneratedContent(String(data.content || ''))
+    if (!content.trim()) throw new Error('品牌模型没有返回 Agent 结果')
+    return content
   }
 
   const postLocalCreation = async (signal?: AbortSignal) => {
@@ -832,6 +1352,312 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     return finalContent
   }
 
+  const selectedSkillPayload = () => resolveCreationSkillDependencies(
+    matchedSkills.map(({ skill }) => skill),
+    localSkills,
+  ).map(skill => ({
+    id: skill.clientSkillKey || String(skill.id),
+    title: skill.title,
+    summary: skill.summary,
+    skillDescription: skill.skillDescription,
+    executionSteps: skill.executionSteps,
+    titleDesignStyle: skill.commonTitles,
+    writingDesign: skill.textStyle,
+    imageGeneration: skill.diagramStyle,
+    structurePattern: skill.structurePattern,
+    voiceStyle: skill.writingGuidelines,
+    fieldExamples: {
+      titleDesignStyle: skill.fieldExamples.commonTitles,
+      writingDesign: skill.fieldExamples.textStyle,
+      imageGeneration: skill.fieldExamples.diagramStyle,
+      structurePattern: skill.fieldExamples.structurePattern,
+      voiceStyle: skill.fieldExamples.writingGuidelines,
+    },
+    exampleDocument: skill.exampleDocument,
+  }))
+
+  const buildAgentPayload = (
+    message: string,
+    chat: CreationChatMessage[],
+    extras: Record<string, unknown> = {},
+  ) => {
+    const payload = buildPayload(message)
+    const liveDraft = useAppStore.getState().creationDraft
+    delete payload.creation_model
+    delete payload.creation_base_url
+    return {
+      ...payload,
+      user_prompt: messageWithAttachments(message),
+      session_id: liveDraft.sessionId,
+      root_request: liveDraft.rootRequest
+        || liveDraft.conversation.find(item => item.role === 'user')?.content
+        || messageWithAttachments(message),
+      current_document: liveDraft.generatedContent,
+      conversation: chat.map(item => ({ role: item.role, content: item.content })),
+      selected_skills: selectedSkillPayload(),
+      model_mode: useGatewayCreation && currentUser?.id ? 'external' : 'local',
+      ...extras,
+    }
+  }
+
+  const toStoredAgentEvent = (event: CreationAgentEvent): CreationAgentEvent => {
+    const base: CreationAgentEvent = {
+      ...event,
+      actor: {
+        ...event.actor,
+        name: event.actor?.id === 'creation_main_agent'
+          ? '创作 Agent'
+          : String(event.actor?.name || '创作 Agent').replace(/创作主 Agent/g, '创作 Agent'),
+      },
+      summary: String(event.summary || '').replace(/创作主 Agent/g, '创作 Agent'),
+      goal: event.goal ? { ...event.goal, objective: '' } : undefined,
+      environment_patch: {},
+      data: {},
+    }
+    if (event.type === 'intent.interpreted') {
+      return {
+        ...base,
+        data: {
+          operation: event.data?.operation,
+          target_sections: event.data?.target_sections,
+          preserve_untouched: event.data?.preserve_untouched,
+          reasoning_summary: event.data?.reasoning_summary,
+        },
+      }
+    }
+    if (event.type === 'model.request') {
+      return {
+        ...base,
+        data: { request_id: event.data?.request_id },
+      }
+    }
+    if (event.type === 'run.paused') {
+      return {
+        ...base,
+        data: { reason: event.data?.reason },
+      }
+    }
+    if (event.type === 'run.failed') {
+      return {
+        ...base,
+        summary: '创作 Agent 执行失败（详细错误未写入轨迹）',
+      }
+    }
+    if (event.type === 'document.replaced') {
+      return {
+        ...base,
+        data: { operation: event.data?.operation || 'rewrite_document' },
+      }
+    }
+    if (event.type === 'document.patch.applied') {
+      return {
+        ...base,
+        environment_patch: { document_patch: event.data?.patch },
+        data: { patch: event.data?.patch },
+      }
+    }
+    if (event.type === 'tool.completed' || event.type === 'tool.failed') {
+      return {
+        ...base,
+        data: {
+          result_count: event.data?.result_count,
+          diagram_type: event.data?.diagram_type,
+          error_code: event.data?.error_code,
+        },
+      }
+    }
+    if (event.type === 'skill.completed') {
+      return {
+        ...base,
+        environment_patch: { skill: event.environment_patch?.skill },
+      }
+    }
+    if (event.actor?.id === 'quality_review_agent') {
+      return {
+        ...base,
+        environment_patch: { quality_review: event.environment_patch?.quality_review },
+      }
+    }
+    return base
+  }
+
+  const applyAgentEvent = (event: CreationAgentEvent, phase: AgentPhaseResult) => {
+    phase.sessionId = event.session_id || phase.sessionId
+    phase.runId = event.run_id || phase.runId
+    if (event.run_id) {
+      let currentConversation = useAppStore.getState().creationDraft.conversation
+      const activeUserEntry = activeUserEntryRef.current
+      let userMessageIndex = activeUserEntry
+        ? currentConversation.findIndex(item => item.id === activeUserEntry.id)
+        : -1
+      if (userMessageIndex < 0 && activeUserEntry) {
+        currentConversation = [...currentConversation, activeUserEntry]
+        userMessageIndex = currentConversation.length - 1
+        setConversation(currentConversation)
+      }
+      if (userMessageIndex < 0) {
+        userMessageIndex = currentConversation.length - 1
+        while (userMessageIndex >= 0 && currentConversation[userMessageIndex].role !== 'user') {
+          userMessageIndex -= 1
+        }
+      }
+      if (userMessageIndex >= 0) {
+        const userMessage = currentConversation[userMessageIndex]
+        const runIds = [...new Set([
+          ...(userMessage.runIds || []),
+          ...(userMessage.runId ? [userMessage.runId] : []),
+          event.run_id,
+        ])]
+        if (runIds.length !== userMessage.runIds?.length) {
+          const nextConversation = [...currentConversation]
+          nextConversation[userMessageIndex] = { ...userMessage, runIds }
+          setConversation(nextConversation)
+        }
+      }
+    }
+    if (event.type === 'agent.started' && event.actor?.id === 'document_writer_agent') {
+      phase.document = ''
+    }
+    if (!['document.delta', 'document.patch.delta'].includes(event.type)) {
+      const current = useAppStore.getState().creationDraft.agentEvents
+      setAgentEvents([...current, event])
+    }
+    if (['document.delta', 'document.patch.delta'].includes(event.type)) {
+      const content = String(event.data?.content || '')
+      if (content) {
+        phase.document += content
+        setGeneratedContent(phase.document)
+      }
+    }
+    if (event.type === 'document.replaced') {
+      phase.document = sanitizeGeneratedContent(String(event.data?.content || ''))
+      if (phase.document) setGeneratedContent(phase.document)
+    }
+    if (event.type === 'document.patch.applied') {
+      phase.document = sanitizeGeneratedContent(String(event.data?.content || ''))
+      if (phase.document) setGeneratedContent(phase.document)
+    }
+    if (event.type === 'intent.interpreted') {
+      const restoredRoot = String(event.data?.root_request || '').trim()
+      if (restoredRoot) setRootRequest(restoredRoot)
+    }
+    if (event.type === 'model.request') {
+      const messages = event.data?.messages
+      phase.modelMessages = Array.isArray(messages)
+        ? messages
+          .filter((item: any) => item && typeof item.content === 'string')
+          .map((item: any) => ({ role: String(item.role || 'user'), content: item.content }))
+        : null
+    }
+    if (event.type === 'run.paused') {
+      const continuation = event.data?.continuation
+      phase.continuation = continuation && typeof continuation === 'object'
+        ? continuation as Record<string, unknown>
+        : null
+      phase.pausedForConfirmation = event.data?.reason === 'user_confirmation'
+    }
+    if (event.type === 'confirmation.required') {
+      setPendingConfirmation({
+        question: String(event.data?.question || event.summary),
+        userMessage: activeUserMessageRef.current,
+        requestId: String(event.data?.request_id || event.event_id),
+      })
+    }
+    if (event.type === 'tool.completed' && event.actor?.id === 'memory_search') {
+      const items = event.environment_patch?.references
+      if (Array.isArray(items)) {
+        setReferencePreview({
+          requirement: {
+            topic: messageWithAttachments(activeUserMessageRef.current),
+            doc_type: docType,
+            audience,
+            style: '',
+            keywords: [],
+          },
+          references: items.map((item: any) => ({
+            id: Number(item.id),
+            title: String(item.title || '本地参考资料'),
+            doc_type: String(item.doc_type || ''),
+            final_weight: Number(item.final_weight || 0),
+            relevance_score: Number(item.relevance_score || 0),
+            quality_score: Number(item.quality_score || 0),
+            completeness_score: Number(item.completeness_score || 0),
+            usage_score: Number(item.usage_score || 0),
+            format_score: Number(item.format_score || 0),
+            freshness_score: Number(item.freshness_score || 0),
+            usage_count: Number(item.usage_count || 0),
+            reason: String(item.reason || ''),
+            summary: String(item.summary || ''),
+            source_url: item.source_url ? String(item.source_url) : undefined,
+          })),
+        })
+      }
+    }
+    if (event.type === 'run.completed') {
+      const completedDocument = sanitizeGeneratedContent(String(event.data?.document || ''))
+      if (completedDocument) {
+        phase.document = completedDocument
+        setGeneratedContent(completedDocument)
+      }
+      phase.completed = true
+    }
+    if (event.type === 'run.failed') throw new Error(event.summary || '创作 Agent 执行失败')
+  }
+
+  const readAgentPhase = async (response: Response): Promise<AgentPhaseResult> => {
+    if (!response.ok) {
+      throw new Error(await readApiErrorMessage(response, `创作 Agent 启动失败: ${response.status}`))
+    }
+    const reader = response.body?.getReader()
+    if (!reader) throw new Error('无法读取创作 Agent 事件流')
+    const decoder = new TextDecoder()
+    let buffer = ''
+    const phase: AgentPhaseResult = {
+      events: [],
+      continuation: null,
+      modelMessages: null,
+      completed: false,
+      pausedForConfirmation: false,
+      document: '',
+      sessionId: null,
+      runId: null,
+    }
+    const processLine = (line: string) => {
+      if (!line.startsWith('data: ')) return
+      const event = JSON.parse(line.slice(6)) as CreationAgentEvent
+      phase.events.push(event)
+      applyAgentEvent(event, phase)
+    }
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+      lines.forEach(processLine)
+    }
+    if (buffer.trim()) processLine(buffer.trim())
+    return phase
+  }
+
+  const postAgentPhase = async (
+    payload: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) => {
+    const response = await fetch(`${apiBaseUrl}/api/creation/agent/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify(payload),
+    })
+    if (response.status === 404) {
+      const error = new Error('当前本地服务尚未提供创作 Agent 接口')
+      ;(error as Error & { code?: string }).code = 'CREATION_AGENT_NOT_AVAILABLE'
+      throw error
+    }
+    return readAgentPhase(response)
+  }
+
   const postReferencePreview = async (signal?: AbortSignal) => {
     const payload = buildPayload()
     const response = await fetch(`${apiBaseUrl}/api/creation/references`, {
@@ -880,103 +1706,248 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     }
   }
 
-  const handleGenerate = async () => {
-    if (!prompt.trim()) return
+  const persistCreationResult = async (
+    userMessage: string,
+    content: string,
+    chat: CreationChatMessage[],
+    usedModelId: string,
+    latencyMs: number | null,
+  ) => {
+    const state = useAppStore.getState().creationDraft
+    const references = state.referencePreview?.references || []
+    const latestCompletedRunId = [...state.agentEvents]
+      .reverse()
+      .find(item => item.type === 'run.completed' && item.status === 'completed')
+      ?.run_id
+    const latestDocumentEvent = [...state.agentEvents]
+      .reverse()
+      .find(item => (
+        ['document.patch.applied', 'document.replaced'].includes(item.type)
+        && (!latestCompletedRunId || item.run_id === latestCompletedRunId)
+      ))
+    const documentPatch = latestDocumentEvent?.type === 'document.patch.applied'
+      ? latestDocumentEvent.data?.patch
+      : null
+    const editOperation = String(
+      (documentPatch as Record<string, unknown> | undefined)?.operation
+      || latestDocumentEvent?.data?.operation
+      || (state.sessionId ? 'rewrite_document' : 'create_document'),
+    )
+    const sourceHistoryId = currentDocumentSource?.kind === 'creation_history'
+      ? Number(currentDocumentSource.id)
+      : Number.NaN
+    try {
+      const saveResponse = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: userMessage,
+          generated_content: sanitizeGeneratedContent(content),
+          doc_type: docType || null,
+          audience: audience || null,
+          reference_count: references.length,
+          references,
+          model: usedModelId,
+          latency_ms: latencyMs,
+          session_id: state.sessionId,
+          history_id: Number.isSafeInteger(sourceHistoryId) ? sourceHistoryId : null,
+          root_request: state.rootRequest || userMessage,
+          conversation: chat,
+          agent_trace: state.agentEvents.map(toStoredAgentEvent),
+          goal: [...state.agentEvents].reverse().find(item => item.goal)?.goal || null,
+          edit_operation: editOperation,
+          document_patch: documentPatch || null,
+        }),
+      })
+      if (saveResponse.ok) {
+        const saved = await saveResponse.json()
+        const savedTitle = state.rootRequest || userMessage
+        setCurrentDocumentSource({
+          kind: 'creation_history',
+          id: String(saved.id),
+          title: savedTitle,
+          content: sanitizeGeneratedContent(content),
+          docType,
+        })
+      }
+      if (historyPage === 1) void loadCreationHistory()
+      else setHistoryPage(1)
+    } catch (saveErr) {
+      console.error('保存创作记录失败:', saveErr)
+    }
+  }
 
+  const appendAssistantCompletion = (
+    chat: CreationChatMessage[],
+    runId: string | null,
+  ) => {
+    const activeUserEntry = activeUserEntryRef.current
+    const ensuredChat = activeUserEntry && !chat.some(item => item.id === activeUserEntry.id)
+      ? [...chat, activeUserEntry]
+      : chat
+    const latestMutation = [...useAppStore.getState().creationDraft.agentEvents]
+      .reverse()
+      .find(item => (
+        ['document.patch.applied', 'document.replaced'].includes(item.type)
+        && (!runId || item.run_id === runId)
+      ))
+    const patch = latestMutation?.type === 'document.patch.applied'
+      ? latestMutation.data?.patch as Record<string, unknown> | undefined
+      : undefined
+    const targets = Array.isArray(patch?.target_sections)
+      ? patch.target_sections.map(item => String(item)).filter(Boolean)
+      : []
+    const patchSummary = patch
+      ? String(patch.summary || `文档已完成${targets.length ? `“${targets.join('、')}”相关` : ''}修订`)
+        .replace(/[。.!！]+$/, '')
+      : ''
+    const assistant: CreationChatMessage = {
+      id: `assistant-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      role: 'assistant',
+      content: patch
+        ? `${patchSummary}。你可以继续修改。`
+        : '文档已更新。你可以继续提出修改要求，我会基于当前版本继续优化。',
+      createdAt: Date.now(),
+      runId: runId || undefined,
+    }
+    const next = [...ensuredChat, assistant]
+    setConversation(next)
+    return next
+  }
+
+  const runLegacyGeneration = async (
+    userMessage: string,
+    chat: CreationChatMessage[],
+    controller: AbortController,
+  ) => {
+    let referencesForHistory: CreationReferenceItem[] = []
+    if (memorySearchEnabled) {
+      try {
+        const refResponse = await postReferencePreview(controller.signal)
+        if (refResponse.ok) {
+          const refData = await refResponse.json()
+          setReferencePreview(refData)
+          referencesForHistory = Array.isArray(refData?.references) ? refData.references : []
+        }
+      } catch (refErr) {
+        console.warn('参考资料同步加载失败，继续生成:', refErr)
+      }
+    }
+    const startedAt = Date.now()
+    let usedModelId = activeCreationModelId
+    let content = ''
+    if (useGatewayCreation && currentUser?.id) {
+      const data = await postGatewayCreation(referencesForHistory, controller.signal)
+      content = sanitizeGeneratedContent(String(data.content || ''))
+    } else {
+      usedModelId = LOCAL_CREATION_MODEL_ID
+      content = await postLocalCreation(controller.signal)
+    }
+    if (!content.trim()) throw new Error('生成结束但没有返回内容')
+    setGeneratedContent(content)
+    const latencyMs = Date.now() - startedAt
+    setLastInferenceMeta({ model: usedModelId, latencyMs })
+    const finalChat = appendAssistantCompletion(chat, null)
+    await persistCreationResult(userMessage, content, finalChat, usedModelId, latencyMs)
+  }
+
+  const runAgentTurn = async ({
+    userMessage,
+    confirmed = false,
+    appendUser = true,
+  }: {
+    userMessage: string
+    confirmed?: boolean
+    appendUser?: boolean
+  }) => {
+    const message = userMessage.trim()
+    if (!message) return
+    const storedSessionId = useAppStore.getState().creationDraft.sessionId
+    const activeSessionId = storedSessionId || createCreationSessionId()
+    if (!storedSessionId) setSessionId(activeSessionId)
+    activeUserMessageRef.current = message
+    const liveConversation = useAppStore.getState().creationDraft.conversation
+    const existingUserEntry = !appendUser
+      ? liveConversation.find(item => item.id === activeUserEntryRef.current?.id)
+        || [...liveConversation].reverse().find(item => (
+          item.role === 'user' && item.content.trim() === message
+        ))
+      : undefined
+    const userEntry: CreationChatMessage = existingUserEntry || {
+      id: `user-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      role: 'user',
+      content: message,
+      createdAt: Date.now(),
+    }
+    activeUserEntryRef.current = userEntry
+    const chat = appendUser
+      ? [...liveConversation, userEntry]
+      : existingUserEntry
+        ? liveConversation
+        : [...liveConversation, userEntry]
+    if (appendUser || !existingUserEntry) setConversation(chat)
+    const liveRootRequest = useAppStore.getState().creationDraft.rootRequest
+    if (!liveRootRequest.trim()) {
+      setRootRequest(
+        chat.find(item => item.role === 'user')?.content
+        || messageWithAttachments(message),
+      )
+    }
+    setPendingConfirmation(null)
     setIsGenerating(true)
     setError(null)
-    setGeneratedContent('')
     setLastInferenceMeta(null)
     const controller = new AbortController()
     abortRef.current = controller
     startTimer()
+    const startedAt = Date.now()
 
     try {
-      let refCount = 0
-      let referencesForHistory: CreationReferenceItem[] = []
-      let finalSaveContent = ''
-      let usedModelId = activeCreationModelId
-      let inferenceLatencyMs: number | null = null
-      if (enableRag) {
-        try {
-          const refResponse = await postReferencePreview(controller.signal)
-          if (refResponse.ok) {
-            const refData = await refResponse.json()
-            setReferencePreview(refData)
-            referencesForHistory = Array.isArray(refData?.references) ? refData.references : []
-            refCount = referencesForHistory.length
-          }
-        } catch (refErr) {
-          console.warn('参考资料同步加载失败,继续生成:', refErr)
-        }
-      }
-
-      if (useGatewayCreation && currentUser?.id) {
-        if (!localDebugModeEnabled) {
-          console.info('MBCD Plus v1.0 将通过 gateway 调用')
-        }
-        try {
-          usedModelId = REMOTE_CREATION_MODEL_ID
-          const inferenceStartedAt = Date.now()
-          const data = await postGatewayCreation(referencesForHistory, controller.signal)
-          const content = sanitizeGeneratedContent(data.content || '')
-          if (!content.trim()) throw new Error('生成结束但没有返回内容，请稍后重试或切换为本地创作模型')
-          setGeneratedContent(content)
-          finalSaveContent = content
-          inferenceLatencyMs = Date.now() - inferenceStartedAt
-        } catch (gatewayErr) {
-          console.warn('云端创作不可用，自动回落本地创作:', gatewayErr)
-          usedModelId = LOCAL_CREATION_MODEL_ID
-          const inferenceStartedAt = Date.now()
-          const content = await postLocalCreation(controller.signal)
-          finalSaveContent = content
-          inferenceLatencyMs = Date.now() - inferenceStartedAt
-        }
-      } else {
-        usedModelId = LOCAL_CREATION_MODEL_ID
-        const inferenceStartedAt = Date.now()
-        const content = await postLocalCreation(controller.signal)
-        finalSaveContent = content
-        inferenceLatencyMs = Date.now() - inferenceStartedAt
-      }
-
-      if (finalSaveContent) {
-        setLastInferenceMeta({ model: usedModelId, latencyMs: inferenceLatencyMs })
-        try {
-          const saveResponse = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              prompt: prompt.trim(),
-              generated_content: sanitizeGeneratedContent(finalSaveContent),
-              doc_type: docType || null,
-              audience: audience || null,
-              reference_count: refCount,
-              references: referencesForHistory,
-              model: usedModelId,
-              latency_ms: inferenceLatencyMs,
-            }),
+      let payload = buildAgentPayload(message, chat, {
+        session_id: activeSessionId,
+        confirmed,
+      })
+      let finalRunId: string | null = null
+      while (true) {
+        const phase = await postAgentPhase(payload, controller.signal)
+        if (phase.sessionId) setSessionId(phase.sessionId)
+        finalRunId = phase.runId || finalRunId
+        if (phase.pausedForConfirmation) return
+        if (phase.modelMessages) {
+          if (!phase.continuation) throw new Error('创作 Agent 缺少恢复状态')
+          const modelResult = await postGatewayAgentCall(phase.modelMessages, controller.signal)
+          payload = buildAgentPayload(message, chat, {
+            session_id: phase.sessionId,
+            run_id: phase.runId,
+            resume_state: phase.continuation,
+            model_result: modelResult,
+            confirmed: true,
           })
-          if (saveResponse.ok) {
-            const saved = await saveResponse.json()
-            setCurrentDocumentSource({
-              kind: 'creation_history',
-              id: String(saved.id),
-              title: prompt.trim(),
-              content: sanitizeGeneratedContent(finalSaveContent),
-              docType,
-            })
-          }
-          if (historyPage === 1) {
-            void loadCreationHistory()
-          } else {
-            setHistoryPage(1)
-          }
-        } catch (saveErr) {
-          console.error('保存创作记录失败:', saveErr)
+          continue
         }
+        if (!phase.completed) throw new Error('创作 Agent 未完成，也没有返回可恢复动作')
+        break
       }
+
+      const finalContent = useAppStore.getState().creationDraft.generatedContent
+      if (!finalContent.trim()) throw new Error('创作 Agent 完成但没有生成文档')
+      const usedModelId = useGatewayCreation && currentUser?.id
+        ? REMOTE_CREATION_MODEL_ID
+        : LOCAL_CREATION_MODEL_ID
+      const latencyMs = Date.now() - startedAt
+      setLastInferenceMeta({ model: usedModelId, latencyMs })
+      const currentConversation = useAppStore.getState().creationDraft.conversation
+      const finalChat = appendAssistantCompletion(currentConversation, finalRunId)
+      await persistCreationResult(message, finalContent, finalChat, usedModelId, latencyMs)
+      setPrompt('')
+      setAttachments([])
     } catch (err) {
+      const code = (err as Error & { code?: string })?.code
+      if (code === 'CREATION_AGENT_NOT_AVAILABLE') {
+        await runLegacyGeneration(message, chat, controller)
+        setPrompt('')
+        return
+      }
       if (err instanceof DOMException && err.name === 'AbortError') {
         setError('已中止本次创作')
         return
@@ -989,11 +1960,64 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     }
   }
 
+  const handleGenerate = async () => {
+    await runAgentTurn({ userMessage: prompt })
+  }
+
+  const handleConfirmContinue = async () => {
+    if (!pendingConfirmation) return
+    const message = pendingConfirmation.userMessage
+    setPendingConfirmation(null)
+    await runAgentTurn({ userMessage: message, confirmed: true, appendUser: false })
+  }
+
   const handleStopGenerate = () => {
     abortRef.current?.abort()
     setIsGenerating(false)
     stopTimer()
     setError('已中止本次创作')
+  }
+
+  const hasActiveSession = Boolean(
+    prompt.trim()
+    || generatedContent.trim()
+    || referencePreview
+    || sessionId
+    || conversation.length
+    || agentEvents.length
+    || attachments.length
+    || pendingConfirmation,
+  )
+
+  const handleNewConversation = () => {
+    if (isGenerating || !hasActiveSession) return
+
+    activeUserMessageRef.current = ''
+    activeUserEntryRef.current = null
+    setCreationDraft({
+      prompt: '',
+      generatedContent: '',
+      referencePreview: null,
+      sessionId: null,
+      rootRequest: '',
+      conversation: [],
+      agentEvents: [],
+    })
+    setAttachments([])
+    setAttachmentError(null)
+    setCurrentDocumentSource(null)
+    setCurrentDocumentSkills([])
+    setPendingConfirmation(null)
+    setSkillPickerOpen(false)
+    setSkillQuery('')
+    setError(null)
+    setCopySuccess(false)
+    setLastInferenceMeta(null)
+    setElapsedSeconds(0)
+    setActiveBottomTab(null)
+    activeUserMessageRef.current = ''
+    if (contentRef.current) contentRef.current.scrollTop = 0
+    window.requestAnimationFrame(() => promptInputRef.current?.focus())
   }
 
   const handleCopy = async () => {
@@ -1006,12 +2030,52 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     if (contentRef.current) contentRef.current.scrollTop = contentRef.current.scrollHeight
   }, [generatedContent])
 
+  useEffect(() => {
+    if (chatTimelineRef.current) {
+      chatTimelineRef.current.scrollTop = chatTimelineRef.current.scrollHeight
+    }
+  }, [agentEvents, conversation, pendingConfirmation])
+
   const totalWeight = contentWeight + qualityWeight + completenessWeight + usageWeight + formatWeight + freshnessWeight
   const generationProgress = isGenerating
     ? Math.min(95, Math.max(5, Math.round((elapsedSeconds / 90) * 100)))
     : generatedContent
       ? 100
       : 0
+  const latestAgentRunId = [...agentEvents].reverse().find(item => item.run_id)?.run_id
+  const latestRunEvents = latestAgentRunId
+    ? agentEvents.filter(item => item.run_id === latestAgentRunId)
+    : []
+  const latestRunHasLifecycle = latestRunEvents.some(item => item.type.startsWith('run.'))
+  const latestRunCompleted = latestRunEvents.some(item => (
+    item.type === 'run.completed' && item.status === 'completed'
+  ))
+  const canDisplayLatestMutation = latestRunCompleted
+    || (!isGenerating && !latestRunHasLifecycle)
+  const latestDocumentMutation = canDisplayLatestMutation
+    ? [...agentEvents]
+      .reverse()
+      .find(item => (
+        ['document.patch.applied', 'document.replaced'].includes(item.type)
+        && (!latestAgentRunId || item.run_id === latestAgentRunId)
+      ))
+    : undefined
+  const latestDocumentPatch = latestDocumentMutation?.type === 'document.patch.applied'
+    ? latestDocumentMutation.data?.patch as Record<string, unknown> | undefined
+    : undefined
+  const latestPatchTargets = Array.isArray(latestDocumentPatch?.target_sections)
+    ? latestDocumentPatch.target_sections.map(item => String(item)).filter(Boolean)
+    : []
+  const latestPatchChanges = documentChangesFromPatch(latestDocumentPatch, generatedContent)
+  const latestPatchChangeCount = Math.max(
+    latestPatchChanges.length,
+    Number(latestDocumentPatch?.change_count) || 0,
+  )
+  const latestUserInstruction = [...conversation]
+    .reverse()
+    .find(message => message.role === 'user')
+    ?.content
+  const creationTimeline = buildCreationTimeline(conversation, agentEvents)
 
   const handleReferenceClick = (refId: string) => {
     const normalizedId = Number(refId)
@@ -1041,7 +2105,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
               handleReferenceClick(refId)
             }}
             style={{
-              color: '#0f766e',
+              color: '#a45d22',
               textDecoration: 'underline',
               cursor: 'pointer',
               fontWeight: 500,
@@ -1061,29 +2125,29 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
               e.preventDefault()
               document.getElementById(decodeURIComponent(href.substring(1)))?.scrollIntoView({ behavior: 'smooth', block: 'start' })
             }}
-            style={{ color: '#0f766e', textDecoration: 'underline', cursor: 'pointer' }}
+            style={{ color: '#a45d22', textDecoration: 'underline', cursor: 'pointer' }}
           >{children}</a>
         )
       }
-      return <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: '#0f766e', textDecoration: 'underline' }} {...props}>{children}</a>
+      return <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: '#a45d22', textDecoration: 'underline' }} {...props}>{children}</a>
     }
   }
 
   return (
-    <div className={className} style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: '#f6f7f9', color: '#172033' }}>
+    <div className={`creation-panel ${className}`.trim()} style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: '#f6f7f9', color: '#172033' }}>
 
       {/* 顶部 Tab 栏 */}
-      <div style={{ display: 'flex', borderBottom: '1px solid #e1e5ea', background: '#fff', padding: '0 22px', flexShrink: 0 }}>
-        {(['creation', 'history', 'skills'] as const).map((tab) => (
+      <div className="creation-top-tabs" style={{ display: 'flex', borderBottom: '1px solid #e1e5ea', background: '#fff', padding: '0 22px', flexShrink: 0 }}>
+        {(['creation', 'history', 'skills', 'tools'] as const).map((tab) => (
           <button
             key={tab}
             onClick={() => setTopTab(tab)}
             style={{
               padding: '12px 16px',
               border: 'none',
-              borderBottom: topTab === tab ? '2px solid #0f766e' : '2px solid transparent',
+              borderBottom: topTab === tab ? '2px solid #a45d22' : '2px solid transparent',
               background: 'none',
-              color: topTab === tab ? '#0f766e' : '#667085',
+              color: topTab === tab ? '#a45d22' : '#667085',
               fontWeight: topTab === tab ? 650 : 400,
               fontSize: 14,
               cursor: 'pointer',
@@ -1091,10 +2155,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             }}
           >
             {tab === 'creation'
-              ? '方案创作'
+              ? '创作'
               : tab === 'history'
                 ? `创作记录${historyTotal ? ` (${historyTotal})` : ''}`
-                : `创作 Skill${localSkills.length ? ` (${localSkills.length})` : ''}`}
+                : tab === 'skills'
+                  ? `技能${localSkills.length ? ` (${localSkills.length})` : ''}`
+                  : `工具 (${enabledToolIds.length})`}
           </button>
         ))}
       </div>
@@ -1128,7 +2194,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                     >
                       <span className="creation-history__title">{item.prompt}</span>
                       <span className="creation-history__meta">
-                        {item.timestamp} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latencyMs)}
+                        完整会话 · {item.timestamp} · 模型：{getModelDisplayName(item.model)} · 推理耗时：{formatInferenceLatency(item.latencyMs)}
                       </span>
                       <span className="creation-history__preview">{item.preview}</span>
                     </button>
@@ -1143,7 +2209,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                         docType: item.docType,
                       } })}
                     >
-                      <Sparkles size={14} /> 沉淀 Skill
+                      <Sparkles size={14} /> 沉淀技能
                     </button>
                   </article>
                 ))}
@@ -1166,11 +2232,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         <div className="creation-skill-library">
           <header>
             <div>
-              <h2>{skillLibraryView === 'mine' ? '我的创作 Skill' : '创作 Skill 市场'}</h2>
-              <p>{skillLibraryView === 'mine' ? '管理本地 Skill、发布状态和安装状态。' : '直接在客户端搜索并安装公开 Skill。'}</p>
+              <h2>{skillLibraryView === 'mine' ? '我的技能' : '技能市场'}</h2>
             </div>
             <div className="creation-skill-library__header-actions">
-              <div className="creation-skill-library__switcher" role="tablist" aria-label="创作 Skill 来源">
+              <div className="creation-skill-library__switcher" role="tablist" aria-label="技能来源">
                 <button
                   type="button"
                   role="tab"
@@ -1178,7 +2243,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                   className={skillLibraryView === 'mine' ? 'is-active' : ''}
                   onClick={() => setSkillLibraryView('mine')}
                 >
-                  <Library size={14} /> 我的 Skill
+                  <Library size={14} /> 我的技能
                 </button>
                 <button
                   type="button"
@@ -1187,9 +2252,32 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                   className={skillLibraryView === 'market' ? 'is-active' : ''}
                   onClick={() => setSkillLibraryView('market')}
                 >
-                  <Store size={14} /> Skill 市场
+                  <Store size={14} /> 技能市场
                 </button>
               </div>
+              {skillLibraryView === 'mine' && (
+                <>
+                  <input
+                    ref={skillPackageInputRef}
+                    className="creation-skill-package-input"
+                    type="file"
+                    multiple
+                    onChange={handleSkillPackageSelected}
+                    {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => skillPackageInputRef.current?.click()}
+                    disabled={uploadingSkillPackage}
+                    title="选择一个包含根目录 SKILL.md 的 Codex 技能文件夹"
+                  >
+                    {uploadingSkillPackage
+                      ? <Loader2 className="spin" size={14} />
+                      : <Upload size={14} />}
+                    {uploadingSkillPackage ? '正在上传…' : '上传技能包'}
+                  </button>
+                </>
+              )}
               <button
                 type="button"
                 onClick={() => void (skillLibraryView === 'mine'
@@ -1205,7 +2293,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
           {skillLibraryView === 'market' && (
             <form className="creation-skill-market-search" onSubmit={handleMarketSearch} role="search">
               <label className="creation-skill-market-search__field">
-                <span>搜索市场 Skill</span>
+                <span>搜索市场技能</span>
                 <span className="creation-skill-market-search__query">
                   <Search size={16} />
                   <input
@@ -1216,18 +2304,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                 </span>
               </label>
               <label className="creation-skill-market-search__field">
-                <span>创作类目</span>
-                <select
+                <span>技能类目</span>
+                <CreationSkillCategoryCombobox
                   value={marketCategoryIdDraft}
-                  onChange={event => setMarketCategoryIdDraft(event.target.value)}
-                >
-                  <option value="">全部行业与工种</option>
-                  {marketCategoryOptions.map(category => (
-                    <option key={category.id} value={category.id}>
-                      {`${'　'.repeat(category.depth)}${category.depth > 0 ? '└ ' : ''}${category.name}`}
-                    </option>
-                  ))}
-                </select>
+                  options={marketCategoryOptions}
+                  onChange={setMarketCategoryIdDraft}
+                />
               </label>
               <button type="submit" disabled={marketLoading}>搜索</button>
             </form>
@@ -1237,18 +2319,19 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             <>
               {skillsError && <div className="creation-skill-library__feedback is-error" role="alert">{skillsError}</div>}
               {skillsLoading && localSkills.length === 0 ? (
-                <div className="history-browser__state"><Loader2 className="spin" size={17} /> 正在加载创作 Skill…</div>
+                <div className="history-browser__state"><Loader2 className="spin" size={17} /> 正在加载技能…</div>
               ) : localSkills.length === 0 ? (
-                <div className="creation-skill-library__empty"><Library size={32} /><strong>还没有创作 Skill</strong><span>可以从创作记录沉淀，或去市场安装一份。</span><button type="button" onClick={() => setSkillLibraryView('market')}>浏览 Skill 市场</button></div>
+                <div className="creation-skill-library__empty"><Library size={32} /><strong>还没有技能</strong><span>可以从创作记录沉淀、上传 Codex 技能包，或去市场安装一份。</span><button type="button" onClick={() => setSkillLibraryView('market')}>浏览技能市场</button></div>
               ) : (
                 <div className="creation-skill-library__grid">
                   {localSkills.map(skill => {
                     const fromMarket = skill.sourceKind === 'market'
+                    const imported = skill.sourceKind === 'imported'
                     return (
                       <article key={skill.id}>
                         <div className="creation-skill-library__status-row">
                           <div className="creation-skill-library__status">
-                            {fromMarket ? '来自市场' : skill.published ? '已发布' : skill.status === 'draft' ? '草稿' : '已保存'}
+                            {fromMarket ? '来自市场' : imported ? '手工上传' : skill.published ? '已发布' : skill.status === 'draft' ? '草稿' : '已保存'}
                           </div>
                           <span className={skill.installed ? 'is-installed' : ''}>{skill.installed ? '已安装' : '未安装'}</span>
                         </div>
@@ -1260,14 +2343,18 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                           {skill.title}
                         </button>
                         <p>{skill.summary}</p>
-                        <div className="creation-skill-library__meta">{skill.commonTitles.length} 个标题 · {skill.structurePattern.length} 个章节</div>
+                        <div className="creation-skill-library__meta">
+                          {imported
+                            ? `${skill.packageFiles?.length || 0} 个文件 · Codex 兼容`
+                            : `${skill.commonTitles.length} 个标题 · ${skill.structurePattern.length} 个章节`}
+                        </div>
                         <footer className={fromMarket ? 'is-compact' : ''}>
                           <button
                             type="button"
                             className={skill.installed ? 'is-installed' : ''}
                             onClick={() => void handleToggleSkillInstalled(skill)}
                             disabled={skill.status === 'draft'}
-                            title={skill.status === 'draft' ? '保存 Skill 后才能安装' : undefined}
+                            title={skill.status === 'draft' ? '保存技能后才能安装' : undefined}
                           >
                             {skill.installed ? <PackageCheck size={14} /> : <PackagePlus size={14} />}
                             {skill.installed ? '卸载' : '安装'}
@@ -1275,7 +2362,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                           <button type="button" onClick={() => showLocalSkillDetail(skill)}>
                             <Eye size={14} /> 查看详情
                           </button>
-                          {!fromMarket && (
+                          {!fromMarket && !imported && (
                             <>
                               <button
                                 type="button"
@@ -1283,10 +2370,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                                 onClick={() => void handlePublishSkill(skill, !skill.published)}
                                 disabled={skill.status === 'draft' || publishingSkillId === skill.id}
                                 title={skill.status === 'draft'
-                                  ? '保存 Skill 后才能发布'
+                                  ? '保存技能后才能发布'
                                   : skill.published
-                                    ? '从创作市场取消发布'
-                                    : '发布到创作市场'}
+                                    ? '从技能市场取消发布'
+                                    : '发布到技能市场'}
                               >
                                 {publishingSkillId === skill.id
                                   ? <Loader2 className="spin" size={14} />
@@ -1296,8 +2383,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                                 {skill.published ? '取消发布' : '发布'}
                               </button>
                               <button type="button" onClick={() => setSkillEditor({ initialSkill: skill })}><Pencil size={14} /> 编辑</button>
-                              <button type="button" onClick={() => void handleDeleteSkill(skill)} disabled={skill.published}><Trash2 size={14} /> 删除</button>
                             </>
+                          )}
+                          {!fromMarket && (
+                            <button type="button" onClick={() => handleDeleteSkill(skill)} disabled={skill.published}>
+                              <Trash2 size={14} /> 删除
+                            </button>
                           )}
                         </footer>
                       </article>
@@ -1310,23 +2401,25 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             <>
               {marketError && <div className="creation-skill-library__feedback is-error" role="alert">{marketError}</div>}
               {marketLoading && marketSkills.length === 0 ? (
-                <div className="history-browser__state"><Loader2 className="spin" size={17} /> 正在搜索市场 Skill…</div>
+                <div className="history-browser__state"><Loader2 className="spin" size={17} /> 正在搜索市场技能…</div>
               ) : marketSkills.length === 0 ? (
                 <div className="creation-skill-library__empty">
                   <Store size={32} />
-                  <strong>{marketQuery || marketCategoryId ? '没有找到匹配的 Skill' : '市场暂时还没有公开 Skill'}</strong>
-                  <span>{marketQuery || marketCategoryId ? '换个关键词或类目再试试。' : '稍后刷新即可看到新发布的 Skill。'}</span>
+                  <strong>{marketQuery || marketCategoryId ? '没有找到匹配的技能' : '市场暂时还没有公开技能'}</strong>
+                  <span>{marketQuery || marketCategoryId ? '换个关键词或类目再试试。' : '稍后刷新即可看到新发布的技能。'}</span>
                 </div>
               ) : (
                 <>
-                  <div className="creation-skill-market-count">找到 {marketTotal} 个公开 Skill</div>
+                  <div className="creation-skill-market-count">找到 {marketTotal} 个公开技能</div>
                   <div className="creation-skill-library__grid creation-skill-market-grid">
                     {marketSkills.map(skill => {
                       const installed = installedMarketSkillIds.has(skill.id)
                       return (
                         <article key={skill.id}>
                           <div className="creation-skill-library__status-row">
-                            <div className="creation-skill-library__status">市场 Skill</div>
+                            <div className={`creation-skill-library__status ${skill.isOfficial ? 'is-official' : ''}`}>
+                              {skill.isOfficial ? '官方技能' : '市场技能'}
+                            </div>
                             <span className={installed ? 'is-installed' : ''}>{installed ? '已安装' : '可安装'}</span>
                           </div>
                           <button
@@ -1347,7 +2440,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                             <button
                               type="button"
                               className={installed ? 'is-installed' : ''}
-                              disabled={installed || installingMarketSkillId === skill.id}
+                              disabled={installingMarketSkillId === skill.id}
                               onClick={() => void handleInstallMarketSkill(skill)}
                             >
                               {installingMarketSkillId === skill.id
@@ -1355,7 +2448,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                                 : installed
                                   ? <PackageCheck size={14} />
                                   : <PackagePlus size={14} />}
-                              {installed ? '已安装' : '安装'}
+                              {installed ? '卸载' : '安装'}
                             </button>
                           </footer>
                         </article>
@@ -1386,9 +2479,89 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             </>
           )}
         </div>
+      ) : topTab === 'tools' ? (
+        <CreationToolsPanel
+          tools={creationTools}
+          onInstall={handleInstallTool}
+          onUninstall={handleUninstallTool}
+          onToggle={handleToggleTool}
+        />
       ) : (
-        <main style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          <section style={{ padding: 22, borderBottom: '1px solid #e1e5ea', background: '#fff', flexShrink: 0 }}>
+        <main
+          ref={workspaceRef}
+          className="creation-workspace"
+          style={{
+            flex: 1,
+            minWidth: 0,
+            overflow: 'hidden',
+            '--creation-left-pane': `${workspaceSplit}%`,
+          } as React.CSSProperties}
+        >
+          <section className="creation-chat-shell" aria-label="创作对话">
+            <header className="creation-chat-header">
+              <div>
+                <Bot size={18} />
+                <strong>创作 Agent</strong>
+                {generatedContent && <span>继续对话优化当前文档</span>}
+              </div>
+              <div className="creation-chat-header__actions">
+                {sessionId && <code>{sessionId.slice(-8)}</code>}
+                <button
+                  type="button"
+                  className="creation-new-session-button"
+                  onClick={handleNewConversation}
+                  disabled={isGenerating || !hasActiveSession}
+                  aria-label="开启新会话"
+                  title={isGenerating ? '创作完成或中止后可开启新会话' : '清空当前内容并开启新会话'}
+                >
+                  <MessageSquarePlus size={15} />
+                  新会话
+                </button>
+              </div>
+            </header>
+            {(conversation.length > 0 || agentEvents.length > 0) && (
+              <div className="creation-chat-timeline" ref={chatTimelineRef} aria-live="polite">
+                {creationTimeline.map(item => (
+                  item.kind === 'message'
+                    ? (
+                      <article
+                        key={item.key}
+                        className={`creation-chat-message is-${item.message.role}`}
+                        aria-label={item.message.role === 'user' ? '用户消息' : 'Agent 消息'}
+                      >
+                        <span>{item.message.role === 'user' ? userDisplayName : '创作 Agent'}</span>
+                        <p>{item.message.content}</p>
+                      </article>
+                    )
+                    : <AgentExecutionTrace key={item.key} events={item.events} />
+                ))}
+              </div>
+            )}
+            {pendingConfirmation && (
+              <div className="creation-confirmation" role="group" aria-label="Agent 请求确认">
+                <div>
+                  <Bot size={17} />
+                  <span>
+                    <strong>需要你确认</strong>
+                    {pendingConfirmation.question}
+                  </span>
+                </div>
+                <div>
+                  <button type="button" onClick={() => void handleConfirmContinue()} disabled={isGenerating}>
+                    <Check size={15} /> 按当前信息继续
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPendingConfirmation(null)
+                      window.requestAnimationFrame(() => promptInputRef.current?.focus())
+                    }}
+                  >
+                    补充要求
+                  </button>
+                </div>
+              </div>
+            )}
             <div className="creation-prompt-skill-shell">
               <textarea
                 ref={promptInputRef}
@@ -1399,20 +2572,26 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                     event.preventDefault()
                     setSkillPickerOpen(false)
                   }
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !skillPickerOpen) {
+                    event.preventDefault()
+                    if (prompt.trim() && !isGenerating) void handleGenerate()
+                  }
                 }}
                 onPaste={(event) => {
                   const files = Array.from(event.clipboardData.files || [])
                   if (files.length) void addFiles(files)
                 }}
-                placeholder={`${defaultPrompt}\n输入 @ 可选择已安装的创作 Skill。`}
-                style={{ ...inputStyle, minHeight: 118, resize: 'vertical', lineHeight: 1.6 }}
+                placeholder={generatedContent
+                  ? '继续告诉 Agent 如何修改当前文档。Enter 发送，Shift+Enter 换行；输入 @ 可选择技能。'
+                  : `${defaultPrompt}\n输入 @ 可选择已安装的技能。`}
+                style={{ ...inputStyle, minHeight: conversation.length ? 82 : 112, resize: 'vertical', lineHeight: 1.6 }}
                 disabled={isGenerating}
                 aria-expanded={skillPickerOpen}
                 aria-controls="creation-skill-picker"
               />
               {skillPickerOpen && (
-                <div className="creation-skill-picker" id="creation-skill-picker" role="listbox" aria-label="选择创作 Skill">
-                  <header><AtSign size={15} /><span>选择已安装的 Skill</span><small>{skillPickerItems.length} 项</small></header>
+                <div className="creation-skill-picker" id="creation-skill-picker" role="listbox" aria-label="选择技能">
+                  <header><AtSign size={15} /><span>选择已安装的技能</span><small>{skillPickerItems.length} 项</small></header>
                   {skillPickerItems.length ? skillPickerItems.map(skill => (
                     <button
                       type="button"
@@ -1427,14 +2606,14 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                     </button>
                   )) : (
                     <div className="creation-skill-picker__empty">
-                      {installedSkills.length ? '没有匹配的已安装 Skill。' : '还没有已安装的 Skill，请先到「创作 Skill」页面安装。'}
+                      {installedSkills.length ? '没有匹配的已安装技能。' : '还没有已安装的技能，请先到「技能」页面安装。'}
                     </div>
                   )}
                 </div>
               )}
             </div>
             {matchedSkills.length > 0 && (
-              <div className="creation-matched-skills" aria-label="本次使用的创作 Skill">
+              <div className="creation-matched-skills" aria-label="本次使用的技能">
                 <span>本次将使用</span>
                 {matchedSkills.map(match => (
                   <button type="button" key={match.skill.id} onClick={() => showLocalSkillDetail(match.skill)}>
@@ -1476,8 +2655,8 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                 event.currentTarget.value = ''
               }}
             />
-            <div style={{ marginTop: 14, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', flex: '1 1 320px' }}>
+            <div className="creation-composer-actions" style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <div className="creation-model-row" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', flex: '1 1 300px' }}>
                 <ModelSelect
                   label="模型"
                   value={activeCreationModelId}
@@ -1502,26 +2681,47 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                 附件
               </button>
               <button onClick={isGenerating ? handleStopGenerate : handleGenerate} disabled={!isGenerating && !prompt.trim()} style={isGenerating ? dangerButtonStyle : primaryButtonStyle}>
-                {isGenerating ? <Loader2 size={16} className="spin" /> : <Sparkles size={16} />}
-                {isGenerating ? '中止' : '开始创作'}
+                {isGenerating ? <Loader2 size={16} className="spin" /> : generatedContent ? <Send size={16} /> : <Sparkles size={16} />}
+                {isGenerating ? '中止' : generatedContent ? '发送' : '开始创作'}
               </button>
             </div>
             {isGenerating && (
               <ProgressStrip
-                label={`已思考 ${elapsedSeconds} 秒`}
+                label={`已执行 ${elapsedSeconds} 秒`}
                 percent={generationProgress}
               />
             )}
             {error && <div style={{ marginTop: 12, color: '#b42318', fontSize: 13 }}>{error}</div>}
           </section>
 
-          <section style={{ flex: 1, minHeight: 0, overflow: 'hidden', padding: 22 }}>
-            <div style={{ height: '100%', border: '1px solid #e1e5ea', borderRadius: 8, background: '#fff', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-              <div style={{ height: 48, padding: '0 16px', borderBottom: '1px solid #e1e5ea', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
-                <span style={{ fontSize: 14, fontWeight: 650 }}>创作文档</span>
+          <div
+            className="creation-workspace-divider"
+            role="separator"
+            tabIndex={0}
+            aria-label="调整生成内容和创作对话的宽度"
+            aria-orientation="vertical"
+            aria-valuenow={Math.round(workspaceSplit)}
+            aria-valuetext={`生成内容占 ${Math.round(workspaceSplit)}%`}
+            onPointerDown={handleWorkspaceResizeStart}
+            onKeyDown={handleWorkspaceResizeKeyDown}
+          >
+            <span className="creation-workspace-divider__handle" aria-hidden="true" />
+          </div>
+
+          <section className="creation-document-section" aria-label="生成内容" style={{ flex: 1, minHeight: 0, overflow: 'hidden', padding: 22 }}>
+            <div className="creation-document-card" style={{ height: '100%', border: '1px solid #e1e5ea', borderRadius: 8, background: '#fff', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              <div className="creation-document-header" style={{ height: 48, padding: '0 16px', borderBottom: '1px solid #e1e5ea', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+                <span style={{ fontSize: 14, fontWeight: 650 }}>
+                  创作文档
+                  {latestDocumentPatch && (
+                    <small className="creation-document-patch-badge">
+                      本轮改动 {latestPatchChangeCount || latestPatchTargets.length} 处
+                    </small>
+                  )}
+                </span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   {isGenerating && (
-                    <span style={{ fontSize: 12, color: '#0f766e', fontWeight: 650 }}>
+                    <span style={{ fontSize: 12, color: '#a45d22', fontWeight: 650 }}>
                       {generationProgress}% · {elapsedSeconds} 秒
                     </span>
                   )}
@@ -1536,13 +2736,13 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                     {copySuccess ? '已复制' : '复制'}
                   </button>
                   <button onClick={openCurrentDocumentSkill} disabled={!generatedContent || isGenerating} style={compactButtonStyle}>
-                    <Sparkles size={15} /> 沉淀 Skill
+                    <Sparkles size={15} /> 沉淀技能
                   </button>
                 </div>
               </div>
               {currentDocumentSkills.length > 0 && (
-                <div className="creation-document-skills" aria-label="当前文档关联 Skill">
-                  <span>关联 Skill</span>
+                <div className="creation-document-skills" aria-label="当前文档关联技能">
+                  <span>关联技能</span>
                   {currentDocumentSkills.map(skill => (
                     <button type="button" key={skill.id} onClick={() => showLocalSkillDetail(skill)}>
                       <Sparkles size={13} /> {skill.title}
@@ -1551,14 +2751,40 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                   ))}
                 </div>
               )}
+              {latestDocumentPatch && (
+                <div className="creation-latest-change-summary" aria-label="本轮改动">
+                  <div>
+                    <Sparkles size={15} />
+                    <strong>本轮改动</strong>
+                    {latestUserInstruction && <span>{latestUserInstruction}</span>}
+                  </div>
+                  <div>
+                    {latestPatchChanges.slice(0, 12).map((change, index) => (
+                      <span
+                        key={`${change.changeType}-${change.sectionTitle}-${change.startLine}-${index}`}
+                        className={`is-${change.changeType}`}
+                      >
+                        {changeTypeLabel(change.changeType)} · {change.sectionTitle}
+                      </span>
+                    ))}
+                    {latestPatchChanges.length > 12 && (
+                      <small>另有 {latestPatchChanges.length - 12} 处</small>
+                    )}
+                  </div>
+                </div>
+              )}
               <div ref={contentRef} style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
                 {generatedContent ? (
-                  <MarkdownContent content={generatedContent} components={markdownComponents} />
+                  <MarkdownContent
+                    content={generatedContent}
+                    components={markdownComponents}
+                    changes={latestPatchChanges}
+                  />
                 ) : isGenerating ? (
                   <div style={{ height: '100%', display: 'grid', placeItems: 'center', color: '#667085', fontSize: 14, gap: 12 }}>
-                    <Loader2 size={28} className="spin" color="#0f766e" />
+                    <Loader2 size={28} className="spin" color="#a45d22" />
                     <div style={{ textAlign: 'center', lineHeight: 1.6 }}>
-                      <div style={{ fontWeight: 600, color: '#0f766e', marginBottom: 4 }}>模型正在深度推理中</div>
+                      <div style={{ fontWeight: 600, color: '#a45d22', marginBottom: 4 }}>模型正在深度推理中</div>
                       <div>已思考 {elapsedSeconds} 秒，预计进度 {generationProgress}%</div>
                     </div>
                   </div>
@@ -1572,8 +2798,8 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
           </section>
 
           {/* 底部互斥 Tab */}
-          <div style={{ background: '#fff', borderTop: '1px solid #e1e5ea', flexShrink: 0 }}>
-            <div style={{ display: 'flex', alignItems: 'center', padding: '0 16px' }}>
+          <div className="creation-bottom-panel" style={{ background: '#fff', borderTop: '1px solid #e1e5ea', flexShrink: 0 }}>
+            <div className="creation-bottom-tabs" style={{ display: 'flex', alignItems: 'center', padding: '0 16px' }}>
               {([
                 { key: 'reference', label: '参考资料', badge: referencePreview?.references?.length || 0 },
                 { key: 'config', label: '创作参数', badge: 0 },
@@ -1584,9 +2810,9 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                   style={{
                     padding: '10px 16px',
                     border: 'none',
-                    borderTop: activeBottomTab === key ? '2px solid #0f766e' : '2px solid transparent',
+                    borderTop: activeBottomTab === key ? '2px solid #a45d22' : '2px solid transparent',
                     background: 'none',
-                    color: activeBottomTab === key ? '#0f766e' : '#667085',
+                    color: activeBottomTab === key ? '#a45d22' : '#667085',
                     fontWeight: activeBottomTab === key ? 650 : 400,
                     fontSize: 13,
                     cursor: 'pointer',
@@ -1627,14 +2853,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                   目标读者
                   <input value={audience} onChange={(e) => setAudience(e.target.value)} placeholder="客户" style={inputStyle} />
                 </label>
-                <Toggle label="启用 RAG 参考" checked={enableRag} onChange={setEnableRag} />
                 <Toggle label="继承历史格式" checked={inheritFormat} onChange={setInheritFormat} />
-                <Toggle label="互联网检索" checked={enableWebSearch} onChange={setEnableWebSearch} icon={<Search size={16} />} />
                 <Toggle label="图片生成建议" checked={enableImageGeneration} onChange={setEnableImageGeneration} icon={<Image size={16} />} />
                 <div style={{ height: 1, background: '#e1e5ea', margin: '4px 0' }} />
                 <div style={{ fontSize: 12, color: '#475467', display: 'flex', justifyContent: 'space-between' }}>
                   <span>权重配置</span>
-                  <span style={{ color: totalWeight === 100 ? '#0f766e' : '#b54708' }}>{totalWeight}%</span>
+                  <span style={{ color: totalWeight === 100 ? '#a45d22' : '#b54708' }}>{totalWeight}%</span>
                 </div>
                 <WeightSlider label="内容相关度" value={contentWeight} onChange={setContentWeight} />
                 <WeightSlider label="文档质量" value={qualityWeight} onChange={setQualityWeight} />
@@ -1661,10 +2885,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         <CreationSkillDetail
           skill={skillDetail}
           onClose={closeSkillDetail}
-          primaryAction={skillDetailMarketItem && !skillDetail.installed
+          primaryAction={skillDetailMarketItem
             ? {
-              label: '安装 Skill',
-              loadingLabel: '正在安装…',
+              label: skillDetail.installed ? '卸载技能' : '安装技能',
+              loadingLabel: skillDetail.installed ? '正在卸载…' : '正在安装…',
               loading: installingMarketSkillId === skillDetailMarketItem.id,
               onClick: () => void handleInstallMarketSkill(skillDetailMarketItem),
             }
@@ -1672,11 +2896,306 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         />
       )}
 
+      {skillPendingDelete && (
+        <div
+          className="creation-skill-modal"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && deletingSkillId === null) {
+              setSkillPendingDelete(null)
+            }
+          }}
+        >
+          <section
+            className="creation-skill-delete-confirm"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="creation-skill-delete-title"
+            aria-describedby="creation-skill-delete-description"
+          >
+            <span className="creation-skill-delete-confirm__icon" aria-hidden="true">
+              <Trash2 size={20} />
+            </span>
+            <div>
+              <h2 id="creation-skill-delete-title">确认删除技能？</h2>
+              <p id="creation-skill-delete-description">
+                将删除“{skillPendingDelete.title}”及其本地文件。此操作不会影响原始文档，但删除后无法恢复。
+              </p>
+            </div>
+            <footer>
+              <button
+                type="button"
+                autoFocus
+                onClick={() => setSkillPendingDelete(null)}
+                disabled={deletingSkillId !== null}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="is-danger"
+                onClick={() => void confirmDeleteSkill()}
+                disabled={deletingSkillId !== null}
+              >
+                {deletingSkillId !== null ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                {deletingSkillId !== null ? '正在删除…' : '确认删除'}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+
     </div>
   )
 }
 
-const MarkdownContent = ({ content, components }: { content: string; components: any }) => {
+const displayAgentName = (event: CreationAgentEvent) => {
+  if (event.actor?.id === 'creation_main_agent') return '创作 Agent'
+  return String(event.actor?.name || '创作 Agent').replace(/创作主 Agent/g, '创作 Agent')
+}
+
+const displayAgentText = (value: unknown) =>
+  String(value || '').replace(/创作主 Agent/g, '创作 Agent')
+
+const AgentExecutionTrace = ({
+  events,
+}: {
+  events: CreationAgentEvent[]
+}) => {
+  const [expanded, setExpanded] = useState(true)
+  if (!events.length) return null
+  const latestGoal = [...events].reverse().find(event => event.goal)?.goal
+  const displayEvents = collapseAgentLifecycleEvents(events)
+  const eventGroups = groupConsecutiveAgentEvents(displayEvents)
+
+  return (
+    <section className="creation-agent-trace" aria-label="Agent 执行情况">
+      <button
+        type="button"
+        className="creation-agent-trace__toggle"
+        onClick={() => setExpanded(value => !value)}
+        aria-expanded={expanded}
+      >
+        {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+        <span>执行过程</span>
+        <small>
+          {latestGoal && `目标修订 ${latestGoal.revision} · `}
+          {displayEvents.length} 个步骤
+        </small>
+      </button>
+      {expanded && (
+        <div className="creation-agent-trace__runs">
+          <div className="creation-agent-run">
+            <div>
+              {eventGroups.map((group, groupIndex) => {
+                const actorEvent = group.events[0]
+                const latestEvent = group.events[group.events.length - 1]
+                const resolved = latestEvent.status === 'running' && eventGroups
+                  .slice(groupIndex + 1)
+                  .some(next => (
+                    next.events.some(event => (
+                      event.actor?.id === latestEvent.actor?.id
+                      && ['completed', 'failed'].includes(event.status)
+                    ))
+                  ))
+                const displayStatus = resolved ? 'completed' : latestEvent.status
+                return (
+                  <div
+                    className={`creation-agent-event is-${displayStatus}`}
+                    key={group.key}
+                  >
+                    <span className={`creation-agent-event__icon is-${actorEvent.actor?.kind || 'agent'}`}>
+                      {displayStatus === 'running'
+                        ? <Loader2 size={13} className="spin" />
+                        : displayStatus === 'completed'
+                          ? <Check size={13} />
+                          : actorEvent.actor?.kind === 'tool'
+                            ? <Wrench size={13} />
+                            : actorEvent.actor?.kind === 'skill'
+                              ? <Sparkles size={13} />
+                              : <Bot size={13} />}
+                    </span>
+                    <span>
+                      <strong>
+                        {displayAgentName(actorEvent)}
+                        <em>{agentActorKindLabel(actorEvent.actor?.kind)}</em>
+                      </strong>
+                      <div className="creation-agent-event__updates">
+                        {group.events.map((event) => {
+                          const details = agentEventDetails(event)
+                          return (
+                            <div
+                              className="creation-agent-event__update"
+                              key={event.event_id || `${event.run_id}-${event.sequence}`}
+                            >
+                              <small>{displayAgentText(event.summary)}</small>
+                              {details.length > 0 && (
+                                <dl>
+                                  {details.map(detail => (
+                                    <React.Fragment key={`${event.event_id}-${detail.label}`}>
+                                      <dt>{detail.label}</dt>
+                                      <dd>{detail.value}</dd>
+                                    </React.Fragment>
+                                  ))}
+                                </dl>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+const agentActorKindLabel = (kind?: string) => {
+  if (kind === 'tool') return 'Tool'
+  if (kind === 'skill') return '技能'
+  return 'Agent'
+}
+
+const agentEventDetails = (event: CreationAgentEvent) => {
+  const details: Array<{ label: string; value: string }> = []
+  const data = event.data || {}
+  const patch = (data.patch || event.environment_patch?.document_patch) as Record<string, unknown> | undefined
+  const targetSections = (
+    Array.isArray(data.target_sections)
+      ? data.target_sections
+      : Array.isArray(patch?.target_sections)
+        ? patch?.target_sections
+        : []
+  ).map(item => String(item)).filter(Boolean)
+
+  if (event.type === 'intent.interpreted') {
+    const root = String(data.root_request || '').trim()
+    if (root) details.push({ label: '原始需求', value: root })
+    const current = String(data.current_instruction || '').trim()
+    if (current && current !== root) details.push({ label: '本轮要求', value: current })
+  }
+  const reasoning = String(data.reasoning_summary || '').trim()
+  if (reasoning) details.push({ label: '判断摘要', value: reasoning })
+  if (targetSections.length) {
+    details.push({ label: '变更范围', value: targetSections.join('、') })
+  }
+  if (event.actor?.kind === 'tool' && Number.isFinite(Number(data.result_count))) {
+    details.push({ label: '结果', value: `${Number(data.result_count)} 条` })
+  }
+  if (event.actor?.kind === 'tool' && data.diagram_type) {
+    details.push({ label: '图类型', value: String(data.diagram_type) })
+  }
+  if (event.type === 'tool.failed' && data.error_code) {
+    details.push({ label: '错误码', value: String(data.error_code) })
+  }
+  if (event.type === 'agent.completed') {
+    const resultEntry = Object.entries(event.environment_patch || {})
+      .find(([key, value]) => (
+        ['data_analysis', 'industry_research', 'solution_design'].includes(key)
+        && typeof value === 'string'
+        && value.trim()
+      ))
+    if (resultEntry) {
+      details.push({
+        label: '结果摘要',
+        value: String(resultEntry[1]),
+      })
+    }
+    const plan = event.environment_patch?.plan
+    if (Array.isArray(plan) && plan.length) {
+      details.push({
+        label: '后续步骤',
+        value: plan.map(item => String(item)).join(' → '),
+      })
+    }
+    const quality = event.environment_patch?.quality_review as Record<string, unknown> | undefined
+    if (quality) {
+      const passed = Object.values(quality).every(Boolean)
+      details.push({ label: '检查结果', value: passed ? '全部通过' : '存在待修订项' })
+    }
+  }
+  if (event.type === 'skill.completed') {
+    const skill = event.environment_patch?.skill as Record<string, unknown> | undefined
+    if (skill?.source) {
+      details.push({
+        label: '来源',
+        value: skill.source === 'installed' ? '已安装技能' : '内置技能市场',
+      })
+    }
+  }
+  if (event.type === 'document.patch.applied') {
+    details.push({ label: '结果', value: String(patch?.summary || event.summary) })
+    const changeCount = Number(patch?.change_count)
+    if (Number.isFinite(changeCount) && changeCount > 0) {
+      details.push({ label: '改动', value: `${changeCount} 处` })
+    }
+  }
+  return details
+}
+
+const changeOverlappingLines = (
+  changes: DocumentChange[],
+  startLine: number,
+  endLine: number,
+) => changes.find(change => (
+  change.startLine != null
+  && change.endLine != null
+  && change.startLine <= endLine
+  && change.endLine >= startLine
+))
+
+const markdownComponentsWithChanges = (
+  components: any,
+  blockStartLine: number,
+  changes: DocumentChange[],
+) => {
+  const decorated = { ...components }
+  ;['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'blockquote', 'pre'].forEach((tag) => {
+    const Original = components[tag]
+    decorated[tag] = ({ node, className, ...props }: any) => {
+      const localStart = Number(node?.position?.start?.line)
+      const localEnd = Number(node?.position?.end?.line)
+      const globalStart = blockStartLine + (Number.isFinite(localStart) ? localStart - 1 : 0)
+      const globalEnd = blockStartLine + (Number.isFinite(localEnd) ? localEnd - 1 : 0)
+      const change = changeOverlappingLines(changes, globalStart, globalEnd)
+      const resolvedClassName = [
+        className,
+        change ? 'creation-latest-change' : '',
+        change ? `is-${change.changeType}` : '',
+      ].filter(Boolean).join(' ')
+      const resolvedProps = {
+        ...props,
+        className: resolvedClassName || undefined,
+        ...(change
+          ? {
+            'data-change-type': change.changeType,
+            'data-change-section': change.sectionTitle,
+          }
+          : {}),
+      }
+      if (Original) {
+        return <Original node={node} {...resolvedProps} />
+      }
+      return React.createElement(tag, resolvedProps)
+    }
+  })
+  return decorated
+}
+
+const MarkdownContent = ({
+  content,
+  components,
+  changes = [],
+}: {
+  content: string
+  components: any
+  changes?: DocumentChange[]
+}) => {
   const inlineComponents = {
     ...components,
     p: ({ children }: any) => <>{children}</>,
@@ -1686,11 +3205,28 @@ const MarkdownContent = ({ content, components }: { content: string; components:
     <>
       {parseMarkdownBlocks(content).map((block, index) => {
         if (block.type === 'markdown') {
-          return <ReactMarkdown key={`markdown-${index}`} components={components}>{block.content}</ReactMarkdown>
+          return (
+            <ReactMarkdown
+              key={`markdown-${index}`}
+              components={markdownComponentsWithChanges(components, block.startLine, changes)}
+            >
+              {block.content}
+            </ReactMarkdown>
+          )
         }
 
+        const tableChange = changeOverlappingLines(changes, block.startLine, block.endLine)
         return (
-          <div key={`table-${index}`} style={{ overflowX: 'auto', margin: '16px 0' }}>
+          <div
+            key={`table-${index}`}
+            className={[
+              tableChange ? 'creation-latest-change' : '',
+              tableChange ? `is-${tableChange.changeType}` : '',
+            ].filter(Boolean).join(' ')}
+            data-change-type={tableChange?.changeType}
+            data-change-section={tableChange?.sectionTitle}
+            style={{ overflowX: 'auto', margin: '16px 0' }}
+          >
             <table style={{ width: '100%', minWidth: 720, borderCollapse: 'collapse', fontSize: 14, lineHeight: 1.55 }}>
               <thead>
                 <tr>
@@ -1764,7 +3300,7 @@ const ProgressStrip = ({ label, percent }: { label: string; percent: number }) =
       <span>{percent}%</span>
     </div>
     <div style={{ height: 6, borderRadius: 999, background: '#e4e7ec', overflow: 'hidden' }}>
-      <div style={{ width: `${percent}%`, height: '100%', borderRadius: 999, background: '#0f766e', transition: 'width 0.25s ease' }} />
+      <div style={{ width: `${percent}%`, height: '100%', borderRadius: 999, background: '#a45d22', transition: 'width 0.25s ease' }} />
     </div>
   </div>
 )
@@ -1790,7 +3326,7 @@ const ReferenceRow = ({ item, onOpenSource }: { item: ReferenceItem; onOpenSourc
         border: '1px solid #d0d5dd',
         borderRadius: 6,
         background: '#fff',
-        color: '#0f766e',
+        color: '#a45d22',
         fontSize: 12,
         fontWeight: 600,
         cursor: 'pointer',
@@ -1810,23 +3346,24 @@ const inputStyle: React.CSSProperties = {
   padding: '10px 12px',
   border: '1px solid #d0d5dd',
   borderRadius: 8,
-  fontSize: 14,
+  fontSize: 13,
   fontFamily: 'inherit',
   outline: 'none',
   background: '#fff',
 }
 
 const primaryButtonStyle: React.CSSProperties = {
-  height: 38,
-  padding: '0 15px',
-  border: '1px solid #0f766e',
+  height: 34,
+  padding: '0 12px',
+  border: '1px solid #a45d22',
   borderRadius: 8,
-  background: '#0f766e',
+  background: '#a45d22',
   color: '#fff',
   display: 'inline-flex',
   alignItems: 'center',
-  gap: 8,
+  gap: 6,
   cursor: 'pointer',
+  fontSize: 12,
   fontWeight: 650,
 }
 

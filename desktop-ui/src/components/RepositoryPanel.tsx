@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  useDeleteBakeCapture,
+  useDeleteBakeMemory,
   useFetchBakeMemory,
   useFetchBakeMemories,
   useFetchBakeCaptureDetail,
@@ -26,6 +28,15 @@ import BakeCaptureTab, { parseDateInputToMs } from './bake/BakeCaptureTab'
 import BakeHeader from './bake/BakeHeader'
 import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './bake/BakeShared'
 import './bake/BakePanel.css'
+
+const getFallbackOffsetAfterRemoval = (currentCount: number, offset: number, limit: number) => (
+  currentCount <= 1 && offset > 0 ? Math.max(0, offset - limit) : offset
+)
+
+type PendingDeletion = {
+  kind: 'memory' | 'capture'
+  id: string
+}
 
 const formatMemoryTime = (item: Pick<TimelineItem, 'createdAt' | 'createdAtMs'>) => {
   if (item.createdAtMs > 0) {
@@ -88,8 +99,10 @@ const RepositoryPanel: React.FC = () => {
 
   const fetchMemories = useFetchBakeMemories()
   const fetchMemory = useFetchBakeMemory()
+  const deleteMemory = useDeleteBakeMemory()
   const fetchCaptures = useFetchBakeCaptures()
   const fetchCaptureDetail = useFetchBakeCaptureDetail()
+  const deleteCapture = useDeleteBakeCapture()
   const fetchCapturesRaw = useFetchCaptures()
   const fetchTemplates = useFetchBakeTemplates()
   const fetchKnowledge = useFetchBakeKnowledge()
@@ -116,8 +129,40 @@ const RepositoryPanel: React.FC = () => {
   const [draftCaptureQuery, setDraftCaptureQuery] = useState(repositoryCaptureQuery)
   const [draftCaptureFrom, setDraftCaptureFrom] = useState(repositoryCaptureFrom)
   const [draftCaptureTo, setDraftCaptureTo] = useState(repositoryCaptureTo)
+  const [pendingDeletion, setPendingDeletion] = useState<PendingDeletion | null>(null)
+  const [isDeleting, setIsDeleting] = useState(false)
   const memoryRequestSeqRef = useRef(0)
   const captureRequestSeqRef = useRef(0)
+
+  const refreshMemories = async (offset = bakeMemoryOffset) => {
+    const data = await fetchMemories({
+      q: repositoryMemoryQuery.trim() || undefined,
+      from: parseDateInputToMs(repositoryMemoryFrom),
+      to: parseDateInputToMs(repositoryMemoryTo, true),
+      limit: repositoryMemoryLimit,
+      offset,
+    })
+    setMemories(data.items)
+    setMemoryTotal(data.total)
+    setSelectedMemoryId(data.items[0]?.id ?? null)
+  }
+
+  const refreshCaptures = async (
+    offset = bakeCaptureOffset,
+    sourceCaptureId: string | null = repositoryCaptureSourceCaptureId,
+  ) => {
+    const data = await fetchCaptures({
+      q: repositoryCaptureQuery.trim() || undefined,
+      from: parseDateInputToMs(repositoryCaptureFrom),
+      to: parseDateInputToMs(repositoryCaptureTo, true),
+      source_capture_id: sourceCaptureId ? Number(sourceCaptureId) : undefined,
+      limit: repositoryCaptureLimit,
+      offset,
+    })
+    setCaptureItems(data.items)
+    setCaptureTotal(data.total)
+    setSelectedCaptureId(data.items[0]?.id ?? null)
+  }
 
   useEffect(() => {
     if (repositoryTab !== 'memory') return
@@ -213,6 +258,19 @@ const RepositoryPanel: React.FC = () => {
   }, [statusMessage])
 
   useEffect(() => {
+    if (!pendingDeletion || isDeleting) return
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setPendingDeletion(null)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [isDeleting, pendingDeletion])
+
+  useEffect(() => {
     setDraftMemoryQuery(repositoryMemoryQuery)
     setDraftMemoryFrom(repositoryMemoryFrom)
     setDraftMemoryTo(repositoryMemoryTo)
@@ -230,8 +288,11 @@ const RepositoryPanel: React.FC = () => {
 
   useEffect(() => {
     if (repositoryTab !== 'memory') return
-    if (memories.length === 0) return
-    if (!selectedMemoryId) {
+    if (memories.length === 0) {
+      setSelectedMemoryId(null)
+      return
+    }
+    if (!selectedMemoryId || !memories.some(item => item.id === selectedMemoryId)) {
       setSelectedMemoryId(memories[0].id)
     }
   }, [memories, repositoryTab, selectedMemoryId, setSelectedMemoryId])
@@ -335,6 +396,7 @@ const RepositoryPanel: React.FC = () => {
       repositoryCaptureQuery: draftCaptureQuery,
       repositoryCaptureFrom: draftCaptureFrom,
       repositoryCaptureTo: draftCaptureTo,
+      repositoryCaptureSourceCaptureId: null,
       bakeCaptureOffset: 0,
     })
   }
@@ -351,6 +413,65 @@ const RepositoryPanel: React.FC = () => {
       repositoryCaptureSourceCaptureId: null,
       bakeCaptureOffset: 0,
     })
+  }
+
+  const deleteMemoryAndRefresh = async (id: string) => {
+    try {
+      await deleteMemory(id)
+      clearBakeNavigationStack()
+      const nextOffset = getFallbackOffsetAfterRemoval(memories.length, bakeMemoryOffset, repositoryMemoryLimit)
+      setRepositoryMemoryFocusId(null)
+      setSelectedMemoryId(null)
+      setMemoryCaptures([])
+      setSelectedMemoryRelations({ document: null, knowledge: null, sop: null, loading: false })
+      if (nextOffset !== bakeMemoryOffset) {
+        setBakeMemoryOffset(nextOffset)
+      } else {
+        await refreshMemories(nextOffset)
+      }
+      setStatusMessage('已删除时间线')
+    } catch (error) {
+      setStatusMessage(toUserFacingError(error, '删除时间线失败'))
+    }
+  }
+
+  const deleteCaptureAndRefresh = async (id: string) => {
+    try {
+      await deleteCapture(id)
+      clearBakeNavigationStack()
+      const nextOffset = getFallbackOffsetAfterRemoval(captureItems.length, bakeCaptureOffset, repositoryCaptureLimit)
+      const clearsSourceScope = repositoryCaptureSourceCaptureId === id
+      if (clearsSourceScope) {
+        setRepositoryCaptureSourceCaptureId(null)
+      }
+      setSelectedCaptureId(null)
+      setCaptureDetail(null)
+      if (nextOffset !== bakeCaptureOffset) {
+        setBakeCaptureOffset(nextOffset)
+      } else {
+        await refreshCaptures(nextOffset, clearsSourceScope ? null : repositoryCaptureSourceCaptureId)
+      }
+      setStatusMessage('已删除采集记录')
+    } catch (error) {
+      setStatusMessage(toUserFacingError(error, '删除采集记录失败'))
+    }
+  }
+
+  const confirmDeletion = async () => {
+    if (!pendingDeletion || isDeleting) return
+
+    const deletion = pendingDeletion
+    setIsDeleting(true)
+    try {
+      if (deletion.kind === 'memory') {
+        await deleteMemoryAndRefresh(deletion.id)
+      } else {
+        await deleteCaptureAndRefresh(deletion.id)
+      }
+      setPendingDeletion(null)
+    } finally {
+      setIsDeleting(false)
+    }
   }
 
   const handleRepositoryTabChange = (tab: RepositoryTab) => {
@@ -560,10 +681,9 @@ const RepositoryPanel: React.FC = () => {
             </div>
           </form>
 
-          {(memoryFilterPills.length > 0 || repositoryMemoryFocusId) && (
+          {memoryFilterPills.length > 0 && (
             <div className="bake-filter-summary">
               {memoryFilterPills.map(item => <BakePill key={item} text={item} />)}
-              {repositoryMemoryFocusId && <BakeButton compact onClick={handleClearMemoryFilters}>查看全部</BakeButton>}
             </div>
           )}
 
@@ -784,6 +904,7 @@ const RepositoryPanel: React.FC = () => {
                       <BakeButton compact onClick={() => handleViewRelatedDocument(selectedMemory.id)}>关联文档</BakeButton>
                       <BakeButton compact onClick={() => handleViewRelatedKnowledge(selectedMemory.id)}>关联知识</BakeButton>
                       <BakeButton compact onClick={() => handleViewRelatedSop(selectedMemory.id)}>关联操作</BakeButton>
+                      <BakeButton compact danger onClick={() => setPendingDeletion({ kind: 'memory', id: selectedMemory.id })}>删除时间线</BakeButton>
                     </div>
                     <div className="bake-related-summary">
                       <div className="bake-related-row">
@@ -842,16 +963,66 @@ const RepositoryPanel: React.FC = () => {
             onDraftToChange={setDraftCaptureTo}
             onSearch={handleSearchCaptures}
             onClearFilters={handleClearCaptureFilters}
-            onClearScope={() => {
-              clearBakeNavigationStack()
-              setRepositoryCaptureSourceCaptureId(null)
-            }}
             onViewLinkedTimeline={handleViewLinkedTimeline}
+            onDeleteCapture={(id) => setPendingDeletion({ kind: 'capture', id })}
             canGoBack={Boolean(captureBackTarget)}
             onGoBack={handleCaptureGoBack}
           />
         )}
       </div>
+      {pendingDeletion && (
+        <div
+          className="bake-modal-overlay"
+          onClick={() => {
+            if (!isDeleting) setPendingDeletion(null)
+          }}
+        >
+          <section
+            className="bake-modal bake-modal--confirm"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="repository-delete-title"
+            aria-describedby="repository-delete-description"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="bake-modal__header">
+              <h3 id="repository-delete-title">
+                {pendingDeletion.kind === 'memory' ? '删除时间线？' : '删除采集记录？'}
+              </h3>
+              <button
+                type="button"
+                className="bake-modal__close"
+                aria-label="关闭"
+                disabled={isDeleting}
+                onClick={() => setPendingDeletion(null)}
+              >
+                ×
+              </button>
+            </div>
+            <div className="bake-modal__body bake-modal__body--confirm">
+              <p id="repository-delete-description">
+                {pendingDeletion.kind === 'memory'
+                  ? '删除后无法恢复，关联采集记录、文档、操作和知识会保留。'
+                  : '对应截图会一并删除，已生成的时间线和其他内容会保留。'}
+              </p>
+            </div>
+            <div className="bake-modal__footer">
+              <button
+                type="button"
+                className="bake-btn bake-btn--compact"
+                autoFocus
+                disabled={isDeleting}
+                onClick={() => setPendingDeletion(null)}
+              >
+                取消
+              </button>
+              <BakeButton compact danger disabled={isDeleting} onClick={() => void confirmDeletion()}>
+                {isDeleting ? '删除中…' : '确认删除'}
+              </BakeButton>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   )
 }

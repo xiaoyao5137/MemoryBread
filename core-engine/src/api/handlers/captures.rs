@@ -86,6 +86,7 @@ pub async fn list_captures(
             query: filter.query.clone(),
             capture_id: filter.capture_id,
             exclude_sensitive: filter.exclude_sensitive,
+            exclude_system_session_apps: filter.exclude_system_session_apps,
             limit: filter.limit,
             offset: filter.offset,
         };

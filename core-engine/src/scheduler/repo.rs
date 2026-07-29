@@ -2,7 +2,9 @@
 
 use rusqlite::params;
 
-use super::models::{NewScheduledTask, ScheduledTask, TaskExecution, UpdateScheduledTask};
+use super::models::{
+    NewScheduledTask, ScheduledTask, TaskExecution, TaskNotificationDelivery, UpdateScheduledTask,
+};
 use crate::storage::{StorageError, StorageManager};
 
 pub struct TaskRepo;
@@ -15,11 +17,21 @@ impl TaskRepo {
         now_ms: i64,
     ) -> Result<i64, StorageError> {
         storage.with_conn(|conn| {
+            let notification_channel_ids = serde_json::to_string(&task.notification_channel_ids)
+                .unwrap_or_else(|_| "[]".into());
             conn.execute(
                 "INSERT INTO scheduled_tasks
-                 (name, user_instruction, cron_expression, template_id, enabled, run_count, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?5)",
-                params![task.name, task.user_instruction, task.cron_expression, task.template_id, now_ms],
+                 (name, user_instruction, cron_expression, template_id, notification_channel_ids,
+                  enabled, run_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 0, ?6, ?6)",
+                params![
+                    task.name,
+                    task.user_instruction,
+                    task.cron_expression,
+                    task.template_id,
+                    notification_channel_ids,
+                    now_ms
+                ],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -30,7 +42,8 @@ impl TaskRepo {
         storage.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, name, user_instruction, cron_expression, enabled, template_id,
-                        run_count, last_run_at, last_run_status, next_run_at, created_at, updated_at
+                        is_builtin, notification_channel_ids, run_count, last_run_at,
+                        last_run_status, next_run_at, created_at, updated_at
                  FROM scheduled_tasks WHERE enabled = 1 ORDER BY id",
             )?;
             let rows = stmt.query_map([], |row| Self::row_to_task(row))?;
@@ -43,7 +56,8 @@ impl TaskRepo {
         storage.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, name, user_instruction, cron_expression, enabled, template_id,
-                        run_count, last_run_at, last_run_status, next_run_at, created_at, updated_at
+                        is_builtin, notification_channel_ids, run_count, last_run_at,
+                        last_run_status, next_run_at, created_at, updated_at
                  FROM scheduled_tasks ORDER BY id",
             )?;
             let rows = stmt.query_map([], |row| Self::row_to_task(row))?;
@@ -56,7 +70,8 @@ impl TaskRepo {
         storage.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, name, user_instruction, cron_expression, enabled, template_id,
-                        run_count, last_run_at, last_run_status, next_run_at, created_at, updated_at
+                        is_builtin, notification_channel_ids, run_count, last_run_at,
+                        last_run_status, next_run_at, created_at, updated_at
                  FROM scheduled_tasks WHERE id = ?1",
             )?;
             let mut rows = stmt.query_map(params![id], |row| Self::row_to_task(row))?;
@@ -72,19 +87,25 @@ impl TaskRepo {
         now_ms: i64,
     ) -> Result<bool, StorageError> {
         storage.with_conn(|conn| {
+            let notification_channel_ids = patch
+                .notification_channel_ids
+                .as_ref()
+                .map(|ids| serde_json::to_string(ids).unwrap_or_else(|_| "[]".into()));
             let affected = conn.execute(
                 "UPDATE scheduled_tasks SET
                    name             = COALESCE(?1, name),
                    user_instruction = COALESCE(?2, user_instruction),
                    cron_expression  = COALESCE(?3, cron_expression),
                    enabled          = COALESCE(?4, enabled),
-                   updated_at       = ?5
-                 WHERE id = ?6",
+                   notification_channel_ids = COALESCE(?5, notification_channel_ids),
+                   updated_at       = ?6
+                 WHERE id = ?7",
                 params![
                     patch.name,
                     patch.user_instruction,
                     patch.cron_expression,
                     patch.enabled.map(|b| b as i64),
+                    notification_channel_ids,
                     now_ms,
                     id,
                 ],
@@ -181,9 +202,32 @@ impl TaskRepo {
                     result_text: row.get(7)?,
                     error_message: row.get(8)?,
                     latency_ms: row.get(9)?,
+                    notification_deliveries: Vec::new(),
                 })
             })?;
-            Ok(rows.filter_map(|r| r.ok()).collect())
+            let mut executions = rows.filter_map(Result::ok).collect::<Vec<_>>();
+            for execution in &mut executions {
+                let mut delivery_statement = conn.prepare(
+                    "SELECT d.channel_id, c.name, c.channel_type, d.status,
+                            d.error_message, d.delivered_at
+                     FROM task_notification_deliveries d
+                     JOIN notification_channels c ON c.id = d.channel_id
+                     WHERE d.execution_id = ?1
+                     ORDER BY d.id",
+                )?;
+                let deliveries = delivery_statement.query_map(params![execution.id], |row| {
+                    Ok(TaskNotificationDelivery {
+                        channel_id: row.get(0)?,
+                        channel_name: row.get(1)?,
+                        channel_type: row.get(2)?,
+                        status: row.get(3)?,
+                        error_message: row.get(4)?,
+                        delivered_at: row.get(5)?,
+                    })
+                })?;
+                execution.notification_deliveries = deliveries.filter_map(Result::ok).collect();
+            }
+            Ok(executions)
         })
     }
 
@@ -195,12 +239,16 @@ impl TaskRepo {
             cron_expression: row.get(3)?,
             enabled: row.get::<_, i64>(4)? != 0,
             template_id: row.get(5)?,
-            run_count: row.get(6)?,
-            last_run_at: row.get(7)?,
-            last_run_status: row.get(8)?,
-            next_run_at: row.get(9)?,
-            created_at: row.get(10)?,
-            updated_at: row.get(11)?,
+            is_builtin: row.get::<_, i64>(6)? != 0,
+            can_delete: row.get::<_, i64>(6)? == 0,
+            notification_channel_ids: serde_json::from_str(&row.get::<_, String>(7)?)
+                .unwrap_or_default(),
+            run_count: row.get(8)?,
+            last_run_at: row.get(9)?,
+            last_run_status: row.get(10)?,
+            next_run_at: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
         })
     }
 }

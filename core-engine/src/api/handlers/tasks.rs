@@ -15,6 +15,7 @@ use crate::api::{error::ApiError, state::AppState};
 use crate::scheduler::{
     cron_expression::next_run_at_ms,
     models::{NewScheduledTask, UpdateScheduledTask},
+    notification_repo::NotificationChannelRepo,
     repo::TaskRepo,
 };
 
@@ -23,6 +24,10 @@ pub async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(mut body): Json<NewScheduledTask>,
 ) -> Result<impl IntoResponse, ApiError> {
+    body.notification_channel_ids = normalize_channel_ids(&body.notification_channel_ids);
+    if !NotificationChannelRepo::all_exist(&state.storage, &body.notification_channel_ids)? {
+        return Err(ApiError::BadRequest("消息渠道不存在".into()));
+    }
     let (normalized_cron, next_run) = next_run_at_ms(&body.cron_expression)
         .map_err(|error| ApiError::BadRequest(format!("cron 表达式无效: {error}")))?;
     body.cron_expression = normalized_cron;
@@ -57,6 +62,12 @@ pub async fn update_task(
     Path(id): Path<i64>,
     Json(mut body): Json<UpdateScheduledTask>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if let Some(channel_ids) = body.notification_channel_ids.as_mut() {
+        *channel_ids = normalize_channel_ids(channel_ids);
+        if !NotificationChannelRepo::all_exist(&state.storage, channel_ids)? {
+            return Err(ApiError::BadRequest("消息渠道不存在".into()));
+        }
+    }
     let next_run = if let Some(expression) = body.cron_expression.as_deref() {
         let (normalized, next_run) = next_run_at_ms(expression)
             .map_err(|error| ApiError::BadRequest(format!("cron 表达式无效: {error}")))?;
@@ -85,6 +96,13 @@ pub async fn delete_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let task =
+        TaskRepo::get(&state.storage, id)?.ok_or_else(|| ApiError::NotFound("task".into()))?;
+    if !task.can_delete {
+        return Err(ApiError::BadRequest(
+            "内置日记任务不能删除，可关闭、编辑、执行或查看历史".into(),
+        ));
+    }
     let deleted = TaskRepo::delete(&state.storage, id)?;
     if !deleted {
         return Err(ApiError::NotFound("task".into()));
@@ -131,4 +149,13 @@ pub async fn trigger_task(
 #[derive(Debug, Deserialize)]
 pub struct ExecutionQuery {
     pub limit: Option<i64>,
+}
+
+fn normalize_channel_ids(ids: &[i64]) -> Vec<i64> {
+    ids.iter()
+        .copied()
+        .filter(|id| *id > 0)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }

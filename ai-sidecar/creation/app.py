@@ -2,17 +2,21 @@
 import asyncio
 import queue
 import threading
+import time
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field
+from typing import Any, Optional
 import logging
 
 from inference_queue import LANE_P0_CREATION, Priority, get_global_queue
 
+from .agent_loop import CreationAgentLoop
 from .service import CreationOptions, CreationService
+from .tools import REQUIRED_CREATION_TOOL_IDS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,6 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 creation_service = CreationService()
+creation_agent_loop = CreationAgentLoop(creation_service)
 
 
 class GenerateRequest(BaseModel):
@@ -44,6 +49,9 @@ class GenerateRequest(BaseModel):
     enable_rag: bool = True
     enable_web_search: bool = False
     enable_image_generation: bool = False
+    enabled_tools: list[str] = Field(
+        default_factory=lambda: list(REQUIRED_CREATION_TOOL_IDS)
+    )
     content_weight: float = 0.45
     quality_weight: float = 0.15
     completeness_weight: float = 0.15
@@ -75,6 +83,21 @@ class AnalyzeCreationSkillRequest(BaseModel):
     document_title: str
     document_content: str
     doc_type: str = ""
+
+
+class AgentRunRequest(GenerateRequest):
+    """创作 Agent Loop 的启动或恢复请求。"""
+
+    session_id: Optional[str] = None
+    run_id: Optional[str] = None
+    root_request: Optional[str] = None
+    current_document: str = ""
+    conversation: list[dict[str, str]] = Field(default_factory=list)
+    selected_skills: list[dict[str, Any]] = Field(default_factory=list)
+    model_mode: str = "local"
+    confirmed: bool = False
+    resume_state: Optional[dict[str, Any]] = None
+    model_result: Optional[str] = None
 
 
 @app.post("/creation/generate")
@@ -139,6 +162,143 @@ async def generate_document(request: GenerateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/creation/agent/run")
+async def run_creation_agent(request: AgentRunRequest):
+    """执行可观察、可暂停和可恢复的目标驱动创作循环。"""
+    if request.model_mode not in {"local", "external"}:
+        raise HTTPException(status_code=400, detail="model_mode 只支持 local 或 external")
+    options = _options_from_request(request)
+    resume_state = request.resume_state or {}
+    resolved_session_id = (
+        request.session_id
+        or resume_state.get("session_id")
+        or f"session-{uuid4()}"
+    )
+    resolved_run_id = request.run_id or resume_state.get("run_id") or f"run-{uuid4()}"
+
+    async def event_stream():
+        import json
+
+        event_queue: queue.Queue = queue.Queue()
+        finished = object()
+        cancelled = threading.Event()
+        runtime_identity = {
+            "session_id": resolved_session_id,
+            "run_id": resolved_run_id,
+            "sequence": 0,
+        }
+
+        def run_loop() -> None:
+            async def produce() -> None:
+                async for event in creation_agent_loop.run(
+                    user_message=request.user_prompt,
+                    root_request=request.root_request,
+                    current_document=request.current_document,
+                    conversation=request.conversation,
+                    selected_skills=request.selected_skills,
+                    options=options,
+                    model_mode=request.model_mode,
+                    session_id=resolved_session_id,
+                    run_id=resolved_run_id,
+                    confirmed=request.confirmed,
+                    resume_state=request.resume_state,
+                    model_result=request.model_result,
+                    creation_model=request.creation_model,
+                    creation_api_key=request.creation_api_key,
+                    creation_base_url=request.creation_base_url,
+                ):
+                    if cancelled.is_set():
+                        break
+                    runtime_identity["session_id"] = event.get(
+                        "session_id", runtime_identity["session_id"]
+                    )
+                    runtime_identity["run_id"] = event.get(
+                        "run_id", runtime_identity["run_id"]
+                    )
+                    runtime_identity["sequence"] = event.get(
+                        "sequence", runtime_identity["sequence"]
+                    )
+                    event_queue.put(event)
+
+            try:
+                asyncio.run(produce())
+            except Exception as exc:
+                logger.exception("Creation agent loop failed")
+                event_queue.put(
+                    {
+                        "schema_version": "creation.agent.v1",
+                        "event_id": f"event-{uuid4()}",
+                        "session_id": runtime_identity["session_id"],
+                        "run_id": runtime_identity["run_id"],
+                        "sequence": runtime_identity["sequence"] + 1,
+                        "timestamp": int(time.time() * 1000),
+                        "type": "run.failed",
+                        "status": "failed",
+                        "actor": {
+                            "kind": "agent",
+                            "id": "creation_main_agent",
+                            "name": "创作主 Agent",
+                        },
+                        "summary": str(exc),
+                        "goal": {
+                            "status": "failed",
+                            "revision": 0,
+                            "remaining_steps": [],
+                            "outcome": str(exc),
+                        },
+                        "environment_patch": {},
+                        "data": {},
+                    }
+                )
+            finally:
+                event_queue.put(finished)
+
+        if not request.resume_state:
+            queued_event = {
+                "schema_version": "creation.agent.v1",
+                "event_id": f"event-{uuid4()}",
+                "session_id": resolved_session_id,
+                "run_id": resolved_run_id,
+                "sequence": 0,
+                "timestamp": int(time.time() * 1000),
+                "type": "run.queued",
+                "status": "waiting",
+                "actor": {
+                    "kind": "agent",
+                    "id": "creation_main_agent",
+                    "name": "创作主 Agent",
+                },
+                "summary": "已接收本轮指令，正在准备执行",
+                "goal": {
+                    "status": "active",
+                    "revision": 0,
+                    "remaining_steps": [],
+                    "outcome": "",
+                },
+                "environment_patch": {},
+                "data": {"lane": "interactive_creation"},
+            }
+            yield f"data: {json.dumps(queued_event, ensure_ascii=False)}\n\n"
+
+        future = get_global_queue().submit(
+            Priority.P0,
+            run_loop,
+            lane=LANE_P0_CREATION,
+        )
+        try:
+            while True:
+                item = await asyncio.to_thread(event_queue.get)
+                if item is finished:
+                    break
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            await asyncio.to_thread(future.result)
+        finally:
+            cancelled.set()
+            future.cancel()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @app.post("/creation/references")
 async def preview_references(request: ReferenceRequest):
     """预览本次创作会优先使用的参考资料及权重。"""
@@ -179,7 +339,7 @@ async def preview_references(request: ReferenceRequest):
 
 @app.post("/creation/skills/analyze")
 async def analyze_creation_skill(request: AnalyzeCreationSkillRequest):
-    """在本地从既有文档提炼可编辑的创作 Skill。"""
+    """在本地从既有文档提炼可编辑的技能。"""
     try:
         return await creation_service.analyze_creation_skill(
             document_title=request.document_title,
@@ -190,7 +350,7 @@ async def analyze_creation_skill(request: AnalyzeCreationSkillRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Creation skill analysis error: %s", e)
-        raise HTTPException(status_code=500, detail="本地 Skill 分析失败")
+        raise HTTPException(status_code=500, detail="本地技能分析失败")
 
 
 @app.get("/health")
@@ -253,6 +413,10 @@ def _options_from_request(request) -> CreationOptions:
         enable_rag=bool(getattr(request, "enable_rag", True)),
         enable_web_search=bool(getattr(request, "enable_web_search", False)),
         enable_image_generation=bool(getattr(request, "enable_image_generation", False)),
+        enabled_tools=tuple(
+            getattr(request, "enabled_tools", REQUIRED_CREATION_TOOL_IDS)
+            or REQUIRED_CREATION_TOOL_IDS
+        ),
         content_weight=float(getattr(request, "content_weight", 0.45)),
         quality_weight=float(getattr(request, "quality_weight", 0.15)),
         completeness_weight=float(getattr(request, "completeness_weight", 0.15)),

@@ -4,6 +4,8 @@ import type {
   AuthSession,
   CloudBalance,
   CloudDevice,
+  CloudMessage,
+  CloudMessagePage,
   CloudSnapshot,
   CloudSubscription,
   CloudUser,
@@ -283,6 +285,70 @@ export async function fetchCloudSnapshots(
     throw new Error(authErrorMessage(payload, `snapshots fetch failed: ${response.status}`))
   }
   return payload.data as CloudSnapshot[]
+}
+
+export async function fetchCloudMessages(
+  adminApiBaseUrl: string,
+  token: string,
+  options: { page?: number; pageSize?: number; unreadOnly?: boolean } = {},
+): Promise<CloudMessagePage> {
+  const search = new URLSearchParams({
+    page: String(options.page || 1),
+    page_size: String(options.pageSize || 50),
+  })
+  if (options.unreadOnly) search.set('unread_only', 'true')
+  const response = await fetch(`${adminApiBaseUrl}/v1/messages?${search}`, {
+    headers: { ...serviceEnvironmentHeaders(), Authorization: `Bearer ${token}` },
+  }).catch((error) => {
+    throw normalizeAuthFetchError(error, adminApiBaseUrl)
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(authErrorMessage(payload, `messages fetch failed: ${response.status}`))
+  }
+  const data = (payload?.data || {}) as Partial<CloudMessagePage>
+  return {
+    items: Array.isArray(data.items) ? data.items : [],
+    page: Number(data.page || 1),
+    page_size: Number(data.page_size || options.pageSize || 50),
+    total: Number(data.total || 0),
+    unread_count: Number(data.unread_count || 0),
+  }
+}
+
+export async function markCloudMessageRead(
+  adminApiBaseUrl: string,
+  token: string,
+  messageId: string,
+): Promise<CloudMessage> {
+  const response = await fetch(`${adminApiBaseUrl}/v1/messages/${encodeURIComponent(messageId)}/read`, {
+    method: 'PUT',
+    headers: { ...serviceEnvironmentHeaders(), Authorization: `Bearer ${token}` },
+  }).catch((error) => {
+    throw normalizeAuthFetchError(error, adminApiBaseUrl)
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(authErrorMessage(payload, `message read failed: ${response.status}`))
+  }
+  return payload.data as CloudMessage
+}
+
+export async function markAllCloudMessagesRead(
+  adminApiBaseUrl: string,
+  token: string,
+): Promise<{ updated_count: number; read_at: string }> {
+  const response = await fetch(`${adminApiBaseUrl}/v1/messages/read-all`, {
+    method: 'PUT',
+    headers: { ...serviceEnvironmentHeaders(), Authorization: `Bearer ${token}` },
+  }).catch((error) => {
+    throw normalizeAuthFetchError(error, adminApiBaseUrl)
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(authErrorMessage(payload, `messages read failed: ${response.status}`))
+  }
+  return payload.data
 }
 
 export async function fetchAchievementProfile(

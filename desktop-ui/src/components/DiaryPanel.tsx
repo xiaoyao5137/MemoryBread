@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { Calendar, CheckCircle2, Edit2, NotebookText, RefreshCw } from 'lucide-react'
+import { Calendar, CheckCircle2, Edit2, RefreshCw } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
+import './DiaryPanel.css'
 
 type PeriodType = 'daily' | 'weekly' | 'monthly'
 
@@ -179,168 +180,124 @@ const DiaryPanel: React.FC = () => {
   }, [selectedDiary])
 
   return (
-    <div style={{ padding: '24px', maxWidth: '1180px', margin: '0 auto', color: '#2f241b' }}>
-      <header style={{ marginBottom: '20px' }}>
-        <h1 style={{ fontSize: '24px', fontWeight: 700, margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <NotebookText size={24} />
-          工作日记
-        </h1>
+    <div className="diary-panel">
+      <header className="diary-card diary-header">
+        <h1 className="diary-title">工作日记</h1>
       </header>
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center', marginBottom: '20px' }}>
-        <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', gap: '8px' }} role="tablist" aria-label="日记周期">
+      <section className="diary-card diary-toolbar" aria-label="日记筛选">
+        <div className="diary-toolbar__filters">
+          <div className="diary-segmented-control" role="tablist" aria-label="日记周期">
             {(['daily', 'weekly', 'monthly'] as PeriodType[]).map((type) => (
               <button
+                aria-selected={selectedType === type}
+                className={`diary-tab${selectedType === type ? ' diary-tab--active' : ''}`}
                 key={type}
                 onClick={() => {
                   setSelectedType(type)
                   setIsEditing(false)
                 }}
-                style={{
-                  minWidth: '72px',
-                  padding: '8px 14px',
-                  borderRadius: '8px',
-                  border: selectedType === type ? '1px solid #b56b2a' : '1px solid #e6d8c9',
-                  background: selectedType === type ? '#fff2e2' : '#fffaf4',
-                  color: selectedType === type ? '#8a4a16' : '#514238',
-                  cursor: 'pointer',
-                  fontWeight: selectedType === type ? 700 : 500,
-                }}
+                role="tab"
                 type="button"
               >
                 {PERIOD_LABELS[type]}
               </button>
             ))}
           </div>
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', color: '#514238', fontSize: '14px' }}>
-            日期
+          <label className="diary-date-field">
+            <span>日期</span>
             <input
               aria-label="选择日记日期"
+              className="diary-date-input"
               type="date"
               value={selectedDate}
               onChange={(event) => {
                 setSelectedDate(event.target.value)
                 setIsEditing(false)
               }}
-              style={{
-                height: '36px',
-                borderRadius: '8px',
-                border: '1px solid #e6d8c9',
-                background: '#fffdf9',
-                color: '#2f241b',
-                padding: '0 10px',
-              }}
             />
           </label>
           {selectedDate && (
             <button
+              className="diary-button"
               onClick={() => {
                 setSelectedDate('')
                 setIsEditing(false)
               }}
-              style={secondaryButtonStyle}
               type="button"
             >
               清除日期
             </button>
           )}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '10px', flexWrap: 'wrap' }}>
+        <div className="diary-toolbar__actions">
           {autoRefreshMessage && (
-            <span role="status" style={{ color: '#8a7668', fontSize: '13px' }}>
+            <span className="diary-refresh-status" role="status">
               {autoRefreshMessage}
             </span>
           )}
           <button
+            className="diary-button diary-button--icon"
+            disabled={loading}
             onClick={() => fetchDiaries({ skipAutoRefresh: true })}
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '8px 12px',
-              borderRadius: '8px',
-              border: '1px solid #e6d8c9',
-              background: '#fffaf4',
-              color: '#514238',
-              cursor: 'pointer',
-            }}
             type="button"
           >
-            <RefreshCw size={15} />
+            <RefreshCw className={loading ? 'diary-spin' : ''} size={15} />
             刷新
           </button>
         </div>
-      </div>
+      </section>
 
       {loading ? (
-        <StatusBlock text="加载中..." />
+        <StatusBlock kind="loading" text="加载中..." />
       ) : error ? (
-        <StatusBlock text={error} />
+        <StatusBlock kind="error" text={error} />
       ) : diaries.length === 0 ? (
         <StatusBlock text={selectedDate ? '该日期暂无日记' : '暂无日记'} />
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: '280px minmax(0, 1fr)', gap: '24px' }}>
-          <aside style={{ borderRight: '1px solid #eadccd', paddingRight: '20px' }}>
-            <h2 style={{ fontSize: '15px', fontWeight: 700, margin: '0 0 12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div className="diary-layout">
+          <aside className="diary-card diary-list-panel">
+            <h2 className="diary-section-heading">
               <Calendar size={16} />
               {PERIOD_LABELS[selectedType]}列表
             </h2>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <div className="diary-entry-list">
               {diaries.map((diary) => (
                 <button
+                  aria-current={selectedDiary?.id === diary.id ? 'true' : undefined}
+                  className={`diary-entry${selectedDiary?.id === diary.id ? ' diary-entry--active' : ''}`}
                   key={diary.id}
                   onClick={() => {
                     setSelectedDiary(diary)
                     setIsEditing(false)
                   }}
-                  style={{
-                    width: '100%',
-                    textAlign: 'left',
-                    padding: '12px',
-                    borderRadius: '8px',
-                    border: selectedDiary?.id === diary.id ? '1px solid #b56b2a' : '1px solid #eadccd',
-                    background: selectedDiary?.id === diary.id ? '#fff2e2' : '#fffdf9',
-                    color: '#2f241b',
-                    cursor: 'pointer',
-                  }}
                   type="button"
                 >
-                  <div style={{ fontSize: '14px', fontWeight: 700, marginBottom: '4px' }}>
+                  <span className="diary-entry__date">
                     {diary.diary_date}
-                  </div>
-                  <div style={{ fontSize: '12px', color: '#7c6d62', display: 'flex', alignItems: 'center', gap: '5px' }}>
+                  </span>
+                  <span className="diary-entry__meta">
                     <CheckCircle2 size={13} />
                     {diary.is_system_generated ? '系统生成' : '用户编辑'}
-                  </div>
+                  </span>
                 </button>
               ))}
             </div>
           </aside>
 
           {selectedDiary && (
-            <section style={{ minWidth: 0 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '16px', alignItems: 'flex-start', marginBottom: '18px' }}>
-                <div>
-                  <h2 style={{ fontSize: '20px', fontWeight: 700, margin: '0 0 6px' }}>
+            <section className="diary-card diary-detail">
+              <div className="diary-detail__header">
+                <div className="diary-detail__title-group">
+                  <h2 className="diary-detail__title">
                     {selectedDiary.content.title || `${selectedDiary.diary_date} ${PERIOD_LABELS[selectedType]}`}
                   </h2>
-                  <div style={{ color: '#7c6d62', fontSize: '13px' }}>{periodText}</div>
+                  <div className="diary-detail__period">{periodText}</div>
                 </div>
                 {!isEditing && (
                   <button
+                    className="diary-button diary-button--icon"
                     onClick={handleEdit}
-                    style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: '6px',
-                      padding: '8px 12px',
-                      borderRadius: '8px',
-                      border: '1px solid #e6d8c9',
-                      background: '#fffaf4',
-                      color: '#514238',
-                      cursor: 'pointer',
-                    }}
                     type="button"
                   >
                     <Edit2 size={15} />
@@ -350,26 +307,16 @@ const DiaryPanel: React.FC = () => {
               </div>
 
               {isEditing ? (
-                <div style={{ display: 'grid', gap: '12px' }}>
+                <div className="diary-editor">
                   <textarea
+                    aria-label="编辑日记内容"
+                    className="diary-textarea"
                     value={editMarkdown}
                     onChange={(event) => setEditMarkdown(event.target.value)}
-                    style={{
-                      width: '100%',
-                      minHeight: '360px',
-                      resize: 'vertical',
-                      border: '1px solid #e6d8c9',
-                      borderRadius: '8px',
-                      padding: '12px',
-                      fontSize: '14px',
-                      lineHeight: 1.6,
-                      color: '#2f241b',
-                      background: '#fffdf9',
-                    }}
                   />
-                  <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
-                    <button onClick={() => setIsEditing(false)} style={secondaryButtonStyle} type="button">取消</button>
-                    <button onClick={handleSave} style={primaryButtonStyle} type="button">保存</button>
+                  <div className="diary-editor__actions">
+                    <button className="diary-button" onClick={() => setIsEditing(false)} type="button">取消</button>
+                    <button className="diary-button diary-button--primary" onClick={handleSave} type="button">保存</button>
                   </div>
                 </div>
               ) : (
@@ -396,40 +343,40 @@ const DiaryContentView: React.FC<{ diary: DiaryEntry }> = ({ diary }) => {
   }
 
   return (
-    <div style={{ display: 'grid', gap: '20px' }}>
+    <div className="diary-content">
       <SectionList title="工作产出" items={content.work_outputs || []} />
       <SectionList title="问题与解决" items={content.problems_solved || []} />
       {diary.period_type !== 'daily' && (
         <SectionList title="后续计划" items={content.next_plan || []} />
       )}
       {content.timeline && content.timeline.length > 0 && (
-        <div>
-          <h3 style={sectionTitleStyle}>来源线索</h3>
-          <div style={{ display: 'grid', gap: '8px' }}>
+        <section className="diary-content-section">
+          <h3 className="diary-content-section__title">来源线索</h3>
+          <div className="diary-timeline">
             {content.timeline.map((item, index) => (
-              <div key={`${item.timeline_id || index}-${item.time || ''}`} style={{ padding: '10px 12px', border: '1px solid #eadccd', borderRadius: '8px', background: '#fffdf9' }}>
-                <div style={{ fontSize: '12px', color: '#8a7668', marginBottom: '4px' }}>
+              <article className="diary-timeline__item" key={`${item.timeline_id || index}-${item.time || ''}`}>
+                <div className="diary-timeline__meta">
                   {item.time || '未知时间'}{item.duration_minutes ? ` · ${item.duration_minutes} 分钟` : ''}{item.category ? ` · ${item.category}` : ''}
                 </div>
-                <div style={{ fontSize: '14px', lineHeight: 1.6 }}>{item.summary}</div>
-              </div>
+                <div className="diary-timeline__summary">{item.summary}</div>
+              </article>
             ))}
           </div>
-        </div>
+        </section>
       )}
     </div>
   )
 }
 
 const SectionList: React.FC<{ title: string; items: string[] }> = ({ title, items }) => (
-  <section>
-    <h3 style={sectionTitleStyle}>{title}</h3>
+  <section className="diary-content-section">
+    <h3 className="diary-content-section__title">{title}</h3>
     {items.length === 0 ? (
-      <div style={{ color: '#8a7668', fontSize: '14px' }}>暂无记录</div>
+      <div className="diary-content-section__empty">暂无记录</div>
     ) : (
-      <ul style={{ margin: 0, paddingLeft: '18px', display: 'grid', gap: '8px' }}>
+      <ul className="diary-content-list">
         {items.map((item, index) => (
-          <li key={`${title}-${index}`} style={{ fontSize: '14px', lineHeight: 1.6 }}>{item}</li>
+          <li key={`${title}-${index}`}>{item}</li>
         ))}
       </ul>
     )}
@@ -437,61 +384,26 @@ const SectionList: React.FC<{ title: string; items: string[] }> = ({ title, item
 )
 
 const MarkdownBlock: React.FC<{ markdown: string }> = ({ markdown }) => (
-  <pre style={{
-    whiteSpace: 'pre-wrap',
-    wordBreak: 'break-word',
-    margin: 0,
-    padding: '14px',
-    borderRadius: '8px',
-    border: '1px solid #eadccd',
-    background: '#fffdf9',
-    color: '#3b2c22',
-    fontFamily: 'inherit',
-    fontSize: '14px',
-    lineHeight: 1.65,
-  }}>
+  <pre className="diary-markdown">
     {markdown}
   </pre>
 )
 
-const StatusBlock: React.FC<{ text: string }> = ({ text }) => (
-  <div style={{
-    minHeight: '220px',
-    display: 'grid',
-    placeItems: 'center',
-    color: '#7c6d62',
-    border: '1px solid #eadccd',
-    borderRadius: '8px',
-    background: '#fffdf9',
-  }}>
-    {text}
+const StatusBlock: React.FC<{ text: string; kind?: 'empty' | 'loading' | 'error' }> = ({
+  text,
+  kind = 'empty',
+}) => (
+  <div className={`diary-card diary-status diary-status--${kind}`} role={kind === 'error' ? 'alert' : 'status'}>
+    {kind === 'loading' && (
+      <div className="diary-status__skeleton" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </div>
+    )}
+    <span className="diary-status__text">{text}</span>
   </div>
 )
-
-const sectionTitleStyle: React.CSSProperties = {
-  fontSize: '15px',
-  fontWeight: 700,
-  color: '#5a4030',
-  margin: '0 0 8px',
-}
-
-const secondaryButtonStyle: React.CSSProperties = {
-  padding: '8px 12px',
-  borderRadius: '8px',
-  border: '1px solid #e6d8c9',
-  background: '#fffaf4',
-  color: '#514238',
-  cursor: 'pointer',
-}
-
-const primaryButtonStyle: React.CSSProperties = {
-  padding: '8px 12px',
-  borderRadius: '8px',
-  border: '1px solid #b56b2a',
-  background: '#b56b2a',
-  color: '#fffaf4',
-  cursor: 'pointer',
-}
 
 function firstMeaningfulLine(markdown: string): string {
   for (const rawLine of markdown.split('\n')) {

@@ -76,6 +76,21 @@ fn delete_capture_file(
     }
 }
 
+fn delete_capture_file_strict(captures_dir: &Path, rel_path: &str) -> Result<(), StorageError> {
+    let full_path = safe_capture_file_path(captures_dir, rel_path).ok_or_else(|| {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("不安全的截图路径: {rel_path}"),
+        ))
+    })?;
+
+    match std::fs::remove_file(&full_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StorageError::Io(error)),
+    }
+}
+
 fn cleanup_orphan_capture_files(
     captures_dir: &Path,
     referenced_paths: &HashSet<String>,
@@ -135,6 +150,25 @@ fn cleanup_orphan_capture_files(
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl StorageManager {
+    /// 用户手动删除单条采集记录，同时清理其截图文件和 SQLite 向量元数据。
+    ///
+    /// 截图先删除；若文件系统操作失败则保留数据库记录，让用户可以重试。
+    pub fn delete_capture_with_assets(
+        &self,
+        id: i64,
+        captures_dir: &Path,
+    ) -> Result<bool, StorageError> {
+        let Some(capture) = self.get_capture(id)? else {
+            return Ok(false);
+        };
+
+        if let Some(relative_path) = capture.screenshot_path.as_deref() {
+            delete_capture_file_strict(captures_dir, relative_path)?;
+        }
+
+        self.delete_capture(id)
+    }
+
     /// 清理过期截图文件。
     ///
     /// 步骤：
@@ -792,5 +826,58 @@ mod tests {
             })
             .unwrap();
         assert_eq!(timeline_count, 1);
+    }
+
+    #[test]
+    fn test_manual_capture_delete_removes_file_and_vector_metadata_but_keeps_timeline() {
+        let mgr = make_mgr();
+        let dir = tempdir().unwrap();
+        let relative_path = "screenshots/manual-delete.jpg";
+        write_screenshot(dir.path(), relative_path, b"manual delete screenshot");
+
+        let capture_id = mgr
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO captures (ts, event_type, ax_text, screenshot_path)
+                     VALUES (?1, 'manual', '待删除采集内容', ?2)",
+                    params![current_ts_ms(), relative_path],
+                )?;
+                let capture_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO timelines (capture_id, summary, category)
+                     VALUES (?1, '保留的时间线', 'meeting')",
+                    params![capture_id],
+                )?;
+                let timeline_id = conn.last_insert_rowid();
+                conn.execute(
+                    "UPDATE captures SET timeline_id = ?1 WHERE id = ?2",
+                    params![timeline_id, capture_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO vector_index
+                     (capture_id, qdrant_point_id, chunk_index, chunk_text, model_name, created_at)
+                     VALUES (?1, 'manual-delete-vector', 0, '待删除向量', 'test', ?2)",
+                    params![capture_id, current_ts_ms()],
+                )?;
+                Ok(capture_id)
+            })
+            .unwrap();
+
+        assert!(mgr
+            .delete_capture_with_assets(capture_id, dir.path())
+            .unwrap());
+        assert!(!dir.path().join(relative_path).exists());
+        assert!(mgr.get_capture(capture_id).unwrap().is_none());
+
+        let (timeline_count, vector_count): (i64, i64) = mgr
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM timelines", [], |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM vector_index", [], |row| row.get(0))?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(timeline_count, 1);
+        assert_eq!(vector_count, 0);
     }
 }

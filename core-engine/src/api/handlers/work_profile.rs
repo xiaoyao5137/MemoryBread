@@ -11,14 +11,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{error::ApiError, state::AppState};
-use crate::storage::models::{CaptureActivityAggregate, WorkImExpression};
+use crate::storage::models::{CaptureActivityAggregate, WorkImCaptureSample};
 
 const DAY_MS: i64 = 86_400_000;
 const MAX_RANGE_DAYS: i64 = 400;
 const IDLE_GAP_CAP_MS: i64 = 5 * 60 * 1000;
 const LAST_CAPTURE_TAIL_MS: i64 = 60 * 1000;
 const OVERNIGHT_END_HOUR: i64 = 6;
-const MAX_IM_EXPRESSIONS: usize = 200;
+const MAX_IM_CAPTURE_SAMPLES: usize = 200;
 
 #[derive(Debug, Deserialize)]
 pub struct WorkProfileQuery {
@@ -28,6 +28,8 @@ pub struct WorkProfileQuery {
     pub timezone_offset_minutes: i32,
     #[serde(default)]
     pub include_achievement_metrics: bool,
+    #[serde(default)]
+    pub include_day_details: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +63,7 @@ pub struct TodayWorkSummary {
     pub date: String,
     pub total_minutes: i64,
     pub capture_count: i64,
+    pub active_period_count: i64,
     pub first_capture_at: Option<i64>,
     pub last_capture_at: Option<i64>,
     pub apps: Vec<WorkAppSummary>,
@@ -97,12 +100,21 @@ pub struct WorkDaySummary {
     pub date: String,
     pub minutes: i64,
     pub capture_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_period_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_capture_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_capture_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apps: Option<Vec<WorkAppSummary>>,
 }
 
 #[derive(Debug, Default)]
 struct DayAccumulator {
     duration_ms: i64,
     capture_count: i64,
+    active_period_count: i64,
     first_ts: Option<i64>,
     last_ts: Option<i64>,
     apps: Vec<WorkAppSummary>,
@@ -124,15 +136,19 @@ pub async fn get_work_profile(
     let activity_start = range_start.saturating_sub(IDLE_GAP_CAP_MS);
     let activity_end = range_end.saturating_add(IDLE_GAP_CAP_MS);
     let storage = state.storage.clone();
-    let (rows, expressions, timestamps) = tokio::task::spawn_blocking(move || {
+    let (rows, im_samples, timestamps) = tokio::task::spawn_blocking(move || {
         let rows = storage.summarize_capture_activity(
             range_start,
             range_end,
             timezone_offset_ms,
             IDLE_GAP_CAP_MS,
         )?;
-        let expressions = if mood_start < mood_end {
-            storage.list_work_im_expressions(mood_start, mood_end, MAX_IM_EXPRESSIONS)?
+        let im_samples = if mood_start < mood_end {
+            storage.list_enabled_company_im_capture_samples(
+                mood_start,
+                mood_end,
+                MAX_IM_CAPTURE_SAMPLES,
+            )?
         } else {
             Vec::new()
         };
@@ -141,12 +157,12 @@ pub async fn get_work_profile(
         } else {
             None
         };
-        Ok::<_, crate::storage::error::StorageError>((rows, expressions, timestamps))
+        Ok::<_, crate::storage::error::StorageError>((rows, im_samples, timestamps))
     })
     .await
     .map_err(|error| ApiError::Internal(error.to_string()))??;
 
-    let mood = infer_work_mood(&expressions);
+    let mood = infer_work_mood(&im_samples);
     let response = build_response(
         rows,
         mood,
@@ -154,6 +170,7 @@ pub async fn get_work_profile(
         range_start,
         range_end,
         timezone_offset_ms,
+        params.include_day_details,
     )?;
     Ok(Json(response))
 }
@@ -184,12 +201,14 @@ fn build_response(
     range_start: i64,
     range_end: i64,
     timezone_offset_ms: i64,
+    include_day_details: bool,
 ) -> Result<WorkProfileResponse, ApiError> {
     let mut days: BTreeMap<i64, DayAccumulator> = BTreeMap::new();
     for row in rows {
         let day = days.entry(row.day_index).or_default();
         day.duration_ms += row.duration_ms;
         day.capture_count += row.capture_count;
+        day.active_period_count += row.active_period_count;
         day.first_ts = Some(
             day.first_ts
                 .map_or(row.first_ts, |value| value.min(row.first_ts)),
@@ -216,6 +235,9 @@ fn build_response(
         capture_count: today_accumulator
             .map(|day| day.capture_count)
             .unwrap_or_default(),
+        active_period_count: today_accumulator
+            .map(|day| day.active_period_count)
+            .unwrap_or_default(),
         first_capture_at: today_accumulator.and_then(|day| day.first_ts),
         last_capture_at: today_accumulator.and_then(|day| day.last_ts),
         apps: compact_apps(
@@ -235,6 +257,10 @@ fn build_response(
                 date: day_index_to_date(*day_index)?,
                 minutes: round_minutes(day.duration_ms),
                 capture_count: day.capture_count,
+                active_period_count: include_day_details.then_some(day.active_period_count),
+                first_capture_at: include_day_details.then_some(day.first_ts).flatten(),
+                last_capture_at: include_day_details.then_some(day.last_ts).flatten(),
+                apps: include_day_details.then(|| compact_apps(&day.apps)),
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
@@ -455,10 +481,10 @@ fn current_local_day_range(timezone_offset_ms: i64) -> Result<(i64, i64), ApiErr
     Ok((start, end))
 }
 
-fn infer_work_mood(expressions: &[WorkImExpression]) -> TodayMoodSummary {
-    let source_apps = expressions
+fn infer_work_mood(samples: &[WorkImCaptureSample]) -> TodayMoodSummary {
+    let source_apps = samples
         .iter()
-        .map(|expression| expression.app_name.trim())
+        .map(|sample| sample.app_name.trim())
         .filter(|app_name| !app_name.is_empty())
         .map(str::to_string)
         .collect::<BTreeSet<_>>()
@@ -466,7 +492,7 @@ fn infer_work_mood(expressions: &[WorkImExpression]) -> TodayMoodSummary {
         .take(4)
         .collect::<Vec<_>>();
 
-    if expressions.is_empty() {
+    if samples.is_empty() {
         return TodayMoodSummary {
             inferred: false,
             mood: None,
@@ -561,8 +587,8 @@ fn infer_work_mood(expressions: &[WorkImExpression]) -> TodayMoodSummary {
     let mut tired_score = 0;
     let mut energized_score = 0;
     let mut focused_score = 0;
-    for expression in expressions {
-        let text = expression.input_text.to_lowercase();
+    for sample in samples {
+        let text = sample.text.to_lowercase();
         overloaded_score += keyword_matches(&text, OVERLOADED) * 4;
         tired_score += keyword_matches(&text, TIRED) * 4;
         energized_score += keyword_matches(&text, ENERGIZED) * 2;
@@ -588,7 +614,7 @@ fn infer_work_mood(expressions: &[WorkImExpression]) -> TodayMoodSummary {
     TodayMoodSummary {
         inferred: true,
         mood: Some(mood),
-        expression_count: expressions.len(),
+        expression_count: samples.len(),
         source_apps,
     }
 }
@@ -617,15 +643,16 @@ mod tests {
             app_name: app_name.to_string(),
             duration_ms: minutes * 60_000,
             capture_count: 2,
+            active_period_count: 1,
             first_ts,
             last_ts: first_ts + minutes * 60_000,
         }
     }
 
-    fn expression(app_name: &str, input_text: &str) -> WorkImExpression {
-        WorkImExpression {
+    fn sample(app_name: &str, text: &str) -> WorkImCaptureSample {
+        WorkImCaptureSample {
             app_name: app_name.to_string(),
-            input_text: input_text.to_string(),
+            text: text.to_string(),
         }
     }
 
@@ -639,6 +666,7 @@ mod tests {
             (today - 1) * DAY_MS,
             (today + 1) * DAY_MS,
             0,
+            true,
         )
         .unwrap();
 
@@ -646,10 +674,43 @@ mod tests {
         assert_eq!(response.active_days, 1);
         assert_eq!(response.today.total_minutes, 8);
         assert_eq!(response.today.capture_count, 4);
+        assert_eq!(response.today.active_period_count, 2);
         assert_eq!(response.today.apps[0].name, "Code");
         assert_eq!(response.today.apps[0].minutes, 7);
+        assert_eq!(
+            response.days[0].first_capture_at,
+            response.today.first_capture_at
+        );
+        assert_eq!(
+            response.days[0].last_capture_at,
+            response.today.last_capture_at
+        );
+        let day_apps = response.days[0].apps.as_ref().unwrap();
+        assert_eq!(day_apps[0].name, "Code");
+        assert_eq!(day_apps[0].minutes, 7);
         assert_eq!(response.current_streak, 1);
         assert!(!response.today.mood.inferred);
+    }
+
+    #[test]
+    fn keeps_annual_day_summaries_lightweight_by_default() {
+        let today = Utc::now().timestamp_millis() / DAY_MS;
+        let response = build_response(
+            vec![activity(today - 1, "Code", 45)],
+            infer_work_mood(&[]),
+            None,
+            (today - 2) * DAY_MS,
+            today * DAY_MS,
+            0,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(response.days[0].minutes, 45);
+        assert!(response.days[0].first_capture_at.is_none());
+        assert!(response.days[0].last_capture_at.is_none());
+        assert!(response.days[0].active_period_count.is_none());
+        assert!(response.days[0].apps.is_none());
     }
 
     #[test]
@@ -702,10 +763,10 @@ mod tests {
     }
 
     #[test]
-    fn infers_focused_mood_from_user_im_expressions() {
+    fn infers_focused_mood_from_existing_company_im_captures() {
         let mood = infer_work_mood(&[
-            expression("飞书", "我正在排查这个问题，稍后同步结果"),
-            expression("Slack", "我来跟进发布计划"),
+            sample("飞书", "我正在排查这个问题，稍后同步结果"),
+            sample("Slack", "我来跟进发布计划"),
         ]);
 
         assert!(mood.inferred);
@@ -717,8 +778,8 @@ mod tests {
     #[test]
     fn strong_overload_expression_takes_priority() {
         let mood = infer_work_mood(&[
-            expression("飞书", "我正在处理，也会继续推进"),
-            expression("飞书", "任务太多，已经忙不过来了"),
+            sample("飞书", "我正在处理，也会继续推进"),
+            sample("飞书", "任务太多，已经忙不过来了"),
         ]);
 
         assert_eq!(mood.mood, Some(WorkMood::Overloaded));

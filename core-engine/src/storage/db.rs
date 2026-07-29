@@ -224,6 +224,34 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "053_backfill_document_timeline_metadata",
         include_str!("migrations/053_backfill_document_timeline_metadata.sql"),
     ),
+    (
+        "054_task_notification_channels",
+        include_str!("migrations/054_task_notification_channels.sql"),
+    ),
+    (
+        "055_add_creation_agent_history",
+        include_str!("migrations/055_add_creation_agent_history.sql"),
+    ),
+    (
+        "056_creation_revision_context",
+        include_str!("migrations/056_creation_revision_context.sql"),
+    ),
+    (
+        "057_add_creation_skill_package_files",
+        include_str!("migrations/057_add_creation_skill_package_files.sql"),
+    ),
+    (
+        "058_add_creation_skill_distinctive_sections",
+        include_str!("migrations/058_add_creation_skill_distinctive_sections.sql"),
+    ),
+    (
+        "059_seed_other_privacy_filter",
+        include_str!("migrations/059_seed_other_privacy_filter.sql"),
+    ),
+    (
+        "060_add_creation_skill_description",
+        include_str!("migrations/060_add_creation_skill_description.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -406,6 +434,82 @@ impl StorageManager {
                 continue;
             }
 
+            if *version == "055_add_creation_agent_history" {
+                Self::add_column_if_missing(&conn, "creation_history", "session_id", "TEXT")?;
+                Self::add_column_if_missing(
+                    &conn,
+                    "creation_history",
+                    "conversation_json",
+                    "TEXT",
+                )?;
+                Self::add_column_if_missing(&conn, "creation_history", "agent_trace_json", "TEXT")?;
+                Self::add_column_if_missing(&conn, "creation_history", "goal_json", "TEXT")?;
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_creation_history_session
+                     ON creation_history(session_id, created_at DESC)",
+                    [],
+                )?;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    rusqlite::params![version],
+                    |row| row.get(0),
+                )?;
+                if count == 0 {
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        rusqlite::params![version, current_ts_ms()],
+                    )?;
+                }
+                info!("迁移 {} 执行成功", version);
+                continue;
+            }
+
+            if *version == "056_creation_revision_context" {
+                Self::add_column_if_missing(&conn, "creation_history", "root_request", "TEXT")?;
+                Self::add_column_if_missing(
+                    &conn,
+                    "creation_history",
+                    "parent_history_id",
+                    "INTEGER",
+                )?;
+                Self::add_column_if_missing(
+                    &conn,
+                    "creation_history",
+                    "revision_no",
+                    "INTEGER NOT NULL DEFAULT 1",
+                )?;
+                Self::add_column_if_missing(
+                    &conn,
+                    "creation_history",
+                    "edit_operation",
+                    "TEXT NOT NULL DEFAULT 'create_document'",
+                )?;
+                Self::add_column_if_missing(
+                    &conn,
+                    "creation_history",
+                    "document_patch_json",
+                    "TEXT",
+                )?;
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_creation_history_session_revision
+                     ON creation_history(session_id, revision_no DESC, created_at DESC)",
+                    [],
+                )?;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    rusqlite::params![version],
+                    |row| row.get(0),
+                )?;
+                if count == 0 {
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        rusqlite::params![version, current_ts_ms()],
+                    )?;
+                }
+                info!("迁移 {} 执行成功", version);
+                continue;
+            }
+
             info!("执行迁移: {}", version);
             conn.execute_batch(sql)
                 .map_err(|e| StorageError::MigrationFailed {
@@ -442,6 +546,35 @@ impl StorageManager {
             Self::add_column_if_missing(conn, "creation_history", "model", "TEXT")?;
             Self::add_column_if_missing(conn, "creation_history", "references_json", "TEXT")?;
             Self::add_column_if_missing(conn, "creation_history", "latency_ms", "INTEGER")?;
+            Self::add_column_if_missing(conn, "creation_history", "session_id", "TEXT")?;
+            Self::add_column_if_missing(conn, "creation_history", "conversation_json", "TEXT")?;
+            Self::add_column_if_missing(conn, "creation_history", "agent_trace_json", "TEXT")?;
+            Self::add_column_if_missing(conn, "creation_history", "goal_json", "TEXT")?;
+            Self::add_column_if_missing(conn, "creation_history", "root_request", "TEXT")?;
+            Self::add_column_if_missing(conn, "creation_history", "parent_history_id", "INTEGER")?;
+            Self::add_column_if_missing(
+                conn,
+                "creation_history",
+                "revision_no",
+                "INTEGER NOT NULL DEFAULT 1",
+            )?;
+            Self::add_column_if_missing(
+                conn,
+                "creation_history",
+                "edit_operation",
+                "TEXT NOT NULL DEFAULT 'create_document'",
+            )?;
+            Self::add_column_if_missing(conn, "creation_history", "document_patch_json", "TEXT")?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_creation_history_session
+                 ON creation_history(session_id, created_at DESC)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_creation_history_session_revision
+                 ON creation_history(session_id, revision_no DESC, created_at DESC)",
+                [],
+            )?;
         }
 
         // 极少数残缺旧库只保留了迁移记录和部分业务表；039 会更新
@@ -689,6 +822,16 @@ mod tests {
                     "creation_history",
                     "latency_ms"
                 )?);
+                assert!(StorageManager::has_column(
+                    conn,
+                    "creation_history",
+                    "root_request"
+                )?);
+                assert!(StorageManager::has_column(
+                    conn,
+                    "creation_history",
+                    "document_patch_json"
+                )?);
                 Ok(())
             })
             .unwrap();
@@ -709,6 +852,19 @@ mod tests {
                     .collect::<Result<Vec<_>, _>>()?;
 
                 assert_eq!(rows.len(), 3);
+                let protected_count: i64 = conn.query_row(
+                    "SELECT count(*) FROM scheduled_tasks
+                     WHERE template_id IN ('daily_journal', 'weekly_report', 'monthly_summary')
+                       AND is_builtin = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(protected_count, 3);
+                assert!(StorageManager::has_column(
+                    conn,
+                    "scheduled_tasks",
+                    "notification_channel_ids"
+                )?);
                 assert!(rows.iter().all(|cron| cron.split_whitespace().count() == 6));
                 let weekly_cron: String = conn.query_row(
                     "SELECT cron_expression FROM scheduled_tasks WHERE template_id = 'weekly_report'",
