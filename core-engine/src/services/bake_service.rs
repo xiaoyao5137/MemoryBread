@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::api::error::ApiError;
+use crate::storage::document_identity::canonical_document_identity;
 use crate::storage::models::CaptureRecord;
 use crate::storage::{
     now_ms, BakeActivityRecord, BakeDocumentRecord, BakeKnowledgeRecord, BakeMemorySourceRecord,
@@ -26,10 +27,11 @@ const BAKE_SIDECAR_TIMEOUT_SECS: u64 = 310;
 /// 整个 bake run 的最大执行时间（含候选查询、LLM 提炼、数据库写入）。
 /// 超过此时间强制标记为 failed，防止因死锁或无限等待导致 run 永久挂起。
 const BAKE_RUN_MAX_TOTAL_SECS: u64 = 30 * 60;
-/// 烘焙候选失败即终态，不自动重试。
+/// 单条候选最多执行三次。
 ///
-/// `bake_retry_state` 是历史表名；failure_count >= 1 现在表示永久失败。
-const MAX_BAKE_RETRY_FAILURES: i64 = 1;
+/// 超时和模型结构化输出截断会先把批次标记为 deferred，由后台调度按退避策略
+/// 重新触发；达到此上限后才进入终态，避免一次偶发慢请求直接丢失候选。
+pub(crate) const MAX_BAKE_RETRY_FAILURES: i64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakePagedResponse<T> {
@@ -259,6 +261,7 @@ pub struct BakeSopPayload {
 pub struct BakeOverviewPayload {
     pub capture_count: i64,
     pub memory_count: i64,
+    pub data_count: i64,
     pub knowledge_count: i64,
     pub template_count: i64,
     pub sop_count: i64,
@@ -316,6 +319,8 @@ pub struct InitializeBakeMemoriesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BakeExtractRequest {
     pub trigger_reason: String,
+    /// 已记录的失败次数。sidecar 可据此在重试时启用更紧凑的结构化输出策略。
+    pub retry_attempt: i64,
     pub candidate: BakeExtractCandidatePayload,
 }
 
@@ -323,6 +328,7 @@ pub struct BakeExtractRequest {
 pub struct BakeExtractCandidatePayload {
     pub source_timeline_id: i64,
     pub source_capture_id: i64,
+    pub timeline_category: String,
     pub summary: String,
     pub overview: Option<String>,
     pub details: Option<String>,
@@ -347,6 +353,35 @@ pub struct BakeExtractCandidatePayload {
     pub capture_webpage_title: Option<String>,
     pub url_aggregated_text: Option<String>,
     pub url_aggregated_capture_count: i64,
+    pub document_evidence: BakeDocumentEvidencePayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BakeDocumentEvidenceKind {
+    Insufficient,
+    DocumentUrl,
+    BrowserDocument,
+    NativeDocument,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BakeSourceSurface {
+    Chat,
+    Browser,
+    DocumentEditor,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BakeDocumentEvidencePayload {
+    pub kind: BakeDocumentEvidenceKind,
+    pub source_surface: BakeSourceSurface,
+    pub has_document_url: bool,
+    pub has_document_page_title: bool,
+    pub has_substantive_document_body: bool,
+    pub allows_auto_create: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1604,17 +1639,30 @@ impl BakeService {
             let extracted = match extract_result {
                 Ok(v) => v,
                 Err(err) => {
-                    // 前台推理抢占、限流和短暂网关故障只会延后本批。
+                    // 前台推理抢占、限流和明确的服务不可用只会延后本批。
                     // 不写候选死信，也不推进 watermark，下一批从同一候选继续。
-                    if is_transient_bake_error(&err) {
+                    if is_untracked_transient_bake_error(&err) {
                         return Err(err);
                     }
                     let count = self
                         .storage
-                        .bump_bake_retry_failure(candidate.timeline.id, &err.to_string())
+                        .bump_bake_retry_failure(
+                            candidate.timeline.id,
+                            &bake_retry_failure_summary(&err),
+                        )
                         .unwrap_or(0);
+                    if is_retryable_bake_candidate_error(&err) && count < MAX_BAKE_RETRY_FAILURES {
+                        tracing::warn!(
+                            "bake extract deferred for bounded retry: timeline_id={} failure_count={} max_failures={} err={}",
+                            candidate.timeline.id,
+                            count,
+                            MAX_BAKE_RETRY_FAILURES,
+                            err
+                        );
+                        return Err(err);
+                    }
                     tracing::error!(
-                        "bake extract permanently failed without retry: timeline_id={} failure_count={} timeout={} err={}",
+                        "bake extract permanently failed after bounded retry: timeline_id={} failure_count={} timeout={} err={}",
                         candidate.timeline.id,
                         count,
                         is_bake_candidate_timeout(&err),
@@ -1653,15 +1701,28 @@ impl BakeService {
                 Err(err) => {
                     // 文档合并同样会经过 sidecar，可能在持久化阶段被前台任务抢占。
                     // 此时本地已落盘的部分产物保持幂等，候选留给下一批补齐。
-                    if is_transient_bake_error(&err) {
+                    if is_untracked_transient_bake_error(&err) {
                         return Err(err);
                     }
                     let count = self
                         .storage
-                        .bump_bake_retry_failure(candidate.timeline.id, &err.to_string())
+                        .bump_bake_retry_failure(
+                            candidate.timeline.id,
+                            &bake_retry_failure_summary(&err),
+                        )
                         .unwrap_or(0);
+                    if is_retryable_bake_candidate_error(&err) && count < MAX_BAKE_RETRY_FAILURES {
+                        tracing::warn!(
+                            "bake persist deferred for bounded retry: timeline_id={} failure_count={} max_failures={} err={}",
+                            candidate.timeline.id,
+                            count,
+                            MAX_BAKE_RETRY_FAILURES,
+                            err
+                        );
+                        return Err(err);
+                    }
                     tracing::error!(
-                        "bake persist permanently failed without retry: timeline_id={} failure_count={} timeout={} err={}",
+                        "bake persist permanently failed after bounded retry: timeline_id={} failure_count={} timeout={} err={}",
                         candidate.timeline.id,
                         count,
                         is_bake_candidate_timeout(&err),
@@ -1736,8 +1797,12 @@ impl BakeService {
         candidate: &BakeMemorySourceRecord,
     ) -> Result<BakeExtractResponse, ApiError> {
         let url = format!("{}/bake/extract", self.sidecar_url);
+        let retry_attempt = self
+            .storage
+            .get_bake_retry_failure_count(candidate.timeline.id)?;
         let request_body = BakeExtractRequest {
             trigger_reason: trigger_reason.to_string(),
+            retry_attempt,
             candidate: map_extract_candidate_payload(candidate),
         };
 
@@ -1751,16 +1816,24 @@ impl BakeService {
             .map_err(map_sidecar_request_error)?;
 
         if response.status().is_success() {
-            response
-                .json::<BakeExtractResponse>()
-                .await
-                .map_err(|err| ApiError::Internal(format!("解析 bake sidecar 响应失败: {err}")))
+            response.json::<BakeExtractResponse>().await.map_err(|err| {
+                tracing::warn!("解析 bake sidecar 成功响应失败: {}", err);
+                ApiError::Upstream {
+                    status: StatusCode::BAD_GATEWAY,
+                    code: "BAKE_SIDECAR_RESPONSE_INVALID",
+                    message: "bake 提炼服务返回了无法解析的响应".to_string(),
+                }
+            })
         } else {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
-            tracing::warn!("bake sidecar 返回错误 status={} body={}", status, body_text);
             let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let error = map_sidecar_error(status, body_text, "bake 提炼服务");
+            tracing::warn!(
+                "bake sidecar 返回错误 status={} code={}",
+                status,
+                error.code
+            );
             Err(ApiError::Upstream {
                 status: error.status,
                 code: error.code,
@@ -1819,10 +1892,45 @@ impl BakeService {
         existing_sources: &mut std::collections::HashSet<i64>,
     ) -> Result<CandidatePersistResult, ApiError> {
         let source_capture_ids = collect_source_capture_id_strings(&self.storage, candidate)?;
+        let source_fingerprint = artifact_source_fingerprint(candidate);
+        if let Some(existing_id) = source_fingerprint
+            .as_deref()
+            .map(|fingerprint| {
+                self.storage
+                    .find_bake_artifact_by_source_fingerprint("knowledge", fingerprint)
+            })
+            .transpose()?
+            .flatten()
+        {
+            if let Some(existing) = self.storage.get_bake_knowledge(existing_id)? {
+                self.merge_existing_knowledge_source_captures(&existing, &source_capture_ids)?;
+                self.storage.record_bake_artifact_source(
+                    "knowledge",
+                    existing.id,
+                    candidate.timeline.id,
+                    source_fingerprint.as_deref(),
+                )?;
+                existing_sources.insert(candidate.timeline.id);
+                tracing::info!(
+                    "bake knowledge no_change: timeline_id={} knowledge_id={} reason=source_fingerprint_already_seen",
+                    candidate.timeline.id,
+                    existing.id,
+                );
+                return Ok(CandidatePersistResult::discarded());
+            }
+        }
         if existing_sources.contains(&candidate.timeline.id) {
-            let existing = self
+            let mut existing = self
                 .storage
                 .find_bake_knowledge_by_timeline_id(candidate.timeline.id)?;
+            if existing.is_none() {
+                existing = self
+                    .storage
+                    .find_bake_artifact_by_source_timeline("knowledge", candidate.timeline.id)?
+                    .map(|id| self.storage.get_bake_knowledge(id))
+                    .transpose()?
+                    .flatten();
+            }
             let Some(existing) = existing else {
                 tracing::warn!(
                     "bake knowledge existing set contained timeline_id={} but no row was found",
@@ -1848,11 +1956,14 @@ impl BakeService {
                 return Ok(CandidatePersistResult::discarded());
             }
 
-            let payload = extraction.payload.clone().ok_or_else(|| {
-                ApiError::Internal(
-                    "bake sidecar 返回 knowledge.accepted=true 但缺少 payload".to_string(),
-                )
-            })?;
+            let payload = extraction
+                .payload
+                .clone()
+                .ok_or_else(|| ApiError::Upstream {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "BAKE_ARTIFACT_PAYLOAD_INVALID",
+                    message: "bake knowledge 产物缺少必要 payload".to_string(),
+                })?;
             let payload = parse_bake_knowledge_payload(payload, candidate)?;
             if let Some(memory_id) = memory_id {
                 self.update_memory_match_metadata(
@@ -1895,11 +2006,14 @@ impl BakeService {
             return Ok(CandidatePersistResult::discarded());
         }
 
-        let payload = extraction.payload.clone().ok_or_else(|| {
-            ApiError::Internal(
-                "bake sidecar 返回 knowledge.accepted=true 但缺少 payload".to_string(),
-            )
-        })?;
+        let payload = extraction
+            .payload
+            .clone()
+            .ok_or_else(|| ApiError::Upstream {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "BAKE_ARTIFACT_PAYLOAD_INVALID",
+                message: "bake knowledge 产物缺少必要 payload".to_string(),
+            })?;
         let payload = parse_bake_knowledge_payload(payload, candidate)?;
         if let Some(memory_id) = memory_id {
             self.update_memory_match_metadata(
@@ -1929,7 +2043,13 @@ impl BakeService {
             trigger_reason,
             &source_capture_ids,
         )?;
-        self.storage.insert_bake_knowledge(&record)?;
+        let knowledge_id = self.storage.insert_bake_knowledge(&record)?;
+        self.storage.record_bake_artifact_source(
+            "knowledge",
+            knowledge_id,
+            candidate.timeline.id,
+            source_fingerprint.as_deref(),
+        )?;
         existing_sources.insert(candidate.timeline.id);
         Ok(CandidatePersistResult::created_knowledge(
             review_status == "auto_created",
@@ -2053,6 +2173,20 @@ impl BakeService {
         existing_sources: &mut std::collections::HashSet<i64>,
         existing_urls: &mut std::collections::HashSet<String>,
     ) -> Result<CandidatePersistResult, ApiError> {
+        let evidence = document_evidence(candidate);
+        if !evidence.allows_auto_create {
+            tracing::info!(
+                "bake document discard: timeline_id={} reason=insufficient_document_evidence evidence_kind={:?} source_surface={:?} has_document_url={} has_document_page_title={} has_substantive_document_body={}",
+                candidate.timeline.id,
+                evidence.kind,
+                evidence.source_surface,
+                evidence.has_document_url,
+                evidence.has_document_page_title,
+                evidence.has_substantive_document_body,
+            );
+            return Ok(CandidatePersistResult::discarded());
+        }
+
         if existing_sources.contains(&candidate.timeline.id) {
             if extraction.accepted {
                 if let Some(existing_doc) = self
@@ -2106,6 +2240,46 @@ impl BakeService {
             }
         }
 
+        // URL 查询未命中时继续使用可靠来源标题兜底：
+        // - 旧记录无 URL、后来 capture 补到 URL，仍应合入旧记录并补齐 URL；
+        // - 双方都有 URL 且身份不同，则不能仅凭同名合并。
+        if let Some(source_title) = document_source_title(candidate) {
+            if let Some(existing_doc) = self
+                .storage
+                .find_bake_document_by_source_title(&source_title)?
+            {
+                if document_urls_compatible_for_title_match(
+                    existing_doc.source_url.as_deref(),
+                    candidate.capture_url.as_deref(),
+                ) {
+                    if extraction.accepted {
+                        self.merge_document_with_sidecar(candidate, &existing_doc)
+                            .await?;
+                        existing_sources.insert(candidate.timeline.id);
+                        tracing::info!(
+                            "bake document merged: timeline_id={} source_title={} doc_id={} reason=same_document_source_title",
+                            candidate.timeline.id,
+                            source_title,
+                            existing_doc.id,
+                        );
+                        return Ok(CandidatePersistResult::created_document(false));
+                    }
+                    tracing::info!(
+                        "bake document discard: timeline_id={} reason=source_title_already_has_document_sidecar_rejected source_title={}",
+                        candidate.timeline.id,
+                        source_title,
+                    );
+                    return Ok(CandidatePersistResult::discarded());
+                }
+                tracing::info!(
+                    "bake document title match ignored: timeline_id={} source_title={} existing_doc_id={} reason=different_document_url",
+                    candidate.timeline.id,
+                    source_title,
+                    existing_doc.id,
+                );
+            }
+        }
+
         if !extraction.accepted {
             tracing::info!(
                 "bake document discard: timeline_id={} reason=sidecar_rejected reason_text={:?}",
@@ -2115,9 +2289,14 @@ impl BakeService {
             return Ok(CandidatePersistResult::discarded());
         }
 
-        let payload = extraction.payload.clone().ok_or_else(|| {
-            ApiError::Internal("bake sidecar 返回 design.accepted=true 但缺少 payload".to_string())
-        })?;
+        let payload = extraction
+            .payload
+            .clone()
+            .ok_or_else(|| ApiError::Upstream {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "BAKE_ARTIFACT_PAYLOAD_INVALID",
+                message: "bake design 产物缺少必要 payload".to_string(),
+            })?;
         let payload = parse_bake_document_payload(payload, candidate)?;
         if let Some(memory_id) = memory_id {
             self.update_memory_match_metadata(
@@ -2143,7 +2322,38 @@ impl BakeService {
         let source_capture_ids = collect_source_capture_id_strings(&self.storage, candidate)?;
         let document =
             build_bake_document(candidate, &payload, &review_status, &source_capture_ids)?;
-        self.storage.insert_bake_document(&document)?;
+        let document_id = match self.storage.insert_bake_document(&document) {
+            Ok(document_id) => document_id,
+            Err(insert_error) => {
+                // 数据库唯一 identity 是最终并发兜底。若另一个 run 刚插入同一文档，
+                // 立即转为合并，不能把唯一键冲突暴露成整轮 bake 失败。
+                let concurrently_created = candidate
+                    .capture_url
+                    .as_deref()
+                    .map(|url| self.storage.find_document_by_source_url(url))
+                    .transpose()?
+                    .flatten();
+                if let Some(existing_doc) = concurrently_created {
+                    self.merge_document_with_sidecar(candidate, &existing_doc)
+                        .await?;
+                    existing_sources.insert(candidate.timeline.id);
+                    tracing::info!(
+                        "bake document merged after identity race: timeline_id={} doc_id={}",
+                        candidate.timeline.id,
+                        existing_doc.id,
+                    );
+                    return Ok(CandidatePersistResult::created_document(false));
+                }
+                return Err(insert_error.into());
+            }
+        };
+        if let Some(fingerprint) = artifact_source_fingerprint(candidate) {
+            self.storage.record_bake_document_source_fingerprint(
+                document_id,
+                &fingerprint,
+                candidate.timeline.id,
+            )?;
+        }
         existing_sources.insert(candidate.timeline.id);
         if let Some(u) = candidate_url_norm {
             existing_urls.insert(u);
@@ -2158,6 +2368,22 @@ impl BakeService {
         candidate: &BakeMemorySourceRecord,
         existing_doc: &BakeDocumentRecord,
     ) -> Result<(), ApiError> {
+        let source_fingerprint = artifact_source_fingerprint(candidate);
+        if let Some(fingerprint) = source_fingerprint.as_deref() {
+            if self
+                .storage
+                .has_bake_document_source_fingerprint(existing_doc.id, fingerprint)?
+            {
+                self.refresh_document_source_metadata(candidate, existing_doc)?;
+                tracing::info!(
+                    "bake document no_change: timeline_id={} doc_id={} reason=source_fingerprint_already_seen",
+                    candidate.timeline.id,
+                    existing_doc.id,
+                );
+                return Ok(());
+            }
+        }
+
         let (mut update, source_metadata_changed) =
             self.document_with_merged_source_metadata(candidate, existing_doc)?;
         let existing_json = serde_json::to_value(existing_doc)
@@ -2180,11 +2406,6 @@ impl BakeService {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            tracing::warn!(
-                "bake merge_document sidecar error status={} body={}",
-                status,
-                body
-            );
             if source_metadata_changed {
                 self.storage
                     .update_bake_document(existing_doc.id, &update)?;
@@ -2193,6 +2414,11 @@ impl BakeService {
             // 不能把 504 或其他 sidecar 错误伪装成成功后再次入队。
             let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let error = map_sidecar_error(status, body, "bake 文档合并服务");
+            tracing::warn!(
+                "bake merge_document sidecar error status={} code={}",
+                status,
+                error.code
+            );
             return Err(ApiError::Upstream {
                 status: error.status,
                 code: error.code,
@@ -2200,15 +2426,16 @@ impl BakeService {
             });
         }
 
-        let merged: BakeMergeDocumentResponse = response
-            .json()
-            .await
-            .map_err(|e| ApiError::Internal(format!("解析 merge_document 响应失败: {e}")))?;
+        let merged: BakeMergeDocumentResponse = response.json().await.map_err(|error| {
+            tracing::warn!("解析 merge_document 成功响应失败: {}", error);
+            ApiError::Upstream {
+                status: StatusCode::BAD_GATEWAY,
+                code: "BAKE_SIDECAR_RESPONSE_INVALID",
+                message: "bake 文档合并服务返回了无法解析的响应".to_string(),
+            }
+        })?;
 
         if !merged.no_change {
-            if let Some(title) = merged.title.filter(|value| !value.trim().is_empty()) {
-                update.title = title;
-            }
             update.summary = merged.summary.or(update.summary);
             if let Some(merged_content) = merged.full_content {
                 if document_merge_preserves_existing(
@@ -2236,6 +2463,13 @@ impl BakeService {
                 existing_doc.id,
             );
         }
+        // 同一文档合并只更新正文和来源，不允许模型把稳定标题改成
+        // “文档增量/新增内容”。历史上已出现这类标题时，用可靠来源标题修复。
+        if generated_title_uses_incremental_wording(&update.title) {
+            if let Some(source_title) = document_source_title(candidate) {
+                update.title = source_title;
+            }
+        }
 
         // 更新 content_hash（若 full_content 有更新）
         if update.full_content.is_some() {
@@ -2248,6 +2482,13 @@ impl BakeService {
 
         self.storage
             .update_bake_document(existing_doc.id, &update)?;
+        if let Some(fingerprint) = source_fingerprint {
+            self.storage.record_bake_document_source_fingerprint(
+                existing_doc.id,
+                &fingerprint,
+                candidate.timeline.id,
+            )?;
+        }
         Ok(())
     }
 
@@ -2316,9 +2557,17 @@ impl BakeService {
             update.source_app_name = candidate.capture_app_name.clone();
             changed = true;
         }
-        if update.source_win_title.is_none() && candidate.capture_win_title.is_some() {
-            update.source_win_title = candidate.capture_win_title.clone();
-            changed = true;
+        if update
+            .source_win_title
+            .as_deref()
+            .is_none_or(is_generic_document_source_title)
+        {
+            if let Some(source_title) = document_source_title(candidate) {
+                if update.source_win_title.as_deref() != Some(source_title.as_str()) {
+                    update.source_win_title = Some(source_title);
+                    changed = true;
+                }
+            }
         }
 
         Ok((update, changed))
@@ -2332,7 +2581,43 @@ impl BakeService {
         extraction: &BakeArtifactExtraction,
         existing_sources: &mut std::collections::HashSet<i64>,
     ) -> Result<CandidatePersistResult, ApiError> {
+        let source_capture_ids = collect_source_capture_id_strings(&self.storage, candidate)?;
+        let source_fingerprint = artifact_source_fingerprint(candidate);
+        if let Some(existing_id) = source_fingerprint
+            .as_deref()
+            .map(|fingerprint| {
+                self.storage
+                    .find_bake_artifact_by_source_fingerprint("sop", fingerprint)
+            })
+            .transpose()?
+            .flatten()
+        {
+            if let Some(existing) = self.storage.get_bake_sop(existing_id)? {
+                self.merge_existing_sop_source_captures(&existing, &source_capture_ids)?;
+                self.storage.record_bake_artifact_source(
+                    "sop",
+                    existing.id,
+                    candidate.timeline.id,
+                    source_fingerprint.as_deref(),
+                )?;
+                existing_sources.insert(candidate.timeline.id);
+                tracing::info!(
+                    "bake sop no_change: timeline_id={} sop_id={} reason=source_fingerprint_already_seen",
+                    candidate.timeline.id,
+                    existing.id,
+                );
+                return Ok(CandidatePersistResult::discarded());
+            }
+        }
         if existing_sources.contains(&candidate.timeline.id) {
+            if let Some(existing_id) = self
+                .storage
+                .find_bake_artifact_by_source_timeline("sop", candidate.timeline.id)?
+            {
+                if let Some(existing) = self.storage.get_bake_sop(existing_id)? {
+                    self.merge_existing_sop_source_captures(&existing, &source_capture_ids)?;
+                }
+            }
             tracing::info!(
                 "bake sop discard: timeline_id={} reason=already_has_sop",
                 candidate.timeline.id,
@@ -2348,9 +2633,14 @@ impl BakeService {
             return Ok(CandidatePersistResult::discarded());
         }
 
-        let payload = extraction.payload.clone().ok_or_else(|| {
-            ApiError::Internal("bake sidecar 返回 sop.accepted=true 但缺少 payload".to_string())
-        })?;
+        let payload = extraction
+            .payload
+            .clone()
+            .ok_or_else(|| ApiError::Upstream {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "BAKE_ARTIFACT_PAYLOAD_INVALID",
+                message: "bake sop 产物缺少必要 payload".to_string(),
+            })?;
         let payload = parse_bake_sop_payload(payload, candidate)?;
         if let Some(memory_id) = memory_id {
             self.update_memory_match_metadata(
@@ -2373,7 +2663,6 @@ impl BakeService {
             payload.match_level,
             review_status,
         );
-        let source_capture_ids = collect_source_capture_id_strings(&self.storage, candidate)?;
         let sop = build_bake_sop_entry(
             candidate,
             &payload,
@@ -2381,12 +2670,34 @@ impl BakeService {
             trigger_reason,
             &source_capture_ids,
         )?;
-        self.storage.insert_bake_sop(&sop)?;
+        let sop_id = self.storage.insert_bake_sop(&sop)?;
+        self.storage.record_bake_artifact_source(
+            "sop",
+            sop_id,
+            candidate.timeline.id,
+            source_fingerprint.as_deref(),
+        )?;
         existing_sources.insert(candidate.timeline.id);
         Ok(CandidatePersistResult::created_sop(
             review_status == "auto_created",
         ))
     }
+
+    fn merge_existing_sop_source_captures(
+        &self,
+        existing: &crate::storage::BakeSopRecord,
+        source_capture_ids: &[String],
+    ) -> Result<(), ApiError> {
+        let merged_capture_ids = merge_string_lists(
+            parse_optional_json_vec_string(&existing.source_capture_ids),
+            source_capture_ids,
+        );
+        let source_capture_ids_json = to_json_string(&merged_capture_ids)?;
+        self.storage
+            .update_bake_sop_source_capture_ids(existing.id, &source_capture_ids_json)?;
+        Ok(())
+    }
+
     fn update_memory_match_metadata(
         &self,
         memory_id: i64,
@@ -2457,6 +2768,14 @@ impl BakeService {
             .collect::<Vec<_>>();
         let latest_run = self.storage.get_latest_bake_run()?;
         let memory_count = self.storage.count_timelines(None)?;
+        let data_count = self.storage.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM data_sources WHERE status = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::Sqlite)
+        })?;
         let inventory_trend = build_inventory_trend(
             &memory_entries,
             &knowledge_entries,
@@ -2495,6 +2814,7 @@ impl BakeService {
         let overview = BakeOverviewRecord {
             capture_count,
             memory_count,
+            data_count,
             knowledge_count: knowledge_entries.len() as i64,
             template_count: templates.len() as i64,
             sop_count: sop_entries.len() as i64,
@@ -2534,6 +2854,7 @@ impl BakeService {
         Ok(BakeOverviewPayload {
             capture_count: overview.capture_count,
             memory_count: overview.memory_count,
+            data_count: overview.data_count,
             knowledge_count: overview.knowledge_count,
             template_count: overview.template_count,
             sop_count: overview.sop_count,
@@ -2654,6 +2975,7 @@ fn map_extract_candidate_payload(
     BakeExtractCandidatePayload {
         source_timeline_id: candidate.timeline.id,
         source_capture_id: candidate.timeline.capture_id,
+        timeline_category: candidate.timeline.category.clone(),
         summary: candidate.timeline.summary.clone(),
         overview: candidate.timeline.overview.clone(),
         details: candidate.timeline.details.clone(),
@@ -2678,6 +3000,7 @@ fn map_extract_candidate_payload(
         capture_webpage_title: candidate.capture_webpage_title.clone(),
         url_aggregated_text: candidate.url_aggregated_text.clone(),
         url_aggregated_capture_count: candidate.url_aggregated_capture_count,
+        document_evidence: document_evidence(candidate),
     }
 }
 
@@ -2687,7 +3010,7 @@ fn map_sidecar_request_error(err: reqwest::Error) -> ApiError {
         tracing::warn!("bake sidecar 响应超时: {}", err);
         ApiError::Upstream {
             status: StatusCode::GATEWAY_TIMEOUT,
-            code: "GATEWAY_TIMEOUT",
+            code: "INFERENCE_TIMEOUT",
             message: format!(
                 "bake 提炼请求超时（>{} 秒），请稍后重试",
                 BAKE_SIDECAR_TIMEOUT_SECS
@@ -2696,24 +3019,58 @@ fn map_sidecar_request_error(err: reqwest::Error) -> ApiError {
     } else {
         tracing::warn!("无法连接到 bake sidecar: {}", err);
         ApiError::Upstream {
-            status: StatusCode::BAD_GATEWAY,
-            code: "BAD_GATEWAY",
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "SIDECAR_UNAVAILABLE",
             message: format!("bake 提炼服务不可用，请确认 AI Sidecar 已正常启动: {err}"),
         }
     }
 }
 
-fn is_transient_bake_error(error: &ApiError) -> bool {
+fn is_untracked_transient_bake_error(error: &ApiError) -> bool {
     matches!(
         error,
-        ApiError::Upstream { status, .. }
+        ApiError::Upstream { code, .. }
             if matches!(
-                *status,
-                StatusCode::BAD_GATEWAY
-                    | StatusCode::SERVICE_UNAVAILABLE
-                    | StatusCode::TOO_MANY_REQUESTS
+                *code,
+                "INFERENCE_PREEMPTED"
+                    | "MODEL_RATE_LIMITED"
+                    | "MODEL_UNAVAILABLE"
+                    | "SIDECAR_UNAVAILABLE"
             )
     )
+}
+
+fn bake_retry_failure_summary(error: &ApiError) -> String {
+    match error {
+        ApiError::Upstream { status, code, .. } => {
+            format!("bake_error code={code} status={}", status.as_u16())
+        }
+        _ => error.to_string(),
+    }
+}
+
+fn is_retryable_bake_candidate_error(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::Upstream { code, .. }
+            if matches!(
+                *code,
+                "INFERENCE_TIMEOUT"
+                    | "GATEWAY_TIMEOUT"
+                    | "BAKE_OUTPUT_TRUNCATED"
+                    | "BAKE_OUTPUT_INVALID"
+                    | "BAKE_MODEL_RESPONSE_INVALID"
+                    | "BAKE_MODEL_UPSTREAM_ERROR"
+                    | "BAKE_SIDECAR_RESPONSE_INVALID"
+                    | "BAKE_ARTIFACT_PAYLOAD_INVALID"
+                    | "BAKE_INTERNAL_ERROR"
+                    | "BAKE_UNCLASSIFIED_UPSTREAM_ERROR"
+            )
+    )
+}
+
+fn is_transient_bake_error(error: &ApiError) -> bool {
+    is_untracked_transient_bake_error(error) || is_retryable_bake_candidate_error(error)
 }
 
 fn is_bake_candidate_timeout(error: &ApiError) -> bool {
@@ -2730,8 +3087,15 @@ fn parse_bake_knowledge_payload(
     value: Value,
     candidate: &BakeMemorySourceRecord,
 ) -> Result<BakeKnowledgeArtifactPayload, ApiError> {
-    let mut payload: BakeKnowledgeArtifactPayload = serde_json::from_value(value)
-        .map_err(|err| ApiError::Internal(format!("解析 bake knowledge payload 失败: {err}")))?;
+    let mut payload: BakeKnowledgeArtifactPayload =
+        serde_json::from_value(value).map_err(|err| {
+            tracing::warn!("解析 bake knowledge payload 失败: {}", err);
+            ApiError::Upstream {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "BAKE_ARTIFACT_PAYLOAD_INVALID",
+                message: "bake knowledge 产物结构无效".to_string(),
+            }
+        })?;
     if payload.summary.trim().is_empty() {
         payload.summary = candidate.timeline.summary.clone();
     }
@@ -2742,9 +3106,18 @@ fn parse_bake_document_payload(
     value: Value,
     candidate: &BakeMemorySourceRecord,
 ) -> Result<BakeDocumentArtifactPayload, ApiError> {
-    let mut payload: BakeDocumentArtifactPayload = serde_json::from_value(value)
-        .map_err(|err| ApiError::Internal(format!("解析 bake design payload 失败: {err}")))?;
-    if payload.title.trim().is_empty() {
+    let mut payload: BakeDocumentArtifactPayload =
+        serde_json::from_value(value).map_err(|err| {
+            tracing::warn!("解析 bake design payload 失败: {}", err);
+            ApiError::Upstream {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "BAKE_ARTIFACT_PAYLOAD_INVALID",
+                message: "bake design 产物结构无效".to_string(),
+            }
+        })?;
+    if let Some(source_title) = document_source_title(candidate) {
+        payload.title = source_title;
+    } else if payload.title.trim().is_empty() {
         payload.title = candidate
             .capture_webpage_title
             .as_deref()
@@ -2753,6 +3126,8 @@ fn parse_bake_document_payload(
             .filter(|value| !value.is_empty())
             .unwrap_or(candidate.timeline.summary.as_str())
             .to_string();
+    } else {
+        payload.title = sanitize_generated_document_title(&payload.title);
     }
     Ok(payload)
 }
@@ -2761,8 +3136,14 @@ fn parse_bake_sop_payload(
     value: Value,
     candidate: &BakeMemorySourceRecord,
 ) -> Result<BakeSopArtifactPayload, ApiError> {
-    let mut payload: BakeSopArtifactPayload = serde_json::from_value(value)
-        .map_err(|err| ApiError::Internal(format!("解析 bake sop payload 失败: {err}")))?;
+    let mut payload: BakeSopArtifactPayload = serde_json::from_value(value).map_err(|err| {
+        tracing::warn!("解析 bake sop payload 失败: {}", err);
+        ApiError::Upstream {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "BAKE_ARTIFACT_PAYLOAD_INVALID",
+            message: "bake sop 产物结构无效".to_string(),
+        }
+    })?;
     if payload.summary.trim().is_empty() {
         payload.summary = candidate.timeline.summary.clone();
     }
@@ -2779,34 +3160,78 @@ fn map_sidecar_error(
     body_text: String,
     service_name: &str,
 ) -> BakeSidecarError {
-    let structured_code = serde_json::from_str::<Value>(&body_text)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("code")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        });
-    let (mapped_status, code) = match structured_code.as_deref() {
+    #[derive(Deserialize)]
+    struct ErrorEnvelope {
+        code: Option<String>,
+        retryable: Option<bool>,
+        scope: Option<String>,
+    }
+
+    fn has_valid_contract(envelope: &ErrorEnvelope) -> bool {
+        let Some(code) = envelope.code.as_deref() else {
+            return false;
+        };
+        match code {
+            "INFERENCE_PREEMPTED"
+            | "MODEL_RATE_LIMITED"
+            | "MODEL_UNAVAILABLE"
+            | "SIDECAR_UNAVAILABLE" => {
+                envelope.scope.as_deref() == Some("service") && envelope.retryable == Some(true)
+            }
+            "INFERENCE_TIMEOUT"
+            | "BAKE_OUTPUT_TRUNCATED"
+            | "BAKE_OUTPUT_INVALID"
+            | "BAKE_MODEL_RESPONSE_INVALID"
+            | "BAKE_MODEL_UPSTREAM_ERROR"
+            | "BAKE_INTERNAL_ERROR" => {
+                envelope.scope.as_deref() == Some("candidate") && envelope.retryable == Some(true)
+            }
+            "BAKE_MODEL_REQUEST_INVALID" | "BAKE_REQUEST_INVALID" => {
+                envelope.scope.as_deref() == Some("candidate") && envelope.retryable == Some(false)
+            }
+            _ => false,
+        }
+    }
+
+    let envelope = serde_json::from_str::<ErrorEnvelope>(&body_text).ok();
+    let structured_code = envelope
+        .as_ref()
+        .filter(|value| has_valid_contract(value))
+        .and_then(|value| value.code.as_deref());
+    let (mapped_status, code) = match structured_code {
         Some("BAKE_OUTPUT_TRUNCATED") => {
             (StatusCode::UNPROCESSABLE_ENTITY, "BAKE_OUTPUT_TRUNCATED")
         }
         Some("BAKE_OUTPUT_INVALID") => (StatusCode::UNPROCESSABLE_ENTITY, "BAKE_OUTPUT_INVALID"),
+        Some("BAKE_MODEL_RESPONSE_INVALID") => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "BAKE_MODEL_RESPONSE_INVALID",
+        ),
+        Some("BAKE_MODEL_REQUEST_INVALID") => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "BAKE_MODEL_REQUEST_INVALID",
+        ),
+        Some("BAKE_REQUEST_INVALID") => (StatusCode::BAD_REQUEST, "BAKE_REQUEST_INVALID"),
+        Some("INFERENCE_TIMEOUT") => (StatusCode::GATEWAY_TIMEOUT, "INFERENCE_TIMEOUT"),
+        Some("INFERENCE_PREEMPTED") => (StatusCode::SERVICE_UNAVAILABLE, "INFERENCE_PREEMPTED"),
+        Some("MODEL_RATE_LIMITED") => (StatusCode::SERVICE_UNAVAILABLE, "MODEL_RATE_LIMITED"),
+        Some("MODEL_UNAVAILABLE") => (StatusCode::SERVICE_UNAVAILABLE, "MODEL_UNAVAILABLE"),
+        Some("SIDECAR_UNAVAILABLE") => (StatusCode::SERVICE_UNAVAILABLE, "SIDECAR_UNAVAILABLE"),
+        Some("BAKE_MODEL_UPSTREAM_ERROR") => (StatusCode::BAD_GATEWAY, "BAKE_MODEL_UPSTREAM_ERROR"),
+        Some("BAKE_INTERNAL_ERROR") => (StatusCode::INTERNAL_SERVER_ERROR, "BAKE_INTERNAL_ERROR"),
         _ => match status.as_u16() {
             400 | 422 => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
-            502 => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
-            503 => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
-            504 => (StatusCode::GATEWAY_TIMEOUT, "GATEWAY_TIMEOUT"),
-            code if code >= 500 => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
-            _ => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            504 => (StatusCode::GATEWAY_TIMEOUT, "INFERENCE_TIMEOUT"),
+            code if code >= 500 => (
+                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+                "BAKE_UNCLASSIFIED_UPSTREAM_ERROR",
+            ),
+            _ => (StatusCode::BAD_GATEWAY, "BAKE_UNCLASSIFIED_UPSTREAM_ERROR"),
         },
     };
 
-    let message = if body_text.trim().is_empty() {
-        format!("{service_name}返回错误 ({status})")
-    } else {
-        format!("{service_name}返回错误 ({status})：{body_text}")
-    };
+    // Sidecar 原始 body 可能包含供应商模型名或底层响应，不进入客户端错误详情。
+    let message = format!("{service_name}返回错误 ({status}, code={code})");
 
     BakeSidecarError {
         status: mapped_status,
@@ -2842,6 +3267,160 @@ fn normalize_doc_url(url: &str) -> String {
     let no_fragment = trimmed.split('#').next().unwrap_or(trimmed);
     let no_query = no_fragment.split('?').next().unwrap_or(no_fragment);
     no_query.trim_end_matches('/').to_string()
+}
+
+fn document_urls_compatible_for_title_match(
+    existing_url: Option<&str>,
+    candidate_url: Option<&str>,
+) -> bool {
+    match (
+        existing_url.and_then(canonical_document_identity),
+        candidate_url.and_then(canonical_document_identity),
+    ) {
+        (Some(existing), Some(candidate)) => existing == candidate,
+        _ => true,
+    }
+}
+
+fn artifact_source_fingerprint(candidate: &BakeMemorySourceRecord) -> Option<String> {
+    let source_text = candidate
+        .url_aggregated_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            let parts = [
+                candidate.capture_ax_text.as_deref(),
+                candidate.capture_ocr_text.as_deref(),
+                candidate.capture_input_text.as_deref(),
+                candidate.capture_audio_text.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        })?;
+    let normalized = source_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    Some(format!("source-v1:{:x}", hasher.finalize()))
+}
+
+fn document_source_title(candidate: &BakeMemorySourceRecord) -> Option<String> {
+    if !document_evidence(candidate).allows_auto_create {
+        return None;
+    }
+    candidate
+        .capture_webpage_title
+        .as_deref()
+        .and_then(|title| {
+            canonical_document_source_title(title, candidate.capture_app_name.as_deref())
+        })
+        .or_else(|| {
+            candidate.capture_win_title.as_deref().and_then(|title| {
+                canonical_document_source_title(title, candidate.capture_app_name.as_deref())
+            })
+        })
+}
+
+fn canonical_document_source_title(value: &str, app_name: Option<&str>) -> Option<String> {
+    let mut title = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return None;
+    }
+
+    // 窗口标题经常带浏览器/编辑器后缀；去掉这些 UI 后缀后才能稳定识别同一文档。
+    loop {
+        let lowered = title.to_lowercase();
+        let suffix = [
+            " - google chrome",
+            " - microsoft edge",
+            " - safari",
+            " - firefox",
+            " - arc",
+            " - microsoft word",
+            " - word",
+            " - visual studio code",
+            " - cursor",
+            " - pages",
+        ]
+        .into_iter()
+        .find(|suffix| lowered.ends_with(suffix));
+        let Some(suffix) = suffix else {
+            break;
+        };
+        title.truncate(title.len().saturating_sub(suffix.len()));
+        title = title.trim().to_string();
+    }
+
+    if title.is_empty()
+        || app_name.is_some_and(|app| title.eq_ignore_ascii_case(app.trim()))
+        || is_generic_document_source_title(&title)
+    {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn is_generic_document_source_title(value: &str) -> bool {
+    let normalized = value.trim().to_lowercase();
+    normalized.chars().count() < 3
+        || matches!(
+            normalized.as_str(),
+            "docs"
+                | "document"
+                | "文档"
+                | "云文档"
+                | "在线文档"
+                | "untitled"
+                | "无标题"
+                | "google chrome"
+                | "microsoft edge"
+                | "safari"
+                | "firefox"
+                | "microsoft word"
+                | "word"
+                | "pages"
+                | "kim"
+                | "chatgpt"
+                | "snip"
+        )
+}
+
+fn sanitize_generated_document_title(value: &str) -> String {
+    let title = value.trim();
+    for prefix in ["文档增量", "增量文档", "文档更新", "文档补充", "新增文档"] {
+        if let Some(rest) = title.strip_prefix(prefix) {
+            let rest = rest.trim_start();
+            if let Some(cleaned) = rest.strip_prefix(['：', ':', '-', '—']) {
+                let cleaned = cleaned.trim();
+                if !cleaned.is_empty() {
+                    return cleaned.to_string();
+                }
+            }
+        }
+    }
+    title.to_string()
+}
+
+fn generated_title_uses_incremental_wording(value: &str) -> bool {
+    sanitize_generated_document_title(value) != value.trim()
 }
 
 fn normalize_optional_url(url: Option<String>) -> Option<String> {
@@ -2978,7 +3557,8 @@ fn build_bake_document(
         diagram_code: payload.diagram_code.clone(),
         image_assets: "[]".to_string(),
         source_app_name: source.capture_app_name.clone(),
-        source_win_title: source.capture_win_title.clone(),
+        source_win_title: document_source_title(source)
+            .or_else(|| source.capture_win_title.clone()),
         source_url: source.capture_url.clone(),
         content_hash,
         language: None,
@@ -3561,55 +4141,161 @@ fn is_high_value_candidate(candidate: &BakeMemorySourceRecord) -> bool {
 }
 
 fn is_substantive_document_candidate(candidate: &BakeMemorySourceRecord) -> bool {
+    document_evidence(candidate).allows_auto_create
+}
+
+fn document_evidence(candidate: &BakeMemorySourceRecord) -> BakeDocumentEvidencePayload {
     const MIN_DOCUMENT_CHARS: usize = 200;
 
+    let app_name = candidate.capture_app_name.as_deref().unwrap_or_default();
+    let source_surface = classify_source_surface(app_name);
     let has_document_url = candidate
         .capture_url
         .as_deref()
         .is_some_and(looks_like_document_url);
-    let category = candidate.timeline.category.trim().to_lowercase();
-    let has_document_category =
-        category.contains("文档") || matches!(category.as_str(), "document" | "design");
-    let title = candidate
+    let has_document_page_title = candidate
         .capture_webpage_title
         .as_deref()
-        .or(candidate.capture_win_title.as_deref())
-        .unwrap_or_default()
-        .to_lowercase();
-    let has_document_title = [
+        .is_some_and(looks_like_document_title)
+        || candidate
+            .capture_win_title
+            .as_deref()
+            .is_some_and(looks_like_document_title);
+    let aggregated_body_char_count = candidate
+        .url_aggregated_text
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .map(non_whitespace_char_count)
+        .unwrap_or(0);
+    let capture_body_char_count = [
+        candidate.capture_ax_text.as_deref(),
+        candidate.capture_ocr_text.as_deref(),
+        candidate.capture_input_text.as_deref(),
+        candidate.capture_audio_text.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(non_whitespace_char_count)
+    .sum();
+    let body_char_count = aggregated_body_char_count.max(capture_body_char_count);
+    let has_substantive_document_body = body_char_count >= MIN_DOCUMENT_CHARS;
+    let has_meaningful_native_title = candidate
+        .capture_win_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .is_some_and(|title| !title.eq_ignore_ascii_case(app_name.trim()));
+
+    let is_code_editor = is_code_editor_app(app_name);
+    let kind = if !has_substantive_document_body || source_surface == BakeSourceSurface::Chat {
+        BakeDocumentEvidenceKind::Insufficient
+    } else if has_document_url {
+        BakeDocumentEvidenceKind::DocumentUrl
+    } else if source_surface == BakeSourceSurface::Browser && has_document_page_title {
+        BakeDocumentEvidenceKind::BrowserDocument
+    } else if source_surface == BakeSourceSurface::DocumentEditor
+        && has_meaningful_native_title
+        && (!is_code_editor || has_document_page_title)
+    {
+        BakeDocumentEvidenceKind::NativeDocument
+    } else {
+        BakeDocumentEvidenceKind::Insufficient
+    };
+
+    BakeDocumentEvidencePayload {
+        kind,
+        source_surface,
+        has_document_url,
+        has_document_page_title,
+        has_substantive_document_body,
+        allows_auto_create: kind != BakeDocumentEvidenceKind::Insufficient,
+    }
+}
+
+fn non_whitespace_char_count(value: &str) -> usize {
+    value.chars().filter(|ch| !ch.is_whitespace()).count()
+}
+
+fn classify_source_surface(app_name: &str) -> BakeSourceSurface {
+    let normalized = app_name.trim().to_lowercase();
+    if [
+        "kim",
+        "kem",
+        "微信",
+        "wechat",
+        "slack",
+        "teams",
+        "microsoft teams",
+        "钉钉",
+        "dingtalk",
+        "飞书",
+        "feishu",
+        "lark",
+    ]
+    .iter()
+    .any(|marker| normalized == *marker || normalized.contains(marker))
+    {
+        return BakeSourceSurface::Chat;
+    }
+    if [
+        "chrome",
+        "safari",
+        "arc",
+        "edge",
+        "firefox",
+        "chatgpt atlas",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return BakeSourceSurface::Browser;
+    }
+    if [
+        "microsoft word",
+        "word",
+        "pages",
+        "wps",
+        "libreoffice writer",
+        "obsidian",
+        "typora",
+        "cursor",
+        "visual studio code",
+        "code",
+    ]
+    .iter()
+    .any(|marker| normalized == *marker || normalized.contains(marker))
+    {
+        return BakeSourceSurface::DocumentEditor;
+    }
+    BakeSourceSurface::Other
+}
+
+fn is_code_editor_app(app_name: &str) -> bool {
+    let normalized = app_name.trim().to_lowercase();
+    ["cursor", "visual studio code", "code", "xcode"]
+        .iter()
+        .any(|marker| normalized == *marker || normalized.contains(marker))
+}
+
+fn looks_like_document_title(title: &str) -> bool {
+    let lowered = title.trim().to_lowercase();
+    [
         "云文档",
         "在线文档",
         "google docs",
+        "google 文档",
         "飞书文档",
         "语雀",
         "notion",
         "confluence",
         "石墨文档",
+        ".doc",
+        ".docx",
+        ".pages",
+        ".md",
     ]
     .iter()
-    .any(|marker| title.contains(marker));
-    if !(has_document_url || has_document_category || has_document_title) {
-        return false;
-    }
-
-    let body = candidate
-        .url_aggregated_text
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| {
-            [
-                candidate.capture_ax_text.as_deref(),
-                candidate.capture_ocr_text.as_deref(),
-                candidate.capture_input_text.as_deref(),
-                candidate.capture_audio_text.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" ")
-        });
-    body.chars().filter(|ch| !ch.is_whitespace()).count() >= MIN_DOCUMENT_CHARS
+    .any(|marker| lowered.contains(marker))
 }
 
 fn substantive_document_url(candidate: &BakeMemorySourceRecord) -> Option<String> {
@@ -4147,27 +4833,138 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_gateway_timeout_is_not_transient() {
-        for status in [
-            StatusCode::BAD_GATEWAY,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::TOO_MANY_REQUESTS,
+    fn test_candidate_failures_use_bounded_retry_classification() {
+        for code in [
+            "INFERENCE_PREEMPTED",
+            "MODEL_RATE_LIMITED",
+            "MODEL_UNAVAILABLE",
+            "SIDECAR_UNAVAILABLE",
         ] {
-            assert!(is_transient_bake_error(&ApiError::Upstream {
-                status,
-                code: "RETRYABLE",
+            let error = ApiError::Upstream {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code,
                 message: "稍后重试".to_string(),
-            }));
+            };
+            assert!(is_untracked_transient_bake_error(&error));
+            assert!(is_transient_bake_error(&error));
         }
-        assert!(!is_transient_bake_error(&ApiError::Upstream {
+        for code in [
+            "BAKE_MODEL_UPSTREAM_ERROR",
+            "BAKE_INTERNAL_ERROR",
+            "BAKE_UNCLASSIFIED_UPSTREAM_ERROR",
+        ] {
+            let error = ApiError::Upstream {
+                status: StatusCode::BAD_GATEWAY,
+                code,
+                message: "候选级错误".to_string(),
+            };
+            assert!(!is_untracked_transient_bake_error(&error));
+            assert!(is_retryable_bake_candidate_error(&error));
+            assert!(is_transient_bake_error(&error));
+        }
+        let timeout = ApiError::Upstream {
             status: StatusCode::GATEWAY_TIMEOUT,
             code: "INFERENCE_TIMEOUT",
             message: "任务已取消".to_string(),
-        }));
+        };
+        assert!(!is_untracked_transient_bake_error(&timeout));
+        assert!(is_retryable_bake_candidate_error(&timeout));
+        assert!(is_transient_bake_error(&timeout));
         assert!(!is_transient_bake_error(&ApiError::Internal(
             "永久 payload 错误".to_string(),
         )));
-        assert_eq!(MAX_BAKE_RETRY_FAILURES, 1);
+        assert_eq!(MAX_BAKE_RETRY_FAILURES, 3);
+    }
+
+    #[test]
+    fn test_sidecar_error_contract_does_not_infer_service_scope_from_5xx() {
+        let cases = [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "code": "BAKE_INTERNAL_ERROR",
+                    "scope": "candidate",
+                    "retryable": true
+                })
+                .to_string(),
+                "BAKE_INTERNAL_ERROR",
+                false,
+                true,
+            ),
+            (
+                StatusCode::BAD_GATEWAY,
+                json!({
+                    "code": "BAKE_MODEL_UPSTREAM_ERROR",
+                    "scope": "candidate",
+                    "retryable": true
+                })
+                .to_string(),
+                "BAKE_MODEL_UPSTREAM_ERROR",
+                false,
+                true,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({
+                    "code": "MODEL_UNAVAILABLE",
+                    "scope": "service",
+                    "retryable": true
+                })
+                .to_string(),
+                "MODEL_UNAVAILABLE",
+                true,
+                false,
+            ),
+            (
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"unstructured failure"}"#.to_string(),
+                "BAKE_UNCLASSIFIED_UPSTREAM_ERROR",
+                false,
+                true,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({
+                    "code": "MODEL_UNAVAILABLE",
+                    "scope": "candidate",
+                    "retryable": true
+                })
+                .to_string(),
+                "BAKE_UNCLASSIFIED_UPSTREAM_ERROR",
+                false,
+                true,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"unstructured rate limit"}"#.to_string(),
+                "BAKE_UNCLASSIFIED_UPSTREAM_ERROR",
+                false,
+                true,
+            ),
+        ];
+
+        for (status, body, expected_code, untracked, candidate_retry) in cases {
+            let mapped = map_sidecar_error(status, body, "bake 提炼服务");
+            assert_eq!(mapped.code, expected_code);
+            let error = ApiError::Upstream {
+                status: mapped.status,
+                code: mapped.code,
+                message: mapped.message,
+            };
+            assert_eq!(is_untracked_transient_bake_error(&error), untracked);
+            assert_eq!(is_retryable_bake_candidate_error(&error), candidate_retry);
+        }
+    }
+
+    #[test]
+    fn test_sidecar_error_message_does_not_expose_raw_provider_body() {
+        let mapped = map_sidecar_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"provider-model secret response"}"#.to_string(),
+            "bake 提炼服务",
+        );
+        assert!(!mapped.message.contains("provider-model"));
+        assert!(!mapped.message.contains("secret response"));
     }
 
     #[test]
@@ -4185,24 +4982,27 @@ mod tests {
     }
 
     #[test]
-    fn test_structured_truncated_output_is_not_transient() {
+    fn test_structured_truncated_output_uses_bounded_retry() {
         let mapped = map_sidecar_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({
                 "code": "BAKE_OUTPUT_TRUNCATED",
                 "error": "bake bundle output invalid: truncated_json",
-                "retryable": false,
+                "retryable": true,
+                "scope": "candidate",
             })
             .to_string(),
             "bake 提炼服务",
         );
         assert_eq!(mapped.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(mapped.code, "BAKE_OUTPUT_TRUNCATED");
-        assert!(!is_transient_bake_error(&ApiError::Upstream {
+        let error = ApiError::Upstream {
             status: mapped.status,
             code: mapped.code,
             message: mapped.message,
-        }));
+        };
+        assert!(is_retryable_bake_candidate_error(&error));
+        assert!(is_transient_bake_error(&error));
     }
 
     #[test]
@@ -4294,6 +5094,9 @@ mod tests {
         candidate.timeline.evidence_strength = None;
 
         assert!(is_high_value_candidate(&candidate));
+        let evidence = document_evidence(&candidate);
+        assert_eq!(evidence.kind, BakeDocumentEvidenceKind::DocumentUrl);
+        assert!(evidence.allows_auto_create);
         assert_eq!(
             substantive_document_url(&candidate).as_deref(),
             Some("https://docs.corp.kuaishou.com/k/home/space/document-id")
@@ -4320,6 +5123,185 @@ mod tests {
         candidate.timeline.evidence_strength = None;
 
         assert!(!is_high_value_candidate(&candidate));
+    }
+
+    #[tokio::test]
+    async fn test_chat_document_mentions_cannot_create_document_artifact() {
+        let service = make_service();
+        let capture_id = seed_capture(&service, 1_710_000_000_000, "Kim", "Kim");
+        let timeline_id = seed_knowledge(&service, "会议", capture_id, 4, 2);
+        let mut candidate = make_candidate(&service, timeline_id);
+        candidate.capture_app_name = Some("Kim".to_string());
+        candidate.capture_win_title = Some("Kim".to_string());
+        candidate.capture_ax_text = Some(
+            "会议群聊天：你之前设计的那个剧本库文档看一下。[云文档] AIGC 剧本创作规范。".repeat(20),
+        );
+        candidate.capture_url = None;
+        candidate.capture_webpage_title = None;
+        candidate.timeline.history_view = false;
+        candidate.timeline.activity_type = Some("meeting".to_string());
+        candidate.timeline.content_origin = Some("live_interaction".to_string());
+
+        assert!(is_high_value_candidate(&candidate));
+        let evidence = document_evidence(&candidate);
+        assert_eq!(evidence.kind, BakeDocumentEvidenceKind::Insufficient);
+        assert_eq!(evidence.source_surface, BakeSourceSurface::Chat);
+        assert!(evidence.has_substantive_document_body);
+        assert!(!evidence.allows_auto_create);
+        let payload = map_extract_candidate_payload(&candidate);
+        assert_eq!(payload.timeline_category, "会议");
+        assert_eq!(
+            payload.document_evidence.kind,
+            BakeDocumentEvidenceKind::Insufficient
+        );
+        assert!(!payload.document_evidence.allows_auto_create);
+
+        let mut chat_with_document_link = candidate.clone();
+        chat_with_document_link.capture_url =
+            Some("https://docs.corp.kuaishou.com/d/home/document-id".to_string());
+        let linked_evidence = document_evidence(&chat_with_document_link);
+        assert!(linked_evidence.has_document_url);
+        assert_eq!(linked_evidence.kind, BakeDocumentEvidenceKind::Insufficient);
+        assert!(!linked_evidence.allows_auto_create);
+
+        let extraction = BakeArtifactExtraction {
+            accepted: true,
+            reason: None,
+            payload: Some(json!({
+                "name": "[云文档] AIGC 剧本创作规范（推测）",
+                "full_content": "模型错误生成的文档正文",
+                "match_score": 0.95,
+                "match_level": "high",
+                "review_status": "auto_created"
+            })),
+        };
+        let mut existing_sources = std::collections::HashSet::new();
+        let mut existing_urls = std::collections::HashSet::new();
+
+        let result = service
+            .persist_document_artifact(
+                None,
+                &candidate,
+                &extraction,
+                &mut existing_sources,
+                &mut existing_urls,
+            )
+            .await
+            .expect("聊天文档门禁执行失败");
+
+        assert_eq!(result.discarded_count, 1);
+        assert_eq!(result.document_created_count, 0);
+        assert!(service.storage.list_bake_documents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_native_document_editor_without_url_has_document_evidence() {
+        let service = make_service();
+        let capture_id = seed_capture(
+            &service,
+            1_710_000_000_000,
+            "Microsoft Word",
+            "季度复盘方案.docx",
+        );
+        let timeline_id = seed_knowledge(&service, "文档", capture_id, 2, 1);
+        let mut candidate = make_candidate(&service, timeline_id);
+        candidate.capture_app_name = Some("Microsoft Word".to_string());
+        candidate.capture_win_title = Some("季度复盘方案.docx".to_string());
+        candidate.capture_ax_text = Some("季度复盘正文".repeat(80));
+        candidate.capture_url = None;
+        candidate.capture_webpage_title = None;
+
+        let evidence = document_evidence(&candidate);
+
+        assert_eq!(evidence.kind, BakeDocumentEvidenceKind::NativeDocument);
+        assert_eq!(evidence.source_surface, BakeSourceSurface::DocumentEditor);
+        assert!(evidence.allows_auto_create);
+        assert!(is_high_value_candidate(&candidate));
+    }
+
+    #[test]
+    fn test_document_source_title_is_stable_and_overrides_incremental_model_title() {
+        let service = make_service();
+        let capture_id = seed_capture(
+            &service,
+            1_710_000_000_000,
+            "Microsoft Word",
+            "季度复盘方案.docx - Microsoft Word",
+        );
+        let timeline_id = seed_knowledge(&service, "文档", capture_id, 4, 1);
+        let mut candidate = make_candidate(&service, timeline_id);
+        candidate.capture_app_name = Some("Microsoft Word".to_string());
+        candidate.capture_win_title = Some("季度复盘方案.docx - Microsoft Word".to_string());
+        candidate.capture_ax_text = Some("季度复盘正文".repeat(80));
+
+        assert_eq!(
+            document_source_title(&candidate).as_deref(),
+            Some("季度复盘方案.docx")
+        );
+        let payload = parse_bake_document_payload(
+            json!({
+                "name": "文档增量：季度复盘方案",
+                "full_content": "季度复盘正文"
+            }),
+            &candidate,
+        )
+        .unwrap();
+        assert_eq!(payload.title, "季度复盘方案.docx");
+    }
+
+    #[test]
+    fn test_title_fallback_accepts_missing_url_but_rejects_different_urls() {
+        assert!(document_urls_compatible_for_title_match(
+            None,
+            Some("https://docs.corp.example/d/home/abc123?section=one"),
+        ));
+        assert!(document_urls_compatible_for_title_match(
+            Some("https://docs.corp.example/d/home/ABC123#one"),
+            Some("http://docs.corp.example/d/home/abc123?section=two"),
+        ));
+        assert!(!document_urls_compatible_for_title_match(
+            Some("https://docs.corp.example/d/home/abc123"),
+            Some("https://docs.corp.example/d/home/other456"),
+        ));
+    }
+
+    #[test]
+    fn test_document_source_fingerprint_ignores_whitespace_but_tracks_changes() {
+        let service = make_service();
+        let capture_id = seed_capture(
+            &service,
+            1_710_000_000_000,
+            "Microsoft Word",
+            "季度复盘方案.docx",
+        );
+        let timeline_id = seed_knowledge(&service, "文档", capture_id, 4, 1);
+        let mut first = make_candidate(&service, timeline_id);
+        first.capture_ax_text = Some("第一章  背景\n第二章  方案".to_string());
+        let mut same = first.clone();
+        same.capture_ax_text = Some("第一章 背景 第二章 方案".to_string());
+        let mut changed = first.clone();
+        changed.capture_ax_text = Some("第一章 背景 第二章 新方案".to_string());
+
+        assert_eq!(
+            artifact_source_fingerprint(&first),
+            artifact_source_fingerprint(&same)
+        );
+        assert_ne!(
+            artifact_source_fingerprint(&first),
+            artifact_source_fingerprint(&changed)
+        );
+    }
+
+    #[test]
+    fn test_generated_document_title_removes_incremental_wording() {
+        assert_eq!(
+            sanitize_generated_document_title("文档增量：3BU AI 能力盘点"),
+            "3BU AI 能力盘点"
+        );
+        assert_eq!(
+            sanitize_generated_document_title("商业体系 AI 建设方案"),
+            "商业体系 AI 建设方案"
+        );
     }
 
     #[test]
@@ -4718,5 +5700,82 @@ mod tests {
         let details = updated.detailed_content.unwrap();
         assert!(details.contains("旧详情"));
         assert!(details.contains("新详情"));
+    }
+
+    #[test]
+    fn test_same_source_across_timelines_reuses_knowledge_and_sop_artifacts() {
+        let service = make_service();
+        let first_capture = seed_capture(&service, 1_710_000_000_000, "Code", "第一次采集");
+        let second_capture = seed_capture(&service, 1_710_000_010_000, "Code", "第二次采集");
+        let first_timeline = seed_knowledge(&service, "meeting", first_capture, 4, 1);
+        let second_timeline = seed_knowledge(&service, "meeting", second_capture, 4, 1);
+        let first = make_candidate(&service, first_timeline);
+        let second = make_candidate(&service, second_timeline);
+
+        let knowledge_extraction = BakeArtifactExtraction {
+            accepted: true,
+            reason: None,
+            payload: Some(json!({
+                "summary": "可复用知识",
+                "overview": "相同来源只保留一条知识",
+                "details": "知识详情",
+                "entities": ["判重"],
+                "importance": 4
+            })),
+        };
+        let sop_extraction = BakeArtifactExtraction {
+            accepted: true,
+            reason: None,
+            payload: Some(json!({
+                "summary": "可复用 SOP",
+                "overview": "相同来源只保留一条 SOP",
+                "details": "SOP 详情",
+                "steps": ["识别来源", "复用已有产物"],
+                "linked_knowledge_ids": []
+            })),
+        };
+
+        let mut knowledge_sources = std::collections::HashSet::new();
+        service
+            .persist_knowledge_artifact(
+                None,
+                &first,
+                "test",
+                &knowledge_extraction,
+                &mut knowledge_sources,
+            )
+            .unwrap();
+        let duplicate_knowledge = service
+            .persist_knowledge_artifact(
+                None,
+                &second,
+                "test",
+                &knowledge_extraction,
+                &mut knowledge_sources,
+            )
+            .unwrap();
+
+        let mut sop_sources = std::collections::HashSet::new();
+        service
+            .persist_sop_artifact(None, &first, "test", &sop_extraction, &mut sop_sources)
+            .unwrap();
+        let duplicate_sop = service
+            .persist_sop_artifact(None, &second, "test", &sop_extraction, &mut sop_sources)
+            .unwrap();
+
+        assert_eq!(service.storage.count_bake_knowledge().unwrap(), 1);
+        assert_eq!(service.storage.count_bake_sops().unwrap(), 1);
+        assert_eq!(duplicate_knowledge.discarded_count, 1);
+        assert_eq!(duplicate_sop.discarded_count, 1);
+        assert!(service
+            .storage
+            .find_existing_knowledge_timeline_ids(&[second_timeline])
+            .unwrap()
+            .contains(&second_timeline));
+        assert!(service
+            .storage
+            .find_existing_sop_timeline_ids(&[second_timeline])
+            .unwrap()
+            .contains(&second_timeline));
     }
 }

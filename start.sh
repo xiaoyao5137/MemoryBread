@@ -256,7 +256,8 @@ core_sources_changed() {
         "$PROJECT_ROOT/core-engine/src" \
         "$PROJECT_ROOT/core-engine/Cargo.toml" \
         "$PROJECT_ROOT/core-engine/Cargo.lock" \
-        "$PROJECT_ROOT/shared/ipc-protocol/rust"
+        "$PROJECT_ROOT/shared/ipc-protocol/rust" \
+        "$PROJECT_ROOT/shared/db-schema"
 }
 
 python_sources_newer_than() {
@@ -557,6 +558,7 @@ check_core_api_readiness() {
     wait_for_http "http://localhost:${CORE_PORT}/health" "Core Engine" 20 1 || failed=1
     wait_for_http "http://localhost:${CORE_PORT}/api/creation/history?paged=true&limit=1&offset=0" "Core API /api/creation/history" 10 1 || failed=1
     wait_for_http "http://localhost:${CORE_PORT}/api/bake/captures?limit=1" "Core API /api/bake/captures" 10 1 || failed=1
+    wait_for_http "http://localhost:${CORE_PORT}/api/data/sources?limit=1&offset=0" "Core API /api/data/sources" 10 1 || failed=1
     wait_for_http "http://localhost:${CORE_PORT}/api/monitor/overview?range=7d" "Core API /api/monitor/overview" 10 1 || failed=1
 
     if [ "$failed" -ne 0 ]; then

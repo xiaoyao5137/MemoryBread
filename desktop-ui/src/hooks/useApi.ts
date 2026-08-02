@@ -15,6 +15,8 @@ import type {
   ConfigCheckItem,
   DebugLogContent,
   DebugLogFile,
+  DataExtractionSummary,
+  DataSource,
   MemoryPackageExportResult,
   MemoryPackageImportReport,
   TimelineItem,
@@ -130,7 +132,7 @@ export const getActiveCreationModelPayload = (configs: CreationModelConfig[], re
   const active = configs.find(config => config.id === LOCAL_CREATION_MODEL_ID)
   if (!active) return {}
   const payload: Record<string, string> = {
-    creation_model: 'qwen3.5:4b',
+    creation_model: LOCAL_CREATION_MODEL_ID,
   }
   if (active.baseUrl) {
     payload.creation_base_url = active.baseUrl
@@ -508,11 +510,11 @@ export async function runGatewayRagQueryStream(
 export interface ModelStatus {
   llm: boolean
   embedding: boolean
-  ollama: boolean
+  runtime: boolean
 }
 
 export function useModelStatus() {
-  const [status, setStatus] = useState<ModelStatus>({ llm: false, embedding: false, ollama: false })
+  const [status, setStatus] = useState<ModelStatus>({ llm: false, embedding: false, runtime: false })
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
@@ -520,17 +522,17 @@ export function useModelStatus() {
       try {
         const resp = await fetch(`${LOCAL_MODEL_API}/api/models`)
         if (!resp.ok) {
-          setStatus({ llm: false, embedding: false, ollama: false })
+          setStatus({ llm: false, embedding: false, runtime: false })
           return
         }
         const data = await resp.json()
         const models = data.models || []
         const llm = models.some((m: any) => m.category === 'llm' && (m.status === 'active' || m.is_active))
         const embedding = models.some((m: any) => m.category === 'embedding' && (m.status === 'active' || m.is_active))
-        const ollama = models.some((m: any) => m.id === 'ollama' && (m.status === 'active' || m.is_active))
-        setStatus({ llm, embedding, ollama })
+        const runtime = models.some((m: any) => m.category === 'inference_engine' && (m.status === 'active' || m.is_active))
+        setStatus({ llm, embedding, runtime })
       } catch {
-        setStatus({ llm: false, embedding: false, ollama: false })
+        setStatus({ llm: false, embedding: false, runtime: false })
       } finally {
         setLoading(false)
       }
@@ -540,7 +542,7 @@ export function useModelStatus() {
     return () => clearInterval(interval)
   }, [])
 
-  return { status, loading, ready: status.llm && status.embedding && status.ollama }
+  return { status, loading, ready: status.llm && status.embedding && status.runtime }
 }
 
 export function useHealthCheck() {
@@ -851,6 +853,7 @@ export function useRestoreMemoryPackageFromCloud() {
 export interface BakeOverviewResponse {
   capture_count: number
   memory_count: number
+  data_count?: number
   knowledge_count: number
   template_count: number
   sop_count?: number
@@ -865,6 +868,80 @@ export interface BakeOverviewResponse {
     template_count: number
     sop_count: number
   }>
+}
+
+export interface DataSourceListResponse {
+  items: DataSource[]
+  total: number
+  pending_items?: DataSource[]
+  pending_total?: number
+  limit: number
+  offset: number
+}
+
+export function useFetchDataSources() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (params: { q?: string; limit?: number; offset?: number } = {}): Promise<DataSourceListResponse> => {
+    const url = new URL(`${apiBaseUrl}/api/data/sources`)
+    if (params.q) url.searchParams.set('q', params.q)
+    if (params.limit != null) url.searchParams.set('limit', String(params.limit))
+    if (params.offset != null) url.searchParams.set('offset', String(params.offset))
+    const resp = await fetchWithLocalhostFallback(url.toString())
+    if (!resp.ok) throw new Error(await parseApiErrorMessage(resp, `data source fetch failed: ${resp.status}`))
+    return resp.json()
+  }, [apiBaseUrl])
+}
+
+export function useExtractDataSources() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (limit = 1000): Promise<DataExtractionSummary> => {
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/data/sources/extract`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit }),
+    })
+    if (!resp.ok) throw new Error(await parseApiErrorMessage(resp, `data source extraction failed: ${resp.status}`))
+    return resp.json()
+  }, [apiBaseUrl])
+}
+
+export function useRefreshDataSource() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (sourceId: number, mode: 'auto' | 'browser' | 'http' = 'auto') => {
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/data/sources/${sourceId}/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    })
+    if (!resp.ok) throw new Error(await parseApiErrorMessage(resp, `data source refresh failed: ${resp.status}`))
+    return resp.json() as Promise<{
+      schema_version: string
+      source_id: number
+      collector: string
+      browser?: 'chrome' | 'chrome_canary' | 'edge' | 'brave' | 'chromium' | 'vivaldi' | 'safari' | null
+      interaction_mode?: 'background_tab' | 'none'
+      collected_at: number
+      title: string
+      url: string
+      content_text: string
+      structured_data: Record<string, unknown>
+      content_hash: string
+    }>
+  }, [apiBaseUrl])
+}
+
+export function useDeleteDataSource() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (sourceId: number): Promise<void> => {
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/data/sources/${sourceId}`, {
+      method: 'DELETE',
+    })
+    if (!resp.ok) throw new Error(await parseApiErrorMessage(resp, `data source delete failed: ${resp.status}`))
+  }, [apiBaseUrl])
 }
 
 export function useFetchBakeOverview() {

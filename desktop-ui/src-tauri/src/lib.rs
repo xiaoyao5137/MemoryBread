@@ -32,13 +32,15 @@ use objc2::{
     msg_send,
     rc::Retained,
     runtime::AnyObject,
-    AllocAnyThread, DeclaredClass, MainThreadMarker,
+    AllocAnyThread, DeclaredClass, MainThreadMarker, MainThreadOnly,
 };
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
-    NSEvent, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWorkspace,
+    NSApplication, NSEvent, NSImage, NSImageView, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSWindow, NSWindowCollectionBehavior, NSWorkspace,
 };
+#[cfg(target_os = "macos")]
+use objc2_foundation::NSData;
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
 #[cfg(debug_assertions)]
@@ -54,6 +56,10 @@ const FLOATING_ASSIST_DEFAULT_SIZE: i32 = 82;
 const FLOATING_ASSIST_TEMP_KEEP_SECS: u64 = 24 * 60 * 60;
 const FLOATING_ASSIST_TEMP_CLEANUP_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 const TRAY_TEMPLATE_ICON_SIZE: u32 = 64;
+#[cfg(target_os = "macos")]
+const DOCK_ICON_SCALE: f64 = 1.0;
+#[cfg(target_os = "macos")]
+const MACOS_APP_ICON_BYTES: &[u8] = include_bytes!("../icons/icon.icns");
 
 #[cfg(target_os = "macos")]
 static FLOATING_ASSIST_HOVER_OWNER_KEY: u8 = 0;
@@ -282,6 +288,40 @@ trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
 #[cfg(target_os = "macos")]
+fn configure_macos_dock_icon() {
+    let Some(main_thread_marker) = MainThreadMarker::new() else {
+        eprintln!("无法在主线程配置 macOS Dock 图标");
+        return;
+    };
+    let application = NSApplication::sharedApplication(main_thread_marker);
+    let icon_data = NSData::with_bytes(MACOS_APP_ICON_BYTES);
+    let Some(application_icon) = NSImage::initWithData(NSImage::alloc(), &icon_data) else {
+        eprintln!("无法从内置资源加载 macOS 应用图标");
+        return;
+    };
+    unsafe {
+        application.setApplicationIconImage(Some(&application_icon));
+    }
+    let dock_tile = application.dockTile();
+    let tile_size = dock_tile.size();
+
+    let container = NSView::initWithFrame(NSView::alloc(main_thread_marker), Default::default());
+    container.setFrameSize(tile_size);
+
+    let icon_view = NSImageView::imageViewWithImage(&application_icon, main_thread_marker);
+    let mut icon_frame = icon_view.frame();
+    icon_frame.size.width = tile_size.width * DOCK_ICON_SCALE;
+    icon_frame.size.height = tile_size.height * DOCK_ICON_SCALE;
+    icon_frame.origin.x = (tile_size.width - icon_frame.size.width) / 2.0;
+    icon_frame.origin.y = (tile_size.height - icon_frame.size.height) / 2.0;
+    icon_view.setFrame(icon_frame);
+
+    container.addSubview(&icon_view);
+    dock_tile.setContentView(Some(&container));
+    dock_tile.display();
+}
+
+#[cfg(target_os = "macos")]
 fn set_main_window_background_mode(app: &AppHandle, enabled: bool) {
     let policy = if enabled {
         tauri::ActivationPolicy::Accessory
@@ -290,6 +330,11 @@ fn set_main_window_background_mode(app: &AppHandle, enabled: bool) {
     };
     if let Err(error) = app.set_activation_policy(policy) {
         eprintln!("更新 macOS 应用显示模式失败: {error}");
+    }
+    if !enabled {
+        if let Err(error) = app.run_on_main_thread(configure_macos_dock_icon) {
+            eprintln!("配置 macOS Dock 图标失败: {error}");
+        }
     }
 }
 
@@ -1593,8 +1638,11 @@ pub fn run() {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
-                schedule_backend_startup();
             }
+
+            // 开发窗口可能由 `tauri dev` 直接启动，也会在 Rust 源码变化后独立重启。
+            // 每次 setup 都执行幂等的后端启动检查，避免只剩 UI 时初始化接口报 Load failed。
+            schedule_backend_startup();
 
             Ok(())
         })
@@ -1612,6 +1660,14 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(&event, RunEvent::Ready) {
+                // Ready 时显式注册并刷新内置图标，避免直接运行 target/debug
+                // 二进制时回退为 macOS 的 exec 通用图标。
+                if let Err(error) = app.run_on_main_thread(configure_macos_dock_icon) {
+                    eprintln!("刷新 macOS Dock 图标失败: {error}");
+                }
+            }
             #[cfg(target_os = "macos")]
             if matches!(&event, RunEvent::Reopen { .. }) {
                 show_main_window(app);

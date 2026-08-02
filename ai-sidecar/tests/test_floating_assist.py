@@ -51,6 +51,34 @@ def test_floating_assist_rag_query_does_not_use_url_as_core_question():
     assert _build_floating_assist_rag_query(raw_query, metadata) == raw_query
 
 
+def test_manual_floating_assist_retrieval_uses_only_manual_instruction():
+    raw_query = "\n".join(
+        [
+            "你是记忆面包的工作场景助手。用户在悬浮咨询面板中手工输入了一条指令。",
+            "请优先回答这条手工指令；如果同时提供了当前屏幕 OCR 内容，请把它作为辅助上下文。",
+            "不要提及供应商模型、密钥、成本或内部实现。",
+            "",
+            "用户手工指令：",
+            "smact文档",
+            "",
+            "当前屏幕 OCR：",
+            "记忆面包悬浮咨询面板",
+        ]
+    )
+    query_with_attachment = "\n".join(
+        [
+            "用户手工指令:",
+            "分析 SMACT 与 SMOCC",
+            "",
+            "用户随本次请求附加了以下文件。请结合附件信息回答；如果当前模型无法直接读取图片内容，请明确基于用户指令和可见上下文给出结果，不要声称已经看到了图片细节。",
+            "1. gpu-metrics.pdf（application/pdf，12 KB）",
+        ]
+    )
+
+    assert _extract_core_retrieval_query(raw_query) == "smact文档"
+    assert _extract_core_retrieval_query(query_with_attachment) == "分析 SMACT 与 SMOCC"
+
+
 def test_floating_assist_model_intent_understands_ocr_before_rag_query():
     llm = FakeIntentLlm(
         """
@@ -146,6 +174,29 @@ def test_rag_stream_sends_references_before_answer_and_finishes_with_elapsed(mon
     assert [event["text"] for event in events if event["type"] == "delta"] == ["部分", "答案"]
     done = next(event for event in events if event["type"] == "done")
     assert done["answer"] == "部分答案"
-    assert done["model"] == "mbcd-std-v1"
+    assert done["model"] == "mbem-v1-local"
     assert done["elapsed_ms"] >= 0
     assert done["inference_elapsed_ms"] >= 0
+
+
+def test_local_brand_model_is_resolved_only_inside_sidecar():
+    assert model_api_server._brand_model_id("provider-local-model") == "mbem-v1-local"
+    assert model_api_server._brand_model_id("provider-plus-model") == "mbcd-plus-v1"
+    assert (
+        model_api_server._runtime_model_name("mbcd-std-v1")
+        == model_api_server.MANAGER_MODELS["mbem-v1-local"].model_id
+    )
+
+
+def test_local_model_catalog_response_uses_only_memorybread_branding():
+    meta = model_api_server.get_model("mbem-v1-local")
+    payload = model_api_server._model_to_dict(
+        meta,
+        {"status": "installed", "is_active": False},
+    )
+    serialized = json.dumps(payload, ensure_ascii=False).lower()
+
+    assert payload["name"] == "MBEM v1.0"
+    assert payload["provider"] == "memorybread"
+    assert "qwen" not in serialized
+    assert "ollama" not in serialized

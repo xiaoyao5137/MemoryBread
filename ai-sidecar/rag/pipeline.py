@@ -47,6 +47,20 @@ def _extract_core_retrieval_query(user_query: str) -> str:
         line = line.strip()
         if line.startswith("核心问题：") or line.startswith("核心问题:"):
             return line.split(":", 1)[1].strip() if ":" in line else line.split("：", 1)[1].strip()
+    for marker in ("用户手工指令：", "用户手工指令:"):
+        if marker not in text:
+            continue
+        section = text.split(marker, 1)[1]
+        for next_marker in (
+            "\n当前屏幕 OCR：",
+            "\n当前屏幕 OCR:",
+            "\n用户随本次请求附加了以下文件。",
+        ):
+            if next_marker in section:
+                section = section.split(next_marker, 1)[0]
+        manual_instruction = section.strip()
+        if manual_instruction:
+            return manual_instruction
     return text
 
 _WEEKLY_REPORT_SYSTEM_PROMPT = (

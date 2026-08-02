@@ -20,6 +20,7 @@ from embedding.model import EmbeddingModel
 from rag.llm.base    import LlmBackend, LlmResponse
 from rag.llm.ollama  import OllamaBackend
 from rag.pipeline    import RagPipeline, RagResult, _normalize_evidence_references, _normalize_weekly_report
+from rag.query_planner import build_artifact_query_plan
 from rag.retriever   import (
     Fts5Retriever,
     KnowledgeFts5Retriever,
@@ -1376,6 +1377,79 @@ class TestSqliteRetrievers:
         doc_keys = [chunk.doc_key for chunk in results]
         assert "document_url:https://docs.example/container-gpu" in doc_keys
         assert "bake_knowledge:229" in doc_keys
+
+    def test_artifact_query_plan_keeps_rare_identifier_across_generic_word_variants(self, tmp_path):
+        db_path = str(tmp_path / "artifact-query-plan.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE bake_documents (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                doc_type TEXT NOT NULL,
+                summary TEXT,
+                full_content TEXT,
+                sections_json TEXT NOT NULL DEFAULT '[]',
+                source_url TEXT,
+                source_memory_ids TEXT NOT NULL DEFAULT '[]',
+                linked_knowledge_ids TEXT NOT NULL DEFAULT '[]',
+                deleted_at INTEGER,
+                updated_at INTEGER
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO bake_documents
+                (id, title, doc_type, summary, full_content, source_url, updated_at)
+            VALUES
+                (80, '容器云 GPU 指标采集项目', '技术文档',
+                 'SMACT 与 SMOCC 指标说明', 'SMACT 用于衡量空分利用率。',
+                 'https://docs.example/smact', 1000)
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO bake_documents
+                (id, title, doc_type, summary, full_content, source_url, updated_at)
+            VALUES (?, ?, '技术文档', '通用指标资料', '这是通用指标文档和项目方案。',
+                    ?, ?)
+            """,
+            [
+                (
+                    index,
+                    f"项目指标文档 {index}",
+                    f"https://docs.example/generic-{index}",
+                    2000 + index,
+                )
+                for index in range(100, 140)
+            ],
+        )
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+
+        plan = build_artifact_query_plan(
+            conn.cursor(),
+            "帮我找 SMACT 相关资料",
+        )
+        assert [term.text for term in plan.discriminative_terms] == ["smact"]
+        assert "资料" in [term.text for term in plan.type_terms]
+        assert {"帮我", "相关"}.issubset(plan.instruction_terms)
+
+        generic_plan = build_artifact_query_plan(conn.cursor(), "GPU 指标")
+        assert "gpu" in [term.text for term in generic_plan.discriminative_terms]
+        assert "指标" in [term.text for term in generic_plan.generic_terms]
+
+        retriever = KnowledgeFts5Retriever(db_path)
+        for query in ("SMACT", "SMACT文档", "帮我找 SMACT 相关资料"):
+            results = retriever._search_artifacts(
+                conn.cursor(),
+                query,
+                top_k=5,
+                entity_terms=None,
+            )
+            assert results[0].doc_key == "document_url:https://docs.example/smact"
+        conn.close()
 
     def test_fts5_retriever_falls_back_to_app_name_match(self, tmp_path):
         db_path = str(tmp_path / "captures.db")

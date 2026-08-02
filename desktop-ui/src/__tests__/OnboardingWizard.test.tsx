@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import OnboardingWizard from '../components/OnboardingWizard'
 import { useAppStore } from '../store/useAppStore'
-import type { InitializationStatus } from '../utils/initialization'
+import { fetchInitializationStatus, type InitializationStatus } from '../utils/initialization'
 
 const stageIds = [
   ['preflight', '检查运行环境'],
@@ -75,6 +75,15 @@ afterEach(() => {
 })
 
 describe('首次启动一键初始化', () => {
+  it('本地服务无法连接时返回可操作提示而不是浏览器底层错误', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Load failed')))
+
+    await expect(fetchInitializationStatus()).rejects.toMatchObject({
+      code: 'INITIALIZATION_SERVICE_UNAVAILABLE',
+      message: expect.stringContaining('请退出并重新启动记忆面包'),
+    })
+  })
+
   it('未初始化时只提供一个初始化主操作且不能跳过', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => response({
       status: 'ok',

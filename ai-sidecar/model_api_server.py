@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
+LOCAL_ANALYSIS_MODEL_ID = "mbem-v1-local"
+LOCAL_CREATION_MODEL_IDS = frozenset({LOCAL_ANALYSIS_MODEL_ID, "mbcd-std-v1"})
+
 
 @dataclass
 class FloatingAssistIntent:
@@ -181,6 +184,55 @@ def bake_inference_timeout_seconds(prompt_tokens: int) -> float:
         BAKE_LONG_INFERENCE_TIMEOUT_SECONDS
         if max(0, int(prompt_tokens or 0)) >= BAKE_LONG_PROMPT_TOKENS
         else BAKE_INFERENCE_TIMEOUT_SECONDS
+    )
+
+
+def _bake_error_response(
+    message: str,
+    *,
+    code: str,
+    retryable: bool,
+    scope: str,
+    status: int,
+):
+    """统一烘焙错误契约；Core 必须按 code/scope 分类，不能仅凭 HTTP 5xx。"""
+    return jsonify({
+        'error': message,
+        'code': code,
+        'retryable': bool(retryable),
+        'scope': scope,
+    }), status
+
+
+def _bake_exception_response(error: Exception, operation: str):
+    code = getattr(error, 'code', None)
+    scope = getattr(error, 'scope', None)
+    retryable = getattr(error, 'retryable', None)
+    status = getattr(error, 'http_status', None)
+    public_message = getattr(error, 'public_message', None)
+    if (
+        isinstance(code, str)
+        and scope in {'candidate', 'service'}
+        and isinstance(retryable, bool)
+        and isinstance(status, int)
+        and isinstance(public_message, str)
+    ):
+        return _bake_error_response(
+            public_message,
+            code=code,
+            retryable=retryable,
+            scope=scope,
+            status=status,
+        )
+
+    # 未分类的代码异常保持真实 500，但明确限定为 candidate 范围。Core 会做
+    # 有界重试并转入死信，不再把裸 500/502 当作可无限延后的服务故障。
+    return _bake_error_response(
+        f'{operation}内部处理失败',
+        code='BAKE_INTERNAL_ERROR',
+        retryable=True,
+        scope='candidate',
+        status=500,
     )
 
 
@@ -503,7 +555,16 @@ def _brand_model_id(model_name: str | None) -> str:
     raw = (model_name or '').lower()
     if 'plus' in raw or 'opus' in raw:
         return 'mbcd-plus-v1'
-    return 'mbcd-std-v1'
+    return LOCAL_ANALYSIS_MODEL_ID
+
+
+def _runtime_model_name(model_id: str) -> str:
+    """在 sidecar 边界内把品牌模型 ID 解析为本地运行时名称。"""
+    normalized = MODEL_ID_ALIASES.get(model_id, model_id)
+    if normalized in LOCAL_CREATION_MODEL_IDS:
+        normalized = LOCAL_ANALYSIS_MODEL_ID
+    model = MANAGER_MODELS.get(normalized)
+    return model.model_id if model is not None else model_id
 
 
 def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[dict], latency_ms: int, metadata: dict | None = None, model: str | None = None) -> int | None:
@@ -588,7 +649,7 @@ def rag_history():
                 'contexts': contexts,
                 'context_count': len(contexts),
                 'latency_ms': row['latency_ms'],
-                'model': row['model'],
+                'model': _brand_model_id(row['model']),
             })
 
         return jsonify({'items': items})
@@ -683,18 +744,20 @@ def _build_rag_llm_override(data: dict, timeout: int = 360, num_predict: int = 1
     if not model:
         return None
 
-    # 有 API Key 的模型按创作页云端模型处理；没有 API Key 的 qwen3.5:4b 等本地模型走 Ollama。
+    # 有 API Key 的模型按创作页云端模型处理；本地品牌模型只在 sidecar 内解析运行时名称。
     if api_key:
         from rag.llm.cloud import CloudChatBackend
         return CloudChatBackend(model=model, api_key=api_key, base_url=base_url, timeout=timeout)
 
     from rag.llm.ollama import OllamaBackend
-    return OllamaBackend(model=model, timeout=timeout, num_predict=num_predict)
+    return OllamaBackend(model=_runtime_model_name(model), timeout=timeout, num_predict=num_predict)
 
 
 def _model_to_dict(meta, status_info: dict) -> dict:
     """将 ModelMeta + 状态信息合并为前端所需的 dict"""
     d = dataclasses.asdict(meta)
+    if d.get('provider') == 'ollama':
+        d['provider'] = 'memorybread'
     status = status_info.get('status', 'not_installed')
 
     # 特殊处理：本地模型需要检查 RAG pipeline 是否就绪
@@ -836,15 +899,15 @@ def list_models():
         # 添加 Ollama 推理引擎状态
         ollama_status = model_manager.get_ollama_setup_status()
         result.append({
-            'id': 'ollama',
-            'name': 'Ollama',
+            'id': 'mb-local-engine',
+            'name': '本地运行环境',
             'category': 'inference_engine',
-            'provider': 'ollama',
+            'provider': 'memorybread',
             'status': 'active' if ollama_status['ollama_running'] else 'not_installed' if not ollama_status['ollama_installed'] else 'installed',
             'is_active': ollama_status['ollama_running'],
             'download_progress': 100 if ollama_status['ollama_installed'] else 0,
             'recommended': True,
-            'recommend_reason': 'Ollama 是本地推理引擎，必须运行才能使用 LLM 模型',
+            'recommend_reason': '用于在设备本地运行 MemoryBread AI 能力',
             'version': ollama_status.get('ollama_version'),
             'can_upgrade': ollama_status['ollama_installed'] and ollama_status['brew_available'],
         })
@@ -1599,7 +1662,7 @@ def rag_query_stream():
                     'done',
                     answer=result.answer,
                     contexts=response_contexts,
-                    model='mbcd-std-v1',
+                    model=_brand_model_id(result.model),
                     done_reason=result.done_reason,
                     output_truncated=bool(result.output_truncated),
                     elapsed_ms=elapsed_ms,
@@ -1758,7 +1821,7 @@ def rag_query():
         return jsonify({
             'answer': result.answer,
             'contexts': response_contexts,
-            'model': result.model,
+            'model': _brand_model_id(result.model),
             'done_reason': result.done_reason,
             'output_truncated': bool(result.output_truncated),
         })
@@ -1900,17 +1963,40 @@ def extract_bake():
         candidate = data.get('candidate')
         trigger_reason = data.get('trigger_reason') or 'manual_debug'
         if not isinstance(candidate, dict):
-            return jsonify({'error': '缺少 candidate 对象'}), 400
+            return _bake_error_response(
+                '缺少 candidate 对象',
+                code='BAKE_REQUEST_INVALID',
+                retryable=False,
+                scope='candidate',
+                status=400,
+            )
         if not candidate.get('source_timeline_id') and candidate.get('source_knowledge_id'):
             candidate['source_timeline_id'] = candidate.get('source_knowledge_id')
         if not candidate.get('source_timeline_id'):
-            return jsonify({'error': 'candidate.source_timeline_id 缺失'}), 400
+            return _bake_error_response(
+                'candidate.source_timeline_id 缺失',
+                code='BAKE_REQUEST_INVALID',
+                retryable=False,
+                scope='candidate',
+                status=400,
+            )
 
         source_timeline_id = candidate.get('source_timeline_id')
+        try:
+            retry_attempt = max(0, int(data.get('retry_attempt') or 0))
+        except (TypeError, ValueError):
+            return _bake_error_response(
+                'retry_attempt 必须是非负整数',
+                code='BAKE_REQUEST_INVALID',
+                retryable=False,
+                scope='candidate',
+                status=400,
+            )
         logger.info(
-            "bake extract request start source_timeline_id=%s trigger_reason=%s",
+            "bake extract request start source_timeline_id=%s trigger_reason=%s retry_attempt=%s",
             source_timeline_id,
             trigger_reason,
+            retry_attempt,
         )
         extractor = get_bake_extractor()
         estimated_prompt_tokens = extractor.estimate_bake_bundle_prompt_tokens(candidate)
@@ -1928,27 +2014,32 @@ def extract_bake():
                 lambda: extractor.extract_bake_bundle(
                     candidate,
                     preempt_check=current_task_preempt_requested,
+                    retry_attempt=retry_attempt,
                 ),
                 timeout=inference_timeout,
                 lane=LANE_P2_BAKE,
             )
         except QueueEvictedError as ee:
             logger.warning(f"bake extract 被队列淘汰: {ee}")
-            return jsonify({
-                'error': 'AI 正在处理其他任务，请稍候再试',
-                'code': 'INFERENCE_PREEMPTED',
-                'retryable': True,
-            }), 503
+            return _bake_error_response(
+                'AI 正在处理其他任务，请稍候再试',
+                code='INFERENCE_PREEMPTED',
+                retryable=True,
+                scope='service',
+                status=503,
+            )
         except concurrent.futures.TimeoutError:
             logger.warning(
-                "bake extract 执行超过 %.0fs，已取消且不会重试",
+                "bake extract 执行超过 %.0fs，已取消并交由有界退避重试",
                 inference_timeout,
             )
-            return jsonify({
-                'error': 'bake 提炼超时，任务已取消',
-                'code': 'INFERENCE_TIMEOUT',
-                'retryable': False,
-            }), 504
+            return _bake_error_response(
+                'bake 提炼超时，任务已取消',
+                code='INFERENCE_TIMEOUT',
+                retryable=True,
+                scope='candidate',
+                status=504,
+            )
         lock_wait_ms = int(time.time() * 1000) - lock_wait_start_ms
         logger.info(
             "bake extract done source_timeline_id=%s queue_wait_ms=%s",
@@ -1970,33 +2061,33 @@ def extract_bake():
         return jsonify(result)
     except Exception as e:
         logger.error("bake 提炼失败: %s", e, exc_info=True)
-        error_code = getattr(e, 'code', None)
-        retryable = getattr(e, 'retryable', None)
-        if error_code in {'BAKE_OUTPUT_TRUNCATED', 'BAKE_OUTPUT_INVALID'} and retryable is False:
-            return jsonify({
-                'error': str(e),
-                'code': error_code,
-                'retryable': False,
-            }), 422
-        lowered = str(e).lower()
-        if 'ollama' in lowered or 'bad gateway' in lowered:
-            return jsonify({'error': str(e)}), 502
-        if 'service unavailable' in lowered or 'busy' in lowered:
-            return jsonify({'error': str(e)}), 503
-        return jsonify({'error': str(e)}), 500
+        return _bake_exception_response(e, '烘焙提炼')
 
 
 @app.route('/bake/merge_document', methods=['POST'])
 def merge_bake_document():
     """将新 capture 合并进已有文档，返回更新后的字段。"""
+    inference_timeout = BAKE_INFERENCE_TIMEOUT_SECONDS
     try:
         data = request.get_json(silent=True) or {}
         existing_document = data.get('existing_document')
         candidate = data.get('candidate')
         if not isinstance(existing_document, dict) or not isinstance(candidate, dict):
-            return jsonify({'error': '缺少 existing_document 或 candidate'}), 400
+            return _bake_error_response(
+                '缺少 existing_document 或 candidate',
+                code='BAKE_REQUEST_INVALID',
+                retryable=False,
+                scope='candidate',
+                status=400,
+            )
         if not candidate.get('source_timeline_id'):
-            return jsonify({'error': 'candidate.source_timeline_id 缺失'}), 400
+            return _bake_error_response(
+                'candidate.source_timeline_id 缺失',
+                code='BAKE_REQUEST_INVALID',
+                retryable=False,
+                scope='candidate',
+                status=400,
+            )
         extractor = get_bake_extractor()
         estimated_prompt_tokens = extractor.estimate_merge_document_prompt_tokens(
             existing_document,
@@ -2020,24 +2111,28 @@ def merge_bake_document():
         return jsonify(result)
     except QueueEvictedError as e:
         logger.warning("bake merge_document 被队列淘汰: %s", e)
-        return jsonify({
-            'error': 'AI 正在处理其他任务，请稍候再试',
-            'code': 'INFERENCE_PREEMPTED',
-            'retryable': True,
-        }), 503
+        return _bake_error_response(
+            'AI 正在处理其他任务，请稍候再试',
+            code='INFERENCE_PREEMPTED',
+            retryable=True,
+            scope='service',
+            status=503,
+        )
     except concurrent.futures.TimeoutError:
         logger.warning(
-            "bake merge_document 执行超过 %.0fs，已取消且不会重试",
+            "bake merge_document 执行超过 %.0fs，已取消并交由有界退避重试",
             inference_timeout,
         )
-        return jsonify({
-            'error': 'bake 文档合并超时，任务已取消',
-            'code': 'INFERENCE_TIMEOUT',
-            'retryable': False,
-        }), 504
+        return _bake_error_response(
+            'bake 文档合并超时，任务已取消',
+            code='INFERENCE_TIMEOUT',
+            retryable=True,
+            scope='candidate',
+            status=504,
+        )
     except Exception as e:
         logger.error("bake merge_document 失败: %s", e, exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return _bake_exception_response(e, '烘焙文档合并')
 
 
 # ── 内部工具 ──────────────────────────────────────────────────────────────────

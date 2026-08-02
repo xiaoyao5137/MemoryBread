@@ -29,6 +29,12 @@ shared/db-schema/
 | `app_filters` | 应用采集白/黑名单 |
 | `rag_sessions` | RAG 问答会话记录 |
 | `data_cleanup_log` | 数据清理任务日志 |
+| `data_sources` | 数据模块的报表 URL 与工作数据来源、访问模式和刷新策略 |
+| `data_snapshots` | 每个数据源唯一的一份最新快照；新采集覆盖正文、结构化内容、时间和时效 TTL |
+| `data_source_links` | 数据来源到 capture/timeline 的可追溯关联 |
+| `data_snapshots_fts` | 数据快照正文与结构化内容全文索引 |
+| `data_extraction_state` | 数据识别的近期高水位与历史回填游标（运行状态，不进入资产快照） |
+| `creation_evidence_assets` | 归属创作运行的本机截图证据及 OCR/DOM 校验结果（原图不进入资产快照） |
 
 ## 视图总览
 
@@ -104,5 +110,4 @@ sqlite3 ~/.memory-bread/memory-bread.db "VACUUM;"
 
 ### 5. Rust 层迁移管理
 
-实际项目中，这些 SQL 文件将通过 `sqlx::migrate!()` 宏嵌入 Rust 二进制，
-在应用启动时自动按版本顺序执行，无需用户手动操作。
+实际项目由 Core Engine 的迁移表嵌入 SQL，并在应用启动时按版本顺序执行，无需用户手动操作。数据模块从 `064_data_memory_module.sql` 开始，旧数据库会增量创建数据资产表与全文索引；`065_allow_browser_attach_snapshots.sql` 修复早期草案数据库已存在同名表时无法接纳通用浏览器会话快照的升级兼容问题，并保留已有快照与全文索引。

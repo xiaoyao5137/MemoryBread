@@ -318,7 +318,40 @@ impl StorageManager {
             0
         } else {
             self.with_conn(|conn| {
-                conn.execute(
+                let vector_tx = conn.unchecked_transaction()?;
+                vector_tx.execute(
+                    "INSERT OR IGNORE INTO vector_deletion_queue (
+                         qdrant_point_id, source_type, reason, enqueued_at
+                     )
+                     SELECT
+                         qdrant_point_id,
+                         source_type,
+                         'capture_retention_expired',
+                         ?2
+                     FROM vector_index
+                     WHERE capture_id IN (
+                        SELECT id FROM captures
+                        WHERE ts < ?1
+                          AND (event_type IS NULL OR event_type <> 'snapshot_ref')
+                          AND (
+                              timeline_id IS NOT NULL
+                              OR EXISTS (
+                                  SELECT 1 FROM timelines t
+                                  WHERE t.capture_id = captures.id
+                              )
+                              OR (
+                                  COALESCE(ax_text, '') = ''
+                                  AND COALESCE(ocr_text, '') = ''
+                                  AND COALESCE(input_text, '') = ''
+                                  AND COALESCE(audio_text, '') = ''
+                                  AND COALESCE(url, '') = ''
+                                  AND COALESCE(webpage_title, '') = ''
+                              )
+                          )
+                     )",
+                    params![older_than_ms, current_ts_ms()],
+                )?;
+                vector_tx.execute(
                     "DELETE FROM vector_index
                  WHERE capture_id IN (
                     SELECT id FROM captures
@@ -342,6 +375,7 @@ impl StorageManager {
                  )",
                     params![older_than_ms],
                 )?;
+                vector_tx.commit()?;
 
                 conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
                 let delete_result = conn.execute(
@@ -811,6 +845,14 @@ mod tests {
                  VALUES (?1, 'timeline extract', 'meeting')",
                 params![capture_id],
             )?;
+            conn.execute(
+                "INSERT INTO vector_index (
+                     capture_id, qdrant_point_id, chunk_index, chunk_text,
+                     model_name, created_at, source_type
+                 )
+                 VALUES (?1, 'retention-vector', 0, 'raw vector', 'test', ?2, 'capture')",
+                params![capture_id, current_ts_ms()],
+            )?;
             Ok(())
         })
         .unwrap();
@@ -826,6 +868,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(timeline_count, 1);
+        let queued_point: String = mgr
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT qdrant_point_id
+                     FROM vector_deletion_queue
+                     WHERE reason = 'capture_retention_expired'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(StorageError::Sqlite)
+            })
+            .unwrap();
+        assert_eq!(queued_point, "retention-vector");
     }
 
     #[test]
@@ -869,15 +924,23 @@ mod tests {
         assert!(!dir.path().join(relative_path).exists());
         assert!(mgr.get_capture(capture_id).unwrap().is_none());
 
-        let (timeline_count, vector_count): (i64, i64) = mgr
+        let (timeline_count, vector_count, queued_count): (i64, i64, i64) = mgr
             .with_conn(|conn| {
                 Ok((
                     conn.query_row("SELECT COUNT(*) FROM timelines", [], |row| row.get(0))?,
                     conn.query_row("SELECT COUNT(*) FROM vector_index", [], |row| row.get(0))?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM vector_deletion_queue
+                         WHERE qdrant_point_id = 'manual-delete-vector'
+                           AND reason = 'capture_deleted_by_user'",
+                        [],
+                        |row| row.get(0),
+                    )?,
                 ))
             })
             .unwrap();
         assert_eq!(timeline_count, 1);
         assert_eq!(vector_count, 0);
+        assert_eq!(queued_count, 1);
     }
 }

@@ -39,7 +39,6 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
   } = useAppStore()
   const [mode, setMode] = useState<AuthMode>('login')
   const [loginMethod, setLoginMethod] = useState<LoginMethod>('email')
-  const [username, setUsername] = useState('')
   const [nickname, setNickname] = useState('')
   const [companyName, setCompanyName] = useState('')
   const [email, setEmail] = useState('')
@@ -79,7 +78,7 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
           adminApiBaseUrl,
           phone,
           phoneCode,
-          mode === 'register' ? username : undefined,
+          undefined,
           mode === 'register' ? nickname : undefined,
           mode === 'register' ? companyName : undefined,
         )
@@ -91,7 +90,7 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
         mode,
         email,
         password,
-        username,
+        undefined,
         nickname,
         companyName,
       )
@@ -153,7 +152,7 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
         <div className="auth-panel__form-head">
           <span className="auth-panel__form-icon" aria-hidden="true"><LockKeyhole size={18} /></span>
           <div>
-            <strong>登录账户</strong>
+            <strong>{mode === 'login' ? '登录账户' : '注册账户'}</strong>
             <span>{mode === 'login' ? '使用已有账户登录' : '创建账户后自动登录'}</span>
           </div>
         </div>
@@ -181,7 +180,7 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
           </button>
         </div>
 
-        <div className="auth-panel__method-tabs" role="tablist" aria-label="登录方式">
+        <div className="auth-panel__method-tabs" role="tablist" aria-label={mode === 'login' ? '登录方式' : '注册方式'}>
           <button
             aria-selected={loginMethod === 'email'}
             className={loginMethod === 'email' ? 'auth-panel__method-tab auth-panel__method-tab--active' : 'auth-panel__method-tab'}
@@ -190,7 +189,7 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
             type="button"
           >
             <Mail size={15} aria-hidden />
-            邮箱登录
+            {mode === 'login' ? '邮箱登录' : '邮箱注册'}
           </button>
           <button
             aria-selected={loginMethod === 'phone'}
@@ -200,7 +199,7 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
             type="button"
           >
             <Smartphone size={15} aria-hidden />
-            手机号登录
+            {mode === 'login' ? '手机号登录' : '手机号注册'}
           </button>
         </div>
 
@@ -218,19 +217,35 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
           </label>
         )}
 
-        {mode === 'register' && (
+        {loginMethod === 'email' && (
           <label>
-            <span>账户名</span>
+            <span>{mode === 'register' ? '邮箱地址' : '邮箱'}</span>
             <div className="auth-panel__input-with-icon">
-              <UserRound size={16} aria-hidden />
+              <Mail size={16} aria-hidden />
               <input
-                autoComplete="username"
-                maxLength={30}
-                minLength={2}
-                onChange={(event) => setUsername(event.target.value)}
-                placeholder="用于识别账户，注册后保留展示"
+                autoComplete="email"
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder={mode === 'login' ? 'you@example.com' : undefined}
                 required
-                value={username}
+                type="email"
+                value={email}
+              />
+            </div>
+          </label>
+        )}
+
+        {loginMethod === 'phone' && (
+          <label>
+            <span>手机号</span>
+            <div className="auth-panel__input-with-icon">
+              <Smartphone size={16} aria-hidden />
+              <input
+                autoComplete="tel"
+                onChange={(event) => setPhone(event.target.value)}
+                placeholder={mode === 'login' ? '请输入手机号' : undefined}
+                required
+                type="tel"
+                value={phone}
               />
             </div>
           </label>
@@ -246,7 +261,6 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
                 maxLength={30}
                 minLength={2}
                 onChange={(event) => setNickname(event.target.value)}
-                placeholder="用于头像和左下角用户卡片"
                 required
                 value={nickname}
               />
@@ -275,81 +289,49 @@ const AuthPanel: React.FC<AuthPanelProps> = ({
         )}
 
         {loginMethod === 'email' && (
-          <>
-            <label>
-              <span>邮箱</span>
-              <div className="auth-panel__input-with-icon">
-                <Mail size={16} aria-hidden />
-                <input
-                  autoComplete="email"
-                  onChange={(event) => setEmail(event.target.value)}
-                  placeholder="you@example.com"
-                  required
-                  type="email"
-                  value={email}
-                />
-              </div>
-            </label>
-            <label>
-              <span>密码</span>
-              <div className="auth-panel__input-with-icon">
-                <KeyRound size={16} aria-hidden />
-                <input
-                  autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-                  minLength={8}
-                  onChange={(event) => setPassword(event.target.value)}
-                  placeholder="至少 8 个字符"
-                  required
-                  type="password"
-                  value={password}
-                />
-              </div>
-            </label>
-          </>
+          <label>
+            <span>密码</span>
+            <div className="auth-panel__input-with-icon">
+              <KeyRound size={16} aria-hidden />
+              <input
+                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                minLength={8}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder="至少 8 个字符"
+                required
+                type="password"
+                value={password}
+              />
+            </div>
+          </label>
         )}
 
         {loginMethod === 'phone' && (
-          <>
-            <label>
-              <span>手机号</span>
+          <label>
+            <span>验证码</span>
+            <div className="auth-panel__code-row">
               <div className="auth-panel__input-with-icon">
-                <Smartphone size={16} aria-hidden />
+                <KeyRound size={16} aria-hidden />
                 <input
-                  autoComplete="tel"
-                  onChange={(event) => setPhone(event.target.value)}
-                  placeholder="请输入手机号"
+                  autoComplete="one-time-code"
+                  inputMode="numeric"
+                  maxLength={8}
+                  onChange={(event) => setPhoneCode(event.target.value)}
+                  placeholder={codeSent ? '请输入短信验证码' : '先获取验证码'}
                   required
-                  type="tel"
-                  value={phone}
+                  value={phoneCode}
                 />
               </div>
-            </label>
-            <label>
-              <span>验证码</span>
-              <div className="auth-panel__code-row">
-                <div className="auth-panel__input-with-icon">
-                  <KeyRound size={16} aria-hidden />
-                  <input
-                    autoComplete="one-time-code"
-                    inputMode="numeric"
-                    maxLength={8}
-                    onChange={(event) => setPhoneCode(event.target.value)}
-                    placeholder={codeSent ? '请输入短信验证码' : '先获取验证码'}
-                    required
-                    value={phoneCode}
-                  />
-                </div>
-                <button
-                  className="auth-panel__code-button"
-                  disabled={loading || !phone.trim()}
-                  onClick={handleSendPhoneCode}
-                  type="button"
-                >
-                  {codeSent ? '重新发送' : '获取验证码'}
-                </button>
-              </div>
-            </label>
-          </>
+              <button
+                className="auth-panel__code-button"
+                disabled={loading || !phone.trim()}
+                onClick={handleSendPhoneCode}
+                type="button"
+              >
+                {codeSent ? '重新发送' : '获取验证码'}
+              </button>
+            </div>
+          </label>
         )}
 
         {error && <div className="auth-panel__error" role="alert">{error}</div>}

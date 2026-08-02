@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 const HISTORY_SELECT: &str = "SELECT id, prompt, generated_content, doc_type, audience,
     reference_count, references_json, model, latency_ms, session_id, conversation_json,
     agent_trace_json, goal_json, root_request, parent_history_id, revision_no,
-    edit_operation, document_patch_json, created_at, updated_at
+    edit_operation, document_patch_json, evidence_json, created_at, updated_at
     FROM creation_history ch";
 
 const LATEST_SESSION_PREDICATE: &str = "(COALESCE(TRIM(ch.session_id), '') = ''
@@ -59,6 +59,8 @@ pub struct CreationHistory {
     pub edit_operation: String,
     #[serde(default)]
     pub document_patch_json: Option<String>,
+    #[serde(default)]
+    pub evidence_json: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -314,6 +316,14 @@ pub fn next_revision_no(conn: &Connection, session_id: &str) -> Result<i64> {
     Ok(max_revision.max(count) + 1)
 }
 
+pub fn set_evidence_json(conn: &Connection, history_id: i64, evidence_json: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE creation_history SET evidence_json = ?2 WHERE id = ?1",
+        params![history_id, evidence_json],
+    )?;
+    Ok(())
+}
+
 fn map_history_row(row: &rusqlite::Row<'_>) -> Result<CreationHistory> {
     Ok(CreationHistory {
         id: row.get(0)?,
@@ -334,8 +344,9 @@ fn map_history_row(row: &rusqlite::Row<'_>) -> Result<CreationHistory> {
         revision_no: row.get(15)?,
         edit_operation: row.get(16)?,
         document_patch_json: row.get(17)?,
-        created_at: row.get(18)?,
-        updated_at: row.get(19)?,
+        evidence_json: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
     })
 }
 
@@ -373,6 +384,7 @@ mod tests {
                 revision_no INTEGER NOT NULL DEFAULT 1,
                 edit_operation TEXT NOT NULL DEFAULT 'create_document',
                 document_patch_json TEXT,
+                evidence_json TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );",
@@ -435,6 +447,12 @@ mod tests {
             None,
         )
         .unwrap();
+        set_evidence_json(
+            &conn,
+            id,
+            r#"[{"id":"evidence-1","validation_status":"verified"}]"#,
+        )
+        .unwrap();
 
         let (items, total) = list_page(&conn, None, 20, 0).unwrap();
         assert_eq!(total, 1);
@@ -450,6 +468,11 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("agent.completed"));
+        assert!(items[0]
+            .evidence_json
+            .as_deref()
+            .unwrap()
+            .contains("evidence-1"));
     }
 
     #[test]

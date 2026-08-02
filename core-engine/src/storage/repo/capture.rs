@@ -46,11 +46,26 @@ impl StorageManager {
                 return Ok(false);
             }
 
-            conn.execute(
+            let vector_tx = conn.unchecked_transaction()?;
+            vector_tx.execute(
+                "INSERT OR IGNORE INTO vector_deletion_queue (
+                     qdrant_point_id, source_type, reason, enqueued_at
+                 )
+                 SELECT
+                     qdrant_point_id,
+                     source_type,
+                     'capture_deleted_by_user',
+                     ?2
+                 FROM vector_index
+                 WHERE capture_id = ?1 AND source_type = 'capture'",
+                params![id, current_ts_ms()],
+            )?;
+            vector_tx.execute(
                 "DELETE FROM vector_index
                  WHERE capture_id = ?1 AND source_type = 'capture'",
                 params![id],
             )?;
+            vector_tx.commit()?;
 
             conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
             let delete_result = conn.execute("DELETE FROM captures WHERE id = ?1", params![id]);

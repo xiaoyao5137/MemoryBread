@@ -30,11 +30,16 @@ _PROCESS_LOCK_FILE = "/tmp/memory-bread-knowledge-extract.lock"
 _DEFAULT_CORE_ENGINE_URL = "http://127.0.0.1:7070"
 _DEFAULT_MODEL_API_URL = "http://127.0.0.1:7071"
 _BAKE_RUN_ENDPOINT = "/api/bake/run"
+_DATA_EXTRACTION_ENDPOINT = "/api/data/sources/extract"
 _INFERENCE_QUEUE_STATUS_ENDPOINT = "/api/inference/queue-status"
 _CHARGING_CATCHUP_MAX_BATCH_SIZE = 100
 _CHARGING_CATCHUP_SLEEP_SECS = 1
 _SUBSTANTIVE_DOCUMENT_MIN_CHARS = 200
+_ARTIFACT_VECTOR_CHECK_INTERVAL_SECS = 5 * 60
+_VECTOR_CONSISTENCY_AUDIT_INTERVAL_SECS = 24 * 60 * 60
 _BAKE_DEFERRED_RETRY_BACKOFF_MS = 2 * 60 * 1000
+_MAX_BAKE_RETRY_FAILURES = 3
+_DATA_EXTRACTION_INTERVAL_SECS = 5 * 60
 
 # 全局 embedding 信号量，限制并发数
 _embedding_semaphore = asyncio.Semaphore(2)
@@ -188,6 +193,7 @@ class BackgroundProcessor:
         self.running = False
         self._run_lock = asyncio.Lock()
         self._last_energy_mode: Optional[str] = None
+        self._last_data_extraction_at: float = 0.0
 
         # 懒加载 workers
         self._embed_worker = None
@@ -630,6 +636,48 @@ class BackgroundProcessor:
                 result.get("candidate_count"),
                 result.get("discarded_count"),
             )
+        return result
+
+    async def _trigger_data_extraction(self, limit: int = 1000) -> dict:
+        """让 Core 基于 capture/timeline 识别数据源和工作数据记忆。
+
+        这里只传数量上限，不传正文或 URL；原始数据始终由共享本机 SQLite 读取。
+        """
+        url = f"{self._get_core_engine_url().rstrip('/')}{_DATA_EXTRACTION_ENDPOINT}"
+        payload = json.dumps({"limit": max(1, min(int(limit), 5000))}).encode("utf-8")
+        request = urllib_request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        def _send() -> dict:
+            try:
+                with urllib_request.urlopen(request, timeout=15) as response:
+                    body = response.read().decode("utf-8") if response else ""
+                    data = json.loads(body) if body else {}
+                return {
+                    "triggered": True,
+                    "scanned_count": int(data.get("scanned_count") or 0),
+                    "source_created_count": int(data.get("source_created_count") or 0),
+                    "source_updated_count": int(data.get("source_updated_count") or 0),
+                    "snapshot_created_count": int(data.get("snapshot_created_count") or 0),
+                }
+            except Exception as exc:
+                logger.warning("数据记忆识别触发失败: %s", type(exc).__name__)
+                return {"triggered": False, "reason": "request_failed"}
+
+        result = await asyncio.to_thread(_send)
+        if result.get("triggered"):
+            self._last_data_extraction_at = time.monotonic()
+            if result.get("source_created_count") or result.get("snapshot_created_count"):
+                logger.info(
+                    "数据记忆识别完成: scanned=%s sources=%s snapshots=%s",
+                    result.get("scanned_count"),
+                    result.get("source_created_count"),
+                    result.get("snapshot_created_count"),
+                )
         return result
 
     def _process_batch_sync(self, limit_override: Optional[int] = None, force_finalize_tail: bool = False) -> dict:
@@ -1569,6 +1617,193 @@ class BackgroundProcessor:
                 "error": str(exc),
             }
 
+    async def backfill_bake_document_vectors(self, limit: int = 128) -> dict:
+        """Backfill vectors from durable bake documents, independent of captures."""
+        try:
+            documents = await asyncio.to_thread(
+                self._load_pending_bake_documents,
+                limit,
+            )
+            if not documents:
+                return {"candidate_count": 0, "processed_count": 0}
+
+            processed = 0
+            for offset in range(0, len(documents), 4):
+                processed += await self._process_bake_document_vector_batch(
+                    documents[offset : offset + 4]
+                )
+                await asyncio.sleep(0)
+            logger.info(
+                "持久 bake 文档向量补齐完成: candidates=%s processed=%s",
+                len(documents),
+                processed,
+            )
+            return {
+                "candidate_count": len(documents),
+                "processed_count": processed,
+            }
+        except Exception as exc:
+            logger.error("持久 bake 文档向量补齐失败: %s", exc, exc_info=True)
+            return {
+                "candidate_count": 0,
+                "processed_count": 0,
+                "error": str(exc),
+            }
+
+    async def _process_bake_document_vector_batch(
+        self,
+        documents: list[dict],
+    ) -> int:
+        from embedding.document_chunks import build_bake_document_snapshot
+        from embedding.vector_storage import get_vector_storage
+
+        storage = get_vector_storage()
+        availability_check = getattr(storage, "is_qdrant_available", None)
+        if callable(availability_check) and not availability_check():
+            logger.debug("Qdrant 暂不可写，延后持久 bake 文档向量补齐")
+            return 0
+        snapshots = [
+            snapshot
+            for document in documents
+            if (snapshot := build_bake_document_snapshot(document)) is not None
+            and not storage.artifact_document_version_exists(
+                snapshot.document_id,
+                snapshot.doc_key,
+                snapshot.content_hash,
+                len(snapshot.chunks),
+            )
+        ]
+        if not snapshots:
+            return 0
+
+        texts = [chunk for snapshot in snapshots for chunk in snapshot.chunks]
+        async with _embedding_semaphore:
+            from model_registry_global import get_shared_embedding
+
+            model = get_shared_embedding()
+            vectors = []
+            for offset in range(0, len(texts), 32):
+                batch_vectors = await asyncio.to_thread(
+                    model.encode,
+                    texts[offset : offset + 32],
+                )
+                vectors.extend(batch_vectors)
+
+        processed = 0
+        vector_offset = 0
+        documents_by_id = {
+            int(document.get("id") or 0): document for document in documents
+        }
+        for snapshot in snapshots:
+            chunk_count = len(snapshot.chunks)
+            chunk_vectors = [
+                item.vector
+                for item in vectors[vector_offset : vector_offset + chunk_count]
+            ]
+            vector_offset += chunk_count
+            if len(chunk_vectors) != chunk_count or any(not item for item in chunk_vectors):
+                logger.warning(
+                    "持久文档 embedding 结果不完整: document_id=%s",
+                    snapshot.document_id,
+                )
+                continue
+            document = documents_by_id.get(snapshot.document_id, {})
+            if storage.store_artifact_document_vectors(
+                document_id=snapshot.document_id,
+                chunks=snapshot.chunks,
+                vectors=chunk_vectors,
+                metadata={
+                    "doc_key": snapshot.doc_key,
+                    "content_hash": snapshot.content_hash,
+                    "url": snapshot.canonical_url,
+                    "title": snapshot.title,
+                    "doc_type": document.get("doc_type"),
+                    "updated_at": document.get("updated_at"),
+                    "model_name": model.model_name,
+                },
+            ):
+                processed += 1
+        return processed
+
+    def _load_pending_bake_documents(self, limit: int) -> list[dict]:
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                        WHERE type = 'table'
+                          AND name IN ('bake_documents', 'artifact_vector_index')
+                        """
+                    )
+                }
+                if tables != {"bake_documents", "artifact_vector_index"}:
+                    return []
+                rows = conn.execute(
+                    """
+                    SELECT
+                        d.id,
+                        d.title,
+                        d.doc_type,
+                        d.summary,
+                        d.full_content,
+                        d.sections_json,
+                        d.source_url,
+                        d.updated_at
+                    FROM bake_documents d
+                    LEFT JOIN artifact_vector_index v
+                      ON v.document_id = d.id
+                    WHERE d.deleted_at IS NULL
+                      AND (
+                          LENGTH(COALESCE(d.full_content, '')) >= ?
+                          OR LENGTH(COALESCE(d.sections_json, '')) >= ?
+                      )
+                    GROUP BY d.id
+                    HAVING COUNT(v.id) = 0
+                        OR MAX(v.indexed_at) < d.updated_at
+                    ORDER BY d.updated_at DESC, d.id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        _SUBSTANTIVE_DOCUMENT_MIN_CHARS,
+                        _SUBSTANTIVE_DOCUMENT_MIN_CHARS,
+                        max(1, int(limit)),
+                    ),
+                ).fetchall()
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("读取待补齐持久文档失败: %s", exc)
+            return []
+        return [
+            {
+                "id": row[0],
+                "title": row[1],
+                "doc_type": row[2],
+                "summary": row[3],
+                "full_content": row[4],
+                "sections_json": row[5],
+                "source_url": row[6],
+                "updated_at": row[7],
+            }
+            for row in rows
+        ]
+
+    def _drain_vector_deletion_queue(self) -> dict:
+        from embedding.vector_storage import get_vector_storage
+
+        return get_vector_storage().drain_deletion_queue()
+
+    def _audit_vector_consistency(self) -> dict:
+        from embedding.vector_storage import get_vector_storage
+
+        try:
+            return get_vector_storage().audit_qdrant_consistency(
+                mark_missing_artifacts=True,
+            )
+        except Exception as exc:
+            logger.warning("向量一致性审计失败: %s", exc)
+            return {"available": False, "error": str(exc)}
+
     def _load_document_backfill_captures(self, limit: int) -> list[dict]:
         url_markers = (
             "docs.corp",
@@ -1901,9 +2136,9 @@ class BackgroundProcessor:
                     LEFT JOIN bake_retry_state r ON r.timeline_id = t.id
                     WHERE t.category NOT IN ('bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate')
                       AND t.is_self_generated = 0
-                      -- 与 Core 的“一次终态失败即跳过”口径一致，避免只剩死信时
+                      -- 与 Core 的“最多三次后终态”口径一致，避免只剩死信时
                       -- sidecar 仍每 30 秒触发一个实际无候选的空批次。
-                      AND COALESCE(r.failure_count, 0) < 1
+                      AND COALESCE(r.failure_count, 0) < ?
                       AND (
                           t.importance >= 4
                           OR t.user_verified = 1
@@ -1952,7 +2187,7 @@ class BackgroundProcessor:
                                 WHERE json_each.value = CAST(t.id AS TEXT)
                             )
                       )
-                """)
+                """, (_MAX_BAKE_RETRY_FAILURES,))
                 row = cursor.fetchone()
                 return bool(row and row[0] > 0)
             finally:
@@ -2023,11 +2258,37 @@ class BackgroundProcessor:
         logger.info(f"🚀 后台处理器启动 (间隔={self.interval}s, 批量={self.batch_size})")
 
         _last_periodic_bake_ts: float = 0.0
+        _last_artifact_vector_check_ts: float = 0.0
+        _last_vector_consistency_audit_ts: float = 0.0
 
         while self.running:
             sleep_secs = self.interval
             try:
                 self._touch_status_file()
+                await asyncio.to_thread(self._drain_vector_deletion_queue)
+
+                now = time.monotonic()
+                if (
+                    now - _last_vector_consistency_audit_ts
+                    >= _VECTOR_CONSISTENCY_AUDIT_INTERVAL_SECS
+                ):
+                    audit = await asyncio.to_thread(self._audit_vector_consistency)
+                    if audit.get("available"):
+                        _last_vector_consistency_audit_ts = now
+                        if audit.get("missing_count") or audit.get("orphan_count"):
+                            logger.warning(
+                                "向量一致性审计: missing=%s repaired_artifacts=%s "
+                                "orphans=%s（孤儿仅报告，不自动删除）",
+                                audit.get("missing_count"),
+                                audit.get("missing_artifacts_marked_for_rebuild"),
+                                audit.get("orphan_count"),
+                            )
+                if (
+                    now - _last_artifact_vector_check_ts
+                    >= _ARTIFACT_VECTOR_CHECK_INTERVAL_SECS
+                ):
+                    await self.backfill_bake_document_vectors(limit=16)
+                    _last_artifact_vector_check_ts = now
 
                 if not self._capture_and_extraction_enabled():
                     logger.debug("采集与自动提炼已暂停，跳过本轮后台处理")
@@ -2075,6 +2336,16 @@ class BackgroundProcessor:
                 )
                 processed = int(batch_result.get('processed_count', 0))
                 self._touch_status_file()
+
+                data_extraction_due = (
+                    processed > 0
+                    or time.monotonic() - self._last_data_extraction_at
+                    >= _DATA_EXTRACTION_INTERVAL_SECS
+                )
+                if data_extraction_due:
+                    batch_result['data_extraction'] = await self._trigger_data_extraction(
+                        limit=max(1000, timeline_batch_limit * 20),
+                    )
 
                 if processed > 0:
                     logger.info(f"✅ 本轮处理完成: {processed} 条记录")

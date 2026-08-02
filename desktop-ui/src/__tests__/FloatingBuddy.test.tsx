@@ -121,7 +121,7 @@ describe('BakeTabs', () => {
     render(<BakeTabs current="overview" onChange={onChange} />)
 
     const tabs = screen.getAllByRole('button').map(button => button.textContent)
-    expect(tabs).toEqual(['总览', '文档', '知识', '操作'])
+    expect(tabs).toEqual(['总览', '文档', '知识', '操作', '数据'])
     expect(screen.queryByText('高价值文档')).not.toBeInTheDocument()
   })
 })

@@ -321,6 +321,26 @@ describe('技能云端发布边界', () => {
       published: false,
     })
   })
+
+  it('市场请求悬挂时会超时退出加载状态', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException('The operation was aborted.', 'AbortError'))
+        if (init?.signal?.aborted) abort()
+        else init?.signal?.addEventListener('abort', abort, { once: true })
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = searchCreationSkillMarket('https://api.example.test')
+    const rejection = expect(pending).rejects.toThrow('技能市场请求超时，请稍后重试')
+    await vi.advanceTimersByTimeAsync(8_000)
+    await rejection
+    vi.useRealTimers()
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal)
+  })
 })
 
 describe('技能本地生成与类目容错', () => {
@@ -368,6 +388,45 @@ describe('技能本地生成与类目容错', () => {
     expect(analysis.textStyle.length).toBeGreaterThanOrEqual(400)
     expect(analysis.diagramStyle.length).toBeGreaterThanOrEqual(400)
     expect(analysis.writingGuidelines.join('').length).toBeGreaterThanOrEqual(400)
+  })
+
+  it('分析服务短暂不可用时自动重试并使用服务端结果', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({
+        error: 'CREATION_SKILL_ANALYZER_UNAVAILABLE',
+        message: '本地技能分析服务不可用',
+      }, { status: 502 }))
+      .mockResolvedValueOnce(Response.json({
+        title: '技术架构设计文档',
+        summary: '适合梳理系统边界、关键取舍和验证路径。',
+        common_titles: ['总体架构与关键取舍'],
+        title_style: '使用短名词结构。',
+        text_style: '先界定边界，再给出方案和验证方式。',
+        diagram_style: '使用 PlantUML 表达已在正文定义的组件关系。',
+        structure_pattern: ['背景与目标', '总体方案', '风险与验证'],
+        writing_guidelines: ['结论后紧接依据和适用边界。'],
+        section_headings: DEFAULT_CREATION_SKILL_SECTION_HEADINGS,
+        field_examples: DEFAULT_CREATION_SKILL_FIELD_EXAMPLES,
+        example_document: DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
+        analysis_mode: 'local_model',
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const pending = analyzeCreationSkill('http://127.0.0.1:7070', {
+      kind: 'bake_document',
+      id: 'doc-retry',
+      title: '订单中心总体架构设计',
+      docType: '技术架构设计文档',
+      content: '# 背景与目标\n建设订单中心。\n## 总体架构\n说明系统边界和关键链路。\n## 演进计划\n分阶段实施。',
+    })
+    await vi.runAllTimersAsync()
+    const analysis = await pending
+    vi.useRealTimers()
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(analysis.analysisMode).toBe('local_model')
+    expect(analysis.fallbackReason).toBeUndefined()
   })
 
   it('修复旧分析结果中的短示例、重复占位标题和过短写作指引', async () => {
@@ -782,6 +841,7 @@ describe('技能本地生成与类目容错', () => {
     expect(skill.executionSteps.map(step => step.id)).toEqual([
       'collect-context',
       'design-solution',
+      'design-chapters',
       'draft-document',
       'review-delivery',
     ])

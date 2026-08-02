@@ -366,24 +366,25 @@ const InventoryTrendChart: React.FC<{ overview: BakeOverview }> = ({ overview })
 
 const BakeOverviewTab: React.FC<{
   overview: BakeOverview
-  onOpenTab: (tab: 'knowledge' | 'templates' | 'sop') => void
+  onOpenTab: (tab: 'knowledge' | 'templates' | 'sop' | 'data') => void
   onOpenRepository: (tab: 'memory' | 'capture') => void
   footer?: React.ReactNode
 }> = ({ overview, onOpenTab, onOpenRepository, footer }) => {
 
   return (
     <div style={{ display: 'grid', gap: 16 }}>
-      <div className="bake-grid-4">
+      <div className="bake-grid-overview">
         <BakeCard><div className="bake-muted">时间线</div><div className="bake-stat-value">{overview.memoryCount}</div></BakeCard>
         <BakeCard><div className="bake-muted">文档</div><div className="bake-stat-value">{overview.templateCount}</div></BakeCard>
         <BakeCard><div className="bake-muted">知识</div><div className="bake-stat-value">{overview.knowledgeCount}</div></BakeCard>
         <BakeCard><div className="bake-muted">操作</div><div className="bake-stat-value">{overview.sopCount}</div></BakeCard>
+        <BakeCard><div className="bake-muted">数据</div><div className="bake-stat-value">{overview.dataCount}</div></BakeCard>
       </div>
 
       <InventoryTrendChart overview={overview} />
 
       <BakeCard>
-        <BakeSectionHeader title="生产关系" subtitle="时间线可提炼为文档/知识/操作；采集只承接时间线与采集记录回溯" right={<BakePill text="时间线 → 文档 / 知识 / 操作；采集 → 时间线 / 采集记录" />} />
+        <BakeSectionHeader title="生产关系" subtitle="时间线可提炼为文档、知识、操作与数据；实时数据网址在使用时刷新" right={<BakePill text="时间线 → 文档 / 知识 / 操作 / 数据" />} />
         <div className="bake-list">
           <div className="bake-list-item">
             <div className="bake-inline-meta">
@@ -398,6 +399,7 @@ const BakeOverviewTab: React.FC<{
               <BakeButton compact onClick={() => onOpenTab('templates')}>文档</BakeButton>
               <BakeButton compact onClick={() => onOpenTab('knowledge')}>知识</BakeButton>
               <BakeButton compact onClick={() => onOpenTab('sop')}>操作</BakeButton>
+              <BakeButton compact onClick={() => onOpenTab('data')}>数据</BakeButton>
             </div>
           </div>
         </div>
@@ -443,6 +445,15 @@ const BakeOverviewTab: React.FC<{
                 <BakeButton primary onClick={() => onOpenTab('sop')}>打开</BakeButton>
               </div>
             </div>
+            <div className="bake-list-item">
+              <div className="bake-inline-meta">
+                <div style={{ minWidth: 0 }}>
+                  <div className="bake-list-item__title">管理数据</div>
+                  <div className="bake-muted">检索工作数据并即时刷新报表网页</div>
+                </div>
+                <BakeButton primary onClick={() => onOpenTab('data')}>打开</BakeButton>
+              </div>
+            </div>
           </div>
         </BakeCard>
 
@@ -454,6 +465,7 @@ const BakeOverviewTab: React.FC<{
               <div className="bake-muted">文档 {overview.templateCount}</div>
               <div className="bake-muted">知识 {overview.knowledgeCount}</div>
               <div className="bake-muted">操作 {overview.sopCount}</div>
+              <div className="bake-muted">数据 {overview.dataCount}</div>
               <div className="bake-muted">采集记录 {overview.captureCount}</div>
             </div>
           </BakeCard>

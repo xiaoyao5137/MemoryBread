@@ -22,6 +22,7 @@ import type { ConfigCheckItem, ConfigCheckStatus, PreferenceRecord } from '../ty
 import { toUserFacingError } from '../utils/userFacingError'
 import { openExternalUrl, useAppMetadata } from '../utils/appMetadata'
 import { fetchSoftwareUpdate, type SoftwareUpdateCheck } from '../utils/softwareUpdate'
+import { useImeCompositionGuard } from '../hooks/useImeCompositionGuard'
 import InteractionSettings from './InteractionSettings'
 import './Settings.v2.css'
 
@@ -37,6 +38,7 @@ const USER_VISIBLE_PREFERENCE_KEYS = new Set<string>([
 
 const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
   const appMetadata = useAppMetadata()
+  const identityImeGuard = useImeCompositionGuard<HTMLInputElement>()
   const CAPTURE_INTERVAL_KEY = 'privacy.capture_interval_sec'
   const SCREENSHOT_KEEP_DAYS_KEY = 'privacy.screenshot_keep_days'
   const CAPTURE_RETENTION_DAYS_KEY = 'privacy.capture_retention_days'
@@ -391,7 +393,15 @@ const Settings: React.FC<SettingsProps> = ({ className = '' }) => {
                 value={identityInput}
                 onChange={(e) => setIdentityInput(e.target.value)}
                 placeholder="输入你的名字或昵称，多个用逗号分隔"
-                onKeyDown={(e) => { if (e.key === 'Enter') handleSaveIdentity() }}
+                onCompositionStart={identityImeGuard.onCompositionStart}
+                onCompositionEnd={identityImeGuard.onCompositionEnd}
+                onBlur={identityImeGuard.onBlur}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !identityImeGuard.isImeEvent(e)) {
+                    e.preventDefault()
+                    void handleSaveIdentity()
+                  }
+                }}
               />
               <button
                 data-testid="identity-save"

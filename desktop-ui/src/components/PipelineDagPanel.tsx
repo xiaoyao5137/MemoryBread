@@ -10,20 +10,23 @@ interface Props {
 // DAG 布局：分叉
 //   capture → timeline → ┬─ knowledge
 //                        ├─ sop
-//                        └─ document
+//                        ├─ document
+//                        └─ data
 const NODE_W = 168
 const NODE_H = 96
 const COL_GAP = 96
 const ROW_GAP = 18
 const SVG_W = NODE_W * 4 + COL_GAP * 3 + 48
-const SVG_H = NODE_H * 3 + ROW_GAP * 2 + 48
+const SVG_H = NODE_H * 4 + ROW_GAP * 3 + 48
+const PIPELINE_CENTER_Y = 24 + (NODE_H + ROW_GAP) * 1.5
 
 const NODE_POS: Record<DagStageKey, { x: number; y: number }> = {
-  capture:   { x: 24,                                  y: 24 + NODE_H + ROW_GAP },
-  timeline:  { x: 24 + (NODE_W + COL_GAP),             y: 24 + NODE_H + ROW_GAP },
+  capture:   { x: 24,                                  y: PIPELINE_CENTER_Y },
+  timeline:  { x: 24 + (NODE_W + COL_GAP),             y: PIPELINE_CENTER_Y },
   knowledge: { x: 24 + (NODE_W + COL_GAP) * 2,         y: 24 },
   sop:       { x: 24 + (NODE_W + COL_GAP) * 2,         y: 24 + NODE_H + ROW_GAP },
   document:  { x: 24 + (NODE_W + COL_GAP) * 2,         y: 24 + (NODE_H + ROW_GAP) * 2 },
+  data:      { x: 24 + (NODE_W + COL_GAP) * 2,         y: 24 + (NODE_H + ROW_GAP) * 3 },
 }
 
 const STAGE_COLOR: Record<DagStageKey, { fill: string; stroke: string; accent: string }> = {
@@ -32,6 +35,7 @@ const STAGE_COLOR: Record<DagStageKey, { fill: string; stroke: string; accent: s
   knowledge: { fill: '#F3EBFF', stroke: '#AF52DE', accent: '#AF52DE' },
   sop:       { fill: '#E8F8EE', stroke: '#34C759', accent: '#34C759' },
   document:  { fill: '#FFEBEE', stroke: '#FF3B30', accent: '#FF3B30' },
+  data:      { fill: '#E8F7F7', stroke: '#008A8A', accent: '#008A8A' },
 }
 
 const EXTRACTOR_LABEL: Record<string, { text: string; color: string }> = {
@@ -40,6 +44,36 @@ const EXTRACTOR_LABEL: Record<string, { text: string; color: string }> = {
   idle:    { text: '空闲',   color: '#8E8E93' },
   stalled: { text: '已停止', color: '#FF3B30' },
   paused:  { text: '已暂停', color: '#8E8E93' },
+}
+
+function emptyStage(
+  key: DagStageKey,
+  label: string,
+  inProgressLabel: string,
+  pendingLabel = '',
+): DagStage {
+  return {
+    key,
+    label,
+    in_progress_label: inProgressLabel,
+    pending_label: pendingLabel,
+    in_progress_count: 0,
+    pending_count: 0,
+    completed_today: 0,
+    in_progress_items: [],
+    pending_items: [],
+  }
+}
+
+// 后端与桌面端可能在滚动升级期间短暂版本不一致。先提供完整中文阶段，
+// 再用接口数据覆盖，避免缺失阶段退回英文 key，也保证节点始终可打开抽屉。
+const DEFAULT_STAGES: Record<DagStageKey, DagStage> = {
+  capture: emptyStage('capture', '采集', '提炼中', '排队'),
+  timeline: emptyStage('timeline', '预提炼', '提炼中', '待提炼'),
+  knowledge: emptyStage('knowledge', '知识', '生成中'),
+  sop: emptyStage('sop', '操作手册', '生成中'),
+  document: emptyStage('document', '文档', '生成中'),
+  data: emptyStage('data', '数据', '生成中'),
 }
 
 function fmtRelTime(ms: number, nowMs: number): string {
@@ -119,7 +153,7 @@ const PipelineDagPanel: React.FC<Props> = ({ base, isVisible }) => {
   useEffect(() => () => abortRef.current?.abort(), [])
 
   const stagesByKey = useMemo(() => {
-    const map: Partial<Record<DagStageKey, DagStage>> = {}
+    const map: Record<DagStageKey, DagStage> = { ...DEFAULT_STAGES }
     if (data) for (const s of data.stages) map[s.key] = s
     return map
   }, [data])
@@ -158,18 +192,23 @@ const PipelineDagPanel: React.FC<Props> = ({ base, isVisible }) => {
         setWindowMode('bake')
         setBakeTab('templates')
         break
+      case 'data':
+        setWindowMode('bake')
+        setBakeTab('data')
+        break
       default:
         break
     }
     setDrawerStage(null)
   }
 
-  // SVG 连线（capture→timeline→3 个分叉）
+  // SVG 连线（capture→timeline→4 个分叉）
   const edges: { from: DagStageKey; to: DagStageKey }[] = [
     { from: 'capture', to: 'timeline' },
     { from: 'timeline', to: 'knowledge' },
     { from: 'timeline', to: 'sop' },
     { from: 'timeline', to: 'document' },
+    { from: 'timeline', to: 'data' },
   ]
 
   return (
@@ -405,7 +444,7 @@ const Drawer: React.FC<{
             items={stage.in_progress_items}
             onItemClick={onItemClick}
             nowMs={nowMs}
-            emptyHint="当前没有正在提炼的条目"
+            emptyHint={inProgressLabel === '生成中' ? '当前没有正在生成的条目' : '当前没有正在提炼的条目'}
             accent={accent}
           />
           {showPending && (

@@ -6,6 +6,7 @@ pub mod captures;
 pub mod config_checks;
 pub mod creation;
 pub mod creation_skill;
+pub mod data;
 pub mod debug;
 pub mod diary;
 pub mod health;

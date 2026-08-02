@@ -279,8 +279,7 @@ impl StorageManager {
 
     /// 记录单条 timeline 的烘焙失败。
     ///
-    /// 当前策略是失败一次即永久跳过；沿用历史表的 failure_count 字段仅为
-    /// 数据库兼容，不再自动清除或自动重试。
+    /// failure_count 由 BakeService 用于有界重试；达到服务端上限后才成为终态。
     pub fn bump_bake_retry_failure(
         &self,
         timeline_id: i64,
@@ -306,6 +305,21 @@ impl StorageManager {
         })
     }
 
+    /// 返回候选已记录的失败次数；尚未失败时为 0。
+    pub fn get_bake_retry_failure_count(&self, timeline_id: i64) -> Result<i64, StorageError> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(
+                    (SELECT failure_count FROM bake_retry_state WHERE timeline_id = ?1),
+                    0
+                 )",
+                params![timeline_id],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
+        })
+    }
+
     /// 候选成功处理后移除旧失败记录，避免历史失败继续污染监控或后续增量处理。
     pub fn clear_bake_retry_failure(&self, timeline_id: i64) -> Result<bool, StorageError> {
         self.with_conn(|conn| {
@@ -321,7 +335,8 @@ impl StorageManager {
     ///
     /// 删除误写的死信之前先找到最早受影响候选，并把 unified watermark
     /// 回退到它之前。否则只删失败标记仍会因为 watermark 已跨过候选而无法补偿。
-    /// 真正的 504/内容错误不匹配该白名单，仍保持一次失败即永久跳过。
+    /// 新错误会以 `bake_error code=... status=...` 保存，不匹配这组仅用于
+    /// 一次性历史修复的旧字符串，避免每次重启都把有界重试计数清零。
     pub fn clear_recoverable_bake_retry_failures(&self) -> Result<usize, StorageError> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
@@ -475,7 +490,7 @@ mod tests {
     fn test_clear_retry_failure_and_recoverable_history() {
         let mgr = make_mgr();
         mgr.with_conn(|conn| {
-            for id in [101_i64, 102, 103, 104, 105, 106, 107] {
+            for id in [101_i64, 102, 103, 104, 105, 106, 107, 108] {
                 conn.execute(
                     "INSERT INTO captures (id, ts, event_type) VALUES (?1, ?1, 'manual')",
                     params![id],
@@ -516,7 +531,14 @@ mod tests {
         .unwrap();
         mgr.bump_bake_retry_failure(107, "upstream error (429 Too Many Requests): busy")
             .unwrap();
+        mgr.bump_bake_retry_failure(
+            108,
+            "bake_error code=BAKE_UNCLASSIFIED_UPSTREAM_ERROR status=502",
+        )
+        .unwrap();
 
+        assert_eq!(mgr.get_bake_retry_failure_count(105).unwrap(), 1);
+        assert_eq!(mgr.get_bake_retry_failure_count(999).unwrap(), 0);
         assert_eq!(mgr.clear_recoverable_bake_retry_failures().unwrap(), 5);
         assert_eq!(
             mgr.get_bake_watermark("unified")
@@ -529,6 +551,7 @@ mod tests {
         assert!(!mgr.clear_bake_retry_failure(104).unwrap());
         assert!(!mgr.clear_bake_retry_failure(106).unwrap());
         assert!(!mgr.clear_bake_retry_failure(107).unwrap());
+        assert_eq!(mgr.get_bake_retry_failure_count(108).unwrap(), 1);
         assert!(mgr.clear_bake_retry_failure(105).unwrap());
         assert!(mgr.clear_bake_retry_failure(103).unwrap());
         assert!(!mgr.clear_bake_retry_failure(103).unwrap());

@@ -782,7 +782,7 @@ def test_periodic_bake_check_excludes_permanent_failures(tmp_path) -> None:
         )
         VALUES (1, 1, '候选', '文档', 5, 0, 0, 1000, 1000);
         INSERT INTO bake_retry_state
-        VALUES (1, 1, 'terminal payload error', 1000);
+        VALUES (1, 3, 'terminal payload error', 1000);
         """
     )
     conn.commit()
@@ -792,7 +792,7 @@ def test_periodic_bake_check_excludes_permanent_failures(tmp_path) -> None:
     assert processor._has_pending_bake_timelines() is False
 
     conn = sqlite3.connect(db_path)
-    conn.execute("DELETE FROM bake_retry_state")
+    conn.execute("UPDATE bake_retry_state SET failure_count = 1")
     conn.commit()
     conn.close()
     assert processor._has_pending_bake_timelines() is True

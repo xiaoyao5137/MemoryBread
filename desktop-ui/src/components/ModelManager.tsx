@@ -5,10 +5,9 @@ import type { CreationModelConfig } from '../store/useAppStore'
 import { fetchBillingBalance } from '../utils/authApi'
 import { REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel } from '../utils/modelSelection'
 import { toUserFacingError } from '../utils/userFacingError'
-import { openExternalUrl } from '../utils/openExternalUrl'
+import { useImeCompositionGuard } from '../hooks/useImeCompositionGuard'
 
 const SIDECAR = 'http://localhost:7071'
-const OLLAMA_MACOS_DOWNLOAD_URL = 'https://ollama.com/download/mac'
 
 type OllamaSetupDetail = {
   message?: string
@@ -27,6 +26,7 @@ type OllamaSetupDetail = {
 }
 
 const PROVIDER_LABEL: Record<string, string> = {
+  memorybread: '本地运行',
   ollama: '本地运行', huggingface: '本地向量',
   openai: '云端能力', anthropic: '云端能力',
   gateway: '云端创作',
@@ -34,6 +34,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   google: '云端能力', kling: '云端能力',
 }
 const PROVIDER_COLOR: Record<string, string> = {
+  memorybread: '#007AFF',
   ollama: '#007AFF', huggingface: '#FF9500',
   openai: '#34C759', anthropic: '#AF52DE',
   gateway: '#AF52DE',
@@ -55,7 +56,6 @@ const STATUS_LABEL: Record<string, string> = {
 
 const ANALYSIS_MODEL_ALIASES = new Set([
   'mbem-v1-local',
-  'qwen3.5-4b',
 ])
 
 const VECTOR_MODEL_ALIASES = new Set([
@@ -98,9 +98,7 @@ function normalizeVisibleModels(items: ModelEntry[]): ModelEntry[] {
     // 云端创作只通过 MemoryBread 品牌模型配置，不显示供应商模型或密钥入口。
     if (model.category === 'image' || model.requires_api_key) continue
 
-    if (model.category === 'inference_engine') {
-      normalized.push(model)
-    }
+    // 推理引擎由首次初始化自动托管，不作为独立模型暴露给用户。
   }
 
   return normalized
@@ -203,6 +201,7 @@ const ModelChatDialog: React.FC<{
   const [chatLoading, setChatLoading] = useState(false)
   const [chatError, setChatError] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const chatInputImeGuard = useImeCompositionGuard<HTMLInputElement>()
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' })
@@ -364,7 +363,15 @@ const ModelChatDialog: React.FC<{
           <input
             value={inputValue}
             onChange={e => setInputValue(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
+            onCompositionStart={chatInputImeGuard.onCompositionStart}
+            onCompositionEnd={chatInputImeGuard.onCompositionEnd}
+            onBlur={chatInputImeGuard.onBlur}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey && !chatInputImeGuard.isImeEvent(e)) {
+                e.preventDefault()
+                void handleSend()
+              }
+            }}
             placeholder="输入消息..."
             disabled={chatLoading}
             style={{
@@ -580,7 +587,7 @@ const ModelManager: React.FC = () => {
 
   const handleInstallOllama = async () => {
     if (ollamaSetup && !ollamaSetup.ollama_installed && !ollamaSetup.can_auto_install) {
-      await openExternalUrl(ollamaSetup.official_download_url || OLLAMA_MACOS_DOWNLOAD_URL)
+      setOllamaError('请重新打开应用，MemoryBread 会自动恢复本地 AI 能力')
       return
     }
 
@@ -991,18 +998,13 @@ const CREATION_MODEL_DEFS = [
   },
   {
     id: 'mbcd-std-v1',
-    name: 'MBCD Std v1.0',
-    description: 'MemoryBread Create Document Standard 1.0，文本创作模型 v1',
+    name: 'MBEM v1.0',
+    description: 'MemoryBread Extract Model 1.0，用于本地理解、提炼、创作与咨询',
     provider: 'ollama',
     hasBaseUrl: true,
     sizeGb: 3.4,
   },
 ] as const
-
-const CREATION_MODEL_ID_TO_NAME: Record<string, string> = {
-  'mbcd-std-v1':  'qwen3.5:4b',
-  'qwen-3-5-4b': 'qwen3.5:4b',
-}
 
 const CREATION_SVC = 'http://127.0.0.1:8001'
 const LOCAL_CREATION_MODEL_ID = 'mbcd-std-v1'
@@ -1018,6 +1020,7 @@ const CreationModelChatDialog: React.FC<{ entry: CreationChatEntry; onClose: () 
   const [loading, setLoading] = useState(false)
   const [chatError, setChatError] = useState('')
   const endRef = useRef<HTMLDivElement>(null)
+  const chatInputImeGuard = useImeCompositionGuard<HTMLInputElement>()
   useEffect(() => { endRef.current?.scrollIntoView?.({ behavior: 'smooth' }) }, [messages])
 
   const handleSend = async () => {
@@ -1113,7 +1116,16 @@ const CreationModelChatDialog: React.FC<{ entry: CreationChatEntry; onClose: () 
           <div ref={endRef} />
         </div>
         <div style={{ padding: '10px 16px', borderTop: '1px solid rgba(0,0,0,0.07)', display: 'flex', gap: 8 }}>
-          <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void handleSend() } }}
+          <input value={input} onChange={e => setInput(e.target.value)}
+            onCompositionStart={chatInputImeGuard.onCompositionStart}
+            onCompositionEnd={chatInputImeGuard.onCompositionEnd}
+            onBlur={chatInputImeGuard.onBlur}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey && !chatInputImeGuard.isImeEvent(e)) {
+                e.preventDefault()
+                void handleSend()
+              }
+            }}
             placeholder="输入消息…"
             style={{ flex: 1, padding: '8px 10px', border: '1px solid #E5E5EA', borderRadius: 8, fontSize: 13, outline: 'none' }} />
           <button onClick={handleSend} disabled={loading || !input.trim()} style={btn(loading || !input.trim() ? '#E5E5EA' : '#007AFF', loading || !input.trim() ? '#AEAEB2' : 'white', 12)}>
@@ -1137,7 +1149,7 @@ const CreationModelPanel: React.FC<{
   const [chattingModel, setChattingModel] = React.useState<CreationChatEntry | null>(null)
   const activeConfig = configs.find(config => config.enabled && (remoteAllowed || config.id !== REMOTE_CREATION_MODEL_ID))
   const activeDef = CREATION_MODEL_DEFS.find(def => def.id === activeConfig?.id)
-  const activeModelName = activeDef?.name || 'MBCD Std v1.0'
+  const activeModelName = activeDef?.name || 'MBEM v1.0'
 
   const handleTest = async (def: typeof CREATION_MODEL_DEFS[number], cfg: { id: string; enabled: boolean; apiKey: string; baseUrl?: string }) => {
     if (!cfg.apiKey) return
@@ -1147,7 +1159,7 @@ const CreationModelPanel: React.FC<{
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: CREATION_MODEL_ID_TO_NAME[def.id] || def.id,
+          model: def.id,
           api_key: cfg.apiKey,
           base_url: cfg.baseUrl || undefined,
         }),
@@ -1170,7 +1182,7 @@ const CreationModelPanel: React.FC<{
         <span style={{ fontSize: 12, fontWeight: 600, color: '#333' }}>咨询生成模型</span>
       </div>
       <div style={{ fontSize: 11, color: '#8E8E93', marginBottom: 10, lineHeight: 1.5 }}>
-        只能启用一个咨询生成模型。未登录或未开启云端创作时，默认使用本地 MBCD Std v1.0。
+        只能启用一个咨询生成模型。未登录或未开启云端创作时，默认使用本地 MBEM v1.0。
         {availableCredit != null ? ` 当前可用 Credit：${availableCredit}` : ''}
       </div>
       {CREATION_MODEL_DEFS.map(def => {

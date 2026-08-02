@@ -4,6 +4,7 @@ import { AtSign, Bot, Check, ChevronDown, ChevronRight, CloudOff, CloudUpload, C
 import { serviceEnvironmentHeaders, useAppStore } from '../store/useAppStore'
 import type { CreationAgentEvent, CreationChatMessage, CreationReferenceItem, CreationReferencePreview } from '../store/useAppStore'
 import { fetchWithLocalhostFallback } from '../hooks/useApi'
+import { useImeCompositionGuard } from '../hooks/useImeCompositionGuard'
 import { getUserDisplayName } from '../utils/accountDisplay'
 import { fetchBillingBalance } from '../utils/authApi'
 import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
@@ -12,6 +13,8 @@ import { toUserFacingError } from '../utils/userFacingError'
 import {
   buildCreationSkillInstruction,
   categoryPathFor,
+  CREATION_SKILL_AGENT_OPTIONS,
+  CREATION_SKILL_TOOL_OPTIONS,
   creationSkillCategoryOptions,
   deleteLocalCreationSkill,
   fetchCreationSkillCategories,
@@ -72,6 +75,16 @@ interface CreationHistoryItem {
   documentPatch: Record<string, unknown> | null
   model?: string | null
   latencyMs?: number | null
+  evidence: CreationEvidenceItem[]
+}
+interface CreationEvidenceItem {
+  id: string
+  source_url: string
+  page_title: string
+  captured_at: number
+  image_url: string
+  validation_status: string
+  validation?: Record<string, unknown>
 }
 type MarkdownBlock =
   | { type: 'markdown'; content: string; startLine: number; endLine: number }
@@ -98,8 +111,58 @@ const defaultPrompt = '请生成一份“数据治理平台建设方案”，参
 const HISTORY_PAGE_SIZE = 20
 const SKILL_MARKET_PAGE_SIZE = 18
 const MAX_CONVERSATION_MESSAGES = 60
+const DOCUMENT_MUTATION_AGENT_IDS = new Set([
+  'document_writer_agent',
+  'anti_ai_style_agent',
+  'detail_polish_agent',
+  'table_polish_agent',
+  'typography_polish_agent',
+  'image_polish_agent',
+])
+
+const intentOperationForRun = (
+  events: CreationAgentEvent[],
+  runId?: string | null,
+) => {
+  const intent = [...events]
+    .reverse()
+    .find(event => (
+      event.type === 'intent.interpreted'
+      && (!runId || event.run_id === runId)
+    ))
+  const operation = String(intent?.data?.operation || '').trim()
+  return operation || null
+}
+
 const createCreationSessionId = () =>
   `creation-${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+const formatCreationMessageTimestamp = (createdAt: number, now = Date.now()) => {
+  const date = new Date(createdAt)
+  if (!Number.isFinite(date.getTime())) return null
+
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const full = `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${time}`
+  const today = new Date(now)
+  const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1)
+  const isSameDate = (left: Date, right: Date) => (
+    left.getFullYear() === right.getFullYear()
+    && left.getMonth() === right.getMonth()
+    && left.getDate() === right.getDate()
+  )
+
+  let label = full
+  if (isSameDate(date, today)) {
+    label = time
+  } else if (isSameDate(date, yesterday)) {
+    label = `昨天 ${time}`
+  } else if (date.getFullYear() === today.getFullYear()) {
+    label = `${date.getMonth() + 1}月${date.getDate()}日 ${time}`
+  }
+
+  return { label, full, iso: date.toISOString() }
+}
 
 const sanitizeGeneratedContent = (content: string) =>
   content.replace(/<a\s+(?:id|name)=["'][^"']+["']\s*>\s*<\/a>/gi, '')
@@ -309,6 +372,7 @@ const mapCreationHistory = (histories: any[]): CreationHistoryItem[] => historie
     documentPatch: parseHistoryJson<Record<string, unknown> | null>(h.document_patch_json, null),
     model: h.model || null,
     latencyMs: normalizeLatencyMs(h.latency_ms),
+    evidence: parseHistoryJson<CreationEvidenceItem[]>(h.evidence_json, []),
   }
 })
 
@@ -614,6 +678,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const skillPackageInputRef = useRef<HTMLInputElement>(null)
   const promptInputRef = useRef<HTMLTextAreaElement>(null)
+  const promptImeGuard = useImeCompositionGuard<HTMLTextAreaElement>()
   const activeUserMessageRef = useRef('')
   const activeUserEntryRef = useRef<CreationChatMessage | null>(null)
   const enabledToolIds = useMemo(
@@ -1205,7 +1270,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       max_references: 6,
       attachments: buildAttachmentMetadata(attachments),
       ...(activeCreationModelId === LOCAL_CREATION_MODEL_ID && activeModel ? {
-        creation_model: 'qwen3.5:4b',
+        creation_model: LOCAL_CREATION_MODEL_ID,
         creation_base_url: activeModel.baseUrl || undefined,
       } : {}),
     }
@@ -1456,6 +1521,18 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         data: { patch: event.data?.patch },
       }
     }
+    if (event.type === 'document.evidence.applied') {
+      return {
+        ...base,
+        data: { evidence: event.data?.evidence },
+      }
+    }
+    if (event.type === 'run.completed') {
+      return {
+        ...base,
+        data: { evidence: event.data?.evidence },
+      }
+    }
     if (event.type === 'tool.completed' || event.type === 'tool.failed') {
       return {
         ...base,
@@ -1466,10 +1543,38 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         },
       }
     }
+    if (event.type === 'harness.decision') {
+      return {
+        ...base,
+        data: {
+          trigger: event.data?.trigger,
+          trigger_status: event.data?.trigger_status,
+          reason_code: event.data?.reason_code,
+          result_count: event.data?.result_count,
+          refreshable_count: event.data?.refreshable_count,
+          analyzable_count: event.data?.analyzable_count,
+          quality_cycle: event.data?.quality_cycle,
+          issue_count: event.data?.issue_count,
+          issue_codes: event.data?.issue_codes,
+          scheduled: event.data?.scheduled,
+          activated_skills: event.data?.activated_skills,
+          error_code: event.data?.error_code,
+        },
+      }
+    }
     if (event.type === 'skill.completed') {
       return {
         ...base,
-        environment_patch: { skill: event.environment_patch?.skill },
+        environment_patch: {
+          skill: event.environment_patch?.skill,
+          skill_step: event.environment_patch?.skill_step,
+          quality_skill_activation: event.environment_patch?.quality_skill_activation,
+        },
+        data: event.data ? {
+          quality_cycle: event.data?.quality_cycle,
+          issue_codes: event.data?.issue_codes,
+          capabilities: event.data?.capabilities,
+        } : undefined,
       }
     }
     if (event.actor?.id === 'quality_review_agent') {
@@ -1515,7 +1620,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         }
       }
     }
-    if (event.type === 'agent.started' && event.actor?.id === 'document_writer_agent') {
+    if (
+      event.type === 'agent.started'
+      && DOCUMENT_MUTATION_AGENT_IDS.has(String(event.actor?.id || ''))
+    ) {
       phase.document = ''
     }
     if (!['document.delta', 'document.patch.delta'].includes(event.type)) {
@@ -1534,6 +1642,10 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       if (phase.document) setGeneratedContent(phase.document)
     }
     if (event.type === 'document.patch.applied') {
+      phase.document = sanitizeGeneratedContent(String(event.data?.content || ''))
+      if (phase.document) setGeneratedContent(phase.document)
+    }
+    if (event.type === 'document.evidence.applied') {
       phase.document = sanitizeGeneratedContent(String(event.data?.content || ''))
       if (phase.document) setGeneratedContent(phase.document)
     }
@@ -1725,17 +1837,28 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         ['document.patch.applied', 'document.replaced'].includes(item.type)
         && (!latestCompletedRunId || item.run_id === latestCompletedRunId)
       ))
-    const documentPatch = latestDocumentEvent?.type === 'document.patch.applied'
+    const intentOperation = intentOperationForRun(state.agentEvents, latestCompletedRunId)
+    const isInitialCreation = intentOperation === 'create_document'
+    const documentPatch = !isInitialCreation && latestDocumentEvent?.type === 'document.patch.applied'
       ? latestDocumentEvent.data?.patch
       : null
     const editOperation = String(
-      (documentPatch as Record<string, unknown> | undefined)?.operation
+      intentOperation
+      || (documentPatch as Record<string, unknown> | undefined)?.operation
       || latestDocumentEvent?.data?.operation
-      || (state.sessionId ? 'rewrite_document' : 'create_document'),
+      || (currentDocumentSource ? 'rewrite_document' : 'create_document'),
     )
     const sourceHistoryId = currentDocumentSource?.kind === 'creation_history'
       ? Number(currentDocumentSource.id)
       : Number.NaN
+    const evidence = ([...state.agentEvents]
+      .reverse()
+      .find(item => (
+        item.type === 'run.completed'
+        && item.status === 'completed'
+        && (!latestCompletedRunId || item.run_id === latestCompletedRunId)
+      ))
+      ?.data?.evidence || []) as CreationEvidenceItem[]
     try {
       const saveResponse = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/history`, {
         method: 'POST',
@@ -1757,6 +1880,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
           goal: [...state.agentEvents].reverse().find(item => item.goal)?.goal || null,
           edit_operation: editOperation,
           document_patch: documentPatch || null,
+          evidence: Array.isArray(evidence) ? evidence : [],
         }),
       })
       if (saveResponse.ok) {
@@ -1791,7 +1915,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         ['document.patch.applied', 'document.replaced'].includes(item.type)
         && (!runId || item.run_id === runId)
       ))
-    const patch = latestMutation?.type === 'document.patch.applied'
+    const intentOperation = intentOperationForRun(
+      useAppStore.getState().creationDraft.agentEvents,
+      runId,
+    )
+    const isInitialCreation = intentOperation === 'create_document'
+    const patch = !isInitialCreation && latestMutation?.type === 'document.patch.applied'
       ? latestMutation.data?.patch as Record<string, unknown> | undefined
       : undefined
     const targets = Array.isArray(patch?.target_sections)
@@ -1804,9 +1933,11 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     const assistant: CreationChatMessage = {
       id: `assistant-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       role: 'assistant',
-      content: patch
-        ? `${patchSummary}。你可以继续修改。`
-        : '文档已更新。你可以继续提出修改要求，我会基于当前版本继续优化。',
+      content: isInitialCreation
+        ? '首版文档已生成。你可以继续提出修改要求，我会基于当前版本继续优化。'
+        : patch
+          ? `${patchSummary}。你可以继续修改。`
+          : '文档已更新。你可以继续提出修改要求，我会基于当前版本继续优化。',
       createdAt: Date.now(),
       runId: runId || undefined,
     }
@@ -2050,9 +2181,12 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const latestRunCompleted = latestRunEvents.some(item => (
     item.type === 'run.completed' && item.status === 'completed'
   ))
+  const latestRunIsInitialCreation = (
+    intentOperationForRun(latestRunEvents, latestAgentRunId) === 'create_document'
+  )
   const canDisplayLatestMutation = latestRunCompleted
     || (!isGenerating && !latestRunHasLifecycle)
-  const latestDocumentMutation = canDisplayLatestMutation
+  const latestDocumentMutation = canDisplayLatestMutation && !latestRunIsInitialCreation
     ? [...agentEvents]
       .reverse()
       .find(item => (
@@ -2093,6 +2227,18 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     p: ({ node, ...props }: any) => <p style={{ margin: '9px 0', lineHeight: 1.75 }} {...props} />,
     li: ({ node, ...props }: any) => <li style={{ margin: '6px 0', lineHeight: 1.65 }} {...props} />,
     code: ({ node, ...props }: any) => <code style={{ background: '#f2f4f7', padding: '2px 5px', borderRadius: 4 }} {...props} />,
+    strong: ({ node, ...props }: any) => (
+      <strong
+        style={{
+          color: '#9a4f1c',
+          fontWeight: 750,
+          textDecoration: 'underline',
+          textDecorationColor: '#e4b48e',
+          textUnderlineOffset: 3,
+        }}
+        {...props}
+      />
+    ),
     a: ({ node, href, children, ...props }: any) => {
       if (href?.startsWith('#ref-')) {
         const refId = href.substring(5)
@@ -2130,7 +2276,21 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         )
       }
       return <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: '#a45d22', textDecoration: 'underline' }} {...props}>{children}</a>
-    }
+    },
+    img: ({ node, src, alt, ...props }: any) => {
+      const resolvedSrc = typeof src === 'string' && src.startsWith('/api/creation/evidence/')
+        ? `${apiBaseUrl}${src}`
+        : src
+      return (
+        <img
+          {...props}
+          src={resolvedSrc}
+          alt={alt || '创作证据截图'}
+          className="creation-evidence-image"
+          loading="lazy"
+        />
+      )
+    },
   }
 
   return (
@@ -2521,20 +2681,34 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
             </header>
             {(conversation.length > 0 || agentEvents.length > 0) && (
               <div className="creation-chat-timeline" ref={chatTimelineRef} aria-live="polite">
-                {creationTimeline.map(item => (
-                  item.kind === 'message'
-                    ? (
-                      <article
-                        key={item.key}
-                        className={`creation-chat-message is-${item.message.role}`}
-                        aria-label={item.message.role === 'user' ? '用户消息' : 'Agent 消息'}
-                      >
+                {creationTimeline.map((item) => {
+                  if (item.kind === 'trace') {
+                    return <AgentExecutionTrace key={item.key} events={item.events} />
+                  }
+
+                  const timestamp = formatCreationMessageTimestamp(item.message.createdAt)
+                  return (
+                    <article
+                      key={item.key}
+                      className={`creation-chat-message is-${item.message.role}`}
+                      aria-label={item.message.role === 'user' ? '用户消息' : 'Agent 消息'}
+                    >
+                      <div className="creation-chat-message__meta">
                         <span>{item.message.role === 'user' ? userDisplayName : '创作 Agent'}</span>
-                        <p>{item.message.content}</p>
-                      </article>
-                    )
-                    : <AgentExecutionTrace key={item.key} events={item.events} />
-                ))}
+                        {timestamp && (
+                          <time
+                            dateTime={timestamp.iso}
+                            title={`发送于 ${timestamp.full}`}
+                            aria-label={`发送时间：${timestamp.full}`}
+                          >
+                            {timestamp.label}
+                          </time>
+                        )}
+                      </div>
+                      <p>{item.message.content}</p>
+                    </article>
+                  )
+                })}
               </div>
             )}
             {pendingConfirmation && (
@@ -2567,12 +2741,20 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                 ref={promptInputRef}
                 value={prompt}
                 onChange={(event) => handlePromptChange(event.target.value, event.target.selectionStart)}
+                onCompositionStart={promptImeGuard.onCompositionStart}
+                onCompositionEnd={promptImeGuard.onCompositionEnd}
+                onBlur={promptImeGuard.onBlur}
                 onKeyDown={(event) => {
                   if (event.key === 'Escape' && skillPickerOpen) {
                     event.preventDefault()
                     setSkillPickerOpen(false)
                   }
-                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !skillPickerOpen) {
+                  if (
+                    event.key === 'Enter'
+                    && !event.shiftKey
+                    && !skillPickerOpen
+                    && !promptImeGuard.isImeEvent(event)
+                  ) {
                     event.preventDefault()
                     if (prompt.trim() && !isGenerating) void handleGenerate()
                   }
@@ -2955,7 +3137,57 @@ const displayAgentName = (event: CreationAgentEvent) => {
 }
 
 const displayAgentText = (value: unknown) =>
-  String(value || '').replace(/创作主 Agent/g, '创作 Agent')
+  String(value || '')
+    .replace(/创作主 Agent/g, '创作 Agent')
+    .replace(/质检通过，Harness 结束本轮优化循环/g, '质量检查通过')
+    .replace(/已达到质检循环上限，Harness 保留剩余问题供用户复核/g, '已达到自动优化上限，剩余问题需要人工复核')
+    .replace(/Harness 根据 [^\n，。]+反馈追加[:：][^\n]*/g, '已根据反馈补充后续处理')
+    .replace(/Harness 根据 [^\n，。]+反馈跳过不必要的(?:后续|数据)步骤/g, '已根据反馈保留当前处理计划')
+
+const agentEventCapabilityLabels = new Map<string, string>([
+  ['creation_main_agent', '创作 Agent'],
+  ...CREATION_SKILL_AGENT_OPTIONS.map(item => [item.id, item.label] as [string, string]),
+  ...CREATION_SKILL_TOOL_OPTIONS.map(item => [item.id, item.label] as [string, string]),
+])
+
+const agentEventStatusLabels: Record<string, string> = {
+  waiting: '等待中',
+  running: '进行中',
+  completed: '已完成',
+  failed: '未完成',
+  paused: '已暂停',
+}
+
+const harnessDecisionReasonLabels: Record<string, string> = {
+  data_search_failed: '数据检索未完成，继续使用其他可用资料',
+  refresh_required: '发现需要即时刷新的报表',
+  snapshot_ready: '已有可分析的数据快照',
+  source_metadata_only: '只找到来源信息，暂时没有可用数据',
+  no_matching_data: '没有找到匹配的数据来源',
+  refresh_failed_stale_snapshot_available: '即时刷新失败，保留历史快照并标记时效',
+  refresh_feedback_ready: '即时采集完成，可以继续分析最新数据',
+  refresh_failed_without_snapshot: '即时刷新失败，也没有可用历史快照',
+  refresh_returned_no_analyzable_data: '页面已刷新，但没有提取到可分析数据',
+  quality_review_failed: '质量检查未完成',
+  quality_gate_passed: '质量要求已满足',
+  quality_cycle_budget_exhausted: '已达到自动优化上限',
+  quality_issues_detected: '发现可继续优化的问题',
+  hard_failure_retry_exhausted: '完整文档重试后仍有阻断问题',
+}
+
+const qualityIssueLabels: Record<string, string> = {
+  has_document: '正文内容不足',
+  has_structure: '章节结构不足',
+  revision_changed: '修订没有产生有效变化',
+  ai_style_signals: '表达方式需要自然化',
+  detail_incomplete: '章节细节不完整',
+  table_needs_polish: '表格结构需要优化',
+  emphasis_needs_polish: '重点标识需要优化',
+  visual_needs_polish: '关键关系需要图示说明',
+}
+
+const agentEventCapabilityLabel = (value: unknown) =>
+  agentEventCapabilityLabels.get(String(value || '')) || '其他处理步骤'
 
 const AgentExecutionTrace = ({
   events,
@@ -3093,10 +3325,43 @@ const agentEventDetails = (event: CreationAgentEvent) => {
   if (event.type === 'tool.failed' && data.error_code) {
     details.push({ label: '错误码', value: String(data.error_code) })
   }
+  if (event.type === 'harness.decision') {
+    const triggerStatus = agentEventStatusLabels[String(data.trigger_status || '')] || '状态未知'
+    details.push({
+      label: '触发反馈',
+      value: `${agentEventCapabilityLabel(data.trigger)} · ${triggerStatus}`,
+    })
+    details.push({
+      label: '决策原因',
+      value: harnessDecisionReasonLabels[String(data.reason_code || '')] || '已根据本次反馈完成判断',
+    })
+    if (Number(data.issue_count) > 0) {
+      const issueCodes = Array.isArray(data.issue_codes)
+        ? data.issue_codes
+          .map(item => qualityIssueLabels[String(item)] || '其他质量问题')
+          .filter(Boolean)
+        : []
+      details.push({
+        label: `质检问题（第 ${Number(data.quality_cycle) || 0} 轮）`,
+        value: issueCodes.length ? issueCodes.join('、') : `${Number(data.issue_count)} 个`,
+      })
+    }
+    const scheduled = Array.isArray(data.scheduled)
+      ? data.scheduled.map(agentEventCapabilityLabel)
+      : []
+    const activatedSkills = Array.isArray(data.activated_skills)
+      ? data.activated_skills.map(item => String(item)).filter(Boolean)
+      : []
+    const additions = [
+      ...(activatedSkills.length ? [`${activatedSkills.length} 项已应用技能`] : []),
+      ...scheduled,
+    ]
+    details.push({ label: '追加能力', value: additions.length ? additions.join(' → ') : '无，继续现有计划' })
+  }
   if (event.type === 'agent.completed') {
     const resultEntry = Object.entries(event.environment_patch || {})
       .find(([key, value]) => (
-        ['data_analysis', 'industry_research', 'solution_design'].includes(key)
+        ['data_analysis', 'industry_research', 'solution_design', 'chapter_design'].includes(key)
         && typeof value === 'string'
         && value.trim()
       ))
@@ -3234,9 +3499,9 @@ const MarkdownContent = ({
                     <th
                       key={cellIndex}
                       style={{
-                        border: '1px solid #d0d5dd',
-                        background: '#f8fafc',
-                        color: '#172033',
+                        border: '1px solid #ddc5b2',
+                        background: '#f7eadf',
+                        color: '#6b3517',
                         fontWeight: 700,
                         padding: '10px 12px',
                         textAlign: block.alignments[cellIndex] || 'left',
@@ -3259,7 +3524,7 @@ const MarkdownContent = ({
                           padding: '10px 12px',
                           textAlign: block.alignments[cellIndex] || 'left',
                           verticalAlign: 'top',
-                          background: rowIndex % 2 === 0 ? '#fff' : '#fbfcfe',
+                          background: rowIndex % 2 === 0 ? '#fff' : '#fdf9f5',
                         }}
                       >
                         <ReactMarkdown components={inlineComponents}>{row[cellIndex] || ''}</ReactMarkdown>

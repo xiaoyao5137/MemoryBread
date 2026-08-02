@@ -2,6 +2,7 @@ use rusqlite::{params, Connection};
 
 use crate::storage::{
     db::current_ts_ms,
+    document_identity::canonical_document_identity,
     error::StorageError,
     models_bake::{
         BakeDocumentRecord, BakeKnowledgeRecord, BakeMemorySourceRecord, BakeSopRecord,
@@ -32,62 +33,6 @@ fn keyword_terms(query: &str) -> Vec<String> {
     }
 
     terms
-}
-
-fn extract_document_identity(url: &str) -> String {
-    let url = url.trim();
-    if url.is_empty() {
-        return url.to_string();
-    }
-
-    let doc_markers = [
-        "docs.corp",
-        "/docs/",
-        "docs.google",
-        "/document/",
-        "yuque.com",
-        "feishu.cn/docx",
-        "feishu.cn/wiki",
-        "notion.so",
-        "confluence",
-        "/wiki/",
-        "shimo.im",
-        "/d/home/",
-        "/s/home/",
-    ];
-
-    let lowered = url.to_lowercase();
-    if !doc_markers.iter().any(|m| lowered.contains(m)) {
-        return url.to_string();
-    }
-
-    let without_protocol = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-
-    if let Some((host, rest)) = without_protocol.split_once('/') {
-        let path_without_query = rest.split('?').next().unwrap_or(rest);
-        let path = path_without_query
-            .split('#')
-            .next()
-            .unwrap_or(path_without_query)
-            .trim_end_matches('/');
-
-        if path.is_empty() {
-            return host.to_lowercase();
-        }
-
-        if let Some(last_segment) = path.rsplit('/').next() {
-            if last_segment.len() >= 6 {
-                return format!("{}::{}", host.to_lowercase(), last_segment);
-            }
-        }
-
-        format!("{}::{}", host.to_lowercase(), path.to_lowercase())
-    } else {
-        without_protocol.to_lowercase()
-    }
 }
 
 #[derive(Debug)]
@@ -184,7 +129,7 @@ fn find_timeline_fallback_source_url(
         if url.is_empty() {
             continue;
         }
-        let identity = extract_document_identity(&url);
+        let identity = canonical_document_identity(&url).unwrap_or_else(|| url.to_lowercase());
         let affinity = source_title_affinity(win_title.as_deref(), preferred_titles).max(
             source_title_affinity(webpage_title.as_deref(), preferred_titles),
         );
@@ -707,73 +652,6 @@ impl StorageManager {
             .collect())
     }
 
-    pub fn find_document_by_source_url(
-        &self,
-        url: &str,
-    ) -> Result<Option<BakeDocumentRecord>, StorageError> {
-        if url.trim().is_empty() {
-            return Ok(None);
-        }
-        let doc_id = extract_document_identity(url);
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, doc_type, status, tags, applicable_tasks, source_memory_ids,
-                        source_capture_ids, source_episode_ids, linked_knowledge_ids,
-                        sections_json, style_phrases, replacement_rules, summary, full_content,
-                        structured_content, prompt_hint, diagram_code, image_assets,
-                        source_app_name, source_win_title, source_url, content_hash, language,
-                        usage_count, match_score, match_level, creation_mode, review_status,
-                        evidence_summary, generation_version, deleted_at,
-                        created_at, updated_at
-                 FROM bake_documents
-                 WHERE deleted_at IS NULL AND source_url IS NOT NULL
-                   AND (source_url = ?1 OR instr(source_url, ?2) > 0)
-                 LIMIT 1",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![url, &doc_id])?;
-            if let Some(row) = rows.next()? {
-                Ok(Some(BakeDocumentRecord {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    doc_type: row.get(2)?,
-                    status: row.get(3)?,
-                    tags: row.get(4)?,
-                    applicable_tasks: row.get(5)?,
-                    source_memory_ids: row.get(6)?,
-                    source_capture_ids: row.get(7)?,
-                    source_episode_ids: row.get(8)?,
-                    linked_knowledge_ids: row.get(9)?,
-                    sections_json: row.get(10)?,
-                    style_phrases: row.get(11)?,
-                    replacement_rules: row.get(12)?,
-                    summary: row.get(13)?,
-                    full_content: row.get(14)?,
-                    structured_content: row.get(15)?,
-                    prompt_hint: row.get(16)?,
-                    diagram_code: row.get(17)?,
-                    image_assets: row.get(18)?,
-                    source_app_name: row.get(19)?,
-                    source_win_title: row.get(20)?,
-                    source_url: row.get(21)?,
-                    content_hash: row.get(22)?,
-                    language: row.get(23)?,
-                    usage_count: row.get(24)?,
-                    match_score: row.get(25)?,
-                    match_level: row.get(26)?,
-                    creation_mode: row.get(27)?,
-                    review_status: row.get(28)?,
-                    evidence_summary: row.get(29)?,
-                    generation_version: row.get(30)?,
-                    deleted_at: row.get(31)?,
-                    created_at: row.get(32)?,
-                    updated_at: row.get(33)?,
-                }))
-            } else {
-                Ok(None)
-            }
-        })
-    }
-
     /// 新的 bake_knowledge 查询函数（返回新类型）
     fn list_bake_knowledge_new(
         &self,
@@ -946,7 +824,7 @@ impl StorageManager {
     }
 
     /// 与 [`list_bake_memory_init_candidates`] 相同，但额外按 `bake_retry_state.failure_count`
-    /// 过滤：失败次数 >= `max_failures` 的 timeline 会被永久跳过，避免毒丸候选反复触发整轮失败。
+    /// 过滤：失败次数 >= `max_failures` 的 timeline 会进入终态，避免毒丸候选反复触发整轮失败。
     pub fn list_bake_memory_init_candidates_with_max_failures(
         &self,
         since_ts_ms: i64,
@@ -2152,7 +2030,19 @@ impl StorageManager {
 
     pub fn delete_bake_knowledge(&self, id: i64) -> Result<bool, StorageError> {
         self.with_conn(|conn| {
-            let affected = conn.execute("DELETE FROM bake_knowledge WHERE id = ?1", params![id])?;
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM bake_artifact_source_fingerprints
+                 WHERE artifact_kind = 'knowledge' AND artifact_id = ?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM bake_artifact_source_links
+                 WHERE artifact_kind = 'knowledge' AND artifact_id = ?1",
+                params![id],
+            )?;
+            let affected = tx.execute("DELETE FROM bake_knowledge WHERE id = ?1", params![id])?;
+            tx.commit()?;
             Ok(affected > 0)
         })
     }
@@ -2235,6 +2125,81 @@ impl StorageManager {
         })
     }
 
+    pub fn find_bake_artifact_by_source_fingerprint(
+        &self,
+        artifact_kind: &str,
+        fingerprint: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        self.with_conn(|conn| {
+            match conn.query_row(
+                "SELECT artifact_id
+                 FROM bake_artifact_source_fingerprints
+                 WHERE artifact_kind = ?1 AND fingerprint = ?2",
+                params![artifact_kind, fingerprint],
+                |row| row.get(0),
+            ) {
+                Ok(id) => Ok(Some(id)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(StorageError::Sqlite(error)),
+            }
+        })
+    }
+
+    pub fn find_bake_artifact_by_source_timeline(
+        &self,
+        artifact_kind: &str,
+        source_timeline_id: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        self.with_conn(|conn| {
+            match conn.query_row(
+                "SELECT artifact_id
+                 FROM bake_artifact_source_links
+                 WHERE artifact_kind = ?1 AND source_timeline_id = ?2",
+                params![artifact_kind, source_timeline_id],
+                |row| row.get(0),
+            ) {
+                Ok(id) => Ok(Some(id)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(StorageError::Sqlite(error)),
+            }
+        })
+    }
+
+    pub fn record_bake_artifact_source(
+        &self,
+        artifact_kind: &str,
+        artifact_id: i64,
+        source_timeline_id: i64,
+        fingerprint: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let created_at = current_ts_ms();
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT OR IGNORE INTO bake_artifact_source_links (
+                    artifact_kind, artifact_id, source_timeline_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![artifact_kind, artifact_id, source_timeline_id, created_at],
+            )?;
+            if let Some(fingerprint) = fingerprint {
+                tx.execute(
+                    "INSERT OR IGNORE INTO bake_artifact_source_fingerprints (
+                        artifact_kind, fingerprint, artifact_id, first_timeline_id, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        artifact_kind,
+                        fingerprint,
+                        artifact_id,
+                        source_timeline_id,
+                        created_at
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// 给定候选 timeline_id 集合，返回其中已在 bake_knowledge 中有记录的 timeline_id 子集。
     /// 代替全量拉取所有 knowledge 再构建 HashSet，避免随数据增长内存和时间开销线性膨胀。
     pub fn find_existing_knowledge_timeline_ids(
@@ -2251,14 +2216,20 @@ impl StorageManager {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT timeline_id FROM bake_knowledge WHERE timeline_id IN ({})",
-                placeholders
+                "SELECT timeline_id FROM bake_knowledge WHERE timeline_id IN ({0})
+                 UNION
+                 SELECT source_timeline_id
+                 FROM bake_artifact_source_links
+                 WHERE artifact_kind = 'knowledge'
+                   AND source_timeline_id IN ({0})",
+                placeholders,
             );
             let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> = candidate_ids
+            let mut params: Vec<&dyn rusqlite::ToSql> = candidate_ids
                 .iter()
                 .map(|id| id as &dyn rusqlite::ToSql)
                 .collect();
+            params.extend(candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
             let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
             rows.collect::<Result<std::collections::HashSet<_>, _>>()
                 .map_err(StorageError::Sqlite)
@@ -2280,14 +2251,20 @@ impl StorageManager {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT timeline_id FROM bake_sops WHERE timeline_id IN ({})",
-                placeholders
+                "SELECT timeline_id FROM bake_sops WHERE timeline_id IN ({0})
+                 UNION
+                 SELECT source_timeline_id
+                 FROM bake_artifact_source_links
+                 WHERE artifact_kind = 'sop'
+                   AND source_timeline_id IN ({0})",
+                placeholders,
             );
             let mut stmt = conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> = candidate_ids
+            let mut params: Vec<&dyn rusqlite::ToSql> = candidate_ids
                 .iter()
                 .map(|id| id as &dyn rusqlite::ToSql)
                 .collect();
+            params.extend(candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
             let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
             rows.collect::<Result<std::collections::HashSet<_>, _>>()
                 .map_err(StorageError::Sqlite)
@@ -2332,9 +2309,40 @@ impl StorageManager {
         })
     }
 
+    pub fn update_bake_sop_source_capture_ids(
+        &self,
+        id: i64,
+        source_capture_ids: &str,
+    ) -> Result<bool, StorageError> {
+        self.with_conn(|conn| {
+            let now = current_ts_ms();
+            let affected = conn.execute(
+                "UPDATE bake_sops
+                 SET source_capture_ids = ?1,
+                     updated_at = datetime(?3 / 1000, 'unixepoch'),
+                     updated_at_ms = ?3
+                 WHERE id = ?2",
+                params![source_capture_ids, id, now],
+            )?;
+            Ok(affected > 0)
+        })
+    }
+
     pub fn delete_bake_sop(&self, id: i64) -> Result<bool, StorageError> {
         self.with_conn(|conn| {
-            let affected = conn.execute("DELETE FROM bake_sops WHERE id = ?1", params![id])?;
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM bake_artifact_source_fingerprints
+                 WHERE artifact_kind = 'sop' AND artifact_id = ?1",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM bake_artifact_source_links
+                 WHERE artifact_kind = 'sop' AND artifact_id = ?1",
+                params![id],
+            )?;
+            let affected = tx.execute("DELETE FROM bake_sops WHERE id = ?1", params![id])?;
+            tx.commit()?;
             Ok(affected > 0)
         })
     }
@@ -2498,14 +2506,37 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_document_identity_ignores_fragment() {
+    fn test_document_identity_ignores_fragment() {
         assert_eq!(
-            extract_document_identity(
+            canonical_document_identity(
                 "https://docs.corp.kuaishou.com/d/home/fcAAmNeDmIOF15Y6K80NVq0Wq#section=a"
             ),
-            extract_document_identity(
+            canonical_document_identity(
                 "https://docs.corp.kuaishou.com/d/home/fcAAmNeDmIOF15Y6K80NVq0Wq#section=b"
             )
+        );
+    }
+
+    #[test]
+    fn test_artifact_source_fingerprint_links_cross_timeline_source() {
+        let mgr = make_mgr();
+        mgr.record_bake_artifact_source("knowledge", 77, 1001, Some("source-v1:abc"))
+            .unwrap();
+
+        assert_eq!(
+            mgr.find_bake_artifact_by_source_fingerprint("knowledge", "source-v1:abc")
+                .unwrap(),
+            Some(77)
+        );
+        assert_eq!(
+            mgr.find_bake_artifact_by_source_timeline("knowledge", 1001)
+                .unwrap(),
+            Some(77)
+        );
+        assert_eq!(
+            mgr.find_existing_knowledge_timeline_ids(&[1000, 1001])
+                .unwrap(),
+            std::collections::HashSet::from([1001])
         );
     }
 

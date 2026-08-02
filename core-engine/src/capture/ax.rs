@@ -81,16 +81,24 @@ fn fallback_extractor_for_context(
     app_name: Option<&str>,
 ) -> Option<TextExtractor> {
     match bundle_id {
-        Some("com.google.Chrome") | Some("com.google.Chrome.canary") => {
-            return Some(TextExtractor::Chrome)
-        }
+        Some("com.google.Chrome")
+        | Some("com.google.Chrome.canary")
+        | Some("com.microsoft.edgemac")
+        | Some("com.brave.Browser")
+        | Some("org.chromium.Chromium")
+        | Some("com.vivaldi.Vivaldi") => return Some(TextExtractor::Chrome),
         Some("com.apple.Safari") => return Some(TextExtractor::Safari),
         Some("com.tencent.xinWeChat") => return Some(TextExtractor::WeChat),
         _ => {}
     }
 
     match app_name {
-        Some("Google Chrome") | Some("Google Chrome Canary") => Some(TextExtractor::Chrome),
+        Some("Google Chrome")
+        | Some("Google Chrome Canary")
+        | Some("Microsoft Edge")
+        | Some("Brave Browser")
+        | Some("Chromium")
+        | Some("Vivaldi") => Some(TextExtractor::Chrome),
         Some("Safari") => Some(TextExtractor::Safari),
         Some("WeChat") | Some("微信") => Some(TextExtractor::WeChat),
         _ => None,
@@ -103,8 +111,33 @@ fn browser_identity_is_consistent(bundle_id: Option<&str>, app_name: Option<&str
         Some("com.google.Chrome") | Some("com.google.Chrome.canary") => {
             normalized_name.contains("chrome")
         }
+        Some("com.microsoft.edgemac") => normalized_name.contains("edge"),
+        Some("com.brave.Browser") => normalized_name.contains("brave"),
+        Some("org.chromium.Chromium") => normalized_name.contains("chromium"),
+        Some("com.vivaldi.Vivaldi") => normalized_name.contains("vivaldi"),
         Some("com.apple.Safari") => normalized_name == "safari",
         _ => true,
+    }
+}
+
+fn chromium_app_name(bundle_id: Option<&str>, app_name: Option<&str>) -> Option<&'static str> {
+    match bundle_id {
+        Some("com.google.Chrome") => return Some("Google Chrome"),
+        Some("com.google.Chrome.canary") => return Some("Google Chrome Canary"),
+        Some("com.microsoft.edgemac") => return Some("Microsoft Edge"),
+        Some("com.brave.Browser") => return Some("Brave Browser"),
+        Some("org.chromium.Chromium") => return Some("Chromium"),
+        Some("com.vivaldi.Vivaldi") => return Some("Vivaldi"),
+        _ => {}
+    }
+    match app_name {
+        Some("Google Chrome") => Some("Google Chrome"),
+        Some("Google Chrome Canary") => Some("Google Chrome Canary"),
+        Some("Microsoft Edge") => Some("Microsoft Edge"),
+        Some("Brave Browser") => Some("Brave Browser"),
+        Some("Chromium") => Some("Chromium"),
+        Some("Vivaldi") => Some("Vivaldi"),
+        _ => None,
     }
 }
 
@@ -392,10 +425,11 @@ pub async fn get_frontmost_info_async() -> Option<AXInfo> {
 #[cfg(all(target_os = "macos", not(test)))]
 mod macos_impl {
     use super::{
-        browser_identity_is_consistent, fallback_extractor_for_context, parse_keyed_quoted_value,
-        sanitize_extracted_text_with_reason, AXInfo, ExtractedText, TextExtractor,
-        AX_CACHE_TTL_SECS, AX_SUPPORT_CACHE, EXTRACTED_TEXT_MAX_CHARS, GENERIC_ALL_UI_ITEM_LIMIT,
-        GENERIC_FOCUS_MIN_CHARS, GENERIC_STATIC_ITEM_LIMIT, GENERIC_WINDOW_MIN_CHARS,
+        browser_identity_is_consistent, chromium_app_name, fallback_extractor_for_context,
+        parse_keyed_quoted_value, sanitize_extracted_text_with_reason, AXInfo, ExtractedText,
+        TextExtractor, AX_CACHE_TTL_SECS, AX_SUPPORT_CACHE, EXTRACTED_TEXT_MAX_CHARS,
+        GENERIC_ALL_UI_ITEM_LIMIT, GENERIC_FOCUS_MIN_CHARS, GENERIC_STATIC_ITEM_LIMIT,
+        GENERIC_WINDOW_MIN_CHARS,
     };
     use std::{
         collections::HashMap,
@@ -693,15 +727,18 @@ end tell"#,
         app_name: Option<&str>,
     ) -> Option<(String, String)> {
         match fallback_extractor_for_context(bundle_id, app_name)? {
-            TextExtractor::Chrome => get_chrome_page_metadata(),
+            TextExtractor::Chrome => {
+                get_chromium_page_metadata(chromium_app_name(bundle_id, app_name)?)
+            }
             TextExtractor::Safari => get_safari_page_metadata(),
             _ => None,
         }
     }
 
-    fn get_chrome_page_metadata() -> Option<(String, String)> {
-        let script = r#"
-            tell application "Google Chrome"
+    fn get_chromium_page_metadata(app_name: &str) -> Option<(String, String)> {
+        let script = format!(
+            r#"
+            tell application "{app_name}"
                 if (count of windows) > 0 then
                     set front_win to front window
                     if (count of tabs of front_win) > 0 then
@@ -711,9 +748,11 @@ end tell"#,
                 end if
             end tell
             return ""
-        "#;
+        "#,
+            app_name = app_name,
+        );
 
-        run_browser_metadata_script(script, "chrome_page_metadata")
+        run_browser_metadata_script(&script, "chromium_page_metadata")
     }
 
     fn get_safari_page_metadata() -> Option<(String, String)> {
@@ -872,7 +911,7 @@ end tell"#,
     ) -> Option<ExtractedText> {
         let fallback_text = match fallback {
             TextExtractor::Generic => None,
-            TextExtractor::Chrome => extract_chrome_text(),
+            TextExtractor::Chrome => extract_chromium_text(chromium_app_name(bundle_id, app_name)?),
             TextExtractor::Safari => extract_safari_text(),
             TextExtractor::WeChat => extract_wechat_text(),
         };
@@ -907,11 +946,11 @@ end tell"#,
         })
     }
 
-    /// 提取 Chrome 浏览器的页面文本
-    fn extract_chrome_text() -> Option<String> {
+    /// 提取 Chromium 系浏览器的页面文本
+    fn extract_chromium_text(app_name: &str) -> Option<String> {
         let script = format!(
             r#"
-            tell application "Google Chrome"
+            tell application "{app_name}"
                 if (count of windows) > 0 then
                     set front_win to front window
                     if (count of tabs of front_win) > 0 then
@@ -948,14 +987,15 @@ end tell"#,
             end tell
             return ""
         "#,
+            app_name = app_name,
             max_chars = EXTRACTED_TEXT_MAX_CHARS,
         );
 
-        match run_osascript(&script, "chrome_text") {
+        match run_osascript(&script, "chromium_text") {
             Ok(text) if !text.is_empty() => Some(text),
             Ok(_) => None,
             Err(err) => {
-                debug!("Chrome AX 文本提取失败: {}", err);
+                debug!("Chromium 浏览器 AX 文本提取失败: {}", err);
                 None
             }
         }
@@ -1231,6 +1271,14 @@ mod tests {
             Some(TextExtractor::Safari)
         );
         assert_eq!(
+            fallback_extractor_for_context(Some("com.microsoft.edgemac"), Some("Whatever")),
+            Some(TextExtractor::Chrome)
+        );
+        assert_eq!(
+            chromium_app_name(Some("com.brave.Browser"), Some("Whatever")),
+            Some("Brave Browser")
+        );
+        assert_eq!(
             fallback_extractor_for_context(Some("com.tencent.xinWeChat"), Some("Whatever")),
             Some(TextExtractor::WeChat)
         );
@@ -1248,6 +1296,14 @@ mod tests {
         ));
         assert!(browser_identity_is_consistent(
             Some("com.apple.Safari"),
+            Some("Safari")
+        ));
+        assert!(browser_identity_is_consistent(
+            Some("com.microsoft.edgemac"),
+            Some("Microsoft Edge")
+        ));
+        assert!(!browser_identity_is_consistent(
+            Some("com.brave.Browser"),
             Some("Safari")
         ));
         assert!(browser_identity_is_consistent(

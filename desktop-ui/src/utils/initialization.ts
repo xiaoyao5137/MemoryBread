@@ -61,6 +61,18 @@ interface InitializationEnvelope {
 
 const SIDECAR = 'http://127.0.0.1:7071'
 
+async function requestInitialization(path: string, init?: RequestInit) {
+  try {
+    return await fetch(`${SIDECAR}${path}`, init)
+  } catch {
+    const error = new Error(
+      '无法连接本地初始化服务。本地组件可能仍在启动，请稍候后点击“重新连接”；若持续失败，请退出并重新启动记忆面包。',
+    ) as Error & { code?: string }
+    error.code = 'INITIALIZATION_SERVICE_UNAVAILABLE'
+    throw error
+  }
+}
+
 async function readJson(response: Response) {
   const data = await response.json().catch(() => ({}))
   if (!response.ok || data.status === 'error') {
@@ -81,14 +93,14 @@ async function readJson(response: Response) {
 }
 
 export async function fetchInitializationStatus(): Promise<InitializationStatus> {
-  const response = await fetch(`${SIDECAR}/api/initialization/status`)
+  const response = await requestInitialization('/api/initialization/status')
   const data = await readJson(response) as InitializationEnvelope
   if (!data.initialization) throw new Error('本地初始化服务返回了无效状态')
   return data.initialization
 }
 
 export async function startInitialization(mode: 'normal' | 'sandbox'): Promise<InitializationStatus> {
-  const response = await fetch(`${SIDECAR}/api/initialization/start`, {
+  const response = await requestInitialization('/api/initialization/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mode }),
@@ -99,7 +111,7 @@ export async function startInitialization(mode: 'normal' | 'sandbox'): Promise<I
 }
 
 export async function enableInitializationTestMode(): Promise<InitializationStatus> {
-  const response = await fetch(`${SIDECAR}/api/initialization/test-mode`, {
+  const response = await requestInitialization('/api/initialization/test-mode', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ confirmation: 'ENABLE_INITIALIZATION_TEST_MODE' }),
@@ -110,7 +122,7 @@ export async function enableInitializationTestMode(): Promise<InitializationStat
 }
 
 export async function disableInitializationTestMode(): Promise<InitializationStatus> {
-  const response = await fetch(`${SIDECAR}/api/initialization/test-mode`, {
+  const response = await requestInitialization('/api/initialization/test-mode', {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ confirmation: 'DISABLE_INITIALIZATION_TEST_MODE' }),
@@ -121,7 +133,7 @@ export async function disableInitializationTestMode(): Promise<InitializationSta
 }
 
 export async function fetchInitializationReport(): Promise<Record<string, unknown>> {
-  const response = await fetch(`${SIDECAR}/api/initialization/report-bundle`)
+  const response = await requestInitialization('/api/initialization/report-bundle')
   const data = await readJson(response)
   if (!data.report || typeof data.report !== 'object') {
     throw new Error('本地初始化服务未返回可上报信息')

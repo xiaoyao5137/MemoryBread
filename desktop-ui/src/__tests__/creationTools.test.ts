@@ -14,10 +14,12 @@ describe('创作 Tool 配置', () => {
     window.localStorage.removeItem(CREATION_TOOLS_STORAGE_KEY)
   })
 
-  it('始终安装并开启互联网检索与记忆搜索', () => {
+  it('始终安装并开启互联网检索、记忆搜索与数据工具', () => {
     const tools = normalizeCreationTools([
       { id: 'internet_search', installed: false, enabled: false },
       { id: 'memory_search', installed: false, enabled: false },
+      { id: 'data_search', installed: false, enabled: false },
+      { id: 'webpage_scrape', installed: false, enabled: false },
     ])
 
     expect(tools.find(tool => tool.id === 'internet_search')).toMatchObject({
@@ -28,9 +30,13 @@ describe('创作 Tool 配置', () => {
       installed: true,
       enabled: true,
     })
+    expect(tools.find(tool => tool.id === 'data_search')).toMatchObject({ installed: true, enabled: true })
+    expect(tools.find(tool => tool.id === 'webpage_scrape')).toMatchObject({ installed: true, enabled: true })
     expect(enabledCreationToolIds(tools)).toEqual([
       'internet_search',
       'memory_search',
+      'data_search',
+      'webpage_scrape',
     ])
   })
 

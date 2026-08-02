@@ -88,6 +88,38 @@ describe('创作 Agent 多轮 Loop', () => {
     vi.unstubAllGlobals()
   })
 
+  it('输入法确认候选词时不启动创作', async () => {
+    const fetchMock = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/creation/skills') return Response.json([])
+      if (url.pathname === '/api/creation/history') {
+        return Response.json({ items: [], total: 0, limit: 20, offset: 0 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<CreationPanel />)
+    const input = screen.getByPlaceholderText(/输入 @ 可选择已安装的技能/)
+    fireEvent.change(input, { target: { value: '生成一份方案' } })
+    fireEvent.compositionStart(input)
+    fireEvent.compositionEnd(input, { data: '方案' })
+    const defaultAllowed = fireEvent.keyDown(input, {
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 229,
+      isComposing: false,
+    })
+
+    expect(defaultAllowed).toBe(true)
+    await waitFor(() => {
+      const agentCalls = fetchMock.mock.calls.filter(([request]) =>
+        new URL(String(request)).pathname === '/api/creation/agent/run'
+      )
+      expect(agentCalls).toHaveLength(0)
+    })
+  })
+
   it('开始创作后展示 Agent、Tool、Skill 轨迹，并基于当前文档继续多轮优化', async () => {
     const agentPayloads: any[] = []
     const savedHistories: any[] = []
@@ -106,14 +138,14 @@ describe('创作 Agent 多轮 Loop', () => {
         agentPayloads.push(payload)
         const secondTurn = agentPayloads.length === 2
         const document = secondTurn
-          ? '# Agent 架构方案\n\n## 目标\n\n目标驱动并支持持续优化。\n\n## Loop\n\n本轮补充质量门禁。\n\n## 质量门禁\n\n修订必须通过结构和语义检查。\n\n## 验证\n\n覆盖多轮对话和联动修改。'
-          : '# Agent 架构方案\n\n## 目标\n\n目标驱动。\n\n## Loop\n\n动态调用能力。\n\n## 验证\n\n覆盖完整链路。'
+          ? '# Agent 架构方案\n\n## 目标\n\n**目标驱动**并支持持续优化。\n\n## Loop\n\n本轮补充质量门禁。\n\n| 能力 | 职责 |\n| --- | --- |\n| Harness | 动态调用能力 |\n| Reviewer | 反馈质量问题 |\n\n## 质量门禁\n\n修订必须通过结构和语义检查。\n\n## 验证\n\n覆盖多轮对话和联动修改。'
+          : '# Agent 架构方案\n\n## 目标\n\n**目标驱动**。\n\n## Loop\n\n动态调用能力。\n\n| 能力 | 职责 |\n| --- | --- |\n| Harness | 动态规划 |\n\n## 验证\n\n覆盖完整链路。'
         const offset = secondTurn ? 20 : 1
         const mutationEvent = secondTurn
           ? {
             ...event(
               'document.patch.applied',
-              offset + 5,
+              offset + 6,
               '已按本轮指令完成 3 处调整，涉及目标、Loop、质量门禁、验证',
               { kind: 'agent', id: 'document_writer_agent', name: '文档撰写 Agent' },
               {
@@ -155,7 +187,7 @@ describe('创作 Agent 多轮 Loop', () => {
           }
           : event(
             'document.replaced',
-            offset + 5,
+            offset + 6,
             '文档撰写 Agent 已提交完整文档版本',
             { kind: 'agent', id: 'document_writer_agent', name: '文档撰写 Agent' },
             { content: document, operation: 'create_document' },
@@ -200,36 +232,72 @@ describe('创作 Agent 多轮 Loop', () => {
               }],
             },
           ),
+          {
+            ...event(
+              'harness.decision',
+              offset + 3,
+              'Harness 根据 data_search 反馈跳过不必要的数据步骤',
+              undefined,
+              {
+                trigger: 'data_search',
+                trigger_status: 'completed',
+                reason_code: 'no_matching_data',
+                result_count: 0,
+                refreshable_count: 0,
+                analyzable_count: 0,
+                scheduled: [],
+                error_code: null,
+              },
+            ),
+            status: 'completed',
+          },
           event(
             'skill.completed',
-            offset + 3,
+            offset + 4,
             '已把架构方案模板 Skill 写入环境',
             { kind: 'skill', id: 'architecture-solution-template', name: '架构方案模板 Skill' },
           ),
           event(
             'agent.completed',
-            offset + 4,
+            offset + 5,
             '方案设计 Agent 已完成',
             { kind: 'agent', id: 'solution_design_agent', name: '方案设计 Agent' },
           ),
           mutationEvent,
           event(
             'agent.started',
-            offset + 6,
+            offset + 7,
             '质量审校 Agent 开始执行',
             { kind: 'agent', id: 'quality_review_agent', name: '质量审校 Agent' },
           ),
           {
             ...event(
               'agent.completed',
-              offset + 7,
+              offset + 8,
               '质量检查通过',
               { kind: 'agent', id: 'quality_review_agent', name: '质量审校 Agent' },
             ),
             status: 'completed',
           },
           {
-            ...event('run.completed', offset + 8, '本轮创作完成'),
+            ...event(
+              'harness.decision',
+              offset + 9,
+              '质检通过，Harness 结束本轮优化循环',
+              undefined,
+              {
+                trigger: 'quality_review_agent',
+                trigger_status: 'completed',
+                reason_code: 'quality_gate_passed',
+                issue_count: 0,
+                issue_codes: [],
+                scheduled: [],
+              },
+            ),
+            status: 'completed',
+          },
+          {
+            ...event('run.completed', offset + 10, '本轮创作完成'),
             status: 'completed',
           },
         ])
@@ -292,6 +360,13 @@ describe('创作 Agent 多轮 Loop', () => {
       'user',
     ])
     await screen.findByText('本轮补充质量门禁。')
+    const emphasized = screen.getByText('目标驱动')
+    expect(emphasized.tagName).toBe('STRONG')
+    expect(emphasized).toHaveStyle({ color: '#9a4f1c', textDecoration: 'underline' })
+    expect(screen.getByRole('columnheader', { name: '能力' })).toHaveStyle({
+      background: '#f7eadf',
+      color: '#6b3517',
+    })
     expect(screen.getByText('本轮补充质量门禁。')).toHaveClass('creation-latest-change')
     expect(screen.getByText(/本轮改动 3 处/)).toBeInTheDocument()
     expect(screen.getByLabelText('本轮改动')).toHaveTextContent('修改 · Loop')
@@ -306,7 +381,20 @@ describe('创作 Agent 多轮 Loop', () => {
     expect(executionTraces[1]).not.toHaveTextContent('当前没有既有文档')
     expect(executionTraces[1]).toHaveTextContent('创作 Agent')
     expect(executionTraces[1]).not.toHaveTextContent('创作主 Agent')
-    expect(within(executionTraces[1]).getAllByText('创作 Agent')).toHaveLength(2)
+    expect(executionTraces[1]).toHaveTextContent('数据检索 Tool · 已完成')
+    expect(executionTraces[1]).toHaveTextContent('没有找到匹配的数据来源')
+    expect(executionTraces[1]).toHaveTextContent('已根据反馈保留当前处理计划')
+    expect(executionTraces[1]).not.toHaveTextContent('Harness 根据 data_search')
+    expect(executionTraces[1]).not.toHaveTextContent('no_matching_data')
+    expect(executionTraces[1]).toHaveTextContent('质量审校 Agent · 已完成')
+    expect(executionTraces[1]).toHaveTextContent('质量要求已满足')
+    expect(executionTraces[1]).toHaveTextContent('质量检查通过')
+    expect(executionTraces[1]).not.toHaveTextContent('Harness 结束本轮优化循环')
+    expect(executionTraces[1]).not.toHaveTextContent('quality_review_agent')
+    expect(executionTraces[1]).not.toHaveTextContent('quality_gate_passed')
+    expect(executionTraces[1]).toHaveTextContent('追加能力')
+    expect(executionTraces[1]).toHaveTextContent('无，继续现有计划')
+    expect(within(executionTraces[1]).getAllByText('创作 Agent')).toHaveLength(3)
     const mainAgentStarted = within(executionTraces[1]).getByText('创作 Agent 已接管目标')
     const mainAgentIntent = within(executionTraces[1]).getByText('理解为围绕“质量门禁”联动修订完整文档')
     const mainAgentNode = mainAgentStarted.closest('.creation-agent-event')
@@ -333,10 +421,180 @@ describe('创作 Agent 多轮 Loop', () => {
     expect(savedHistories[1].document_patch.changes).toHaveLength(3)
     const storedIntent = savedHistories[1].agent_trace.find((item: any) => item.type === 'intent.interpreted')
     const storedPatch = savedHistories[1].agent_trace.find((item: any) => item.type === 'document.patch.applied')
+    const storedHarnessDecision = savedHistories[1].agent_trace.find((item: any) => item.type === 'harness.decision')
     expect(storedIntent.data).not.toHaveProperty('root_request')
     expect(storedIntent.data).not.toHaveProperty('current_instruction')
     expect(storedPatch.data).not.toHaveProperty('content')
+    expect(storedHarnessDecision.data).toEqual({
+      trigger: 'data_search',
+      trigger_status: 'completed',
+      reason_code: 'no_matching_data',
+      result_count: 0,
+      refreshable_count: 0,
+      analyzable_count: 0,
+      scheduled: [],
+      error_code: null,
+    })
+    expect(storedHarnessDecision.environment_patch).toEqual({})
     expect(savedHistories[1].agent_trace.every((item: any) => !item.goal?.objective)).toBe(true)
+  })
+
+  it('首版生成中的 Agent 内部润色不显示为用户改动', async () => {
+    const initialDocument = '# GPU 利用率治理方案\n\n## 背景\n\n初始内容。\n\n## 方案\n\n初始表述。'
+    const polishedDocument = '# GPU 利用率治理方案\n\n## 背景\n\n首版内容更自然。\n\n## 方案\n\n完善首版表述。'
+    const savedHistories: any[] = []
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/creation/skills') return Response.json([])
+      if (url.pathname === '/api/creation/history' && (!init?.method || init.method === 'GET')) {
+        return Response.json({ items: [], total: 0, limit: 20, offset: 0 })
+      }
+      if (url.pathname === '/api/creation/history' && init?.method === 'POST') {
+        savedHistories.push(JSON.parse(String(init.body || '{}')))
+        return Response.json({ id: 33 })
+      }
+      if (url.pathname === '/api/creation/agent/run') {
+        const patch = {
+          operation: 'quality_polish:anti_ai_style_agent',
+          target_sections: ['背景', '方案'],
+          change_count: 2,
+          changes: [{
+            change_type: 'modified',
+            section_title: '背景',
+            start_line: 5,
+            end_line: 5,
+            summary: '修改“背景”中的内容',
+          }],
+          summary: '已按本轮指令完成 2 处调整',
+        }
+        return sse([
+          event('run.started', 1, '创作 Agent 已接管目标'),
+          event(
+            'intent.interpreted',
+            2,
+            '理解为新建文档，将按完整需求生成首版内容',
+            undefined,
+            { operation: 'create_document' },
+          ),
+          event(
+            'document.replaced',
+            3,
+            '文档撰写 Agent 已提交完整文档版本',
+            { kind: 'agent', id: 'document_writer_agent', name: '文档撰写 Agent' },
+            { content: initialDocument, operation: 'create_document' },
+          ),
+          {
+            ...event(
+              'document.patch.applied',
+              4,
+              '去 AI 味 Agent 已应用内部润色',
+              { kind: 'agent', id: 'anti_ai_style_agent', name: '去 AI 味 Agent' },
+              { content: polishedDocument, patch },
+            ),
+            status: 'completed',
+          },
+          {
+            ...event(
+              'run.completed',
+              5,
+              '本轮创作完成',
+              undefined,
+              { document: polishedDocument },
+            ),
+            status: 'completed',
+          },
+        ])
+      }
+      return new Response('{}', { status: 404 })
+    }))
+
+    render(<CreationPanel />)
+    const input = screen.getByPlaceholderText(/输入 @ 可选择已安装的技能/)
+    fireEvent.change(input, { target: { value: '创作一份治理 GPU 利用率的方案文档' } })
+    fireEvent.click(screen.getByRole('button', { name: '开始创作' }))
+
+    const polishedText = await screen.findByText('首版内容更自然。')
+    await waitFor(() => expect(savedHistories).toHaveLength(1))
+
+    expect(polishedText).not.toHaveClass('creation-latest-change')
+    expect(screen.queryByLabelText('本轮改动')).not.toBeInTheDocument()
+    expect(screen.queryByText(/本轮改动 \d+ 处/)).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Agent 消息')).toHaveTextContent('首版文档已生成')
+    expect(savedHistories[0].edit_operation).toBe('create_document')
+    expect(savedHistories[0].document_patch).toBeNull()
+    expect(savedHistories[0].agent_trace).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'document.patch.applied' }),
+    ]))
+  })
+
+  it('把校验通过的即时截图显示在引用处并写入创作历史', async () => {
+    const savedHistories: any[] = []
+    const evidence = {
+      id: 'evidence-1',
+      source_url: 'https://bi.example.com/dashboard/gpu',
+      page_title: 'GPU 实时看板',
+      captured_at: 1_770_000_000_000,
+      image_url: '/api/creation/evidence/evidence-1/image',
+      validation_status: 'verified',
+      validation: {
+        verified_claims: [{ label: '国内 GPU 利用率', value: '42%' }],
+      },
+    }
+    const document = [
+      '# GPU 治理方案',
+      '',
+      '国内 GPU 利用率为 42%。',
+      '',
+      '![证据截图：GPU 实时看板](/api/creation/evidence/evidence-1/image)',
+      '',
+      '> 证据截图 · 来源：[GPU 实时看板](<https://bi.example.com/dashboard/gpu>) · 页面数据与截图文字已通过一致性校验',
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/creation/skills') return Response.json([])
+      if (url.pathname === '/api/creation/history' && (!init?.method || init.method === 'GET')) {
+        return Response.json({ items: [], total: 0, limit: 20, offset: 0 })
+      }
+      if (url.pathname === '/api/creation/history' && init?.method === 'POST') {
+        savedHistories.push(JSON.parse(String(init.body || '{}')))
+        return Response.json({ id: 42 })
+      }
+      if (url.pathname === '/api/creation/agent/run') {
+        return sse([
+          event('run.started', 1, '创作 Agent 已接管目标'),
+          event(
+            'document.replaced',
+            2,
+            '文档撰写 Agent 已提交完整文档版本',
+            { kind: 'agent', id: 'document_writer_agent', name: '文档撰写 Agent' },
+            { content: '# GPU 治理方案\n\n国内 GPU 利用率为 42%。', operation: 'create_document' },
+          ),
+          {
+            ...event('document.evidence.applied', 3, '已应用即时截图', undefined, { content: document, evidence: [evidence] }),
+            status: 'completed',
+          },
+          {
+            ...event('run.completed', 4, '本轮创作完成', undefined, { document, evidence: [evidence] }),
+            status: 'completed',
+          },
+        ])
+      }
+      return new Response('{}', { status: 404 })
+    }))
+
+    render(<CreationPanel />)
+    const input = screen.getByPlaceholderText(/输入 @ 可选择已安装的技能/)
+    fireEvent.change(input, { target: { value: '根据最新 GPU 看板创作治理方案' } })
+    fireEvent.click(screen.getByRole('button', { name: '开始创作' }))
+
+    const image = await screen.findByAltText('证据截图：GPU 实时看板')
+    expect(image).toHaveAttribute(
+      'src',
+      'http://localhost:7070/api/creation/evidence/evidence-1/image',
+    )
+    await waitFor(() => expect(savedHistories).toHaveLength(1))
+    expect(savedHistories[0].evidence).toEqual([evidence])
+    expect(savedHistories[0].generated_content).toContain('/api/creation/evidence/evidence-1/image')
   })
 
   it('Agent 要求确认时暂停，用户确认后从同一目标继续', async () => {

@@ -8,14 +8,19 @@ import pytest
 from inference_queue import QueueEvictedError
 from knowledge.extractor_v2 import (
     BAKE_BUNDLE_RESPONSE_SCHEMA,
+    BAKE_COMPACT_BUNDLE_RESPONSE_SCHEMA,
     BAKE_CONTEXT_WINDOW_TOKENS,
     BAKE_INPUT_TOKEN_BUDGET,
     BAKE_NUM_PREDICT,
+    BAKE_RETRY_NUM_PREDICT,
+    BAKE_RETRY_REPEAT_PENALTY,
     BAKE_RESPONSE_SCHEMA,
+    BakeModelRequestError,
     BakeOutputTruncatedError,
     KnowledgeExtractorV2,
     _extract_json_object,
     _extract_ollama_response_text,
+    _ollama_compatible_format,
 )
 
 
@@ -83,6 +88,15 @@ TEMPLATE_ONLY_CANDIDATE = {
     "entities": ["周报", "模板", "背景", "进展", "风险", "下周计划"],
 }
 
+ELIGIBLE_DOCUMENT_EVIDENCE = {
+    "kind": "native_document",
+    "source_surface": "document_editor",
+    "has_document_url": False,
+    "has_document_page_title": True,
+    "has_substantive_document_body": True,
+    "allows_auto_create": True,
+}
+
 
 class DummyClient:
     def __init__(self, response):
@@ -117,6 +131,47 @@ def make_raw_extractor() -> KnowledgeExtractorV2:
     extractor = KnowledgeExtractorV2.__new__(KnowledgeExtractorV2)
     extractor.model = "mock-model"
     return extractor
+
+
+def _schema_contains_key(value, target: str) -> bool:
+    if isinstance(value, dict):
+        return target in value or any(
+            _schema_contains_key(item, target) for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_schema_contains_key(item, target) for item in value)
+    return False
+
+
+def test_ollama_compatible_format_removes_grammar_expanding_string_limits():
+    compatible = _ollama_compatible_format(BAKE_BUNDLE_RESPONSE_SCHEMA)
+
+    assert compatible is not BAKE_BUNDLE_RESPONSE_SCHEMA
+    assert _schema_contains_key(BAKE_BUNDLE_RESPONSE_SCHEMA, "maxLength") is True
+    assert _schema_contains_key(compatible, "maxLength") is False
+    assert _schema_contains_key(compatible, "maxItems") is True
+    assert compatible["required"] == ["knowledge", "design", "sop"]
+
+
+def test_model_request_error_does_not_include_provider_response_in_message():
+    error = BakeModelRequestError(
+        400,
+        '{"error":"failed to parse grammar","model":"provider-model"}',
+    )
+
+    assert error.code == "BAKE_MODEL_REQUEST_INVALID"
+    assert error.retryable is False
+    assert error.status_code == 400
+    assert "provider-model" not in str(error)
+
+
+def test_missing_model_is_classified_as_service_error():
+    error = BakeModelRequestError(404, '{"error":"model not found"}')
+
+    assert error.code == "MODEL_UNAVAILABLE"
+    assert error.retryable is True
+    assert error.scope == "service"
+    assert error.http_status == 503
 
 
 
@@ -176,6 +231,7 @@ def test_call_bake_llm_uses_structured_json_schema():
         "temperature": 0.0,
         "num_ctx": BAKE_CONTEXT_WINDOW_TOKENS,
         "num_predict": BAKE_NUM_PREDICT,
+        "repeat_penalty": 1.0,
     }
     assert meta["empty_content"] is False
 
@@ -266,7 +322,10 @@ def test_extract_bake_bundle_uses_one_llm_call_for_three_artifacts():
     )
     extractor._ollama_chat = client.chat
 
-    result = extractor.extract_bake_bundle(SAMPLE_CANDIDATE)
+    result = extractor.extract_bake_bundle({
+        **SAMPLE_CANDIDATE,
+        "document_evidence": ELIGIBLE_DOCUMENT_EVIDENCE,
+    })
 
     assert len(client.calls) == 1
     assert client.calls[0]["format"] == BAKE_BUNDLE_RESPONSE_SCHEMA
@@ -280,6 +339,107 @@ def test_extract_bake_bundle_uses_one_llm_call_for_three_artifacts():
     assert set(result["stage_elapsed_ms"]) == {"bundle"}
     assert isinstance(result["total_elapsed_ms"], int)
     assert result["total_elapsed_ms"] >= 0
+
+
+def test_extract_bake_bundle_rejects_chat_document_mentions_even_if_model_accepts_design():
+    extractor = make_extractor()
+    response_payload = {
+        "knowledge": {
+            "accepted": True,
+            "reason": None,
+            "payload": {"summary": "会议中要求查看剧本创作规范"},
+        },
+        "design": {
+            "accepted": True,
+            "reason": "聊天中出现了云文档标题",
+            "payload": {
+                "name": "[云文档] AIGC 剧本创作规范（推测）",
+                "full_content": "模型从聊天内容中错误整理出的文档正文",
+                "match_score": 0.95,
+                "match_level": "high",
+                "review_status": "auto_created",
+            },
+        },
+        "sop": {
+            "accepted": False,
+            "reason": "not_a_sop",
+            "payload": None,
+        },
+    }
+    client = DummyClient(
+        {
+            "model": "mock-model",
+            "message": {"content": json.dumps(response_payload, ensure_ascii=False)},
+            "prompt_eval_count": 7,
+            "eval_count": 8,
+        }
+    )
+    extractor._ollama_chat = client.chat
+    candidate = {
+        **SAMPLE_CANDIDATE,
+        "source_timeline_id": 1674,
+        "timeline_category": "会议",
+        "capture_app_name": "Kim",
+        "capture_win_title": "Kim",
+        "capture_url": None,
+        "capture_webpage_title": None,
+        "capture_ax_text": (
+            "会议群聊天：你之前设计的那个剧本库文档看一下。"
+            "[云文档] AIGC Agentic 架构方案；AIGC 剧本创作规范。"
+        ) * 20,
+        "document_evidence": {
+            "kind": "insufficient",
+            "source_surface": "chat",
+            "has_document_url": False,
+            "has_document_page_title": False,
+            "has_substantive_document_body": True,
+            "allows_auto_create": False,
+        },
+    }
+
+    result = extractor.extract_bake_bundle(candidate)
+
+    assert result["knowledge"]["accepted"] is True
+    assert result["design"] == {
+        "accepted": False,
+        "reason": "insufficient_document_evidence",
+        "payload": None,
+    }
+    assert result["sop"]["accepted"] is False
+
+
+def test_document_evidence_fallback_accepts_real_browser_document():
+    extractor = make_raw_extractor()
+    evidence = extractor._resolve_document_evidence({
+        **SAMPLE_CANDIDATE,
+        "capture_app_name": "Google Chrome",
+        "capture_win_title": "AIGC 剧本创作规范 - 云文档",
+        "capture_webpage_title": "AIGC 剧本创作规范 - 云文档",
+        "capture_url": "https://docs.corp.kuaishou.com/d/home/document-id",
+        "capture_ax_text": "文档正文" * 80,
+    })
+
+    assert evidence["kind"] == "document_url"
+    assert evidence["source_surface"] == "browser"
+    assert evidence["allows_auto_create"] is True
+
+
+def test_document_evidence_fallback_rejects_chat_with_document_link_but_no_document_view():
+    extractor = make_raw_extractor()
+    evidence = extractor._resolve_document_evidence({
+        **SAMPLE_CANDIDATE,
+        "capture_app_name": "Kim",
+        "capture_win_title": "Kim",
+        "capture_webpage_title": None,
+        "capture_url": "https://docs.corp.kuaishou.com/d/home/document-id",
+        "capture_ax_text": "聊天中分享了一份云文档，请大家看一下。" * 40,
+    })
+
+    assert evidence["source_surface"] == "chat"
+    assert evidence["has_document_url"] is True
+    assert evidence["has_substantive_document_body"] is True
+    assert evidence["kind"] == "insufficient"
+    assert evidence["allows_auto_create"] is False
 
 
 def test_bake_bundle_prompt_estimate_includes_schema_and_candidate():
@@ -318,29 +478,20 @@ def test_head_tail_context_honors_tiny_budget():
     assert extractor._head_tail_context("abcdef", 0) == ""
 
 
-def test_bake_bundle_retries_truncated_output_once_with_smaller_context():
+def test_bake_bundle_uses_compact_output_on_bounded_retry():
     extractor = make_raw_extractor()
     response_payload = {
         "knowledge": {"accepted": False, "reason": "not_a_knowledge", "payload": None},
         "design": {"accepted": False, "reason": "not_a_document", "payload": None},
         "sop": {"accepted": False, "reason": "not_a_sop", "payload": None},
     }
-    client = SequenceClient([
-        {
-            "model": "mock-model",
-            "message": {"content": '{"knowledge":'},
-            "prompt_eval_count": 24_000,
-            "eval_count": 8_000,
-            "done_reason": "length",
-        },
-        {
-            "model": "mock-model",
-            "message": {"content": json.dumps(response_payload, ensure_ascii=False)},
-            "prompt_eval_count": 18_000,
-            "eval_count": 100,
-            "done_reason": "stop",
-        },
-    ])
+    client = DummyClient({
+        "model": "mock-model",
+        "message": {"content": json.dumps(response_payload, ensure_ascii=False)},
+        "prompt_eval_count": 18_000,
+        "eval_count": 100,
+        "done_reason": "stop",
+    })
     extractor._ollama_chat = client.chat
     candidate = {
         **SAMPLE_CANDIDATE,
@@ -349,12 +500,12 @@ def test_bake_bundle_retries_truncated_output_once_with_smaller_context():
         "url_aggregated_capture_count": 8,
     }
 
-    result = extractor.extract_bake_bundle(candidate)
+    result = extractor.extract_bake_bundle(candidate, retry_attempt=1)
 
-    assert len(client.calls) == 2
-    assert len(client.calls[1]["messages"][1]["content"]) < len(
-        client.calls[0]["messages"][1]["content"]
-    )
+    assert len(client.calls) == 1
+    assert client.calls[0]["format"] == BAKE_COMPACT_BUNDLE_RESPONSE_SCHEMA
+    assert client.calls[0]["options"]["num_predict"] == BAKE_RETRY_NUM_PREDICT
+    assert client.calls[0]["options"]["repeat_penalty"] == BAKE_RETRY_REPEAT_PENALTY
     assert result["degraded"] is False
 
 
@@ -371,7 +522,7 @@ def test_bake_bundle_initial_preemption_stays_retryable():
 def test_extract_bake_bundle_surfaces_invalid_output_as_failure():
     extractor = make_extractor()
     extractor._call_bake_llm = types.MethodType(
-        lambda self, caller_id, system_prompt, user_prompt, response_schema: (
+        lambda self, caller_id, system_prompt, user_prompt, response_schema, **_kwargs: (
             None,
             {
                 "empty_content": False,
@@ -727,6 +878,103 @@ def test_merge_document_no_change_keeps_existing_title_when_model_omits_it():
     assert result == {"no_change": True, "title": "已有文档标题"}
 
 
+def test_merge_document_keeps_existing_title_when_model_returns_incremental_name():
+    extractor = make_raw_extractor()
+    extractor._call_bake_llm = types.MethodType(
+        lambda self, caller_id, system_prompt, user_prompt, response_schema: (
+            {
+                "no_change": False,
+                "title": "文档增量：已有文档标题",
+                "content_patch": "## 新章节\n新增事实",
+            },
+            {},
+        ),
+        extractor,
+    )
+
+    result = extractor._merge_with_llm_once(
+        {
+            "title": "已有文档标题",
+            "full_content": "已有正文",
+            "sections_json": "[]",
+        },
+        SAMPLE_CANDIDATE,
+        "新 capture",
+    )
+
+    assert result["title"] == "已有文档标题"
+    assert result["full_content"] == "已有正文\n\n## 新章节\n新增事实"
+
+
+def test_merge_document_l1_compares_visible_source_text_not_prompt_hash():
+    extractor = make_raw_extractor()
+    existing_content = "同一份文档正文，包含稳定的背景、方案和落地计划。"
+    candidate = {
+        **SAMPLE_CANDIDATE,
+        "capture_ax_text": f"  {existing_content}\n",
+        "capture_ocr_text": "",
+        "capture_input_text": "",
+        "capture_audio_text": "",
+    }
+    extractor._merge_with_llm_once = types.MethodType(
+        lambda *_args, **_kwargs: pytest.fail("正文完全相同时不应调用 LLM"),
+        extractor,
+    )
+
+    result = extractor.merge_bake_document(
+        {
+            "title": "已有文档标题",
+            "full_content": existing_content,
+            "content_hash": "生成正文的旧 hash",
+        },
+        candidate,
+    )
+
+    assert result == {"no_change": True, "title": "已有文档标题"}
+
+
+def test_merge_document_high_embedding_similarity_does_not_drop_small_change():
+    class VectorResult:
+        def __init__(self):
+            self.vector = [1.0, 0.5, 0.25]
+
+    class FakeEmbeddingModel:
+        def encode(self, texts):
+            return [VectorResult() for _ in texts]
+
+    extractor = make_raw_extractor()
+    extractor.embedding_model = FakeEmbeddingModel()
+    extractor._merge_with_llm_once = types.MethodType(
+        lambda *_args, **_kwargs: {
+            "no_change": False,
+            "title": "已有文档标题",
+            "full_content": "保留小幅修订",
+        },
+        extractor,
+    )
+    candidate = {
+        **SAMPLE_CANDIDATE,
+        "capture_ax_text": "候选正文。" * 80,
+        "capture_ocr_text": "",
+        "capture_input_text": "",
+        "capture_audio_text": "",
+    }
+
+    result = extractor.merge_bake_document(
+        {
+            "title": "已有文档标题",
+            "full_content": "已有正文。" * 80,
+        },
+        candidate,
+    )
+
+    assert result == {
+        "no_change": False,
+        "title": "已有文档标题",
+        "full_content": "保留小幅修订",
+    }
+
+
 def test_merge_document_accepts_null_section_notes():
     extractor = make_raw_extractor()
     captured_call = {}
@@ -760,6 +1008,7 @@ def test_extract_bake_design_downgrades_sop_like_high_score_payload():
         "overview": "按步骤执行排查流程",
         "details": "触发条件: 启动失败；前置条件: 有日志；步骤: 检查 health、检查端口、验证结果",
         "entities": ["步骤", "排查", "触发条件"],
+        "document_evidence": ELIGIBLE_DOCUMENT_EVIDENCE,
     }
     payload = {
         "name": "启动故障排查记录",

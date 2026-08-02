@@ -10,6 +10,7 @@ import {
   type RagStreamCallbacks,
   type RagStreamStatus,
 } from '../hooks/useApi'
+import { useImeCompositionGuard } from '../hooks/useImeCompositionGuard'
 import { useAppStore } from '../store/useAppStore'
 import type { AchievementBadge, RagContext } from '../types'
 import { buildAttachmentMetadata, buildAttachmentPrompt, filesToAttachments, formatAttachmentSize, type UserAttachment } from '../utils/attachments'
@@ -271,6 +272,7 @@ const SystemFloatingAssist: React.FC = () => {
   const [nativeHovering, setNativeHovering] = useState(false)
   const [ambientAnimating, setAmbientAnimating] = useState(false)
   const [manualInstruction, setManualInstruction] = useState('')
+  const manualInputImeGuard = useImeCompositionGuard<HTMLTextAreaElement>()
   const [attachments, setAttachments] = useState<UserAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
   const [floatingBadge, setFloatingBadge] = useState<AchievementBadge | null>(null)
@@ -1007,8 +1009,7 @@ const SystemFloatingAssist: React.FC = () => {
     revealing,
   ])
 
-  const runManualAssist = async (event?: { preventDefault: () => void }) => {
-    event?.preventDefault()
+  const runManualAssist = async () => {
     const instruction = manualInstruction.trim()
     if (!instruction || activeAssistTaskRef.current || busy) return
     activeAssistTaskRef.current = true
@@ -1104,6 +1105,12 @@ const SystemFloatingAssist: React.FC = () => {
       if (abortRef.current === controller) abortRef.current = null
       activeAssistTaskRef.current = false
     }
+  }
+
+  const handleManualSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (manualInputImeGuard.shouldBlockSubmit()) return
+    void runManualAssist()
   }
 
   const copyAnswer = async () => {
@@ -1554,7 +1561,7 @@ const SystemFloatingAssist: React.FC = () => {
             )}
           </div>
 
-          <form className="system-floating-assist__manual" onSubmit={runManualAssist}>
+          <form className="system-floating-assist__manual" onSubmit={handleManualSubmit}>
             <div className="system-floating-assist__manual-main">
               <textarea
                 value={manualInstruction}
@@ -1567,9 +1574,17 @@ const SystemFloatingAssist: React.FC = () => {
                 placeholder={screenshot ? '继续输入你的指令，结合当前界面内容咨询' : '输入你的指令，直接向记忆面包咨询'}
                 rows={2}
                 disabled={busy}
+                onCompositionStart={manualInputImeGuard.onCompositionStart}
+                onCompositionEnd={manualInputImeGuard.onCompositionEnd}
+                onBlur={manualInputImeGuard.onBlur}
                 onKeyDown={(event) => {
-                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                    void runManualAssist(event)
+                  if (
+                    event.key === 'Enter'
+                    && !event.shiftKey
+                    && !manualInputImeGuard.isImeEvent(event)
+                  ) {
+                    event.preventDefault()
+                    event.currentTarget.form?.requestSubmit()
                   }
                 }}
               />

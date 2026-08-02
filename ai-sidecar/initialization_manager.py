@@ -42,6 +42,7 @@ MANAGED_OLLAMA_SHA256 = "52acbca4e89c53db9abc586a22b5633fd101db293177264b9a0fe5d
 NORMAL_OLLAMA_PORT = 11434
 SANDBOX_OLLAMA_PORT = 11435
 SANDBOX_CORE_PORT = 17070
+OLLAMA_GUI_APP_ROOT = Path("/Applications/Ollama.app").resolve()
 MIN_FREE_DISK_GB = 6.0
 MAX_PROCESS_LOG_BYTES = 5 * 1024 * 1024
 PROCESS_LOG_BACKUPS = 2
@@ -446,6 +447,33 @@ class InitializationManager:
                     "SANDBOX_ISOLATION_FAILED",
                     "隔离端口被非本次沙箱的本地 AI 服务占用",
                 )
+            if mode == "normal" and self._ollama_gui_running():
+                managed_running = self._managed_ollama_process_owned(mode)
+                executable = self._managed_ollama_executable(mode)
+                if executable is None:
+                    executable = self._install_managed_ollama(mode)
+                self._stop_ollama_gui()
+                if managed_running and self._ollama_healthy(base_url):
+                    state["legacy_runtime_migrated"] = True
+                    self._save_state(state)
+                    return False, "本地 AI 引擎已切换为无界面后台运行"
+                deadline = time.monotonic() + 10
+                while self._port_in_use(self._ollama_port(mode)) and time.monotonic() < deadline:
+                    time.sleep(0.25)
+                if self._port_in_use(self._ollama_port(mode)):
+                    raise InitializationFailure(
+                        "RUNTIME_START_FAILED",
+                        "旧本地 AI 引擎未能退出，请关闭后重试",
+                    )
+                self._start_ollama(mode, executable)
+                deadline = time.monotonic() + 25
+                while time.monotonic() < deadline:
+                    if self._ollama_healthy(base_url):
+                        state["legacy_runtime_migrated"] = True
+                        self._save_state(state)
+                        return False, "本地 AI 引擎已切换为无界面后台运行"
+                    time.sleep(0.5)
+                raise InitializationFailure("RUNTIME_START_FAILED", "本地 AI 引擎启动超时")
             state["runtime_reused"] = True
             self._save_state(state)
             detail = (
@@ -1004,6 +1032,8 @@ class InitializationManager:
             base_url = self._ollama_base_url(mode)
             if not self._ollama_healthy(base_url):
                 return False
+            if mode == "normal" and self._ollama_gui_running():
+                return False
             installed = self._installed_model_names(base_url)
             if not self._model_present(installed, _CAPTURE_MODEL_NAME):
                 return False
@@ -1229,6 +1259,70 @@ class InitializationManager:
             return None
         return self._find_ollama_executable(version_dir / "runtime")
 
+    def _managed_ollama_process_owned(self, mode: str) -> bool:
+        marker_path = self._workspace_root(mode) / "processes" / "ollama.json"
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if mode == "sandbox":
+                sandbox_id = self._sandbox_mode_config().get("sandbox_id")
+                if not sandbox_id or marker.get("sandbox_id") != sandbox_id:
+                    return False
+            if int(marker.get("port")) != self._ollama_port(mode):
+                return False
+            executable = Path(marker["executable"]).resolve()
+            runtime_root = self._runtime_root(mode).resolve()
+            if runtime_root != executable and runtime_root not in executable.parents:
+                return False
+            if Path(marker.get("models_root", "")).resolve() != self._models_root(mode).resolve():
+                return False
+            process = psutil.Process(int(marker["pid"]))
+            create_time = marker.get("create_time")
+            if create_time is None or abs(process.create_time() - float(create_time)) > 0.01:
+                return False
+            return process.is_running() and self._process_matches_marker(process, executable)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _ollama_gui_processes() -> list[psutil.Process]:
+        processes: list[psutil.Process] = []
+        for process in psutil.process_iter(["pid", "exe", "cmdline"]):
+            try:
+                raw_paths = [process.info.get("exe")]
+                raw_paths.extend((process.info.get("cmdline") or [])[:2])
+                for raw_path in raw_paths:
+                    if not raw_path or not str(raw_path).startswith("/"):
+                        continue
+                    candidate = Path(str(raw_path)).resolve()
+                    if candidate == OLLAMA_GUI_APP_ROOT or OLLAMA_GUI_APP_ROOT in candidate.parents:
+                        processes.append(process)
+                        break
+            except (OSError, psutil.Error):
+                continue
+        return processes
+
+    def _ollama_gui_running(self) -> bool:
+        return bool(self._ollama_gui_processes())
+
+    def _stop_ollama_gui(self) -> None:
+        processes = self._ollama_gui_processes()
+        for process in processes:
+            try:
+                process.terminate()
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.Error as exc:
+                raise InitializationFailure(
+                    "RUNTIME_START_FAILED",
+                    "旧本地 AI 引擎无法退出",
+                ) from exc
+        _gone, alive = psutil.wait_procs(processes, timeout=8)
+        if alive:
+            raise InitializationFailure(
+                "RUNTIME_START_FAILED",
+                "旧本地 AI 引擎仍在运行",
+            )
+
     @staticmethod
     def _find_ollama_executable(root: Path) -> Path | None:
         for candidate in (root / "bin" / "ollama", root / "ollama"):
@@ -1450,6 +1544,8 @@ class InitializationManager:
         return False
 
     def _sandbox_process_owned(self, name: str) -> bool:
+        if name == "ollama":
+            return self._managed_ollama_process_owned("sandbox")
         marker_path = self.sandbox_root / "processes" / f"{name}.json"
         try:
             marker = json.loads(marker_path.read_text(encoding="utf-8"))

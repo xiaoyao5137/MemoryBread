@@ -6,6 +6,7 @@
 
 import logging
 import sqlite3
+import time
 import uuid
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -79,10 +80,24 @@ class VectorStorage:
         
         return self._qdrant_client
 
+    def is_qdrant_available(self) -> bool:
+        """Return whether this process can currently write the vector store."""
+        return self._get_qdrant_client() is not None
+
     @staticmethod
     def _document_point_id(doc_key: str, content_hash: str, chunk_index: int) -> str:
         """Stable Qdrant id: unchanged document chunks are naturally idempotent."""
         value = f"memory-bread:{doc_key}:{content_hash}:{chunk_index}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, value))
+
+    @staticmethod
+    def _artifact_document_point_id(
+        document_id: int,
+        content_hash: str,
+        chunk_index: int,
+    ) -> str:
+        """Stable point id whose durable owner is ``bake_documents.id``."""
+        value = f"memory-bread:bake-document:{document_id}:{content_hash}:{chunk_index}"
         return str(uuid.uuid5(uuid.NAMESPACE_URL, value))
 
     def document_version_exists(
@@ -109,6 +124,375 @@ class VectorStorage:
         except sqlite3.Error as exc:
             logger.warning("检查文档向量版本失败: doc_key=%s error=%s", doc_key, exc)
             return False
+
+    def artifact_document_version_exists(
+        self,
+        document_id: int,
+        doc_key: str,
+        content_hash: str,
+        chunk_count: int,
+    ) -> bool:
+        """Check both the durable SQLite ledger and Qdrant when available."""
+        expected = {
+            self._artifact_document_point_id(document_id, content_hash, index)
+            for index in range(chunk_count)
+        }
+        if not expected:
+            return False
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT qdrant_point_id
+                    FROM artifact_vector_index
+                    WHERE document_id = ? AND content_hash = ?
+                    """,
+                    (document_id, content_hash),
+                ).fetchall()
+            recorded = {str(row[0]) for row in rows}
+            if recorded != expected:
+                return False
+
+            qdrant_client = self._get_qdrant_client()
+            if qdrant_client is None or not hasattr(qdrant_client, "retrieve"):
+                return True
+            points = qdrant_client.retrieve(
+                collection_name=self._collection_name,
+                ids=list(expected),
+                with_payload=False,
+                with_vectors=False,
+            )
+            return {str(point.id) for point in points} == expected
+        except sqlite3.Error as exc:
+            logger.warning(
+                "检查持久文档向量版本失败: document_id=%s error=%s",
+                document_id,
+                exc,
+            )
+            return False
+        except Exception as exc:
+            logger.warning(
+                "核验 Qdrant 持久文档向量失败，标记为待修复: document_id=%s error=%s",
+                document_id,
+                exc,
+            )
+            return False
+
+    def store_artifact_document_vectors(
+        self,
+        document_id: int,
+        chunks: List[str],
+        vectors: List[List[float]],
+        metadata: Dict[str, Any],
+    ) -> bool:
+        """Persist vectors owned by a bake document rather than a raw capture."""
+        if document_id <= 0 or not chunks or len(chunks) != len(vectors):
+            logger.error(
+                "持久文档向量参数无效: document_id=%s chunks=%s vectors=%s",
+                document_id,
+                len(chunks),
+                len(vectors),
+            )
+            return False
+
+        metadata = dict(metadata or {})
+        doc_key = str(metadata.get("doc_key") or "").strip()
+        content_hash = str(metadata.get("content_hash") or "").strip()
+        if not doc_key or not content_hash:
+            logger.error("持久文档向量缺少稳定键: document_id=%s", document_id)
+            return False
+        if self.artifact_document_version_exists(
+            document_id,
+            doc_key,
+            content_hash,
+            len(chunks),
+        ):
+            return True
+
+        point_ids = [
+            self._artifact_document_point_id(document_id, content_hash, index)
+            for index in range(len(chunks))
+        ]
+        indexed_at = int(metadata.get("updated_at") or time.time() * 1000)
+        payloads = [
+            {
+                "doc_key": doc_key,
+                "source_type": "document",
+                "capture_id": 0,
+                "document_id": document_id,
+                "knowledge_id": None,
+                "time": indexed_at,
+                "ts": indexed_at,
+                "observed_at": indexed_at,
+                "history_view": False,
+                "content_origin": "bake_document",
+                "activity_type": "document",
+                "is_self_generated": False,
+                "evidence_strength": "high",
+                "category": metadata.get("doc_type") or "文档",
+                "url": metadata.get("url"),
+                "source_url": metadata.get("url"),
+                "title": metadata.get("title"),
+                "content_hash": content_hash,
+                "chunk_index": index,
+                "chunk_count": len(chunks),
+                "text": text,
+            }
+            for index, text in enumerate(chunks)
+        ]
+
+        try:
+            qdrant_client = self._get_qdrant_client()
+            if qdrant_client is None:
+                logger.warning(
+                    "Qdrant 不可用，持久文档不登记完成: document_id=%s",
+                    document_id,
+                )
+                return False
+
+            from qdrant_client.models import PointStruct
+
+            qdrant_client.upsert(
+                collection_name=self._collection_name,
+                points=[
+                    PointStruct(id=point_id, vector=vector, payload=payload)
+                    for point_id, vector, payload in zip(point_ids, vectors, payloads)
+                ],
+            )
+
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "DELETE FROM artifact_vector_index WHERE document_id = ?",
+                    (document_id,),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO artifact_vector_index (
+                        document_id, qdrant_point_id, doc_key, content_hash,
+                        chunk_index, chunk_text, model_name, indexed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            document_id,
+                            point_id,
+                            doc_key,
+                            content_hash,
+                            index,
+                            text,
+                            metadata.get("model_name", "bge-small-zh-v1.5"),
+                            indexed_at,
+                        )
+                        for index, (point_id, text) in enumerate(zip(point_ids, chunks))
+                    ],
+                )
+                placeholders = ", ".join("?" for _ in point_ids)
+                conn.execute(
+                    f"DELETE FROM vector_deletion_queue "
+                    f"WHERE qdrant_point_id IN ({placeholders})",
+                    point_ids,
+                )
+
+            logger.info(
+                "✅ 持久文档分块向量完成: document_id=%s doc_key=%s chunks=%s",
+                document_id,
+                doc_key,
+                len(chunks),
+            )
+            return True
+        except Exception as exc:
+            # point id 稳定；若 Qdrant 成功而 SQLite 失败，下次重试会幂等覆盖。
+            logger.error(
+                "❌ 持久文档向量存储失败: document_id=%s doc_key=%s error=%s",
+                document_id,
+                doc_key,
+                exc,
+                exc_info=True,
+            )
+            return False
+
+    def drain_deletion_queue(self, limit: int = 256) -> dict[str, int | str]:
+        """Drain the SQLite deletion outbox into Qdrant idempotently."""
+        now_ms = int(time.time() * 1000)
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                table_exists = conn.execute(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = 'vector_deletion_queue'
+                    )
+                    """
+                ).fetchone()
+                if not table_exists or not table_exists[0]:
+                    return {"selected_count": 0, "deleted_count": 0}
+                rows = conn.execute(
+                    """
+                    SELECT qdrant_point_id, attempt_count
+                    FROM vector_deletion_queue
+                    WHERE next_attempt_at <= ?
+                    ORDER BY enqueued_at
+                    LIMIT ?
+                    """,
+                    (now_ms, max(1, int(limit))),
+                ).fetchall()
+            point_ids = [str(row[0]) for row in rows]
+            if not point_ids:
+                return {"selected_count": 0, "deleted_count": 0}
+
+            qdrant_client = self._get_qdrant_client()
+            if qdrant_client is None:
+                return {
+                    "selected_count": len(point_ids),
+                    "deleted_count": 0,
+                    "error": "qdrant_unavailable",
+                }
+
+            from qdrant_client.models import PointIdsList
+
+            qdrant_client.delete(
+                collection_name=self._collection_name,
+                points_selector=PointIdsList(points=point_ids),
+            )
+            placeholders = ", ".join("?" for _ in point_ids)
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    f"DELETE FROM vector_deletion_queue "
+                    f"WHERE qdrant_point_id IN ({placeholders})",
+                    point_ids,
+                )
+            return {
+                "selected_count": len(point_ids),
+                "deleted_count": len(point_ids),
+            }
+        except Exception as exc:
+            retry_at = now_ms + 30_000
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.executemany(
+                        """
+                        UPDATE vector_deletion_queue
+                        SET attempt_count = attempt_count + 1,
+                            last_error = ?,
+                            next_attempt_at = ?
+                        WHERE qdrant_point_id = ?
+                        """,
+                        [
+                            (str(exc)[:500], retry_at, str(row[0]))
+                            for row in locals().get("rows", [])
+                        ],
+                    )
+            except sqlite3.Error:
+                pass
+            logger.warning("Qdrant 删除队列消费失败: %s", exc)
+            return {
+                "selected_count": len(locals().get("point_ids", [])),
+                "deleted_count": 0,
+                "error": str(exc),
+            }
+
+    def audit_qdrant_consistency(
+        self,
+        *,
+        enqueue_orphans: bool = False,
+        mark_missing_artifacts: bool = False,
+        max_points: int = 50_000,
+    ) -> dict[str, Any]:
+        """Compare the SQLite ledgers with Qdrant.
+
+        The default is read-only.  ``mark_missing_artifacts=True`` clears only
+        durable ledger rows whose Qdrant points disappeared, allowing the
+        regular backfill to rebuild them.  ``enqueue_orphans=True`` records
+        orphan deletions in the outbox; the background worker performs the
+        actual Qdrant deletion later.
+        """
+        artifact_expected: set[str] = set()
+        with sqlite3.connect(self.db_path) as conn:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name IN ('vector_index', 'artifact_vector_index')
+                    """
+                )
+            }
+            expected: set[str] = set()
+            if "vector_index" in tables:
+                expected.update(
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT qdrant_point_id FROM vector_index"
+                    )
+                )
+            if "artifact_vector_index" in tables:
+                artifact_expected.update(
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT qdrant_point_id FROM artifact_vector_index"
+                    )
+                )
+                expected.update(artifact_expected)
+        qdrant_client = self._get_qdrant_client()
+        if qdrant_client is None:
+            return {"available": False, "expected_count": len(expected)}
+
+        actual: set[str] = set()
+        offset = None
+        while len(actual) < max_points:
+            points, offset = qdrant_client.scroll(
+                collection_name=self._collection_name,
+                limit=min(512, max_points - len(actual)),
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            actual.update(str(point.id) for point in points)
+            if offset is None or not points:
+                break
+
+        scan_truncated = len(actual) >= max_points and offset is not None
+        # A partial scroll can prove an orphan exists, but cannot prove an
+        # expected point is missing.
+        missing = set() if scan_truncated else expected.difference(actual)
+        orphans = actual.difference(expected)
+        missing_artifacts = missing.intersection(artifact_expected)
+        marked_missing_artifacts = 0
+        if mark_missing_artifacts and missing_artifacts:
+            placeholders = ", ".join("?" for _ in missing_artifacts)
+            with sqlite3.connect(self.db_path) as conn:
+                marked_missing_artifacts = conn.execute(
+                    f"DELETE FROM artifact_vector_index "
+                    f"WHERE qdrant_point_id IN ({placeholders})",
+                    list(missing_artifacts),
+                ).rowcount
+        if enqueue_orphans and orphans:
+            now_ms = int(time.time() * 1000)
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO vector_deletion_queue (
+                        qdrant_point_id, source_type, reason, enqueued_at
+                    )
+                    VALUES (?, 'unknown', 'qdrant_orphan_reconciliation', ?)
+                    """,
+                    [(point_id, now_ms) for point_id in orphans],
+                )
+        return {
+            "available": True,
+            "expected_count": len(expected),
+            "actual_count": len(actual),
+            "missing_count": len(missing),
+            "missing_artifact_count": len(missing_artifacts),
+            "missing_artifacts_marked_for_rebuild": marked_missing_artifacts,
+            "orphan_count": len(orphans),
+            "scan_truncated": scan_truncated,
+            "missing_sample": sorted(missing)[:20],
+            "orphan_sample": sorted(orphans)[:20],
+            "orphans_enqueued": len(orphans) if enqueue_orphans else 0,
+        }
 
     def store_document_vectors(
         self,
@@ -244,6 +628,21 @@ class VectorStorage:
                         for index, (point_id, text) in enumerate(zip(point_ids, chunks))
                     ],
                 )
+                deletion_queue_exists = conn.execute(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = 'vector_deletion_queue'
+                    )
+                    """
+                ).fetchone()
+                if deletion_queue_exists and deletion_queue_exists[0]:
+                    placeholders = ", ".join("?" for _ in point_ids)
+                    conn.execute(
+                        f"DELETE FROM vector_deletion_queue "
+                        f"WHERE qdrant_point_id IN ({placeholders})",
+                        point_ids,
+                    )
 
             stale_ids = existing_ids.difference(point_ids)
             if qdrant_client and stale_ids:

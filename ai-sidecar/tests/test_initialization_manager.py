@@ -148,6 +148,47 @@ def test_completed_state_is_gated_again_when_a_required_component_disappears(mon
     assert state["error_code"] == "INITIALIZATION_COMPONENT_MISSING"
 
 
+def test_normal_initialization_migrates_gui_runtime_to_managed_cli(monkeypatch, tmp_path):
+    manager = InitializationManager(base_dir=tmp_path)
+    running = {"value": True}
+    calls: list[str] = []
+    executable = tmp_path / "initialization" / "runtime" / "ollama" / "v-test" / "runtime" / "ollama"
+
+    monkeypatch.setattr(manager, "_ollama_healthy", lambda _url: running["value"])
+    monkeypatch.setattr(manager, "_ollama_gui_running", lambda: True)
+    monkeypatch.setattr(manager, "_managed_ollama_process_owned", lambda _mode: False)
+    monkeypatch.setattr(manager, "_managed_ollama_executable", lambda _mode: executable)
+    monkeypatch.setattr(manager, "_port_in_use", lambda _port: running["value"])
+
+    def stop_gui():
+        calls.append("stop_gui")
+        running["value"] = False
+
+    def start_managed(_mode, selected_executable):
+        calls.append("start_managed")
+        assert selected_executable == executable
+        running["value"] = True
+
+    monkeypatch.setattr(manager, "_stop_ollama_gui", stop_gui)
+    monkeypatch.setattr(manager, "_start_ollama", start_managed)
+
+    state = manager._new_state("normal")
+    skipped, detail = manager._stage_inference_engine("normal", state)
+
+    assert skipped is False
+    assert calls == ["stop_gui", "start_managed"]
+    assert state["legacy_runtime_migrated"] is True
+    assert "无界面后台运行" in detail
+
+
+def test_completed_state_reopens_gate_when_gui_runtime_returns(monkeypatch, tmp_path):
+    manager = InitializationManager(base_dir=tmp_path)
+    monkeypatch.setattr(manager, "_ollama_healthy", lambda _url: True)
+    monkeypatch.setattr(manager, "_ollama_gui_running", lambda: True)
+
+    assert manager._completed_state_still_valid("normal") is False
+
+
 def test_smoke_generation_disables_long_thinking_and_bounds_output(monkeypatch, tmp_path):
     manager = InitializationManager(base_dir=tmp_path)
     captured: dict = {}

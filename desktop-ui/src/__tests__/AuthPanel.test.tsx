@@ -178,6 +178,63 @@ describe('AuthPanel', () => {
     expect(useAppStore.getState().adminApiBaseUrl).toBe('http://127.0.0.1:18080')
   })
 
+  it('注册时按邮箱和手机号区分入口，不再显示独立账户名或灰色提示', () => {
+    render(<AuthPanel />)
+
+    fireEvent.click(screen.getByRole('tab', { name: '注册' }))
+
+    expect(screen.getByText('注册账户')).toBeInTheDocument()
+    expect(screen.getByRole('tablist', { name: '注册方式' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: '邮箱注册' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: '手机号注册' })).toBeInTheDocument()
+    expect(screen.queryByLabelText('账户名')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('邮箱地址')).not.toHaveAttribute('placeholder')
+    expect(screen.getByLabelText('昵称')).not.toHaveAttribute('placeholder')
+
+    fireEvent.click(screen.getByRole('tab', { name: '手机号注册' }))
+    expect(screen.getByLabelText('手机号')).not.toHaveAttribute('placeholder')
+  })
+
+  it('邮箱注册仅提交邮箱标识，不再提交独立账户名', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          access_token: 'mbs_register_token',
+          expires_at: new Date(Date.now() + 86400_000).toISOString(),
+          user: {
+            id: '018f0000-0000-7000-8000-000000000007',
+            nickname: '小麦',
+            email: 'xiaomai@memorybread.local',
+            status: 'active',
+            roles: ['user'],
+            locale: 'zh-CN',
+            timezone: 'Asia/Shanghai',
+            created_at: new Date().toISOString(),
+          },
+        },
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<AuthPanel />)
+
+    fireEvent.click(screen.getByRole('tab', { name: '注册' }))
+    fireEvent.change(screen.getByLabelText('邮箱地址'), { target: { value: 'xiaomai@memorybread.local' } })
+    fireEvent.change(screen.getByLabelText('昵称'), { target: { value: '小麦' } })
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'MemoryBread@2026!' } })
+    fireEvent.click(screen.getByRole('button', { name: '注册并登录' }))
+
+    await waitFor(() => {
+      expect(useAppStore.getState().authToken).toBe('mbs_register_token')
+    })
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit
+    expect(JSON.parse(String(request.body))).toEqual({
+      email: 'xiaomai@memorybread.local',
+      password: 'MemoryBread@2026!',
+      nickname: '小麦',
+    })
+  })
+
   it('默认以未登录界面启动，并在登录后保存管理员会话', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

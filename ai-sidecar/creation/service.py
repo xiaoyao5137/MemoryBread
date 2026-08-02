@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,14 +19,18 @@ from urllib.parse import quote_plus, urlparse
 import httpx
 
 from .tools import (
+    CreationToolExecutionError,
+    DATA_SEARCH_TOOL_ID,
     INTERNET_SEARCH_TOOL_ID,
     MEMORY_SEARCH_TOOL_ID,
+    WEBPAGE_SCRAPE_TOOL_ID,
     normalize_creation_tool_ids,
 )
 
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
+CORE_ENGINE_DEFAULT_BASE_URL = "http://127.0.0.1:7070"
 
 CREATION_SKILL_ANALYSIS_SCHEMA = {
     "type": "object",
@@ -181,6 +188,8 @@ class CreationOptions:
     enabled_tools: tuple[str, ...] = (
         INTERNET_SEARCH_TOOL_ID,
         MEMORY_SEARCH_TOOL_ID,
+        DATA_SEARCH_TOOL_ID,
+        WEBPAGE_SCRAPE_TOOL_ID,
     )
 
     def __post_init__(self) -> None:
@@ -247,6 +256,7 @@ class CreationService:
         self.db_path = db_path or str(Path.home() / ".memory-bread" / "memory-bread.db")
         self.enable_vector_recall = enable_vector_recall
         self._embedding_model = None
+        self._ocr_engine = None
         if enable_vector_recall:
             try:
                 from embedding.model import EmbeddingModel
@@ -255,6 +265,329 @@ class CreationService:
             except Exception as e:
                 logger.warning("初始化embedding模型失败，将禁用向量召回: %s", e)
                 self.enable_vector_recall = False
+
+    @property
+    def core_engine_base_url(self) -> str:
+        return (
+            os.getenv("CORE_ENGINE_URL")
+            or os.getenv("MEMORY_BREAD_CORE_URL")
+            or CORE_ENGINE_DEFAULT_BASE_URL
+        ).rstrip("/")
+
+    async def retrieve_data_context(
+        self,
+        query: str,
+        parsed_requirement: dict,
+        limit: int = 6,
+    ) -> list[dict]:
+        """调用本机数据检索 Tool，返回含时效与可采纳状态的候选。"""
+        payload = {
+            "query": query,
+            "need_fresh": True,
+            "limit": max(1, min(int(limit), 20)),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    f"{self.core_engine_base_url}/api/tools/data-search",
+                    json=payload,
+                )
+        except Exception as exc:
+            raise CreationToolExecutionError(
+                "DATA_SEARCH_UNAVAILABLE",
+                "本地数据检索暂时不可用",
+            ) from exc
+        if not response.is_success:
+            raise CreationToolExecutionError(
+                "DATA_SEARCH_UNAVAILABLE",
+                "本地数据检索暂时不可用",
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise CreationToolExecutionError(
+                "DATA_SEARCH_UNAVAILABLE",
+                "本地数据检索返回格式无效",
+            ) from exc
+        results = data.get("results") if isinstance(data, dict) else []
+        return [item for item in (results or []) if isinstance(item, dict)][:20]
+
+    async def scrape_data_context(
+        self,
+        data_results: list[dict],
+        query: str,
+        parsed_requirement: dict,
+        limit: int = 3,
+        run_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict:
+        """创作时刷新 Top-K 报表源，并生成经 OCR/DOM 校验的通用截图证据。"""
+        report_sources = [
+            item
+            for item in data_results
+            if item.get("source_kind") == "report_url"
+            and item.get("source_url")
+            and item.get("source_id") is not None
+        ][: max(1, min(int(limit), 5))]
+        if not report_sources:
+            return {"scrapes": [], "refreshed_data": data_results}
+
+        scrapes: list[dict] = []
+        first_error_code: str | None = None
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            for item in report_sources:
+                source_id = int(item["source_id"])
+                try:
+                    response = await client.post(
+                        f"{self.core_engine_base_url}/api/data/sources/{source_id}/refresh",
+                        json={
+                            "mode": "auto",
+                            "capture_evidence": True,
+                            "run_id": run_id,
+                            "session_id": session_id,
+                        },
+                    )
+                    if response.is_success:
+                        payload = response.json()
+                        evidence = await self._validate_scrape_evidence(client, payload)
+                        scrapes.append(
+                            {
+                                "source_id": source_id,
+                                "status": (
+                                    "completed"
+                                    if evidence.get("validation_status") == "verified"
+                                    else "rejected"
+                                ),
+                                "collector": payload.get("collector"),
+                                "collected_at": payload.get("collected_at"),
+                                "title": payload.get("title"),
+                                "url": payload.get("url"),
+                                "evidence": evidence,
+                            }
+                        )
+                        continue
+                    error_payload = response.json()
+                    error_code = str(error_payload.get("error") or "SCRAPE_FAILED")
+                except Exception:
+                    error_code = "SCRAPE_FAILED"
+                first_error_code = first_error_code or error_code
+                scrapes.append(
+                    {
+                        "source_id": source_id,
+                        "status": "failed",
+                        "error_code": error_code,
+                    }
+                )
+
+        completed = [item for item in scrapes if item.get("status") == "completed"]
+        if not completed:
+            raise CreationToolExecutionError(
+                first_error_code or "EVIDENCE_VALIDATION_FAILED",
+                "实时报表虽可能已刷新，但截图与页面数据未通过一致性校验",
+            )
+        refreshed = await self.retrieve_data_context(query, parsed_requirement, limit=6)
+        evidence_by_source = {
+            int(item["source_id"]): item.get("evidence")
+            for item in completed
+            if item.get("source_id") is not None and isinstance(item.get("evidence"), dict)
+        }
+        for item in refreshed:
+            source_id = item.get("source_id")
+            evidence = evidence_by_source.get(int(source_id)) if source_id is not None else None
+            if evidence:
+                item["creation_evidence"] = evidence
+                item["can_use"] = True
+            elif item.get("source_kind") == "report_url":
+                item["can_use"] = False
+        return {"scrapes": scrapes, "refreshed_data": refreshed}
+
+    async def _validate_scrape_evidence(
+        self,
+        client: httpx.AsyncClient,
+        scrape_payload: dict,
+    ) -> dict:
+        evidence = scrape_payload.get("evidence")
+        if not isinstance(evidence, dict) or not evidence.get("id"):
+            return {"validation_status": "rejected", "reason": "screenshot_missing"}
+
+        image_url = str(evidence.get("image_url") or "")
+        image_response = await client.get(f"{self.core_engine_base_url}{image_url}")
+        if not image_response.is_success:
+            validation = {"reason": "screenshot_unreadable", "verified_claims": []}
+            return await self._persist_evidence_validation(
+                client, evidence, "rejected", validation
+            )
+
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+                handle.write(image_response.content)
+                temp_path = handle.name
+            if self._ocr_engine is None:
+                from ocr.engine import OcrEngine
+
+                self._ocr_engine = OcrEngine.create_default()
+            output = await asyncio.to_thread(self._ocr_engine.process, temp_path)
+            validation = self._compare_scrape_with_ocr(scrape_payload, output.text)
+            validation["ocr_confidence"] = round(float(output.confidence), 4)
+        except Exception as exc:
+            logger.warning("创作证据 OCR 失败: %s", exc)
+            validation = {"reason": "ocr_failed", "verified_claims": []}
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+        status = "verified" if validation.get("verified_claims") else "rejected"
+        return await self._persist_evidence_validation(client, evidence, status, validation)
+
+    async def _persist_evidence_validation(
+        self,
+        client: httpx.AsyncClient,
+        evidence: dict,
+        status: str,
+        validation: dict,
+    ) -> dict:
+        try:
+            response = await client.post(
+                f"{self.core_engine_base_url}/api/creation/evidence/{evidence['id']}/validate",
+                json={"status": status, "validation": validation},
+            )
+            if response.is_success:
+                return response.json()
+        except Exception as exc:
+            logger.warning("保存创作证据校验状态失败: %s", exc)
+        return {**evidence, "validation_status": "rejected", "validation": validation}
+
+    @classmethod
+    def _compare_scrape_with_ocr(cls, scrape_payload: dict, ocr_text: str) -> dict:
+        evidence = scrape_payload.get("evidence") or {}
+        metadata_ok = (
+            str(evidence.get("source_url") or "") == str(scrape_payload.get("url") or "")
+            and str(evidence.get("page_title") or "") == str(scrape_payload.get("title") or "")
+            and int(evidence.get("captured_at") or 0) == int(scrape_payload.get("collected_at") or -1)
+        )
+        if not metadata_ok:
+            return {
+                "reason": "metadata_mismatch",
+                "metadata_match": False,
+                "verified_claims": [],
+            }
+
+        normalized_ocr = cls._normalize_evidence_text(ocr_text)
+        verified_claims: list[dict] = []
+        for claim in cls._scrape_claim_candidates(scrape_payload):
+            if claim.get("claim_type") == "text":
+                statement = str(claim.get("statement") or "")
+                normalized_statement = cls._normalize_evidence_text(statement)
+                tokens = cls._evidence_match_tokens(statement)
+                matched_tokens = [
+                    token
+                    for token in tokens
+                    if cls._normalize_evidence_text(token) in normalized_ocr
+                ]
+                text_match = (
+                    bool(normalized_statement)
+                    and normalized_statement in normalized_ocr
+                ) or (
+                    len(matched_tokens) >= 2
+                    and len(matched_tokens) / max(1, len(tokens)) >= 0.6
+                )
+                if text_match:
+                    verified_claims.append(claim)
+                if len(verified_claims) >= 20:
+                    break
+                continue
+            value = cls._normalize_evidence_text(str(claim.get("value") or ""))
+            labels = cls._evidence_match_tokens(str(claim.get("label") or ""))
+            value_match = bool(value) and value in normalized_ocr
+            label_match = any(
+                cls._normalize_evidence_text(token) in normalized_ocr for token in labels
+            )
+            if value_match and label_match:
+                verified_claims.append(claim)
+            if len(verified_claims) >= 20:
+                break
+        return {
+            "reason": "matched" if verified_claims else "dom_ocr_mismatch",
+            "metadata_match": True,
+            "verified_claims": verified_claims,
+        }
+
+    @classmethod
+    def _scrape_claim_candidates(cls, scrape_payload: dict) -> list[dict]:
+        structured = scrape_payload.get("structured_data") or {}
+        candidates: list[dict] = []
+        tables = structured.get("tables", []) if isinstance(structured, dict) else []
+        if (
+            isinstance(tables, list)
+            and tables
+            and all(isinstance(row, list) for row in tables)
+            and all(not isinstance(cell, list) for cell in tables[0])
+        ):
+            tables = [tables]
+        for table in tables:
+            if not isinstance(table, list):
+                continue
+            for row in table:
+                if not isinstance(row, list):
+                    continue
+                cells = [str(cell).strip() for cell in row if str(cell).strip()]
+                row_text = " ".join(cells)
+                values = re.findall(r"(?<!\w)[+-]?\d[\d,]*(?:\.\d+)?%?", row_text)
+                label = " ".join(cell for cell in cells if not re.fullmatch(r"[+-]?[\d,.]+%?", cell))
+                for value in values:
+                    candidates.append({"label": label[:240], "value": value, "statement": row_text[:500]})
+        labels = structured.get("metric_labels", []) if isinstance(structured, dict) else []
+        for item in labels if isinstance(labels, list) else []:
+            text = str(item).strip()
+            for value in re.findall(r"(?<!\w)[+-]?\d[\d,]*(?:\.\d+)?%?", text):
+                label = text.replace(value, " ").strip(" :-—")
+                candidates.append({"label": label[:240], "value": value, "statement": text[:500]})
+        text_blocks = structured.get("text_blocks", []) if isinstance(structured, dict) else []
+        for item in text_blocks if isinstance(text_blocks, list) else []:
+            text = " ".join(str(item).split()).strip()
+            if not 8 <= len(text) <= 240 or re.search(r"\d", text):
+                continue
+            tokens = cls._evidence_match_tokens(text)
+            if len(tokens) < 2:
+                continue
+            candidates.append(
+                {
+                    "claim_type": "text",
+                    "label": " ".join(tokens[:4])[:120],
+                    "value": "",
+                    "statement": text,
+                }
+            )
+        if not candidates:
+            for line in str(scrape_payload.get("content_text") or "").splitlines()[:500]:
+                values = re.findall(r"(?<!\w)[+-]?\d[\d,]*(?:\.\d+)?%?", line)
+                if values:
+                    for value in values[:4]:
+                        candidates.append({"label": line.replace(value, " ")[:240], "value": value, "statement": line[:500]})
+        return candidates[:500]
+
+    @staticmethod
+    def _normalize_evidence_text(value: str) -> str:
+        return re.sub(r"[\s,，:：;；|｜]", "", value).lower()
+
+    @staticmethod
+    def _evidence_match_tokens(value: str) -> list[str]:
+        tokens: list[str] = []
+        for english in re.findall(r"[a-zA-Z]{2,}", value):
+            lowered = english.lower()
+            if lowered not in tokens:
+                tokens.append(lowered)
+        for sequence in re.findall(r"[\u4e00-\u9fff]{2,}", value):
+            chars = list(sequence)
+            for index in range(max(1, len(chars) - 1)):
+                token = "".join(chars[index : index + 2])
+                if len(token) == 2 and token not in tokens:
+                    tokens.append(token)
+        return tokens[:24]
 
     async def generate_document(
         self,
@@ -707,7 +1040,7 @@ Skill 命名与简介原则：
 - skill_description 是给创作 Agent 做触发判断的能力说明，不是宣传文案。必须明确能创作哪些文档、解决哪些问题、涉及哪些领域以及交付什么。
 - execution_steps 描述如何从需求走到成稿。按真实先后顺序给出三至八步，并为每一步明确目标、产出，以及可调用的 Agent、Skill、Tool；没有必要的资源数组留空，不得为了显得智能而堆满能力。
 - 每一步的 Agent 与 Tool 合计最多四个；只列这一步真正需要的能力。同一能力可以在不同步骤重复出现，例如先调研、后复核。
-- Agent 只能从 industry_research_agent、data_analysis_agent、solution_design_agent、document_writer_agent、quality_review_agent 中选择；Tool 只能从 memory_search、internet_search、github_search、plantuml_diagram 中选择。Skill 使用可复用技能名称或稳定标识，没有依赖时留空。
+- Agent 只能从 industry_research_agent、data_analysis_agent、solution_design_agent、document_writer_agent、quality_review_agent 中选择；Tool 只能从 memory_search、internet_search、data_search、webpage_scrape、github_search、plantuml_diagram 中选择。Skill 使用可复用技能名称或稳定标识，没有依赖时留空。
 
 隐私与通用化原则：
 - 禁止出现真实或可推断的公司、事业群、事业部、部门、团队、项目、产品、系统、客户、人员、地域、日期、指标和金额。
@@ -1061,6 +1394,8 @@ JSON 类型硬约束：
         allowed_tools = {
             "memory_search",
             "internet_search",
+            "data_search",
+            "webpage_scrape",
             "github_search",
             "plantuml_diagram",
         }
@@ -1581,7 +1916,7 @@ JSON 类型硬约束：
                     "output": "数据判断、口径说明和证据缺口",
                     "agents": ["data_analysis_agent"],
                     "skills": [],
-                    "tools": [],
+                    "tools": ["data_search", "webpage_scrape"],
                 }
             )
         if re.search(r"方案|架构|设计|规划|建设|实施", evidence, re.I):

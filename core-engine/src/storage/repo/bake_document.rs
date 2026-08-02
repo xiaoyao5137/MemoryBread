@@ -2,6 +2,7 @@ use rusqlite::{params, Connection};
 
 use crate::storage::{
     db::current_ts_ms,
+    document_identity::{canonical_document_identity, canonical_document_title_identity},
     error::StorageError,
     models_bake::{BakeDocumentRecord, NewBakeDocument},
     StorageManager,
@@ -149,6 +150,116 @@ impl StorageManager {
         })
     }
 
+    pub fn find_bake_document_by_source_title(
+        &self,
+        source_title: &str,
+    ) -> Result<Option<BakeDocumentRecord>, StorageError> {
+        let Some(source_identity) = canonical_document_title_identity(source_title) else {
+            return Ok(None);
+        };
+        let document_id = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, source_win_title
+                 FROM bake_documents
+                 WHERE deleted_at IS NULL
+                   AND trim(coalesce(source_win_title, '')) <> ''
+                 ORDER BY updated_at DESC, id DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (id, source_win_title) = row?;
+                if source_win_title
+                    .as_deref()
+                    .and_then(canonical_document_title_identity)
+                    .as_deref()
+                    == Some(source_identity.as_str())
+                {
+                    return Ok(Some(id));
+                }
+            }
+            Ok(None)
+        })?;
+        document_id.map_or(Ok(None), |id| self.get_bake_document(id))
+    }
+
+    pub fn find_document_by_source_url(
+        &self,
+        url: &str,
+    ) -> Result<Option<BakeDocumentRecord>, StorageError> {
+        let Some(identity) = canonical_document_identity(url) else {
+            return Ok(None);
+        };
+        let document_id = self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, source_url, document_identity
+                 FROM bake_documents
+                 WHERE deleted_at IS NULL
+                   AND (document_identity = ?1 OR document_identity IS NULL)
+                   AND source_url IS NOT NULL
+                 ORDER BY CASE WHEN document_identity = ?1 THEN 0 ELSE 1 END,
+                          updated_at DESC,
+                          id DESC",
+            )?;
+            let rows = stmt.query_map(params![identity], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, source_url, stored_identity) = row?;
+                let matches = stored_identity.as_deref() == Some(identity.as_str())
+                    || canonical_document_identity(&source_url).as_deref()
+                        == Some(identity.as_str());
+                if matches {
+                    return Ok(Some(id));
+                }
+            }
+            Ok(None)
+        })?;
+        document_id.map_or(Ok(None), |id| self.get_bake_document(id))
+    }
+
+    pub fn has_bake_document_source_fingerprint(
+        &self,
+        document_id: i64,
+        fingerprint: &str,
+    ) -> Result<bool, StorageError> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM bake_document_source_fingerprints
+                    WHERE document_id = ?1 AND fingerprint = ?2
+                 )",
+                params![document_id, fingerprint],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::Sqlite)
+        })
+    }
+
+    pub fn record_bake_document_source_fingerprint(
+        &self,
+        document_id: i64,
+        fingerprint: &str,
+        source_timeline_id: i64,
+    ) -> Result<bool, StorageError> {
+        let created_at = current_ts_ms();
+        self.with_conn(|conn| {
+            let affected = conn.execute(
+                "INSERT OR IGNORE INTO bake_document_source_fingerprints (
+                    document_id, fingerprint, source_timeline_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![document_id, fingerprint, source_timeline_id, created_at],
+            )?;
+            Ok(affected > 0)
+        })
+    }
+
     pub fn update_bake_document(
         &self,
         id: i64,
@@ -165,11 +276,11 @@ impl StorageManager {
                      summary = ?13, full_content = ?14, structured_content = ?15,
                      prompt_hint = ?16, diagram_code = ?17, image_assets = ?18,
                      source_app_name = ?19, source_win_title = ?20, source_url = ?21,
-                     content_hash = ?22, language = ?23,
-                     usage_count = ?24, match_score = ?25, match_level = ?26,
-                     creation_mode = ?27, review_status = ?28, evidence_summary = ?29,
-                     generation_version = ?30, deleted_at = ?31, updated_at = ?32
-                 WHERE id = ?33",
+                     document_identity = ?22, content_hash = ?23, language = ?24,
+                     usage_count = ?25, match_score = ?26, match_level = ?27,
+                     creation_mode = ?28, review_status = ?29, evidence_summary = ?30,
+                     generation_version = ?31, deleted_at = ?32, updated_at = ?33
+                 WHERE id = ?34",
                 params![
                     doc.title,
                     doc.doc_type,
@@ -192,6 +303,9 @@ impl StorageManager {
                     doc.source_app_name,
                     doc.source_win_title,
                     doc.source_url,
+                    doc.source_url
+                        .as_deref()
+                        .and_then(canonical_document_identity),
                     doc.content_hash,
                     doc.language,
                     doc.usage_count,
@@ -261,10 +375,11 @@ fn insert_bake_document_inner(
             summary, full_content, structured_content, prompt_hint,
             diagram_code, image_assets,
             source_app_name, source_win_title, source_url, content_hash, language,
+            document_identity,
             usage_count, match_score, match_level, creation_mode, review_status,
             evidence_summary, generation_version, deleted_at, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
+                   ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)",
         params![
             doc.title,
             doc.doc_type,
@@ -289,6 +404,9 @@ fn insert_bake_document_inner(
             doc.source_url,
             doc.content_hash,
             doc.language,
+            doc.source_url
+                .as_deref()
+                .and_then(canonical_document_identity),
             doc.usage_count,
             doc.match_score,
             doc.match_level,
@@ -411,6 +529,88 @@ mod tests {
         assert_eq!(doc.title, "周报模板");
         assert_eq!(doc.status, "enabled");
         assert_eq!(doc.review_status, "accepted");
+    }
+
+    #[test]
+    fn test_find_bake_document_by_source_title() {
+        let mgr = make_mgr();
+        let mut document = sample_document();
+        document.source_win_title = Some("商业体系-AI建设资产复用方案 - 云文档".to_string());
+        let id = mgr.insert_bake_document(&document).unwrap();
+
+        let found = mgr
+            .find_bake_document_by_source_title("商业体系-AI 建设资产复用方案（云文档）")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.id, id);
+        assert!(mgr
+            .find_bake_document_by_source_title("另一份方案.docx")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_source_title_lookup_does_not_trust_generated_title_without_source_evidence() {
+        let mgr = make_mgr();
+        let mut document = sample_document();
+        document.title = "商业体系-AI建设资产复用方案".to_string();
+        document.source_app_name = Some("Kim".to_string());
+        document.source_win_title = None;
+        mgr.insert_bake_document(&document).unwrap();
+
+        assert!(mgr
+            .find_bake_document_by_source_title("商业体系-AI 建设资产复用方案")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_find_document_by_source_url_ignores_query_fragment_and_scheme() {
+        let mgr = make_mgr();
+        let mut document = sample_document();
+        document.source_url =
+            Some("https://Docs.Corp.Example/d/home/ABC123?section=one#comment".to_string());
+        let id = mgr.insert_bake_document(&document).unwrap();
+
+        let found = mgr
+            .find_document_by_source_url("http://docs.corp.example/d/home/abc123?section=two")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.id, id);
+    }
+
+    #[test]
+    fn test_active_document_identity_is_unique() {
+        let mgr = make_mgr();
+        let mut first = sample_document();
+        first.source_url = Some("https://docs.corp.example/d/home/abc123?section=one".to_string());
+        mgr.insert_bake_document(&first).unwrap();
+
+        let mut duplicate = sample_document();
+        duplicate.source_url =
+            Some("https://docs.corp.example/d/home/ABC123#section=two".to_string());
+        assert!(mgr.insert_bake_document(&duplicate).is_err());
+    }
+
+    #[test]
+    fn test_document_source_fingerprint_is_idempotent() {
+        let mgr = make_mgr();
+        let id = mgr.insert_bake_document(&sample_document()).unwrap();
+
+        assert!(!mgr
+            .has_bake_document_source_fingerprint(id, "sha256:abc")
+            .unwrap());
+        assert!(mgr
+            .record_bake_document_source_fingerprint(id, "sha256:abc", 42)
+            .unwrap());
+        assert!(!mgr
+            .record_bake_document_source_fingerprint(id, "sha256:abc", 43)
+            .unwrap());
+        assert!(mgr
+            .has_bake_document_source_fingerprint(id, "sha256:abc")
+            .unwrap());
     }
 
     #[test]

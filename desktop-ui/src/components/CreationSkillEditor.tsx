@@ -194,7 +194,7 @@ const fallbackNotice = (analysis: CreationSkillAnalysis) => {
     case 'invalid_service_response':
       return '本地分析结果格式不完整；已自动生成完整规则草稿并分析类目，请检查后保存。'
     case 'analysis_request_failed':
-      return '本地分析请求未完成；已自动生成完整规则草稿并分析类目，请检查本地服务后保存。'
+      return '本地分析请求重试后仍未完成；已自动生成完整规则草稿并分析类目，请检查本地服务后保存。'
     default:
       return '本地模型分析未完成；已自动生成完整规则草稿并分析类目，请检查后保存。'
   }

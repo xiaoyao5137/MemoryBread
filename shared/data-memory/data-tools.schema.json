@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memorybread.local/contracts/data-tools.v1.schema.json",
+  "title": "MemoryBread Data Tools v1",
+  "type": "object",
+  "$defs": {
+    "tool_id": {
+      "type": "string",
+      "enum": ["data_search", "webpage_scrape"]
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": ["report_url", "work_memory"]
+    },
+    "freshness_class": {
+      "type": "string",
+      "enum": ["live", "fresh", "aging", "stale", "missing"]
+    },
+    "creation_evidence": {
+      "type": "object",
+      "required": [
+        "id",
+        "run_id",
+        "session_id",
+        "source_url",
+        "page_title",
+        "captured_at",
+        "image_url",
+        "mime_type",
+        "width",
+        "height",
+        "content_hash",
+        "screenshot_source",
+        "validation_status"
+      ],
+      "properties": {
+        "id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "session_id": {"type": "string"},
+        "history_id": {"type": ["integer", "null"]},
+        "source_id": {"type": ["integer", "null"]},
+        "data_snapshot_id": {"type": ["integer", "null"]},
+        "source_url": {"type": "string"},
+        "page_title": {"type": "string"},
+        "captured_at": {"type": "integer", "minimum": 0},
+        "image_url": {"type": "string"},
+        "mime_type": {"const": "image/jpeg"},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "content_hash": {"type": "string"},
+        "screenshot_source": {"const": "browser_window"},
+        "validation_status": {"type": "string", "enum": ["pending", "verified", "rejected"]},
+        "validation": {"type": "object"}
+      }
+    },
+    "data_search_request": {
+      "type": "object",
+      "required": ["query"],
+      "properties": {
+        "query": {"type": "string", "minLength": 1, "maxLength": 12000},
+        "need_fresh": {"type": "boolean", "default": false},
+        "as_of_ms": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 6}
+      },
+      "additionalProperties": false
+    },
+    "data_result": {
+      "type": "object",
+      "required": [
+        "source_id",
+        "title",
+        "source_kind",
+        "freshness_class",
+        "freshness_score",
+        "relevance_score",
+        "final_score",
+        "refresh_required",
+        "can_use"
+      ],
+      "properties": {
+        "source_id": {"type": "integer", "minimum": 1},
+        "title": {"type": "string"},
+        "source_kind": {"$ref": "#/$defs/source_kind"},
+        "source_url": {"type": ["string", "null"]},
+        "observed_at": {"type": ["integer", "null"]},
+        "collected_at": {"type": ["integer", "null"]},
+        "freshness_class": {"$ref": "#/$defs/freshness_class"},
+        "freshness_score": {"type": "number", "minimum": 0, "maximum": 1},
+        "relevance_score": {"type": "number", "minimum": 0, "maximum": 1},
+        "final_score": {"type": "number", "minimum": 0, "maximum": 1},
+        "refresh_required": {"type": "boolean"},
+        "can_use": {"type": "boolean"},
+        "content_excerpt": {"type": ["string", "null"]},
+        "structured_data": {"type": ["object", "array", "null"]},
+        "provenance": {"type": ["object", "null"]}
+      }
+    },
+    "data_search_response": {
+      "type": "object",
+      "required": ["schema_version", "query", "results"],
+      "properties": {
+        "schema_version": {"const": "memorybread.data-search.v1"},
+        "query": {"type": "string"},
+        "results": {"type": "array", "items": {"$ref": "#/$defs/data_result"}}
+      }
+    },
+    "webpage_scrape_request": {
+      "type": "object",
+      "required": ["source_id"],
+      "properties": {
+        "source_id": {"type": "integer", "minimum": 1},
+        "mode": {"type": "string", "enum": ["auto", "browser", "http"], "default": "auto"},
+        "browser_preference": {
+          "type": "string",
+          "enum": ["auto", "chrome", "chrome_canary", "edge", "brave", "chromium", "vivaldi", "safari"],
+          "default": "auto"
+        },
+        "capture_evidence": {"type": "boolean", "default": false},
+        "run_id": {"type": ["string", "null"]},
+        "session_id": {"type": ["string", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "webpage_scrape_response": {
+      "type": "object",
+      "required": ["schema_version", "source_id", "collector", "collected_at", "content_text"],
+      "properties": {
+        "schema_version": {"const": "memorybread.webpage-scrape.v1"},
+        "source_id": {"type": "integer", "minimum": 1},
+        "collector": {"type": "string", "enum": ["browser_attach", "chrome_attach", "direct_http"]},
+        "browser": {
+          "type": ["string", "null"],
+          "enum": ["chrome", "chrome_canary", "edge", "brave", "chromium", "vivaldi", "safari", null]
+        },
+        "interaction_mode": {"type": "string", "enum": ["background_tab", "temporary_foreground_tab", "none"]},
+        "collected_at": {"type": "integer", "minimum": 0},
+        "title": {"type": "string"},
+        "url": {"type": "string"},
+        "content_text": {"type": "string"},
+        "structured_data": {"type": ["object", "array", "null"]},
+        "content_hash": {"type": "string"},
+        "evidence": {
+          "anyOf": [
+            {"$ref": "#/$defs/creation_evidence"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "creation_evidence_validation_request": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"type": "string", "enum": ["verified", "rejected"]},
+        "validation": {"type": "object"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

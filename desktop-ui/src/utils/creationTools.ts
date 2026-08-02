@@ -3,6 +3,8 @@ export const CREATION_TOOLS_STORAGE_KEY = 'memory-bread_creation_tools_v1'
 export const REQUIRED_CREATION_TOOL_IDS = [
   'internet_search',
   'memory_search',
+  'data_search',
+  'webpage_scrape',
 ] as const
 
 export const OPTIONAL_CREATION_TOOL_IDS = [
@@ -43,6 +45,22 @@ export const CREATION_TOOL_DEFINITIONS: readonly CreationToolDefinition[] = [
     name: '记忆搜索 Tool',
     summary: '检索本机记忆、知识和历史文档，让创作延续你的真实上下文。',
     capability: '本地执行 · 原始记忆不上传',
+    required: true,
+    official: true,
+  },
+  {
+    id: 'data_search',
+    name: '数据检索 Tool',
+    summary: '从本机数据模块召回报表来源与工作数据快照，并按采集时间判断可用性。',
+    capability: '本地检索 · 返回时效与来源证据',
+    required: true,
+    official: true,
+  },
+  {
+    id: 'webpage_scrape',
+    name: '网页爬取 Tool',
+    summary: '按需刷新报表网页；优先复用现有 Chrome 登录会话，不保存浏览器 Cookie。',
+    capability: 'Chrome 会话优先 · HTTP 降级',
     required: true,
     official: true,
   },

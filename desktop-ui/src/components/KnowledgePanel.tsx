@@ -8,6 +8,7 @@
 import React, { useCallback, useState, useEffect, useMemo } from 'react'
 
 import { useAppStore } from '../store/useAppStore'
+import { useImeCompositionGuard } from '../hooks/useImeCompositionGuard'
 import { toUserFacingError } from '../utils/userFacingError'
 
 interface KnowledgeEntry {
@@ -41,6 +42,7 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
   const [searchQuery, setSearchQuery] = useState('')
   const [extracting, setExtracting] = useState(false)
   const [extractMessage, setExtractMessage] = useState<string | null>(null)
+  const searchImeGuard = useImeCompositionGuard<HTMLInputElement>()
 
   // 加载知识条目
   const loadEntries = useCallback(async () => {
@@ -255,7 +257,15 @@ const KnowledgePanel: React.FC<KnowledgePanelProps> = ({ className = '' }) => {
             placeholder="搜索知识..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+            onCompositionStart={searchImeGuard.onCompositionStart}
+            onCompositionEnd={searchImeGuard.onCompositionEnd}
+            onBlur={searchImeGuard.onBlur}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !searchImeGuard.isImeEvent(e)) {
+                e.preventDefault()
+                void handleSearch()
+              }
+            }}
             className="search-input"
           />
           <button onClick={handleSearch} className="search-btn" aria-label="搜索知识">

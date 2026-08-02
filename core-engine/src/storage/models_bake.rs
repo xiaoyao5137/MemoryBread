@@ -281,6 +281,7 @@ pub struct BakeActivityRecord {
 pub struct BakeOverviewRecord {
     pub capture_count: i64,
     pub memory_count: i64,
+    pub data_count: i64,
     pub knowledge_count: i64,
     pub template_count: i64,
     pub sop_count: i64,
@@ -302,6 +303,7 @@ impl BakeOverviewRecord {
         Self {
             capture_count: 0,
             memory_count: 0,
+            data_count: 0,
             knowledge_count: 0,
             template_count: 0,
             sop_count: 0,

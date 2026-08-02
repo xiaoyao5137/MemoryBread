@@ -6,7 +6,7 @@
 .account-profile {
   width: 100%;
   min-height: 100%;
-  background: #f7f5f2;
+  background: #F5F5F7;
   color: #322b27;
   overflow-x: hidden;
 }
@@ -58,7 +58,7 @@
   z-index: 2;
   width: 25px;
   height: 25px;
-  border: 3px solid #f7f5f2;
+  border: 3px solid #F5F5F7;
   border-radius: 9px;
   background: var(--mark-accent);
   color: #fffaf5;
@@ -206,7 +206,7 @@
   padding: clamp(24px, 2.5vw, 36px);
   border: 1px solid #e4dfda;
   border-radius: 18px;
-  background: #fcfbf9;
+  background: #FFFFFF;
   display: flex;
   flex-direction: column;
   box-shadow: 0 16px 40px rgb(89 62 44 / 6%);

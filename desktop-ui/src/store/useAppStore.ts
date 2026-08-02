@@ -415,7 +415,6 @@ const loadAuthSession = (environment: ServiceEnvironment): AuthSession | null =>
 export function normalizeCreationModels(models: CreationModelConfig[]): CreationModelConfig[] {
   const aliases: Record<string, string> = {
     'claude-opus-4-8': 'mbcd-plus-v1',
-    'qwen-3-5-4b': 'mbcd-std-v1',
   }
   const byId = new Map<string, CreationModelConfig>()
   for (const model of models) {

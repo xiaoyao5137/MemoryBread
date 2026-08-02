@@ -10,25 +10,31 @@ import hashlib
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any, AsyncIterator, Optional
 from uuid import uuid4
 
 from .service import CreationOptions, CreationService, ReferenceDocument
 from .tools import (
+    CreationToolExecutionError,
+    DATA_SEARCH_TOOL_ID,
     GITHUB_SEARCH_TOOL_ID,
     INTERNET_SEARCH_TOOL_ID,
     MEMORY_SEARCH_TOOL_ID,
     PLANTUML_DIAGRAM_TOOL_ID,
+    WEBPAGE_SCRAPE_TOOL_ID,
     build_plantuml_context,
     normalize_creation_tool_ids,
     should_use_github_search,
     should_use_internet_search,
+    should_use_data_tools,
     should_use_plantuml,
 )
 
 SCHEMA_VERSION = "creation.agent.v1"
 MAX_LOOP_STEPS = 64
+MAX_QUALITY_CYCLES = 3
 MAX_SKILL_STEP_RESOURCES = 4
 KNOWN_SECTION_TITLES = (
     "行业调研",
@@ -70,6 +76,47 @@ SECTION_ORDER_RULES = (
     (80, ("风险", "安全", "合规")),
     (90, ("验证", "验收", "评估")),
     (100, ("参考", "核验", "补充清单", "结语", "总结")),
+)
+
+QUALITY_AGENT_ORDER = (
+    "document_writer_agent",
+    "detail_polish_agent",
+    "table_polish_agent",
+    "image_polish_agent",
+    "anti_ai_style_agent",
+    "typography_polish_agent",
+)
+QUALITY_SKILL_CAPABILITY_FIELDS = {
+    "skill:voice_style": ("voice_style", "guidelines"),
+    "skill:structure": ("structure", "skill_description", "field_examples"),
+    "skill:table_style": ("writing_design", "field_examples"),
+    "skill:typography_style": ("title_design_style", "voice_style"),
+    "skill:image_style": ("image_generation",),
+}
+AI_STYLE_BOILERPLATE = (
+    "在当今",
+    "随着时代的发展",
+    "在这个快速发展的时代",
+    "值得注意的是",
+    "不难发现",
+    "不可否认",
+    "毋庸置疑",
+    "综上所述",
+    "总而言之",
+    "由此可见",
+    "这不仅",
+    "更是",
+    "赋能",
+)
+AI_STYLE_TRANSITIONS = (
+    "首先",
+    "其次",
+    "再次",
+    "此外",
+    "同时",
+    "最后",
+    "一方面",
+    "另一方面",
 )
 
 
@@ -152,6 +199,7 @@ class LoopState:
     sequence: int = 0
     pending_model_step: Optional[dict[str, Any]] = None
     writer_revisions: int = 0
+    quality_cycles: int = 0
 
     def serializable(self) -> dict[str, Any]:
         value = asdict(self)
@@ -162,6 +210,7 @@ class LoopState:
     def restore(cls, value: dict[str, Any]) -> "LoopState":
         data = dict(value)
         data.setdefault("root_request", data.get("user_message", ""))
+        data.setdefault("quality_cycles", 0)
         data["goal"] = GoalState(**data["goal"])
         return cls(**data)
 
@@ -202,8 +251,16 @@ class CreationAgentLoop:
                     status="failed",
                 )
                 return
+            completed_model_step = dict(state.pending_model_step.get("step") or {})
             async for event in self._apply_model_result(state, model_result):
                 yield event
+            decision = self._replan_after_feedback(
+                state,
+                completed_model_step,
+                status="completed",
+            )
+            if decision:
+                yield self._harness_decision_event(state, decision)
         else:
             state = self._new_state(
                 user_message=user_message,
@@ -271,6 +328,8 @@ class CreationAgentLoop:
             step = state.plan[state.cursor]
             state.cursor += 1
             state.goal.remaining_steps = [item["name"] for item in state.plan[state.cursor:]]
+            step_status = "completed"
+            error_code: str | None = None
             try:
                 async for event in self._execute_step(
                     state,
@@ -280,15 +339,20 @@ class CreationAgentLoop:
                     creation_base_url=creation_base_url,
                 ):
                     yield event
-            except Exception:
+            except Exception as exc:
                 if step.get("kind") != "tool":
                     raise
                 tool_id = str(step.get("id") or "")
+                error_code = (
+                    exc.error_code
+                    if isinstance(exc, CreationToolExecutionError)
+                    else "TOOL_EXECUTION_FAILED"
+                )
                 state.environment.setdefault("tool_results", []).append(
                     {
                         "tool_id": tool_id,
                         "status": "failed",
-                        "error_code": "TOOL_EXECUTION_FAILED",
+                        "error_code": error_code,
                     }
                 )
                 self._update_goal(state)
@@ -302,8 +366,18 @@ class CreationAgentLoop:
                         tool_id,
                         str(step.get("name") or "Tool"),
                     ),
-                    data={"error_code": "TOOL_EXECUTION_FAILED"},
+                    data={"error_code": error_code},
                 )
+                step_status = "failed"
+            if not state.pending_model_step:
+                decision = self._replan_after_feedback(
+                    state,
+                    step,
+                    status=step_status,
+                    error_code=error_code,
+                )
+                if decision:
+                    yield self._harness_decision_event(state, decision)
             if state.pending_model_step:
                 yield self._event(
                     state,
@@ -332,6 +406,25 @@ class CreationAgentLoop:
             for item in state.environment.get("quality_soft_warnings", [])
         ]
         quality_warnings = [*hard_failures, *soft_warnings]
+        document, applied_evidence = self._apply_creation_evidence_cards(
+            str(state.environment.get("document") or state.current_document),
+            [
+                item
+                for item in state.environment.get("creation_evidence", [])
+                if isinstance(item, dict)
+            ],
+        )
+        if applied_evidence:
+            state.environment["document"] = document
+            state.current_document = document
+            state.environment["creation_evidence"] = applied_evidence
+            yield self._event(
+                state,
+                "document.evidence.applied",
+                f"已把 {len(applied_evidence)} 张校验通过的即时截图放到对应数据引用下方",
+                status="completed",
+                data={"content": document, "evidence": applied_evidence},
+            )
         state.goal.status = "complete"
         state.goal.remaining_steps = []
         state.goal.outcome = (
@@ -360,6 +453,7 @@ class CreationAgentLoop:
                 "tools": state.environment.get("tool_results", []),
                 "edit_intent": state.environment.get("edit_intent", {}),
                 "document_patch": state.environment.get("last_document_patch"),
+                "evidence": state.environment.get("creation_evidence", []),
                 "goal": asdict(state.goal),
             },
         )
@@ -596,6 +690,7 @@ class CreationAgentLoop:
             INTERNET_SEARCH_TOOL_ID in enabled_tools
             and should_use_internet_search(text, requirement)
         )
+        use_data_tools = should_use_data_tools(text, requirement)
         plan: list[dict[str, Any]] = [
             {
                 "kind": "agent",
@@ -657,12 +752,380 @@ class CreationAgentLoop:
             ):
                 plan.append(self._agent_plan_step("solution_design_agent"))
 
+        if use_data_tools:
+            # 数据检索与记忆/互联网检索同属证据探针。网页刷新和数据分析是
+            # 依赖反馈的动作，不在初始计划中预置固定流水线。
+            normalized_plan: list[dict[str, Any]] = []
+            data_search_step: dict[str, Any] | None = None
+            for item in plan:
+                step_id = str(item.get("id") or "")
+                if step_id in {WEBPAGE_SCRAPE_TOOL_ID, "data_analysis_agent"}:
+                    continue
+                if step_id == DATA_SEARCH_TOOL_ID:
+                    if data_search_step is None:
+                        data_search_step = item
+                    continue
+                normalized_plan.append(item)
+            plan = normalized_plan
+            insert_at = 1
+            while (
+                insert_at < len(plan)
+                and plan[insert_at].get("kind") == "skill"
+                and plan[insert_at].get("action") == "apply_skill"
+            ):
+                insert_at += 1
+            memory_positions = [
+                index
+                for index, item in enumerate(plan)
+                if str(item.get("id") or "") == MEMORY_SEARCH_TOOL_ID
+            ]
+            if memory_positions:
+                insert_at = memory_positions[0] + 1
+            plan.insert(
+                insert_at,
+                data_search_step or self._tool_plan_step(DATA_SEARCH_TOOL_ID),
+            )
+
         scheduled_actions = {str(item.get("id")) for item in plan}
         if "document_writer_agent" not in scheduled_actions:
             plan.append(self._agent_plan_step("document_writer_agent"))
+        if state.mode == "initial":
+            # 章节设计是初稿的显式前置产物。即使 Skill 自带 Writer 步骤，
+            # Harness 也会把统一的章节设计 Agent 放到首个 Writer 之前。
+            plan = [
+                item
+                for item in plan
+                if str(item.get("id") or "") != "chapter_design_agent"
+            ]
+            writer_index = next(
+                index
+                for index, item in enumerate(plan)
+                if str(item.get("id") or "") == "document_writer_agent"
+            )
+            plan.insert(
+                writer_index,
+                self._agent_plan_step("chapter_design_agent"),
+            )
+        scheduled_actions = {str(item.get("id")) for item in plan}
         if "quality_review_agent" not in scheduled_actions:
             plan.append(self._agent_plan_step("quality_review_agent"))
         return plan
+
+    def _replan_after_feedback(
+        self,
+        state: LoopState,
+        step: dict[str, Any],
+        *,
+        status: str,
+        error_code: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Harness 只依据可观察 Tool 反馈追加下一步，不预演固定链路。"""
+        step_id = str(step.get("id") or "")
+        step_key = self._step_schedule_key(step)
+        completed_ids = state.environment.setdefault("harness_completed_step_ids", [])
+        if status == "completed" and step_key and step_key not in completed_ids:
+            completed_ids.append(step_key)
+        if step_id == "quality_review_agent":
+            return self._replan_quality_issues(state, status=status)
+        if step_id not in {DATA_SEARCH_TOOL_ID, WEBPAGE_SCRAPE_TOOL_ID}:
+            return None
+
+        results = [
+            item
+            for item in state.environment.get("data_results", [])
+            if isinstance(item, dict)
+        ]
+        refreshable_count = sum(
+            1
+            for item in results
+            if item.get("source_kind") == "report_url"
+            and item.get("source_url")
+        )
+        analyzable_count = sum(1 for item in results if self._has_analyzable_data(item))
+        scheduled_steps: list[dict[str, Any]] = []
+        reason_code: str
+
+        if step_id == DATA_SEARCH_TOOL_ID:
+            if status != "completed":
+                reason_code = "data_search_failed"
+            elif refreshable_count > 0:
+                scheduled_steps.append(self._tool_plan_step(WEBPAGE_SCRAPE_TOOL_ID))
+                reason_code = "refresh_required"
+            elif analyzable_count > 0:
+                scheduled_steps.append(self._agent_plan_step("data_analysis_agent"))
+                reason_code = "snapshot_ready"
+            elif results:
+                reason_code = "source_metadata_only"
+            else:
+                reason_code = "no_matching_data"
+        elif analyzable_count > 0:
+            scheduled_steps.append(self._agent_plan_step("data_analysis_agent"))
+            reason_code = (
+                "refresh_failed_stale_snapshot_available"
+                if status != "completed"
+                else "refresh_feedback_ready"
+            )
+        else:
+            reason_code = (
+                "refresh_failed_without_snapshot"
+                if status != "completed"
+                else "refresh_returned_no_analyzable_data"
+            )
+
+        inserted = self._insert_harness_steps(state, scheduled_steps)
+        decision = {
+            "trigger": step_id,
+            "trigger_status": status,
+            "reason_code": reason_code,
+            "result_count": len(results),
+            "refreshable_count": refreshable_count,
+            "analyzable_count": analyzable_count,
+            "scheduled": [item["id"] for item in inserted],
+            "error_code": error_code,
+        }
+        state.environment.setdefault("harness_decisions", []).append(decision)
+        self._update_goal(state)
+        return decision
+
+    def _replan_quality_issues(
+        self,
+        state: LoopState,
+        *,
+        status: str,
+    ) -> dict[str, Any]:
+        issues = [
+            item
+            for item in state.environment.get("quality_issues", [])
+            if isinstance(item, dict)
+        ]
+        if status != "completed":
+            reason_code = "quality_review_failed"
+            candidates: list[dict[str, Any] | None] = []
+        elif not issues:
+            reason_code = "quality_gate_passed"
+            candidates = []
+        elif state.quality_cycles >= MAX_QUALITY_CYCLES:
+            reason_code = "quality_cycle_budget_exhausted"
+            candidates = []
+        else:
+            state.quality_cycles += 1
+            cycle = state.quality_cycles
+            state.environment["quality_cycle"] = cycle
+            candidates = []
+            reason_code = "quality_issues_detected"
+            hard_issues = [item for item in issues if item.get("severity") == "hard"]
+            if hard_issues:
+                if state.writer_revisions < 1:
+                    state.writer_revisions += 1
+                    candidates.append(
+                        self._quality_cycle_step("document_writer_agent", cycle)
+                    )
+                else:
+                    reason_code = "hard_failure_retry_exhausted"
+            else:
+                enabled_tools = set(
+                    normalize_creation_tool_ids(state.options.get("enabled_tools"))
+                )
+                requested_agents = {
+                    str(item.get("agent_id") or "") for item in issues
+                }
+                required_capabilities = {
+                    str(capability)
+                    for item in issues
+                    for capability in item.get("required_capabilities", [])
+                    if str(capability)
+                }
+                if (
+                    DATA_SEARCH_TOOL_ID in required_capabilities
+                    and not state.environment.get("data_results")
+                ):
+                    candidates.append(self._tool_plan_step(DATA_SEARCH_TOOL_ID))
+                if (
+                    "data_analysis_agent" in required_capabilities
+                    and not state.environment.get("data_analysis")
+                    and state.environment.get("data_results")
+                ):
+                    candidates.append(
+                        self._quality_cycle_step("data_analysis_agent", cycle)
+                    )
+                if (
+                    PLANTUML_DIAGRAM_TOOL_ID in required_capabilities
+                    and PLANTUML_DIAGRAM_TOOL_ID in enabled_tools
+                    and not state.environment.get("plantuml_diagram")
+                ):
+                    candidates.append(self._tool_plan_step(PLANTUML_DIAGRAM_TOOL_ID))
+                candidates.extend(self._quality_skill_steps(state, issues, cycle))
+                for agent_id in QUALITY_AGENT_ORDER:
+                    if agent_id not in requested_agents:
+                        continue
+                    candidates.append(self._quality_cycle_step(agent_id, cycle))
+            if candidates:
+                review = self._quality_cycle_step("quality_review_agent", cycle)
+                if review:
+                    candidates.append(review)
+
+        inserted = self._insert_harness_steps(state, candidates)
+        activated_skills = [
+            str(item.get("skill_id") or "")
+            for item in inserted
+            if item.get("kind") == "skill"
+        ]
+        decision = {
+            "trigger": "quality_review_agent",
+            "trigger_status": status,
+            "reason_code": reason_code,
+            "quality_cycle": state.quality_cycles,
+            "issue_count": len(issues),
+            "issue_codes": [str(item.get("code") or "") for item in issues],
+            "scheduled": [
+                str(item.get("id") or "")
+                for item in inserted
+                if item.get("kind") != "skill"
+            ],
+            "activated_skills": activated_skills,
+            "error_code": None,
+        }
+        state.environment.setdefault("harness_decisions", []).append(decision)
+        self._update_goal(state)
+        return decision
+
+    def _quality_skill_steps(
+        self,
+        state: LoopState,
+        issues: list[dict[str, Any]],
+        cycle: int,
+    ) -> list[dict[str, Any]]:
+        """把质检声明的 Skill 能力解析成受控、可观察的上下文激活步骤。"""
+        requested = {
+            str(capability)
+            for issue in issues
+            for capability in issue.get("required_capabilities", [])
+            if str(capability).startswith("skill:")
+        }
+        if not requested:
+            return []
+
+        remaining = set(requested)
+        steps: list[dict[str, Any]] = []
+        for skill in state.environment.get("applied_skills", []):
+            if not isinstance(skill, dict):
+                continue
+            matched = [
+                capability
+                for capability in sorted(remaining)
+                if any(
+                    bool(skill.get(field))
+                    for field in QUALITY_SKILL_CAPABILITY_FIELDS.get(capability, ())
+                )
+            ]
+            if not matched:
+                continue
+            skill_id = str(skill.get("id") or "")
+            if not skill_id:
+                continue
+            issue_codes = [
+                str(issue.get("code") or "")
+                for issue in issues
+                if any(
+                    str(capability) in matched
+                    for capability in issue.get("required_capabilities", [])
+                )
+            ]
+            steps.append(
+                {
+                    "kind": "skill",
+                    "id": f"skill:{skill_id}",
+                    "skill_id": skill_id,
+                    "name": f"{skill.get('name') or skill_id} · 质检复用",
+                    "action": "activate_quality_skill",
+                    "skill": skill,
+                    "quality_cycle": cycle,
+                    "quality_issue_codes": issue_codes,
+                    "matched_capabilities": matched,
+                    "schedule_key": f"skill:{skill_id}:quality:{cycle}",
+                }
+            )
+            remaining.difference_update(matched)
+            if not remaining or len(steps) >= 2:
+                break
+        return steps
+
+    def _quality_cycle_step(
+        self,
+        agent_id: str,
+        cycle: int,
+    ) -> dict[str, Any] | None:
+        step = self._agent_plan_step(agent_id)
+        if not step:
+            return None
+        return {
+            **step,
+            "quality_cycle": cycle,
+            "schedule_key": f"{agent_id}:quality:{cycle}",
+        }
+
+    @staticmethod
+    def _has_analyzable_data(item: dict[str, Any]) -> bool:
+        if item.get("source_kind") == "report_url":
+            evidence = item.get("creation_evidence")
+            if not isinstance(evidence, dict) or evidence.get("validation_status") != "verified":
+                return False
+            if item.get("can_use") is not True:
+                return False
+        return bool(item.get("content_excerpt")) or item.get("structured_data") is not None
+
+    @staticmethod
+    def _step_schedule_key(step: dict[str, Any]) -> str:
+        return str(step.get("schedule_key") or step.get("id") or "")
+
+    @staticmethod
+    def _insert_harness_steps(
+        state: LoopState,
+        candidates: list[dict[str, Any] | None],
+    ) -> list[dict[str, Any]]:
+        completed = set(state.environment.get("harness_completed_step_ids", []))
+        future_ids = {
+            CreationAgentLoop._step_schedule_key(item)
+            for item in state.plan[state.cursor :]
+        }
+        inserted: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if not candidate:
+                continue
+            step_id = CreationAgentLoop._step_schedule_key(candidate)
+            if step_id in completed or step_id in future_ids:
+                continue
+            inserted.append(candidate)
+            future_ids.add(step_id)
+        if inserted:
+            state.plan[state.cursor : state.cursor] = inserted
+        return inserted
+
+    def _harness_decision_event(
+        self,
+        state: LoopState,
+        decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        scheduled = decision.get("scheduled") or []
+        activated_skills = decision.get("activated_skills") or []
+        if scheduled or activated_skills:
+            additions = [*activated_skills, *scheduled]
+            summary = f"已根据反馈补充 {len(additions)} 项后续处理"
+        elif decision.get("reason_code") == "quality_gate_passed":
+            summary = "质量检查通过"
+        elif decision.get("reason_code") == "quality_cycle_budget_exhausted":
+            summary = "已达到自动优化上限，剩余问题需要人工复核"
+        else:
+            summary = "已根据反馈保留当前处理计划"
+        return self._event(
+            state,
+            "harness.decision",
+            summary,
+            status="completed",
+            actor=self._actor("agent", "creation_main_agent", "创作 Agent"),
+            environment_patch={"harness_decision": decision},
+            data=decision,
+        )
 
     def _plan_skill_workflow(
         self,
@@ -733,6 +1196,8 @@ class CreationAgentLoop:
         definitions = {
             MEMORY_SEARCH_TOOL_ID: ("记忆搜索 Tool", "memory_search"),
             INTERNET_SEARCH_TOOL_ID: ("互联网检索 Tool", "internet_search"),
+            DATA_SEARCH_TOOL_ID: ("数据检索 Tool", DATA_SEARCH_TOOL_ID),
+            WEBPAGE_SCRAPE_TOOL_ID: ("网页爬取 Tool", WEBPAGE_SCRAPE_TOOL_ID),
             GITHUB_SEARCH_TOOL_ID: ("GitHub 检索 Tool", GITHUB_SEARCH_TOOL_ID),
             PLANTUML_DIAGRAM_TOOL_ID: (
                 "PlantUML 画图 Tool",
@@ -768,7 +1233,37 @@ class CreationAgentLoop:
                 "specialist",
                 "solution_design",
             ),
+            "chapter_design_agent": (
+                "章节设计 Agent",
+                "specialist",
+                "chapter_design",
+            ),
             "document_writer_agent": ("文档撰写 Agent", "writer", None),
+            "anti_ai_style_agent": (
+                "去 AI 味 Agent",
+                "polisher",
+                None,
+            ),
+            "detail_polish_agent": (
+                "细节润色 Agent",
+                "polisher",
+                None,
+            ),
+            "table_polish_agent": (
+                "表格润色 Agent",
+                "polisher",
+                None,
+            ),
+            "typography_polish_agent": (
+                "字体润色 Agent",
+                "polisher",
+                None,
+            ),
+            "image_polish_agent": (
+                "图片润色 Agent",
+                "polisher",
+                None,
+            ),
             "quality_review_agent": ("质量审校 Agent", "review", None),
         }
         definition = definitions.get(agent_id)
@@ -983,6 +1478,109 @@ class CreationAgentLoop:
             )
             return
 
+        if action == DATA_SEARCH_TOOL_ID:
+            results = await self.service.retrieve_data_context(
+                self._step_context_query(state, step),
+                state.environment["requirement"],
+            )
+            self._enforce_report_evidence_policy(results)
+            state.environment["data_results"] = results
+            self._apply_data_freshness_to_references(state, results)
+            refresh_count = sum(
+                1 for item in results if item.get("refresh_required") is True
+            )
+            state.environment.setdefault("tool_results", []).append(
+                {
+                    "tool_id": DATA_SEARCH_TOOL_ID,
+                    "status": "completed",
+                    "result_count": len(results),
+                    "refresh_required_count": refresh_count,
+                }
+            )
+            self._update_goal(state)
+            yield self._event(
+                state,
+                "tool.completed",
+                f"数据检索完成，召回 {len(results)} 个来源，其中 {refresh_count} 个需要刷新",
+                status="completed",
+                actor=actor,
+                environment_patch={
+                    "data_sources": [
+                        {
+                            "source_id": item.get("source_id"),
+                            "title": item.get("title"),
+                            "source_kind": item.get("source_kind"),
+                            "freshness_class": item.get("freshness_class"),
+                            "refresh_required": item.get("refresh_required"),
+                            "can_use": item.get("can_use"),
+                        }
+                        for item in results
+                    ]
+                },
+                data={
+                    "result_count": len(results),
+                    "refresh_required_count": refresh_count,
+                },
+            )
+            return
+
+        if action == WEBPAGE_SCRAPE_TOOL_ID:
+            outcome = await self.service.scrape_data_context(
+                list(state.environment.get("data_results") or []),
+                self._step_context_query(state, step),
+                state.environment["requirement"],
+                run_id=state.run_id,
+                session_id=state.session_id,
+            )
+            scrapes = list(outcome.get("scrapes") or [])
+            refreshed = list(outcome.get("refreshed_data") or [])
+            self._enforce_report_evidence_policy(refreshed)
+            state.environment["webpage_scrapes"] = scrapes
+            state.environment["data_results"] = refreshed
+            state.environment["creation_evidence"] = [
+                item["evidence"]
+                for item in scrapes
+                if item.get("status") == "completed"
+                and isinstance(item.get("evidence"), dict)
+                and item["evidence"].get("validation_status") == "verified"
+            ]
+            self._apply_data_freshness_to_references(state, refreshed)
+            completed_count = sum(
+                1 for item in scrapes if item.get("status") == "completed"
+            )
+            failed_count = sum(
+                1 for item in scrapes if item.get("status") in {"failed", "rejected"}
+            )
+            state.environment.setdefault("tool_results", []).append(
+                {
+                    "tool_id": WEBPAGE_SCRAPE_TOOL_ID,
+                    "status": "completed",
+                    "result_count": completed_count,
+                    "failed_count": failed_count,
+                }
+            )
+            self._update_goal(state)
+            yield self._event(
+                state,
+                "tool.completed",
+                (
+                    f"网页数据刷新完成，更新 {completed_count} 个报表来源"
+                    if scrapes
+                    else "没有可实时刷新的报表 URL，保留工作记忆数据与采集时间"
+                ),
+                status="completed",
+                actor=actor,
+                environment_patch={
+                    "scraped_source_count": completed_count,
+                    "failed_source_count": failed_count,
+                },
+                data={
+                    "result_count": completed_count,
+                    "failed_count": failed_count,
+                },
+            )
+            return
+
         if action == GITHUB_SEARCH_TOOL_ID:
             results = await self.service.search_github_context(
                 self._step_context_query(state, step),
@@ -1087,18 +1685,52 @@ class CreationAgentLoop:
             )
             return
 
-        if action in {"specialist", "writer"}:
+        if action == "activate_quality_skill":
+            skill = step.get("skill") or {}
+            activation = {
+                "skill_id": step.get("skill_id"),
+                "name": skill.get("name") or step.get("name"),
+                "quality_cycle": step.get("quality_cycle"),
+                "issue_codes": step.get("quality_issue_codes", []),
+                "capabilities": step.get("matched_capabilities", []),
+                "structure": skill.get("structure", []),
+                "voice_style": skill.get("voice_style") or skill.get("guidelines", []),
+                "writing_design": skill.get("writing_design", ""),
+                "image_generation": skill.get("image_generation", ""),
+                "field_examples": skill.get("field_examples", {}),
+            }
+            state.environment.setdefault("activated_quality_skills", []).append(
+                activation
+            )
+            self._update_goal(state)
+            yield self._event(
+                state,
+                "skill.completed",
+                f"已按质检问题激活 {activation['name']} 的相关规则",
+                status="completed",
+                actor=actor,
+                environment_patch={"quality_skill_activation": activation},
+                data={
+                    "quality_cycle": activation["quality_cycle"],
+                    "issue_codes": activation["issue_codes"],
+                    "capabilities": activation["capabilities"],
+                },
+            )
+            return
+
+        if action in {"specialist", "writer", "polisher"}:
             intent = state.environment.get("edit_intent", {})
             is_revision = action == "writer" and state.mode == "revision"
-            if is_revision:
+            is_document_mutation = action in {"writer", "polisher"}
+            if is_revision or action == "polisher":
                 targets = [str(item) for item in intent.get("target_sections", [])]
                 yield self._event(
                     state,
                     "document.patch.planned",
                     (
-                        f"将以{'、'.join(targets)}为线索检查全文联动"
+                        f"{step['name']}将以{'、'.join(targets)}为线索检查全文联动"
                         if targets
-                        else "将结合本轮要求检查全文联动"
+                        else f"{step['name']}将根据质检问题检查完整文档"
                     ),
                     status="completed",
                     actor=actor,
@@ -1133,7 +1765,7 @@ class CreationAgentLoop:
                 )
                 return
 
-            if action == "writer":
+            if is_document_mutation:
                 document_parts: list[str] = []
                 async for chunk in self.service.stream_agent_document(
                     system_prompt=system_prompt,
@@ -1145,11 +1777,15 @@ class CreationAgentLoop:
                     document_parts.append(chunk)
                     yield self._event(
                         state,
-                        "document.patch.delta" if is_revision else "document.delta",
                         (
-                            "文档撰写 Agent 正在联动修订全文"
-                            if is_revision
-                            else "文档撰写 Agent 正在更新文档"
+                            "document.patch.delta"
+                            if is_revision or action == "polisher"
+                            else "document.delta"
+                        ),
+                        (
+                            f"{step['name']}正在联动修订全文"
+                            if is_revision or action == "polisher"
+                            else f"{step['name']}正在更新文档"
                         ),
                         actor=actor,
                         data={"content": chunk},
@@ -1170,85 +1806,43 @@ class CreationAgentLoop:
 
         if action == "review":
             document = str(state.environment.get("document") or "")
-            headings = sum(1 for line in document.splitlines() if line.lstrip().startswith("#"))
-            criteria = {
-                "has_document": len(document.strip()) >= 180,
-                "has_structure": headings >= 3,
-                "addresses_goal": bool(state.user_message.strip()),
-            }
-            if state.mode == "revision":
-                base_document = str(
-                    state.environment.get("revision_base_document")
-                    or state.current_document
-                )
-                intent = state.environment.get("edit_intent", {})
-                criteria.update(
-                    {
-                        "revision_changed": self._document_hash(base_document)
-                        != self._document_hash(document),
-                        "preserves_structure": (
-                            not bool(intent.get("preserve_untouched", True))
-                            or self._revision_preserves_structure(
-                                base_document,
-                                document,
-                            )
-                        ),
-                        "target_position_logical": self._target_positions_are_logical(
-                            document,
-                            [
-                                str(item)
-                                for item in intent.get("target_sections", [])
-                            ],
-                            allow_missing=any(
-                                marker in state.user_message
-                                for marker in DELETE_MARKERS
-                            ),
-                        ),
-                    }
-                )
-            passed = all(criteria.values())
-            hard_checks = {
-                "has_document",
-                "has_structure",
-                "revision_changed",
+            criteria, issues = self._inspect_document_quality(state, document)
+            report = {
+                **criteria,
+                "passed": not issues and all(criteria.values()),
+                "cycle": state.quality_cycles,
+                "issues": issues,
             }
             hard_failures = [
-                key
-                for key, value in criteria.items()
-                if key in hard_checks and not value
+                str(item.get("code") or "")
+                for item in issues
+                if item.get("severity") == "hard"
             ]
             soft_warnings = [
+                str(item.get("code") or "")
+                for item in issues
+                if item.get("severity") != "hard"
+            ]
+            soft_warnings.extend(
                 key
                 for key, value in criteria.items()
-                if key not in hard_checks and not value
-            ]
-            state.environment["quality_review"] = criteria
+                if key not in {"has_document", "has_structure", "revision_changed"}
+                and not value
+                and key not in soft_warnings
+            )
+            state.environment["quality_review"] = report
+            state.environment["quality_issues"] = issues
             state.environment["quality_hard_failures"] = hard_failures
             state.environment["quality_soft_warnings"] = soft_warnings
-            if hard_failures and state.writer_revisions < 1:
-                state.writer_revisions += 1
-                insert_at = state.cursor
-                state.plan[insert_at:insert_at] = [
-                    {
-                        "kind": "agent",
-                        "id": "document_writer_agent",
-                        "name": "文档撰写 Agent",
-                        "action": "writer",
-                    },
-                    {
-                        "kind": "agent",
-                        "id": "quality_review_agent",
-                        "name": "质量审校 Agent",
-                        "action": "review",
-                    },
-                ]
-                summary = "质量检查发现内容或结构不完整，已把修订步骤写回目标"
-            elif hard_failures:
-                summary = "已完成最大修订次数，文档仍存在完整性问题"
-            elif soft_warnings:
-                summary = "质量检查完成，已记录待核验项；保留当前完整版本"
-            else:
-                summary = "质量检查通过" if passed else "质量检查完成"
+            summary = (
+                f"质检发现 {len(issues)} 个可执行问题，正在安排后续优化"
+                if issues
+                else (
+                    "质量检查完成，已记录非阻断警告；保留当前完整版本"
+                    if soft_warnings
+                    else "质量检查通过"
+                )
+            )
             self._update_goal(state)
             yield self._event(
                 state,
@@ -1256,8 +1850,325 @@ class CreationAgentLoop:
                 summary,
                 status="completed",
                 actor=actor,
-                environment_patch={"quality_review": criteria},
+                environment_patch={"quality_review": report},
+                data={
+                    "issue_count": len(issues),
+                    "issue_codes": [
+                        str(item.get("code") or "") for item in issues
+                    ],
+                    "quality_cycle": state.quality_cycles,
+                },
             )
+
+    def _inspect_document_quality(
+        self,
+        state: LoopState,
+        document: str,
+    ) -> tuple[dict[str, bool], list[dict[str, Any]]]:
+        """把主观质检拆成可观察指标和可路由的问题。"""
+        headings = sum(
+            1
+            for line in document.splitlines()
+            if re.match(r"^#{1,6}\s+\S", line.lstrip())
+        )
+        criteria: dict[str, bool] = {
+            "has_document": len(document.strip()) >= 180,
+            "has_structure": headings >= 3,
+            "addresses_goal": bool(state.user_message.strip()),
+        }
+        issues: list[dict[str, Any]] = []
+
+        if state.mode == "revision":
+            base_document = str(
+                state.environment.get("revision_base_document")
+                or state.current_document
+            )
+            intent = state.environment.get("edit_intent", {})
+            criteria.update(
+                {
+                    "revision_changed": self._document_hash(base_document)
+                    != self._document_hash(document),
+                    "preserves_structure": (
+                        not bool(intent.get("preserve_untouched", True))
+                        or self._revision_preserves_structure(
+                            base_document,
+                            document,
+                        )
+                    ),
+                    "target_position_logical": self._target_positions_are_logical(
+                        document,
+                        [
+                            str(item)
+                            for item in intent.get("target_sections", [])
+                        ],
+                        allow_missing=any(
+                            marker in state.user_message
+                            for marker in DELETE_MARKERS
+                        ),
+                    ),
+                }
+            )
+
+        hard_checks = {
+            "has_document": "文档正文不足，不能形成可交付版本",
+            "has_structure": "文档缺少可导航的章节结构",
+            "revision_changed": "修订结果与原文没有可观察差异",
+        }
+        for code, summary in hard_checks.items():
+            if code in criteria and not criteria[code]:
+                issues.append(
+                    self._quality_issue(
+                        code=code,
+                        severity="hard",
+                        agent_id="document_writer_agent",
+                        summary=summary,
+                    )
+                )
+
+        prose = self._prose_for_quality(document)
+        ai_style_signals = self._ai_style_signals(prose)
+        criteria["natural_expression"] = not ai_style_signals
+        if ai_style_signals:
+            issues.append(
+                self._quality_issue(
+                    code="ai_style_signals",
+                    severity="soft",
+                    agent_id="anti_ai_style_agent",
+                    summary="表达存在模板词、机械衔接、装饰性引号或长句堆叠",
+                    evidence=ai_style_signals,
+                    required_capabilities=["skill:voice_style"],
+                )
+            )
+
+        short_sections = self._short_detail_sections(document)
+        placeholder_count = len(
+            re.findall(r"(?i)\b(?:TODO|TBD)\b|待补充|此处补充|后续完善", prose)
+        )
+        detail_incomplete = (
+            len(document.strip()) >= 500
+            and (bool(short_sections) or placeholder_count > 0)
+        )
+        criteria["detail_complete"] = not detail_incomplete
+        if detail_incomplete:
+            required_capabilities: list[str] = ["skill:structure"]
+            context = str(state.environment.get("context_query") or state.user_message)
+            requirement = state.environment.get("requirement", {})
+            if should_use_data_tools(context, requirement) and not state.environment.get(
+                "data_analysis"
+            ):
+                if state.environment.get("data_results"):
+                    if any(
+                        self._has_analyzable_data(item)
+                        for item in state.environment.get("data_results", [])
+                        if isinstance(item, dict)
+                    ):
+                        required_capabilities.append("data_analysis_agent")
+                else:
+                    required_capabilities.append(DATA_SEARCH_TOOL_ID)
+            issues.append(
+                self._quality_issue(
+                    code="detail_incomplete",
+                    severity="soft",
+                    agent_id="detail_polish_agent",
+                    summary="部分章节只有观点或结论，缺少边界、动作、依据或例子",
+                    evidence={
+                        "short_sections": short_sections[:8],
+                        "placeholder_count": placeholder_count,
+                    },
+                    required_capabilities=required_capabilities,
+                )
+            )
+
+        context = "\n".join(
+            (
+                state.root_request,
+                state.user_message,
+                str(state.environment.get("requirement", {}).get("doc_type") or ""),
+            )
+        )
+        has_table, malformed_tables = self._markdown_table_quality(document)
+        table_expected = any(
+            marker in context
+            for marker in ("表格", "对比", "矩阵", "清单", "指标", "参数", "排期")
+        )
+        table_needs_polish = malformed_tables > 0 or (
+            len(document.strip()) >= 500 and table_expected and not has_table
+        )
+        criteria["table_readable"] = not table_needs_polish
+        if table_needs_polish:
+            issues.append(
+                self._quality_issue(
+                    code="table_needs_polish",
+                    severity="soft",
+                    agent_id="table_polish_agent",
+                    summary="需要补充或修复结构化表格，确保列口径和 Markdown 结构一致",
+                    evidence={
+                        "has_table": has_table,
+                        "malformed_table_count": malformed_tables,
+                    },
+                    required_capabilities=["skill:table_style"],
+                )
+            )
+
+        bold_spans = re.findall(r"\*\*([^*\n]{1,120})\*\*", document)
+        bold_chars = sum(len(item) for item in bold_spans)
+        prose_chars = max(1, len(re.sub(r"\s+", "", prose)))
+        emphasis_ratio = bold_chars / prose_chars
+        emphasis_needs_polish = len(document.strip()) >= 600 and (
+            not bold_spans or emphasis_ratio > 0.18
+        )
+        criteria["emphasis_selective"] = not emphasis_needs_polish
+        if emphasis_needs_polish:
+            issues.append(
+                self._quality_issue(
+                    code="emphasis_needs_polish",
+                    severity="soft",
+                    agent_id="typography_polish_agent",
+                    summary="重点结论、风险和行动项缺少克制且一致的视觉强调",
+                    evidence={
+                        "bold_span_count": len(bold_spans),
+                        "bold_character_ratio": round(emphasis_ratio, 4),
+                    },
+                    required_capabilities=["skill:typography_style"],
+                )
+            )
+
+        has_diagram = bool(
+            re.search(r"```\s*(?:plantuml|mermaid)\b", document, re.IGNORECASE)
+        )
+        visual_expected = bool(
+            state.environment.get("requirement", {}).get("needs_images")
+        ) or any(
+            marker in context
+            for marker in ("架构", "流程", "时序", "链路", "模块关系", "状态机")
+        )
+        visual_needs_polish = (
+            len(document.strip()) >= 500 and visual_expected and not has_diagram
+        )
+        criteria["visual_explains_relationships"] = not visual_needs_polish
+        if visual_needs_polish:
+            issues.append(
+                self._quality_issue(
+                    code="visual_needs_polish",
+                    severity="soft",
+                    agent_id="image_polish_agent",
+                    summary="关键关系或流程仅靠连续文字表达，需要可编辑代码图示",
+                    evidence={"has_diagram": has_diagram},
+                    required_capabilities=[
+                        PLANTUML_DIAGRAM_TOOL_ID,
+                        "skill:image_style",
+                    ],
+                )
+            )
+
+        return criteria, issues
+
+    @staticmethod
+    def _quality_issue(
+        *,
+        code: str,
+        severity: str,
+        agent_id: str,
+        summary: str,
+        evidence: Any | None = None,
+        required_capabilities: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "code": code,
+            "severity": severity,
+            "agent_id": agent_id,
+            "summary": summary,
+            "evidence": evidence if evidence is not None else {},
+            "required_capabilities": required_capabilities or [],
+        }
+
+    @staticmethod
+    def _prose_for_quality(document: str) -> str:
+        prose = re.sub(r"```.*?```", "", document, flags=re.DOTALL)
+        prose = re.sub(r"(?m)^\s*\|.*\|\s*$", "", prose)
+        prose = re.sub(r"(?m)^#{1,6}\s+", "", prose)
+        return prose
+
+    @staticmethod
+    def _ai_style_signals(prose: str) -> dict[str, Any]:
+        compact = re.sub(r"\s+", "", prose)
+        if len(compact) < 260:
+            return {}
+        quote_pairs = len(re.findall(r"“[^”\n]{1,80}”", prose))
+        boilerplate = {
+            phrase: prose.count(phrase)
+            for phrase in AI_STYLE_BOILERPLATE
+            if prose.count(phrase)
+        }
+        transitions = {
+            phrase: prose.count(phrase)
+            for phrase in AI_STYLE_TRANSITIONS
+            if prose.count(phrase)
+        }
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"[。！？!?；;\n]+", prose)
+            if len(sentence.strip()) >= 8
+        ]
+        overlong_count = sum(1 for sentence in sentences if len(sentence) > 90)
+        signals: dict[str, Any] = {}
+        if quote_pairs >= max(5, len(compact) // 360):
+            signals["decorative_quote_pairs"] = quote_pairs
+        if sum(boilerplate.values()) >= 3:
+            signals["boilerplate_phrases"] = boilerplate
+        if sum(transitions.values()) >= 8 or any(
+            count >= 3 for count in transitions.values()
+        ):
+            signals["mechanical_transitions"] = transitions
+        if overlong_count >= 2 and overlong_count / max(1, len(sentences)) >= 0.18:
+            signals["overlong_sentences"] = overlong_count
+        return signals
+
+    @classmethod
+    def _short_detail_sections(cls, document: str) -> list[str]:
+        result: list[str] = []
+        ignored_markers = ("参考", "附录", "核验", "结语", "总结")
+        for span in cls._markdown_section_spans(document):
+            if int(span.get("level") or 0) != 2:
+                continue
+            title = str(span.get("title") or "")
+            if any(marker in title for marker in ignored_markers):
+                continue
+            block = document[int(span["start"]) : int(span["end"])]
+            body = re.sub(r"(?m)^#{1,6}\s+.*$", "", block)
+            body = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+            body = re.sub(r"(?m)^\s*[-*+]\s+", "", body)
+            body = re.sub(r"\s+", "", body)
+            if 0 < len(body) < 60:
+                result.append(title)
+        return result
+
+    @staticmethod
+    def _markdown_table_quality(document: str) -> tuple[bool, int]:
+        lines = document.splitlines()
+        has_table = False
+        malformed = 0
+        for index in range(len(lines) - 1):
+            header = lines[index].strip()
+            separator = lines[index + 1].strip()
+            if not (header.startswith("|") and header.endswith("|")):
+                continue
+            if not re.match(
+                r"^\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|$",
+                separator,
+            ):
+                continue
+            has_table = True
+            expected = max(0, header.count("|") - 1)
+            row_index = index + 2
+            while row_index < len(lines):
+                row = lines[row_index].strip()
+                if not (row.startswith("|") and row.endswith("|")):
+                    break
+                if max(0, row.count("|") - 1) != expected:
+                    malformed += 1
+                row_index += 1
+        return has_table, malformed
 
     async def _apply_model_result(
         self, state: LoopState, model_result: str
@@ -1275,7 +2186,57 @@ class CreationAgentLoop:
     ) -> AsyncIterator[dict[str, Any]]:
         actor = self._actor("agent", step["id"], step["name"])
         cleaned = result.strip()
-        if step["action"] == "writer":
+        if step["action"] == "polisher":
+            if not cleaned:
+                raise RuntimeError(f"{step['name']} 未返回润色后的完整文档")
+            base_document = state.current_document
+            relevant_issues = [
+                item
+                for item in state.environment.get("quality_issues", [])
+                if isinstance(item, dict) and item.get("agent_id") == step["id"]
+            ]
+            document_patch = self._build_document_revision_patch(
+                base_document,
+                cleaned,
+                operation=f"quality_polish:{step['id']}",
+                requested_sections=[
+                    str(section)
+                    for item in relevant_issues
+                    for section in (
+                        (item.get("evidence") or {}).get("short_sections", [])
+                        if isinstance(item.get("evidence"), dict)
+                        else []
+                    )
+                ],
+                preserved_untouched=True,
+            )
+            state.environment["document"] = cleaned
+            state.environment["last_document_patch"] = document_patch
+            state.current_document = cleaned
+            state.environment.setdefault("quality_mutations", []).append(
+                {
+                    "agent_id": step["id"],
+                    "quality_cycle": step.get("quality_cycle"),
+                    "issue_codes": [
+                        str(item.get("code") or "") for item in relevant_issues
+                    ],
+                    "document_hash": self._document_hash(cleaned),
+                }
+            )
+            patch = {
+                "document_length": len(cleaned),
+                "document_patch": document_patch,
+            }
+            yield self._event(
+                state,
+                "document.patch.applied",
+                f"{step['name']}已应用：{document_patch['summary']}",
+                status="completed",
+                actor=actor,
+                environment_patch={"document_patch": document_patch},
+                data={"content": cleaned, "patch": document_patch},
+            )
+        elif step["action"] == "writer":
             intent = state.environment.get("edit_intent", {})
             operation = str(intent.get("operation") or "")
             if state.mode == "revision":
@@ -1843,8 +2804,9 @@ class CreationAgentLoop:
         agent_id = step["id"]
         if step["action"] == "writer":
             system = """你是 MemoryBread 的文档撰写 Agent。请依据目标、子 Agent 结论、Tool 证据和 Skill 规则，输出完整 Markdown 文档。
+章节设计 Agent 已给出章节蓝图时，以蓝图作为初稿骨架；如证据不足，只能标记缺口，不能用套话把章节撑满。
 对于已安装的技能，优先复刻 title_design_style 中的子标题句式、writing_design 中的行文推进、voice_style 中的惯用话术和 image_generation 中的代码生图方式；field_examples 与 example_document 只用于学习写法，不得照抄主题或事实。不要把这些鲜明特征稀释成通用公文。
-要求：保留可验证事实；不编造政策编号、指标或来源；对外部信息给出链接；环境包含 PlantUML 画图约束时必须输出对应的 ```plantuml 代码块，否则技术关系优先使用 Mermaid；只输出文档正文。"""
+要求：保留可验证事实；不编造政策编号、指标或来源；对外部信息给出链接；数据、文档、知识、操作和互联网线索是平权证据，不因所属模块获得额外优先级，按相关性、可靠性、时效和口径适配度取舍；使用数据时写明统计周期和采集时间，`can_use=false` 或陈旧快照只能作为待核验线索；环境包含 PlantUML 画图约束时必须输出对应的 ```plantuml 代码块，否则技术关系优先使用 Mermaid；只输出文档正文。"""
             if state.mode == "revision":
                 intent = state.environment.get("edit_intent", {})
                 targets = [str(item) for item in intent.get("target_sections", [])]
@@ -1858,13 +2820,29 @@ class CreationAgentLoop:
 3. 一轮可以新增、修改或删除多个章节；不要为了“局部更新”而忽略必要的跨章节修改；
 4. 保留未受影响且仍有效的内容，避免无意义改写；
 5. 本轮明确修改优先于冲突的原始约束，其余原始约束继续生效；
-6. 保留可验证事实，不编造政策编号、指标或来源；外部结论保留链接。
+6. 保留可验证事实，不编造政策编号、指标或来源；外部结论保留链接；数据、文档、知识、操作和互联网线索按相关性、可靠性、时效和口径适配度平权取舍；数据结论写明统计周期和采集时间，`can_use=false` 或陈旧快照只能标为待核验。
 只输出最终完整文档正文，不要输出 JSON 或修订说明；不要用代码围栏包裹整篇文档，但 Tool 要求的 PlantUML 或 Mermaid 图示代码块必须保留。"""
+        elif step["action"] == "polisher":
+            common = """请基于当前完整文档做一次有边界的二次编辑，并输出润色后的完整 Markdown 文档。
+只处理质检分派给你的问题，保留未受影响的章节、事实、来源 URL、数据口径、代码块和用户明确要求。不得编造数字、案例、政策编号或来源；证据不足时保留待核验说明。不要输出 JSON、修改说明或思考过程，也不要用代码围栏包住整篇文档。"""
+            role_instructions = {
+                "anti_ai_style_agent": """目标是提高中文表达的自然度和作者感，不以规避 AIGC 检测为目标。
+删除空泛开场、重复小结、机械的“首先/其次/最后”和无增量的转折；普通概念不要为了强调而滥用引号，真实引语、字段名、代码和专有名词除外。把过长复句拆成自然短句，长短句交替；补出明确主语和动作，能用直接动词就不用“进行、实现、赋能”等名词化套话。优先贴合已安装 Skill 的 voice_style、用户历史表达和当前文档语域，但不得模仿特定在世作者。保持原意和事实强度，不把严谨内容改成网络口头禅。""",
+                "detail_polish_agent": """逐章检查观点是否有完整的“对象/边界—依据—动作或机制—结果/验证”。只在已有用户材料、Tool 证据、数据分析和专业 Agent 结论支持的范围内补充细节；需要数据但环境没有证据时，明确口径或待核验项，不得补造数字。优先深挖质检列出的短章节、跳步推论和只写口号的段落，避免为了变长而重复同义句。""",
+                "table_polish_agent": """修复不合法的 Markdown 表格；对确实需要逐项比较、职责映射、参数口径或验收矩阵的内容使用表格。表头要短而明确，同一列保持同一口径，单元格避免堆整段正文；复杂解释仍放在表格前后。只输出标准 Markdown 表格，不写内联 HTML/CSS。创作页面会自动为合法表头应用品牌背景色、边框、对齐和斑马纹。""",
+                "typography_polish_agent": """只强调读者必须先看到的结论、决策、关键数字、风险和行动项。使用标准 Markdown `**重点**`，每千字通常保留 3—8 处，不能整段加粗，也不要用内联 HTML。页面会把 `strong` 渲染为品牌色、加粗和下划线；标题本身已有层级，不再重复强调。""",
+                "image_polish_agent": """只在组件关系、状态变化、跨角色流程或时间交互用文字难以准确理解时补充代码图示。环境有 PlantUML 约束时优先输出 `plantuml` 代码块；否则使用 `mermaid`。图中对象、连线和标签必须来自正文，先用一段正文说明阅读方式，图后补充异常或边界；不插入装饰图、占位图片或无法编辑的外链图片。""",
+            }
+            system = (
+                f"你是 MemoryBread 的{step['name']}。\n"
+                f"{common}\n{role_instructions.get(agent_id, '')}"
+            )
         else:
             role_instructions = {
-                "data_analysis_agent": "识别可用数据、指标口径、证据缺口和可验证结论。禁止编造数字。输出给文档撰写 Agent 的精炼分析。",
+                "data_analysis_agent": "优先使用网页实时采集后的数据，其次使用数据检索中 can_use=true 的快照。逐项核对采集时间、指标口径和统计周期；不同周期或口径不得直接合并。工作记忆只能按 observed_at 加权，陈旧数据必须标注。禁止编造数字，输出可验证结论与证据缺口。",
                 "industry_research_agent": "综合互联网检索结果，提炼行业现状、趋势、约束与待核验事实。每条外部结论保留来源 URL。",
                 "solution_design_agent": "围绕目标、约束和证据设计可落地方案，明确边界、关键决策、组件关系、实施步骤、风险和验证方式。",
+                "chapter_design_agent": "先设计章节，再交给文档撰写 Agent。结合目标、读者、文档类型、证据和 Skill，输出有顺序的章节蓝图；每章写明目的、要回答的问题、可用证据、建议表达形式和完成标准。章节必须互斥且共同覆盖目标，不写正文，不补造事实。",
             }
             system = f"你是 MemoryBread 的{step['name']}。{role_instructions.get(agent_id, '完成当前专业分析。')}"
         workflow_context = ""
@@ -1895,6 +2873,40 @@ class CreationAgentLoop:
         context_query = str(
             state.environment.get("context_query") or state.user_message
         ).strip()
+        if str(step.get("id") or "") == DATA_SEARCH_TOOL_ID:
+            # data_search 位于 memory_search 之后时，优先带上已经命中的报表标题。
+            # 这样“GPU 利用率治理”既能召回旧资料，也能把其中引用的运营看板
+            # 解析成需要即时刷新的数据源。
+            report_titles = []
+            for reference in state.environment.get("references", []):
+                if not isinstance(reference, dict):
+                    continue
+                title = str(reference.get("title") or "").strip()
+                url = str(reference.get("source_url") or "").strip()
+                evidence = f"{title}\n{url}".lower()
+                if not any(
+                    marker in evidence
+                    for marker in (
+                        "看板",
+                        "报表",
+                        "dashboard",
+                        "report",
+                        "analytics",
+                        "grafana",
+                        "tableau",
+                        "powerbi",
+                        "kwaibi",
+                    )
+                ):
+                    continue
+                if title:
+                    report_titles.append(title)
+                if url:
+                    report_titles.append(url)
+                if len(report_titles) >= 4:
+                    break
+            if report_titles:
+                context_query = "\n".join([*report_titles, context_query])
         objective = str(step.get("skill_step_objective") or "").strip()
         output = str(step.get("skill_step_output") or "").strip()
         skills = [
@@ -1915,6 +2927,182 @@ class CreationAgentLoop:
             if item
         )
 
+    @staticmethod
+    def _apply_data_freshness_to_references(
+        state: LoopState,
+        data_results: list[dict[str, Any]],
+    ) -> None:
+        """阻止报表型旧文档在刷新失败后继续冒充当前数据。"""
+        by_url = {
+            str(item.get("source_url") or "").strip(): item
+            for item in data_results
+            if isinstance(item, dict) and str(item.get("source_url") or "").strip()
+        }
+        if not by_url:
+            return
+        for reference in state.environment.get("references", []):
+            if not isinstance(reference, dict):
+                continue
+            source_url = str(reference.get("source_url") or "").strip()
+            result = by_url.get(source_url)
+            if not result:
+                continue
+            reference["data_freshness"] = {
+                "freshness_class": result.get("freshness_class"),
+                "collected_at": result.get("collected_at"),
+                "refresh_required": result.get("refresh_required"),
+                "can_use": result.get("can_use"),
+                "evidence_verified": (
+                    isinstance(result.get("creation_evidence"), dict)
+                    and result["creation_evidence"].get("validation_status") == "verified"
+                ),
+            }
+            evidence_verified = (
+                isinstance(result.get("creation_evidence"), dict)
+                and result["creation_evidence"].get("validation_status") == "verified"
+            )
+            if result.get("can_use") is True and evidence_verified:
+                reference["data_use_policy"] = "current_snapshot_available"
+                continue
+            reference["content"] = ""
+            reference["summary"] = (
+                "该引用指向需要即时刷新的报表；刷新成功前只能作为来源线索，"
+                "其中的历史数值不得写成当前数据。"
+            )
+            reference["data_use_policy"] = "current_values_unavailable"
+
+    @staticmethod
+    def _enforce_report_evidence_policy(data_results: list[dict[str, Any]]) -> None:
+        """未通过本轮截图校验的报表只保留来源元数据，不把数值暴露给写作 Agent。"""
+        for result in data_results:
+            if not isinstance(result, dict) or result.get("source_kind") != "report_url":
+                continue
+            evidence = result.get("creation_evidence")
+            verified = (
+                isinstance(evidence, dict)
+                and evidence.get("validation_status") == "verified"
+            )
+            if verified:
+                validation = evidence.get("validation") or {}
+                claims = [
+                    claim
+                    for claim in validation.get("verified_claims", [])
+                    if isinstance(claim, dict)
+                ]
+                result["content_excerpt"] = "\n".join(
+                    str(claim.get("statement") or "").strip()
+                    for claim in claims
+                    if str(claim.get("statement") or "").strip()
+                )
+                result["structured_data"] = {
+                    "validation": "dom_ocr_verified",
+                    "verified_claims": claims,
+                }
+                result["provenance"] = {
+                    "creation_evidence_id": evidence.get("id"),
+                    "captured_at": evidence.get("captured_at"),
+                    "source_url": evidence.get("source_url"),
+                }
+                continue
+            result["can_use"] = False
+            result["content_excerpt"] = None
+            result["structured_data"] = None
+            result["provenance"] = None
+
+    @classmethod
+    def _apply_creation_evidence_cards(
+        cls,
+        document: str,
+        evidence_items: list[dict[str, Any]],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        if not document.strip() or not evidence_items:
+            return document, []
+        blocks = re.split(r"(\n\s*\n)", document)
+        applied: list[dict[str, Any]] = []
+        for evidence in evidence_items:
+            if evidence.get("validation_status") != "verified":
+                continue
+            image_url = str(evidence.get("image_url") or "").strip()
+            if not image_url or image_url in document:
+                continue
+            validation = evidence.get("validation") or {}
+            claims = validation.get("verified_claims") or []
+            matched_index: int | None = None
+            for index in range(0, len(blocks), 2):
+                block = blocks[index]
+                normalized_block = cls._normalize_evidence_match_text(block)
+                for claim in claims:
+                    if not isinstance(claim, dict):
+                        continue
+                    if claim.get("claim_type") == "text":
+                        statement = str(claim.get("statement") or "")
+                        normalized_statement = cls._normalize_evidence_match_text(statement)
+                        tokens = cls._evidence_match_tokens(statement)
+                        matched_tokens = [
+                            token
+                            for token in tokens
+                            if cls._normalize_evidence_match_text(token) in normalized_block
+                        ]
+                        if (
+                            normalized_statement
+                            and normalized_statement in normalized_block
+                        ) or (
+                            len(matched_tokens) >= 2
+                            and len(matched_tokens) / max(1, len(tokens)) >= 0.6
+                        ):
+                            matched_index = index
+                            break
+                        continue
+                    value = cls._normalize_evidence_match_text(str(claim.get("value") or ""))
+                    labels = cls._evidence_match_tokens(str(claim.get("label") or ""))
+                    label_match = any(
+                        cls._normalize_evidence_match_text(label) in normalized_block
+                        for label in labels
+                    )
+                    if value and value in normalized_block and label_match:
+                        matched_index = index
+                        break
+                if matched_index is not None:
+                    break
+            if matched_index is None:
+                continue
+            title = str(evidence.get("page_title") or "即时数据页面").replace("]", "）")
+            source_url = str(evidence.get("source_url") or "").strip()
+            captured_at = int(evidence.get("captured_at") or 0)
+            captured_label = (
+                datetime.fromtimestamp(captured_at / 1000).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+                if captured_at > 0
+                else "创作时"
+            )
+            source_markdown = f"[{title}](<{source_url}>)" if source_url else title
+            card = (
+                f"\n\n![证据截图：{title}]({image_url})\n\n"
+                f"> 证据截图 · 来源：{source_markdown} · 采集于 {captured_label} · "
+                "页面数据与截图文字已通过一致性校验"
+            )
+            blocks[matched_index] = f"{blocks[matched_index].rstrip()}{card}"
+            applied.append(evidence)
+        return "".join(blocks), applied
+
+    @staticmethod
+    def _normalize_evidence_match_text(value: str) -> str:
+        return re.sub(r"[\s,，:：;；|｜]", "", value).lower()
+
+    @staticmethod
+    def _evidence_match_tokens(value: str) -> list[str]:
+        tokens: list[str] = []
+        for english in re.findall(r"[a-zA-Z]{2,}", value):
+            lowered = english.lower()
+            if lowered not in tokens:
+                tokens.append(lowered)
+        for sequence in re.findall(r"[\u4e00-\u9fff]{2,}", value):
+            chars = list(sequence)
+            for index in range(max(1, len(chars) - 1)):
+                token = "".join(chars[index : index + 2])
+                if len(token) == 2 and token not in tokens:
+                    tokens.append(token)
+        return tokens[:24]
+
     def _prompt_environment(self, state: LoopState) -> str:
         blocks = [
             f"原始需求：{state.root_request}",
@@ -1922,14 +3110,19 @@ class CreationAgentLoop:
             f"任务画像：{state.environment.get('requirement', {})}",
             f"已应用 Skill：{state.environment.get('applied_skills', [])}",
             f"已激活的 Skill 步骤：{state.environment.get('completed_skill_steps', [])}",
+            f"本轮质检动态激活 Skill：{state.environment.get('activated_quality_skills', [])}",
             f"本地参考：{state.environment.get('references', [])}",
             f"互联网资料：{state.environment.get('web_results', [])}",
             f"GitHub 公开仓库：{state.environment.get('github_results', [])}",
             f"PlantUML 画图约束：{state.environment.get('plantuml_diagram', {})}",
+            f"数据检索结果：{state.environment.get('data_results', [])}",
+            f"网页实时采集记录：{state.environment.get('webpage_scrapes', [])}",
             f"数据分析：{state.environment.get('data_analysis', '')}",
             f"行业调研：{state.environment.get('industry_research', '')}",
             f"方案设计：{state.environment.get('solution_design', '')}",
+            f"章节设计：{state.environment.get('chapter_design', '')}",
             f"上一轮质量审校：{state.environment.get('quality_review', {})}",
+            f"当前质检问题：{state.environment.get('quality_issues', [])}",
         ]
         if state.current_document:
             outline = "\n".join(

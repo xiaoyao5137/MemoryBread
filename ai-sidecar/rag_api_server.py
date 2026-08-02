@@ -18,6 +18,7 @@ CORS(app)
 # 懒加载 RAG pipeline
 _rag_pipeline = None
 RAG_REFERENCE_LIMIT = 10
+LOCAL_ANALYSIS_MODEL_ID = "mbem-v1-local"
 
 
 def coerce_rag_top_k(value, default: int = RAG_REFERENCE_LIMIT) -> int:
@@ -117,7 +118,7 @@ def rag_query():
         response = {
             'answer': result.answer,
             'contexts': contexts,
-            'model': result.model,
+            'model': LOCAL_ANALYSIS_MODEL_ID,
         }
 
         logger.info(f"RAG 查询完成，返回 {len(contexts)} 条上下文")

@@ -10,6 +10,7 @@ chunks that fit the 512-token BGE context window.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
@@ -41,10 +42,20 @@ class DocumentSnapshot:
     chunks: list[str]
 
 
-def canonicalize_document_url(url: str | None) -> str | None:
-    """Return a query/fragment-free URL suitable for document identity."""
+@dataclass(frozen=True)
+class BakeDocumentSnapshot:
+    document_id: int
+    canonical_url: str | None
+    doc_key: str
+    title: str
+    body: str
+    content_hash: str
+    chunks: list[str]
+
+
+def _canonicalize_url(url: str | None) -> str | None:
     value = str(url or "").strip()
-    if not value or not _is_document_url(value):
+    if not value:
         return None
     try:
         parsed = urlsplit(value)
@@ -62,6 +73,14 @@ def canonicalize_document_url(url: str | None) -> str | None:
             "",
         )
     )
+
+
+def canonicalize_document_url(url: str | None) -> str | None:
+    """Return a query/fragment-free URL suitable for document identity."""
+    value = str(url or "").strip()
+    if not value or not _is_document_url(value):
+        return None
+    return _canonicalize_url(value)
 
 
 def document_doc_key(canonical_url: str) -> str:
@@ -231,6 +250,80 @@ def build_document_snapshot(capture: dict) -> DocumentSnapshot | None:
         capture_id=int(capture.get("id") or 0),
         canonical_url=canonical_url,
         doc_key=document_doc_key(canonical_url),
+        title=title,
+        body=body,
+        content_hash=content_hash,
+        chunks=chunks,
+    )
+
+
+def _flatten_section_text(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [
+            text
+            for item in value
+            for text in _flatten_section_text(item)
+        ]
+    if not isinstance(value, dict):
+        return []
+
+    parts: list[str] = []
+    for key in ("title", "heading", "name", "content", "text", "body"):
+        if key in value:
+            parts.extend(_flatten_section_text(value[key]))
+    for key in ("sections", "children", "items"):
+        if key in value:
+            parts.extend(_flatten_section_text(value[key]))
+    return parts
+
+
+def build_bake_document_snapshot(document: dict) -> BakeDocumentSnapshot | None:
+    """Build a durable vector snapshot directly from ``bake_documents``.
+
+    Unlike capture snapshots, this source survives capture retention cleanup and
+    is therefore suitable as the owner of long-lived document vectors.
+    """
+    document_id = int(document.get("id") or 0)
+    if document_id <= 0:
+        return None
+    title = str(document.get("title") or "未命名文档").strip()
+    full_content = str(document.get("full_content") or "").strip()
+    section_parts: list[str] = []
+    sections_json = document.get("sections_json")
+    if sections_json:
+        try:
+            parsed_sections = (
+                json.loads(sections_json)
+                if isinstance(sections_json, str)
+                else sections_json
+            )
+            section_parts = _flatten_section_text(parsed_sections)
+        except (TypeError, ValueError):
+            section_parts = []
+
+    body_candidates = [full_content, "\n\n".join(section_parts)]
+    body = max(body_candidates, key=lambda value: len(re.sub(r"\s+", "", value)))
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    if len(re.sub(r"\s+", "", body)) < MIN_DOCUMENT_CHARS:
+        return None
+
+    canonical_url = _canonicalize_url(document.get("source_url"))
+    doc_key = (
+        document_doc_key(canonical_url)
+        if canonical_url
+        else f"bake_document:{document_id}"
+    )
+    chunks = chunk_document(body, title=title)
+    if not chunks:
+        return None
+    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return BakeDocumentSnapshot(
+        document_id=document_id,
+        canonical_url=canonical_url,
+        doc_key=doc_key,
         title=title,
         body=body,
         content_hash=content_hash,

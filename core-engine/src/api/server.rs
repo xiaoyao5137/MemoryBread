@@ -34,6 +34,10 @@ use super::{
             analyze_creation_skill, delete_creation_skill, get_creation_skill,
             list_creation_skills, save_creation_skill, update_creation_skill,
         },
+        data::{
+            delete_data_source, extract_data_sources, get_creation_evidence_image, get_data_source,
+            list_data_sources, refresh_data_source, search_data, validate_creation_evidence,
+        },
         debug::{
             clear_extraction_queue, debug_log_content, debug_log_files, system_stats, vector_status,
         },
@@ -132,6 +136,22 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/creation/references", post(preview_references))
         .route("/api/creation/history", post(save_history))
         .route("/api/creation/history", get(list_history))
+        .route("/api/data/sources", get(list_data_sources))
+        .route("/api/data/sources/extract", post(extract_data_sources))
+        .route(
+            "/api/data/sources/:id",
+            get(get_data_source).delete(delete_data_source),
+        )
+        .route("/api/data/sources/:id/refresh", post(refresh_data_source))
+        .route("/api/tools/data-search", post(search_data))
+        .route(
+            "/api/creation/evidence/:id/image",
+            get(get_creation_evidence_image),
+        )
+        .route(
+            "/api/creation/evidence/:id/validate",
+            post(validate_creation_evidence),
+        )
         .route("/api/creation/skills/analyze", post(analyze_creation_skill))
         .route(
             "/api/creation/skills",

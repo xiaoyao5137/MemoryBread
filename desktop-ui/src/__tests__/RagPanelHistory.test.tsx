@@ -13,7 +13,7 @@ vi.mock('../hooks/useApi', () => ({
   useFetchRagHistory: () => mocks.fetchHistory,
   useRagQuery: () => mocks.ragQuery,
   useModelStatus: () => ({
-    status: { llm: true, embedding: true, ollama: true },
+    status: { llm: true, embedding: true, runtime: true },
     ready: true,
     loading: false,
   }),
@@ -41,6 +41,8 @@ const item = (id: number, query: string): RagHistoryItem => ({
 beforeEach(() => {
   useAppStore.getState().reset()
   useAppStore.getState().setApiBaseUrl('http://localhost:7070')
+  mocks.ragQuery.mockReset()
+  mocks.ragQuery.mockResolvedValue({ answer: '咨询回答', contexts: [] })
   mocks.fetchHistory.mockReset()
   mocks.fetchHistory.mockImplementation(async (
     params: { limit: number; offset: number; query: string },
@@ -52,6 +54,45 @@ beforeEach(() => {
       limit: params.limit,
       offset: params.offset,
     }
+  })
+})
+
+describe('咨询输入框提交', () => {
+  it('输入法确认候选词时不提交咨询', async () => {
+    render(<RagPanel />)
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '咨询记录 (45)' })).toBeInTheDocument()
+    })
+    const input = screen.getByTestId('rag-panel-input')
+
+    fireEvent.change(input, { target: { value: '你好' } })
+    fireEvent.compositionStart(input)
+    fireEvent.compositionEnd(input, { data: '你好' })
+    const defaultAllowed = fireEvent.keyDown(input, {
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 229,
+      isComposing: false,
+    })
+
+    expect(defaultAllowed).toBe(true)
+    expect(mocks.ragQuery).not.toHaveBeenCalled()
+  })
+
+  it('普通 Enter 提交，Shift+Enter 保留换行', async () => {
+    render(<RagPanel />)
+    const input = screen.getByTestId('rag-panel-input')
+
+    fireEvent.change(input, { target: { value: '第一行' } })
+    expect(fireEvent.keyDown(input, {
+      key: 'Enter',
+      code: 'Enter',
+      shiftKey: true,
+    })).toBe(true)
+    expect(mocks.ragQuery).not.toHaveBeenCalled()
+
+    expect(fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' })).toBe(false)
+    await waitFor(() => expect(mocks.ragQuery).toHaveBeenCalledWith('第一行'))
   })
 })
 

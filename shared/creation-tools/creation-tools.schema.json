@@ -7,7 +7,7 @@
   "properties": {
     "enabled_tools": {
       "type": "array",
-      "description": "本次创作允许 Agent 调用的 Tool ID。服务端必须补齐 internet_search 与 memory_search。",
+      "description": "本次创作允许 Agent 调用的 Tool ID。服务端必须提供 internet_search、memory_search、data_search 与 webpage_scrape 能力；是否实际调用由 Harness 根据意图和 Tool 反馈动态决定。",
       "uniqueItems": true,
       "items": {
         "type": "string",
@@ -15,7 +15,9 @@
       },
       "default": [
         "internet_search",
-        "memory_search"
+        "memory_search",
+        "data_search",
+        "webpage_scrape"
       ]
     }
   },
@@ -25,6 +27,8 @@
       "enum": [
         "internet_search",
         "memory_search",
+        "data_search",
+        "webpage_scrape",
         "plantuml_diagram",
         "github_search"
       ]
@@ -93,10 +97,172 @@
                 "TOOL_NOT_INSTALLED",
                 "TOOL_DISABLED",
                 "TOOL_UNAVAILABLE",
-                "TOOL_EXECUTION_FAILED"
+                "TOOL_EXECUTION_FAILED",
+                "DATA_SEARCH_UNAVAILABLE",
+                "DATA_SOURCE_NOT_FOUND",
+                "DATA_SOURCE_URL_MISSING",
+                "BROWSER_ATTACH_UNAVAILABLE",
+                "BROWSER_SCRIPTING_DISABLED",
+                "SCRAPE_AUTH_REQUIRED",
+                "SCRAPE_EMPTY",
+                "SCRAPE_FAILED"
               ]
             }
           }
+        }
+      }
+    },
+    "quality_issue": {
+      "type": "object",
+      "required": [
+        "code",
+        "severity",
+        "agent_id",
+        "summary",
+        "evidence",
+        "required_capabilities"
+      ],
+      "properties": {
+        "code": {"type": "string", "minLength": 1},
+        "severity": {"type": "string", "enum": ["hard", "soft"]},
+        "agent_id": {
+          "type": "string",
+          "enum": [
+            "document_writer_agent",
+            "detail_polish_agent",
+            "table_polish_agent",
+            "image_polish_agent",
+            "anti_ai_style_agent",
+            "typography_polish_agent"
+          ]
+        },
+        "summary": {"type": "string"},
+        "evidence": {"type": ["object", "array"]},
+        "required_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "data_search",
+              "data_analysis_agent",
+              "plantuml_diagram",
+              "skill:voice_style",
+              "skill:structure",
+              "skill:table_style",
+              "skill:typography_style",
+              "skill:image_style"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "harness_decision_event": {
+      "type": "object",
+      "required": ["schema_version", "type", "status", "actor", "summary", "data"],
+      "properties": {
+        "schema_version": {"const": "creation.agent.v1"},
+        "type": {"const": "harness.decision"},
+        "status": {"const": "completed"},
+        "actor": {
+          "type": "object",
+          "required": ["kind", "id", "name"],
+          "properties": {
+            "kind": {"const": "agent"},
+            "id": {"const": "creation_main_agent"},
+            "name": {"type": "string"}
+          }
+        },
+        "summary": {"type": "string"},
+        "data": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "trigger",
+                "trigger_status",
+                "reason_code",
+                "result_count",
+                "refreshable_count",
+                "analyzable_count",
+                "scheduled"
+              ],
+              "properties": {
+                "trigger": {"type": "string", "enum": ["data_search", "webpage_scrape"]},
+                "trigger_status": {"type": "string", "enum": ["completed", "failed"]},
+                "reason_code": {"type": "string"},
+                "result_count": {"type": "integer", "minimum": 0},
+                "refreshable_count": {"type": "integer", "minimum": 0},
+                "analyzable_count": {"type": "integer", "minimum": 0},
+                "scheduled": {
+                  "type": "array",
+                  "items": {"type": "string", "enum": ["webpage_scrape", "data_analysis_agent"]},
+                  "uniqueItems": true
+                },
+                "error_code": {"type": ["string", "null"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "trigger",
+                "trigger_status",
+                "reason_code",
+                "quality_cycle",
+                "issue_count",
+                "issue_codes",
+                "scheduled",
+                "activated_skills"
+              ],
+              "properties": {
+                "trigger": {"const": "quality_review_agent"},
+                "trigger_status": {"type": "string", "enum": ["completed", "failed"]},
+                "reason_code": {
+                  "type": "string",
+                  "enum": [
+                    "quality_review_failed",
+                    "quality_gate_passed",
+                    "quality_issues_detected",
+                    "quality_cycle_budget_exhausted",
+                    "hard_failure_retry_exhausted"
+                  ]
+                },
+                "quality_cycle": {"type": "integer", "minimum": 0, "maximum": 3},
+                "issue_count": {"type": "integer", "minimum": 0},
+                "issue_codes": {
+                  "type": "array",
+                  "items": {"type": "string", "minLength": 1},
+                  "uniqueItems": true
+                },
+                "scheduled": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "data_search",
+                      "data_analysis_agent",
+                      "plantuml_diagram",
+                      "document_writer_agent",
+                      "detail_polish_agent",
+                      "table_polish_agent",
+                      "image_polish_agent",
+                      "anti_ai_style_agent",
+                      "typography_polish_agent",
+                      "quality_review_agent"
+                    ]
+                  }
+                },
+                "activated_skills": {
+                  "type": "array",
+                  "items": {"type": "string", "minLength": 1},
+                  "uniqueItems": true,
+                  "maxItems": 2
+                },
+                "error_code": {"type": ["string", "null"]}
+              }
+            }
+          ]
         }
       }
     }

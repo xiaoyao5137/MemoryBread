@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from creation.agent_loop import CreationAgentLoop
-from creation.service import CreationOptions, GithubSearchResult
+from creation.service import CreationOptions, CreationService, GithubSearchResult
 
 
 class FakeCreationService:
     def __init__(self):
         self.reference_queries = []
+        self.data_results = []
+        self.scrape_outcome = None
 
     def analyze_requirement(self, message, options):
         return {
@@ -41,6 +45,14 @@ class FakeCreationService:
                 updated_at="2026-07-01T00:00:00Z",
             )
         ]
+
+    async def retrieve_data_context(self, *_args, **_kwargs):
+        return list(self.data_results)
+
+    async def scrape_data_context(self, data_results, *_args, **_kwargs):
+        if self.scrape_outcome is not None:
+            return self.scrape_outcome
+        return {"scrapes": [], "refreshed_data": list(data_results)}
 
     async def run_specialist_agent(self, **kwargs):
         return f"{kwargs['agent_id']} 的分析结论"
@@ -94,6 +106,544 @@ def test_tool_plan_enforces_required_tools_and_invokes_internet_by_intent():
     assert {"memory_search", "internet_search"} <= {
         step["id"] for step in researched.plan
     }
+
+
+def test_weekly_report_starts_with_peer_evidence_probes_not_a_fixed_data_pipeline():
+    loop = CreationAgentLoop(FakeCreationService())
+    state = loop._new_state(
+        user_message="生成本周项目周报，并分析核心指标变化",
+        root_request=None,
+        current_document="",
+        conversation=[],
+        selected_skills=[],
+        options=CreationOptions(enabled_tools=()),
+        model_mode="local",
+        session_id="session-data-report",
+        run_id="run-data-report",
+    )
+
+    step_ids = [step["id"] for step in state.plan]
+    assert "memory_search" in step_ids
+    assert "data_search" in step_ids
+    assert "webpage_scrape" not in step_ids
+    assert "data_analysis_agent" not in step_ids
+    assert step_ids.index("data_search") < step_ids.index("document_writer_agent")
+
+
+def test_metric_governance_uses_report_reference_as_a_data_probe():
+    loop = CreationAgentLoop(FakeCreationService())
+    state = loop._new_state(
+        user_message="创作一份治理GPU利用率的方案文档",
+        root_request=None,
+        current_document="",
+        conversation=[],
+        selected_skills=[],
+        options=CreationOptions(enabled_tools=()),
+        model_mode="local",
+        session_id="session-gpu-governance",
+        run_id="run-gpu-governance",
+    )
+
+    assert "data_search" in [step["id"] for step in state.plan]
+    state.environment["references"] = [
+        {
+            "title": "LangBridge 模型中心运营看板 - KwaiBI | 可视化",
+            "source_url": "https://kwaibi.example.com/dashboard?id=2119187",
+            "summary": "历史摘要",
+            "content": "历史 GPU 利用率 45%",
+        }
+    ]
+    query = loop._step_context_query(state, {"id": "data_search"})
+    assert query.startswith("LangBridge 模型中心运营看板")
+    assert "https://kwaibi.example.com/dashboard?id=2119187" in query
+
+    loop._apply_data_freshness_to_references(
+        state,
+        [
+            {
+                "source_url": "https://kwaibi.example.com/dashboard?id=2119187",
+                "freshness_class": "missing",
+                "collected_at": None,
+                "refresh_required": True,
+                "can_use": False,
+            }
+        ],
+    )
+    reference = state.environment["references"][0]
+    assert reference["content"] == ""
+    assert reference["data_use_policy"] == "current_values_unavailable"
+    assert "不得写成当前数据" in reference["summary"]
+
+
+def test_evidence_validation_requires_matching_metadata_value_and_label():
+    payload = {
+        "title": "GPU 实时看板",
+        "url": "https://bi.example.com/dashboard/gpu",
+        "collected_at": 1770000000000,
+        "structured_data": {
+            "tables": [["区域", "GPU 利用率"], ["国内", "42%"], ["海外", "47%"]]
+        },
+        "evidence": {
+            "page_title": "GPU 实时看板",
+            "source_url": "https://bi.example.com/dashboard/gpu",
+            "captured_at": 1770000000000,
+        },
+    }
+
+    matched = CreationService._compare_scrape_with_ocr(
+        payload,
+        "GPU 实时看板\n区域 GPU 利用率\n国内 42%\n海外 47%",
+    )
+    mismatched = CreationService._compare_scrape_with_ocr(
+        payload,
+        "GPU 实时看板\n国内 65%",
+    )
+
+    assert {claim["value"] for claim in matched["verified_claims"]} == {"42%", "47%"}
+    assert mismatched["verified_claims"] == []
+
+
+def test_evidence_validation_also_supports_document_style_pages():
+    payload = {
+        "title": "容量治理说明",
+        "url": "https://docs.example.com/capacity-governance",
+        "collected_at": 1770000000000,
+        "structured_data": {
+            "text_blocks": ["容量治理应先识别长期闲置资源，再按业务优先级分批回收。"]
+        },
+        "evidence": {
+            "page_title": "容量治理说明",
+            "source_url": "https://docs.example.com/capacity-governance",
+            "captured_at": 1770000000000,
+        },
+    }
+
+    matched = CreationService._compare_scrape_with_ocr(
+        payload,
+        "容量治理说明\n容量治理应先识别长期闲置资源，再按业务优先级分批回收。",
+    )
+
+    assert matched["verified_claims"][0]["claim_type"] == "text"
+
+
+def test_verified_evidence_card_is_inserted_below_the_claim_block():
+    document = "# GPU 治理方案\n\n国内 GPU 利用率为 42%，需要优先治理。\n\n## 后续动作\n\n按周复盘。"
+    evidence = {
+        "id": "evidence-1",
+        "source_url": "https://bi.example.com/dashboard/gpu",
+        "page_title": "GPU 实时看板",
+        "captured_at": 1770000000000,
+        "image_url": "/api/creation/evidence/evidence-1/image",
+        "validation_status": "verified",
+        "validation": {
+            "verified_claims": [
+                {"label": "国内 GPU 利用率", "value": "42%", "statement": "国内 GPU 利用率 42%"}
+            ]
+        },
+    }
+
+    updated, applied = CreationAgentLoop._apply_creation_evidence_cards(document, [evidence])
+
+    assert len(applied) == 1
+    assert updated.index("国内 GPU 利用率为 42%") < updated.index("![证据截图")
+    assert updated.index("![证据截图") < updated.index("## 后续动作")
+    assert "/api/creation/evidence/evidence-1/image" in updated
+
+
+def test_quality_gate_decision_uses_user_facing_summary():
+    loop = CreationAgentLoop(FakeCreationService())
+    state = loop._new_state(
+        user_message="写一份架构方案",
+        root_request=None,
+        current_document="",
+        conversation=[],
+        selected_skills=[],
+        options=CreationOptions(enabled_tools=()),
+        model_mode="local",
+        session_id="session-quality-summary",
+        run_id="run-quality-summary",
+    )
+
+    event = loop._harness_decision_event(
+        state,
+        {
+            "trigger": "quality_review_agent",
+            "trigger_status": "completed",
+            "reason_code": "quality_gate_passed",
+            "scheduled": [],
+            "activated_skills": [],
+        },
+    )
+
+    assert event["summary"] == "质量检查通过"
+    assert "Harness" not in event["summary"]
+
+
+def test_harness_uses_data_search_feedback_to_choose_the_next_capability():
+    loop = CreationAgentLoop(FakeCreationService())
+
+    def state_with(results):
+        state = loop._new_state(
+            user_message="生成本周项目周报，并分析核心指标变化",
+            root_request=None,
+            current_document="",
+            conversation=[],
+            selected_skills=[],
+            options=CreationOptions(enabled_tools=()),
+            model_mode="local",
+            session_id="session-data-feedback",
+            run_id="run-data-feedback",
+        )
+        state.cursor = next(
+            index + 1 for index, step in enumerate(state.plan) if step["id"] == "data_search"
+        )
+        state.environment["data_results"] = results
+        return state
+
+    stale_report = state_with(
+        [
+            {
+                "source_id": 1,
+                "source_kind": "report_url",
+                "source_url": "https://bi.example.com/report",
+                "refresh_required": True,
+                "can_use": False,
+                "content_excerpt": "上次采集的指标",
+            }
+        ]
+    )
+    decision = loop._replan_after_feedback(
+        stale_report,
+        {"id": "data_search"},
+        status="completed",
+    )
+    assert decision["scheduled"] == ["webpage_scrape"]
+    assert stale_report.plan[stale_report.cursor]["id"] == "webpage_scrape"
+
+    fresh_snapshot = state_with(
+        [
+            {
+                "source_id": 2,
+                "source_kind": "report_url",
+                "source_url": "https://bi.example.com/report",
+                "refresh_required": False,
+                "can_use": True,
+                "content_excerpt": "本周订单 1200",
+            }
+        ]
+    )
+    decision = loop._replan_after_feedback(
+        fresh_snapshot,
+        {"id": "data_search"},
+        status="completed",
+    )
+    assert decision["scheduled"] == ["webpage_scrape"]
+    assert fresh_snapshot.plan[fresh_snapshot.cursor]["id"] == "webpage_scrape"
+
+    no_data = state_with([])
+    decision = loop._replan_after_feedback(
+        no_data,
+        {"id": "data_search"},
+        status="completed",
+    )
+    assert decision["scheduled"] == []
+    assert decision["reason_code"] == "no_matching_data"
+
+
+def test_harness_does_not_analyze_unverified_report_after_refresh_failure():
+    loop = CreationAgentLoop(FakeCreationService())
+    state = loop._new_state(
+        user_message="生成本周项目周报，并分析核心指标变化",
+        root_request=None,
+        current_document="",
+        conversation=[],
+        selected_skills=[],
+        options=CreationOptions(enabled_tools=()),
+        model_mode="local",
+        session_id="session-data-refresh-failed",
+        run_id="run-data-refresh-failed",
+    )
+    state.cursor = next(
+        index + 1 for index, step in enumerate(state.plan) if step["id"] == "data_search"
+    )
+    state.environment["data_results"] = [
+        {
+            "source_id": 1,
+            "source_kind": "report_url",
+            "source_url": "https://bi.example.com/report",
+            "refresh_required": True,
+            "can_use": False,
+            "content_excerpt": "历史订单 900",
+        }
+    ]
+    loop._replan_after_feedback(state, {"id": "data_search"}, status="completed")
+    state.cursor += 1
+
+    decision = loop._replan_after_feedback(
+        state,
+        {"id": "webpage_scrape"},
+        status="failed",
+        error_code="SCRAPE_AUTH_REQUIRED",
+    )
+
+    assert decision["scheduled"] == []
+    assert decision["reason_code"] == "refresh_failed_without_snapshot"
+
+
+def test_quality_feedback_routes_specialists_and_dependencies_in_stable_order():
+    loop = CreationAgentLoop(FakeCreationService())
+    state = loop._new_state(
+        user_message="写一份带流程图和对比表的架构方案",
+        root_request=None,
+        current_document="",
+        conversation=[],
+        selected_skills=[],
+        options=CreationOptions(enabled_tools=("plantuml_diagram",)),
+        model_mode="local",
+        session_id="session-quality-routing",
+        run_id="run-quality-routing",
+    )
+    state.cursor = len(state.plan)
+    state.environment["quality_issues"] = [
+        {"code": "ai_style_signals", "severity": "soft", "agent_id": "anti_ai_style_agent", "required_capabilities": []},
+        {"code": "detail_incomplete", "severity": "soft", "agent_id": "detail_polish_agent", "required_capabilities": []},
+        {"code": "table_needs_polish", "severity": "soft", "agent_id": "table_polish_agent", "required_capabilities": []},
+        {"code": "visual_needs_polish", "severity": "soft", "agent_id": "image_polish_agent", "required_capabilities": ["plantuml_diagram"]},
+        {"code": "emphasis_needs_polish", "severity": "soft", "agent_id": "typography_polish_agent", "required_capabilities": []},
+    ]
+
+    decision = loop._replan_after_feedback(
+        state,
+        {"id": "quality_review_agent"},
+        status="completed",
+    )
+
+    assert decision["reason_code"] == "quality_issues_detected"
+    assert decision["quality_cycle"] == 1
+    assert decision["activated_skills"] == []
+    assert decision["scheduled"] == [
+        "plantuml_diagram",
+        "detail_polish_agent",
+        "table_polish_agent",
+        "image_polish_agent",
+        "anti_ai_style_agent",
+        "typography_polish_agent",
+        "quality_review_agent",
+    ]
+
+    contract_path = (
+        Path(__file__).resolve().parents[2]
+        / "shared"
+        / "creation-tools"
+        / "creation-tools.schema.json"
+    )
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    quality_branch = contract["$defs"]["harness_decision_event"]["properties"][
+        "data"
+    ]["oneOf"][1]
+    assert set(quality_branch["required"]) <= set(decision)
+    assert decision["trigger"] == quality_branch["properties"]["trigger"]["const"]
+    allowed_scheduled = set(
+        quality_branch["properties"]["scheduled"]["items"]["enum"]
+    )
+    assert set(decision["scheduled"]) <= allowed_scheduled
+
+
+@pytest.mark.asyncio
+async def test_quality_feedback_dynamically_activates_a_matching_skill():
+    loop = CreationAgentLoop(FakeCreationService())
+    state = loop._new_state(
+        user_message="把复盘写得自然一些",
+        root_request=None,
+        current_document="",
+        conversation=[],
+        selected_skills=[
+            {
+                "id": "natural-retrospective",
+                "title": "自然复盘表达 Skill",
+                "writingGuidelines": ["用团队日常语言陈述判断", "避免模板化转折"],
+                "executionSteps": [],
+            }
+        ],
+        options=CreationOptions(enabled_tools=()),
+        model_mode="local",
+        session_id="session-quality-skill",
+        run_id="run-quality-skill",
+    )
+    state.environment["applied_skills"] = loop._match_skills(state)
+    state.cursor = len(state.plan)
+    state.environment["quality_issues"] = [
+        {
+            "code": "ai_style_signals",
+            "severity": "soft",
+            "agent_id": "anti_ai_style_agent",
+            "required_capabilities": ["skill:voice_style"],
+        }
+    ]
+
+    decision = loop._replan_after_feedback(
+        state,
+        {"id": "quality_review_agent"},
+        status="completed",
+    )
+
+    assert decision["activated_skills"] == ["natural-retrospective"]
+    assert decision["scheduled"] == [
+        "anti_ai_style_agent",
+        "quality_review_agent",
+    ]
+    skill_step = state.plan[state.cursor]
+    assert skill_step["action"] == "activate_quality_skill"
+    events = await collect_events(
+        loop._execute_step(
+            state,
+            skill_step,
+            creation_model=None,
+            creation_api_key=None,
+            creation_base_url=None,
+        )
+    )
+    assert events[-1]["type"] == "skill.completed"
+    assert state.environment["activated_quality_skills"][0]["issue_codes"] == [
+        "ai_style_signals"
+    ]
+    anti_ai_step = next(
+        item for item in state.plan if item["id"] == "anti_ai_style_agent"
+    )
+    _, prompt = loop._model_prompts(state, anti_ai_step)
+    assert "本轮质检动态激活 Skill" in prompt
+    assert "避免模板化转折" in prompt
+
+
+def test_quality_review_detects_observable_ai_style_signals():
+    loop = CreationAgentLoop(FakeCreationService())
+    state = loop._new_state(
+        user_message="写一份运营方案",
+        root_request=None,
+        current_document="",
+        conversation=[],
+        selected_skills=[],
+        options=CreationOptions(enabled_tools=()),
+        model_mode="local",
+        session_id="session-ai-style",
+        run_id="run-ai-style",
+    )
+    repeated = (
+        "首先，值得注意的是，我们需要关注“核心能力”。其次，不难发现，"
+        "“协同机制”具有重要价值。此外，我们还要建设“增长飞轮”。"
+    )
+    document = (
+        "# 运营方案\n\n## 背景\n\n"
+        + repeated * 3
+        + "\n\n## 执行\n\n"
+        + repeated * 3
+        + "\n\n## 验证\n\n通过真实结果复核每项动作。"
+    )
+
+    criteria, issues = loop._inspect_document_quality(state, document)
+
+    assert criteria["natural_expression"] is False
+    style_issue = next(item for item in issues if item["code"] == "ai_style_signals")
+    assert style_issue["agent_id"] == "anti_ai_style_agent"
+    assert style_issue["evidence"]["decorative_quote_pairs"] >= 5
+
+
+@pytest.mark.asyncio
+async def test_quality_loop_runs_anti_ai_polisher_and_rechecks_the_result():
+    class NaturalRewriteService(FakeCreationService):
+        async def stream_agent_document(self, **kwargs):
+            if "去 AI 味 Agent" in kwargs["system_prompt"]:
+                yield """# 项目复盘
+
+## 发生了什么
+
+团队在两周内完成了需求拆分、接口联调和灰度发布。联调阶段暴露出三个边界条件，负责人当天补充了用例，第二天完成回归。这个过程没有改变发布目标，但让验收口径从口头约定变成了可重复检查的清单。
+
+## 我们怎么判断
+
+复盘以工单、测试记录和发布日志为依据。**关键判断是先修正进入条件，再增加提醒。** 原因很直接：同一问题连续出现时，提醒只能让人更忙，明确的进入条件才能减少返工。没有证据支持的猜测继续留在核验清单中。
+
+## 下一步怎么做
+
+产品负责人本周补齐异常路径，研发负责人把边界用例加入回归集，发布负责人在下一次灰度前核对清单。下轮复盘只看三个结果：异常是否提前暴露、返工是否减少、责任人能否根据记录直接接手。
+"""
+                return
+            repeated = (
+                "首先，值得注意的是，我们需要关注“核心能力”。其次，不难发现，"
+                "“协同机制”具有重要价值。此外，我们还要建设“增长飞轮”。"
+            )
+            yield (
+                "# 项目复盘\n\n## 发生了什么\n\n"
+                + repeated * 3
+                + "\n\n## 我们怎么判断\n\n"
+                + repeated * 3
+                + "\n\n## 下一步怎么做\n\n"
+                + repeated * 2
+                + " **下一步由负责人复核结果。**"
+            )
+
+    events = await collect_events(
+        CreationAgentLoop(NaturalRewriteService()).run(
+            user_message="请写一份完整的项目复盘",
+            current_document="",
+            conversation=[],
+            selected_skills=[],
+            options=CreationOptions(enable_rag=False),
+        )
+    )
+
+    assert events[-1]["type"] == "run.completed"
+    assert any(
+        event["type"] == "agent.completed"
+        and event["actor"]["id"] == "anti_ai_style_agent"
+        for event in events
+    )
+    assert sum(
+        event["type"] == "agent.completed"
+        and event["actor"]["id"] == "quality_review_agent"
+        for event in events
+    ) == 2
+    final_document = events[-1]["data"]["document"]
+    assert "值得注意的是" not in final_document
+    assert "关键判断" in final_document
+
+
+@pytest.mark.asyncio
+async def test_harness_replans_during_the_run_from_fresh_data_feedback():
+    service = FakeCreationService()
+    service.data_results = [
+        {
+            "source_id": 2,
+            "source_kind": "work_memory",
+            "source_url": None,
+            "refresh_required": False,
+            "can_use": True,
+            "content_excerpt": "本周完成需求 12 项",
+            "structured_data": {"metric_statements": ["本周完成需求 12 项"]},
+        }
+    ]
+
+    events = await collect_events(
+        CreationAgentLoop(service).run(
+            user_message="生成本周项目周报，并分析核心指标变化",
+            current_document="",
+            conversation=[],
+            selected_skills=[],
+            options=CreationOptions(enabled_tools=()),
+        )
+    )
+
+    decisions = [event for event in events if event["type"] == "harness.decision"]
+    assert decisions[0]["data"]["scheduled"] == ["data_analysis_agent"]
+    assert not any(
+        (event.get("actor") or {}).get("id") == "webpage_scrape" for event in events
+    )
+    assert any(
+        (event.get("actor") or {}).get("id") == "data_analysis_agent"
+        and event["type"] == "agent.completed"
+        for event in events
+    )
+    assert events[-1]["type"] == "run.completed"
 
 
 def test_primary_skill_workflow_drives_agent_tool_order_and_step_context():
@@ -164,6 +714,7 @@ def test_primary_skill_workflow_drives_agent_tool_order_and_step_context():
         "industry_research_agent",
         "data_analysis_agent",
         "solution_design_agent",
+        "chapter_design_agent",
         "document_writer_agent",
         "quality_review_agent",
     ]
@@ -414,6 +965,21 @@ async def test_external_model_can_pause_and_resume_each_dynamic_agent_step():
     assert second[-1]["type"] == "run.paused"
     second_state = second[-1]["data"]["continuation"]
 
+    third = await collect_events(
+        loop.run(
+            user_message="",
+            current_document="",
+            conversation=[],
+            selected_skills=[],
+            options=CreationOptions(),
+            resume_state=second_state,
+            model_result="章节蓝图：目标、总体架构、实施与验证。",
+        )
+    )
+    assert third[-2]["type"] == "model.request"
+    assert third[-1]["type"] == "run.paused"
+    third_state = third[-1]["data"]["continuation"]
+
     document = """# Agent 架构方案
 
 ## 目标
@@ -437,7 +1003,7 @@ async def test_external_model_can_pause_and_resume_each_dynamic_agent_step():
             conversation=[],
             selected_skills=[],
             options=CreationOptions(),
-            resume_state=second_state,
+            resume_state=third_state,
             model_result=document,
         )
     )

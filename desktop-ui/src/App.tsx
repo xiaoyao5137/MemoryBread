@@ -65,38 +65,13 @@ const parseReferenceId = (docKey?: string | null) => {
   return match ? match[1] : null
 }
 
-const InitializationGuardedFloatingAssist: React.FC = () => {
-  const [initializationReady, setInitializationReady] = useState(false)
-
-  useEffect(() => {
-    let mounted = true
-    const verify = () => {
-      void fetchInitializationStatus()
-        .then(status => {
-          if (mounted) setInitializationReady(initializationIsReady(status))
-        })
-        .catch(() => {
-          if (mounted) setInitializationReady(false)
-        })
-    }
-    verify()
-    const interval = window.setInterval(verify, 30_000)
-    window.addEventListener('focus', verify)
-    return () => {
-      mounted = false
-      window.clearInterval(interval)
-      window.removeEventListener('focus', verify)
-    }
-  }, [])
-
-  return initializationReady ? <SystemFloatingAssist /> : null
-}
-
 const App: React.FC = () => {
   const searchParams = new URLSearchParams(window.location.search)
   const isFloatingAssistWindow = searchParams.get('view') === 'floating-assist'
   if (isFloatingAssistWindow) {
-    return <InitializationGuardedFloatingAssist />
+    // 原生层已经负责悬浮窗口的显隐。这里必须立即挂载视觉主体，避免 sidecar
+    // 尚未就绪或临时离线时只剩一个空白原生窗口；实际咨询仍由各自请求处理错误。
+    return <SystemFloatingAssist />
   }
 
   const {

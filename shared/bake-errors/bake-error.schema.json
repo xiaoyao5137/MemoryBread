@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memorybread.local/schemas/bake-error.schema.json",
+  "title": "MemoryBread Bake Sidecar Error",
+  "type": "object",
+  "required": ["error", "code", "retryable", "scope"],
+  "properties": {
+    "error": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "code": {
+      "type": "string"
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "scope": {
+      "enum": ["candidate", "service"]
+    }
+  },
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "code": {
+          "enum": [
+            "INFERENCE_PREEMPTED",
+            "MODEL_RATE_LIMITED",
+            "MODEL_UNAVAILABLE"
+          ]
+        },
+        "retryable": { "const": true },
+        "scope": { "const": "service" }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "enum": [
+            "INFERENCE_TIMEOUT",
+            "BAKE_OUTPUT_TRUNCATED",
+            "BAKE_OUTPUT_INVALID",
+            "BAKE_MODEL_RESPONSE_INVALID",
+            "BAKE_MODEL_UPSTREAM_ERROR",
+            "BAKE_INTERNAL_ERROR"
+          ]
+        },
+        "retryable": { "const": true },
+        "scope": { "const": "candidate" }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "enum": [
+            "BAKE_MODEL_REQUEST_INVALID",
+            "BAKE_REQUEST_INVALID"
+          ]
+        },
+        "retryable": { "const": false },
+        "scope": { "const": "candidate" }
+      }
+    }
+  ]
+}

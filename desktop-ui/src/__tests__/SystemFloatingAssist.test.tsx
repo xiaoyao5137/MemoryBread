@@ -509,6 +509,28 @@ describe('SystemFloatingAssist', () => {
     expect(mockedRunRagQueryStream.mock.calls[0]?.[2]).toContain('第一行\n第二行')
   })
 
+  it('咨询输入框使用输入法确认候选词时不发送', () => {
+    render(<SystemFloatingAssist />)
+    fireEvent.click(assistButton())
+    act(() => {
+      vi.advanceTimersByTime(220)
+    })
+
+    const textarea = screen.getByPlaceholderText('输入你的指令，直接向记忆面包咨询')
+    fireEvent.change(textarea, { target: { value: '你好' } })
+    fireEvent.compositionStart(textarea)
+    fireEvent.compositionEnd(textarea, { data: '你好' })
+    const defaultAllowed = fireEvent.keyDown(textarea, {
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 229,
+      isComposing: false,
+    })
+
+    expect(defaultAllowed).toBe(true)
+    expect(mockedRunRagQueryStream).not.toHaveBeenCalled()
+  })
+
   it('自动识别任务开启后在面包人左上角显示 auto 标识', () => {
     render(<SystemFloatingAssist />)
     expect(screen.queryByText('auto')).not.toBeInTheDocument()

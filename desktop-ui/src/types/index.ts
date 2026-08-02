@@ -395,7 +395,7 @@ export interface CloudMemoryPackageRestoreResult {
   import_report?: MemoryPackageImportReport | null
 }
 
-export type BakeTab = 'overview' | 'templates' | 'knowledge' | 'sop'
+export type BakeTab = 'overview' | 'templates' | 'knowledge' | 'sop' | 'data'
 
 export type BakeBucket = 'extracted' | 'pending'
 
@@ -404,12 +404,57 @@ export type RepositoryTab = 'memory' | 'capture'
 export interface BakeOverview {
   captureCount: number
   memoryCount: number
+  dataCount: number
   knowledgeCount: number
   templateCount: number
   sopCount: number
   pendingCandidates: number
   recentActivities: string[]
   inventoryTrend: BakeInventoryTrendBucket[]
+}
+
+export interface DataSnapshot {
+  id: number
+  source_id: number
+  collected_at: number
+  observed_at?: number | null
+  collector: string
+  content_text: string
+  structured_data: Record<string, unknown>
+  content_hash: string
+  freshness_ttl_seconds: number
+  provenance: Record<string, unknown>
+  source_capture_ids: number[]
+  source_timeline_ids: number[]
+  status: string
+}
+
+export interface DataSource {
+  id: number
+  title: string
+  source_kind: 'report_url' | 'work_memory'
+  source_url?: string | null
+  access_mode: 'browser_session' | 'direct_http' | 'memory_only'
+  refresh_policy: 'on_demand' | 'scheduled' | 'never'
+  realtime_level: 'live' | 'observed'
+  source_app_name?: string | null
+  source_window_title?: string | null
+  tags: string[]
+  first_seen_at: number
+  last_seen_at: number
+  last_collected_at?: number | null
+  last_success_at?: number | null
+  last_error_code?: string | null
+  status: string
+  latest_snapshot?: DataSnapshot | null
+}
+
+export interface DataExtractionSummary {
+  scanned_count: number
+  source_created_count: number
+  source_updated_count: number
+  snapshot_created_count: number
+  skipped_count: number
 }
 
 export interface BakeInventoryTrendBucket {
@@ -656,7 +701,11 @@ export interface MonitorOverview {
     oldest_pending_extraction_at_ms: number | null
     pending_bake_count: number
     oldest_pending_bake_at_ms: number | null
+    bake_retry_pending_count: number
     bake_retry_exhausted_count: number
+    bake_timeout_failure_count: number
+    bake_truncated_failure_count: number
+    bake_other_failure_count: number
     running_bake_count: number
     stale_bake_run_count: number
     by_time: { ts: number; count: number }[]
@@ -710,7 +759,11 @@ export interface ExtractionLive {
   oldest_pending_extraction_at_ms: number | null
   pending_bake_count: number
   oldest_pending_bake_at_ms: number | null
+  bake_retry_pending_count: number
   bake_retry_exhausted_count: number
+  bake_timeout_failure_count: number
+  bake_truncated_failure_count: number
+  bake_other_failure_count: number
   running_bake_count: number
   stale_bake_run_count: number
   bake_watermark_updated_at_ms: number | null
@@ -741,10 +794,10 @@ export interface InferenceQueueMonitor {
 
 // ─── 提炼流水线 DAG ───────────────────────────────────────────────────────────
 
-export type DagStageKey = 'capture' | 'timeline' | 'knowledge' | 'sop' | 'document'
+export type DagStageKey = 'capture' | 'timeline' | 'knowledge' | 'sop' | 'document' | 'data'
 
 export interface DagItem {
-  kind:           string  // 'capture' | 'timeline' | 'bake_knowledge' | 'bake_sop' | 'document'
+  kind:           string  // 'capture' | 'timeline' | 'bake_knowledge' | 'bake_sop' | 'document' | 'data'
   id:             number
   ts:             number
   title:          string

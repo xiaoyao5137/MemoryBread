@@ -252,6 +252,30 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "060_add_creation_skill_description",
         include_str!("migrations/060_add_creation_skill_description.sql"),
     ),
+    (
+        "061_requeue_historical_bake_timeouts",
+        include_str!("migrations/061_requeue_historical_bake_timeouts.sql"),
+    ),
+    (
+        "062_document_artifact_identity",
+        include_str!("migrations/062_document_artifact_identity.sql"),
+    ),
+    (
+        "063_durable_artifact_vectors",
+        include_str!("migrations/063_durable_artifact_vectors.sql"),
+    ),
+    (
+        "064_data_memory_module",
+        include_str!("../../../shared/db-schema/migrations/064_data_memory_module.sql"),
+    ),
+    (
+        "065_allow_browser_attach_snapshots",
+        include_str!("../../../shared/db-schema/migrations/065_allow_browser_attach_snapshots.sql"),
+    ),
+    (
+        "066_creation_evidence_latest_data",
+        include_str!("../../../shared/db-schema/migrations/066_creation_evidence_latest_data.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -510,6 +534,88 @@ impl StorageManager {
                 continue;
             }
 
+            if *version == "066_creation_evidence_latest_data" {
+                // 066 同时包含 ADD COLUMN 和幂等表/索引创建。先补列再执行
+                // 不含 ADD COLUMN 的剩余契约，兼容迁移中断后重新启动。
+                Self::add_column_if_missing(&conn, "creation_history", "evidence_json", "TEXT")?;
+                conn.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     DELETE FROM data_snapshots
+                     WHERE id NOT IN (
+                        SELECT latest.id FROM data_snapshots latest
+                        WHERE latest.id = (
+                            SELECT candidate.id FROM data_snapshots candidate
+                            WHERE candidate.source_id = latest.source_id
+                            ORDER BY candidate.collected_at DESC, candidate.id DESC LIMIT 1
+                        )
+                     );
+                     CREATE UNIQUE INDEX IF NOT EXISTS idx_data_snapshots_single_latest
+                     ON data_snapshots(source_id);
+                     CREATE TABLE IF NOT EXISTS creation_evidence_assets (
+                        id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        history_id INTEGER REFERENCES creation_history(id) ON DELETE SET NULL,
+                        source_id INTEGER REFERENCES data_sources(id) ON DELETE SET NULL,
+                        data_snapshot_id INTEGER REFERENCES data_snapshots(id) ON DELETE SET NULL,
+                        source_url TEXT NOT NULL,
+                        page_title TEXT NOT NULL,
+                        captured_at INTEGER NOT NULL,
+                        image_path TEXT NOT NULL,
+                        mime_type TEXT NOT NULL DEFAULT 'image/jpeg',
+                        width INTEGER NOT NULL,
+                        height INTEGER NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        screenshot_source TEXT NOT NULL,
+                        validation_status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (validation_status IN ('pending', 'verified', 'rejected')),
+                        validation_json TEXT NOT NULL DEFAULT '{}',
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_creation_evidence_run
+                     ON creation_evidence_assets(run_id, captured_at DESC);
+                     CREATE INDEX IF NOT EXISTS idx_creation_evidence_history
+                     ON creation_evidence_assets(history_id, captured_at DESC);
+                     COMMIT;",
+                )
+                .map_err(|e| StorageError::MigrationFailed {
+                    version,
+                    reason: e.to_string(),
+                })?;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    rusqlite::params![version],
+                    |row| row.get(0),
+                )?;
+                if count == 0 {
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        rusqlite::params![version, current_ts_ms()],
+                    )?;
+                }
+                info!("迁移 {} 执行成功", version);
+                continue;
+            }
+
+            if *version == "062_document_artifact_identity" {
+                // ADD COLUMN 本身不支持 IF NOT EXISTS。先用 Rust 幂等补列，再执行
+                // 其余可重复 SQL，避免迁移中断后下次启动卡在 duplicate column。
+                Self::add_column_if_missing(&conn, "bake_documents", "document_identity", "TEXT")?;
+                conn.execute_batch(sql)
+                    .map_err(|e| StorageError::MigrationFailed {
+                        version,
+                        reason: e.to_string(),
+                    })?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+                     VALUES (?1, ?2)",
+                    rusqlite::params![version, current_ts_ms()],
+                )?;
+                info!("迁移 {} 执行成功", version);
+                continue;
+            }
+
             info!("执行迁移: {}", version);
             conn.execute_batch(sql)
                 .map_err(|e| StorageError::MigrationFailed {
@@ -565,6 +671,7 @@ impl StorageManager {
                 "TEXT NOT NULL DEFAULT 'create_document'",
             )?;
             Self::add_column_if_missing(conn, "creation_history", "document_patch_json", "TEXT")?;
+            Self::add_column_if_missing(conn, "creation_history", "evidence_json", "TEXT")?;
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_creation_history_session
                  ON creation_history(session_id, created_at DESC)",
@@ -838,6 +945,68 @@ mod tests {
     }
 
     #[test]
+    fn browser_attach_migration_preserves_legacy_snapshots() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE data_sources (
+                id INTEGER PRIMARY KEY
+             );
+             INSERT INTO data_sources (id) VALUES (1);
+             CREATE TABLE data_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL REFERENCES data_sources(id) ON DELETE CASCADE,
+                collected_at INTEGER NOT NULL,
+                observed_at INTEGER,
+                collector TEXT NOT NULL CHECK (collector IN (
+                    'chrome_attach', 'direct_http', 'memory_extract', 'capture_observation'
+                )),
+                content_text TEXT NOT NULL,
+                structured_data TEXT NOT NULL DEFAULT '{}',
+                content_hash TEXT NOT NULL,
+                freshness_ttl_seconds INTEGER NOT NULL DEFAULT 0,
+                provenance TEXT NOT NULL DEFAULT '{}',
+                source_capture_ids TEXT NOT NULL DEFAULT '[]',
+                source_timeline_ids TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'success' CHECK (status IN ('success', 'partial')),
+                created_at INTEGER NOT NULL,
+                UNIQUE(source_id, content_hash, collected_at)
+             );
+             INSERT INTO data_snapshots (
+                source_id, collected_at, observed_at, collector, content_text,
+                structured_data, content_hash, created_at
+             ) VALUES (1, 1000, 1000, 'memory_extract', '历史数据 42', '{}', 'old', 1000);",
+        )
+        .unwrap();
+
+        conn.execute_batch(include_str!(
+            "../../../shared/db-schema/migrations/065_allow_browser_attach_snapshots.sql"
+        ))
+        .unwrap();
+
+        let preserved: i64 = conn
+            .query_row("SELECT COUNT(*) FROM data_snapshots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(preserved, 1);
+        conn.execute(
+            "INSERT INTO data_snapshots (
+                source_id, collected_at, observed_at, collector, content_text,
+                structured_data, content_hash, created_at
+             ) VALUES (1, 2000, 2000, 'browser_attach', '即时数据 84', '{}', 'new', 2000)",
+            [],
+        )
+        .unwrap();
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM data_snapshots_fts WHERE data_snapshots_fts MATCH '即时数据'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+    }
+
+    #[test]
     fn default_diary_cron_expressions_include_seconds() {
         let storage = StorageManager::open_in_memory().unwrap();
         storage
@@ -1085,5 +1254,179 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(retry_ids, vec![2]);
+    }
+
+    #[test]
+    fn historical_bake_timeout_migration_requeues_and_rolls_back_watermark() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE timelines (
+                id INTEGER PRIMARY KEY,
+                updated_at_ms INTEGER
+             );
+             CREATE TABLE captures (
+                id INTEGER PRIMARY KEY,
+                timeline_id INTEGER,
+                ts INTEGER
+             );
+             CREATE TABLE bake_retry_state (
+                timeline_id INTEGER PRIMARY KEY,
+                failure_count INTEGER NOT NULL,
+                last_error TEXT,
+                last_failed_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE bake_watermarks (
+                pipeline_name TEXT PRIMARY KEY,
+                last_processed_ts INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             );
+             INSERT INTO timelines VALUES (1, 500), (2, 700);
+             INSERT INTO captures VALUES (10, 1, 550), (20, 2, 750);
+             INSERT INTO bake_retry_state VALUES
+                (1, 1, 'upstream error (504 Gateway Timeout): timeout', 600),
+                (2, 3, 'internal error: deterministic payload error', 800);
+             INSERT INTO bake_watermarks VALUES ('unified', 1000, 1000);",
+        )
+        .unwrap();
+
+        conn.execute_batch(include_str!(
+            "migrations/061_requeue_historical_bake_timeouts.sql"
+        ))
+        .unwrap();
+
+        let watermark: i64 = conn
+            .query_row(
+                "SELECT last_processed_ts FROM bake_watermarks WHERE pipeline_name = 'unified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(watermark, 549);
+        let retry_ids: Vec<i64> = conn
+            .prepare("SELECT timeline_id FROM bake_retry_state ORDER BY timeline_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(retry_ids, vec![2]);
+    }
+
+    #[test]
+    fn document_identity_migration_preserves_legacy_duplicates_and_claims_one_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE bake_documents (
+                 id INTEGER PRIMARY KEY,
+                 source_url TEXT,
+                 deleted_at INTEGER
+             );
+             CREATE TABLE bake_knowledge (
+                 id INTEGER PRIMARY KEY,
+                 timeline_id INTEGER NOT NULL,
+                 created_at_ms INTEGER
+             );
+             CREATE TABLE bake_sops (
+                 id INTEGER PRIMARY KEY,
+                 timeline_id INTEGER NOT NULL,
+                 created_at_ms INTEGER
+             );
+             INSERT INTO bake_documents (id, source_url, deleted_at) VALUES
+                 (10, 'https://Docs.Corp.Example/d/home/ABC123?section=one', NULL),
+                 (11, 'http://docs.corp.example/d/home/abc123#section=two', NULL),
+                 (12, 'https://docs.corp.example/d/home/deleted', 123);",
+        )
+        .unwrap();
+
+        StorageManager::add_column_if_missing(&conn, "bake_documents", "document_identity", "TEXT")
+            .unwrap();
+        conn.execute_batch(include_str!(
+            "migrations/062_document_artifact_identity.sql"
+        ))
+        .unwrap();
+
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bake_documents WHERE deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_count, 2);
+        let claimed: Vec<(i64, Option<String>)> = conn
+            .prepare(
+                "SELECT id, document_identity
+                 FROM bake_documents
+                 WHERE deleted_at IS NULL
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            claimed,
+            vec![
+                (10, Some("docs.corp.example/d/home/abc123".to_string())),
+                (11, None),
+            ]
+        );
+        assert!(conn
+            .execute(
+                "UPDATE bake_documents
+                 SET document_identity = 'docs.corp.example/d/home/abc123'
+                 WHERE id = 11",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn durable_artifact_vector_migration_queues_soft_and_hard_deletes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE bake_documents (
+                 id INTEGER PRIMARY KEY,
+                 deleted_at INTEGER
+             );
+             INSERT INTO bake_documents VALUES (80, NULL), (81, NULL);",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("migrations/063_durable_artifact_vectors.sql"))
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO artifact_vector_index (
+                 document_id, qdrant_point_id, doc_key, content_hash,
+                 chunk_index, chunk_text, model_name, indexed_at
+             )
+             VALUES
+                 (80, 'soft-point', 'document:80', 'v1', 0, 'soft', 'test', 1),
+                 (81, 'hard-point', 'document:81', 'v1', 0, 'hard', 'test', 1);
+             UPDATE bake_documents SET deleted_at = 2 WHERE id = 80;
+             PRAGMA foreign_keys = OFF;
+             DELETE FROM bake_documents WHERE id = 81;",
+        )
+        .unwrap();
+
+        let ledger_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM artifact_vector_index", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let queued: Vec<String> = conn
+            .prepare(
+                "SELECT qdrant_point_id
+                 FROM vector_deletion_queue
+                 ORDER BY qdrant_point_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ledger_count, 0);
+        assert_eq!(queued, vec!["hard-point", "soft-point"]);
     }
 }

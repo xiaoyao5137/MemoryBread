@@ -3,7 +3,6 @@
 """
 
 import ast
-import hashlib
 import json
 import logging
 import re
@@ -21,11 +20,13 @@ logger = logging.getLogger(__name__)
 # completion 撑满整个上下文窗口。
 BAKE_CONTEXT_WINDOW_TOKENS = 32768
 BAKE_NUM_PREDICT = 8192
+BAKE_RETRY_NUM_PREDICT = 4096
 BAKE_PROMPT_SAFETY_TOKENS = 1024
 BAKE_INPUT_TOKEN_BUDGET = (
     BAKE_CONTEXT_WINDOW_TOKENS - BAKE_NUM_PREDICT - BAKE_PROMPT_SAFETY_TOKENS
 )
 BAKE_RETRY_INPUT_TOKEN_BUDGET = 18_000
+BAKE_RETRY_REPEAT_PENALTY = 1.15
 # estimate_tokens 对中文结构化 prompt 会低估约 20%-30%；预算判断使用保守倍率，
 # 实际用量仍以 Ollama 返回的 prompt_eval_count 为准。
 BAKE_TOKEN_ESTIMATE_SAFETY_FACTOR = 1.35
@@ -42,11 +43,78 @@ _RAG_LOCK_FILE = "/tmp/memory-bread-rag.lock"
 
 class BakeOutputError(RuntimeError):
     code = "BAKE_OUTPUT_INVALID"
-    retryable = False
+    retryable = True
+    scope = "candidate"
+    http_status = 422
+    public_message = "烘焙输出不符合结构要求"
 
 
 class BakeOutputTruncatedError(BakeOutputError):
     code = "BAKE_OUTPUT_TRUNCATED"
+
+
+class BakeModelRequestError(RuntimeError):
+    """保留模型 HTTP 分类，让返回的 5xx 进入候选有界重试而非永久卡头。"""
+
+    def __init__(self, status_code: int, response_body: str = ""):
+        self.status_code = int(status_code)
+        self.response_body = str(response_body or "")[:2_000]
+        self.scope = "candidate"
+        if self.status_code == 429:
+            self.code = "MODEL_RATE_LIMITED"
+            self.retryable = True
+            self.scope = "service"
+            self.http_status = 503
+            self.public_message = "本地模型当前繁忙，请稍后重试"
+        elif self.status_code in {401, 403, 404}:
+            # 鉴权失败或模型不存在是运行环境配置问题，对每条候选重试都不会成功；
+            # 保留队列等待服务恢复，避免把所有候选逐条误判为坏数据并丢弃。
+            self.code = "MODEL_UNAVAILABLE"
+            self.retryable = True
+            self.scope = "service"
+            self.http_status = 503
+            self.public_message = "本地模型服务配置不可用"
+        elif self.status_code in {408, 504}:
+            self.code = "INFERENCE_TIMEOUT"
+            self.retryable = True
+            self.http_status = 504
+            self.public_message = "本地模型请求超时，请稍后重试"
+        elif self.status_code >= 500:
+            self.code = "BAKE_MODEL_UPSTREAM_ERROR"
+            self.retryable = True
+            self.http_status = 502
+            self.public_message = "本地模型执行烘焙请求失败"
+        else:
+            self.code = "BAKE_MODEL_REQUEST_INVALID"
+            self.retryable = False
+            self.http_status = 422
+            self.public_message = "本地模型拒绝了烘焙请求"
+        super().__init__(f"本地模型请求失败（HTTP {self.status_code}）")
+
+
+class BakeModelTransportError(RuntimeError):
+    """只有无法连接模型服务才属于服务级错误，不由单个候选消耗重试次数。"""
+
+    code = "MODEL_UNAVAILABLE"
+    retryable = True
+    scope = "service"
+    http_status = 503
+    public_message = "本地模型服务暂不可用"
+
+
+class BakeInferenceTimeoutError(RuntimeError):
+    """推理超时与候选内容及输出规模相关，必须走候选有界重试。"""
+
+    code = "INFERENCE_TIMEOUT"
+    retryable = True
+    scope = "candidate"
+    http_status = 504
+    public_message = "本地模型请求超时，请稍后重试"
+
+
+class BakeModelResponseError(BakeOutputError):
+    code = "BAKE_MODEL_RESPONSE_INVALID"
+    public_message = "本地模型返回了无法解析的响应"
 
 
 def _rag_is_active() -> bool:
@@ -404,16 +472,202 @@ BAKE_RESPONSE_SCHEMA = {
     "additionalProperties": False,
 }
 
+
+def _bounded_string(max_length: int, *, nullable: bool = False) -> Dict[str, Any]:
+    return {
+        "type": ["string", "null"] if nullable else "string",
+        "maxLength": max_length,
+    }
+
+
+def _bounded_string_array(max_items: int, item_max_length: int) -> Dict[str, Any]:
+    return {
+        "type": "array",
+        "maxItems": max_items,
+        "items": _bounded_string(item_max_length),
+    }
+
+
+def _artifact_response_schema(payload_schema: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "accepted": {"type": "boolean"},
+            "reason": _bounded_string(240, nullable=True),
+            "payload": {
+                "type": ["object", "null"],
+                **payload_schema,
+            },
+        },
+        "required": ["accepted", "reason", "payload"],
+        "additionalProperties": False,
+    }
+
+
+BAKE_KNOWLEDGE_PAYLOAD_SCHEMA = {
+    "properties": {
+        "summary": _bounded_string(160),
+        "overview": _bounded_string(600, nullable=True),
+        "details": _bounded_string(3_000),
+        "entities": _bounded_string_array(16, 80),
+        "importance": {"type": "integer", "minimum": 1, "maximum": 5},
+        "occurrence_count": {"type": "integer", "minimum": 1},
+        "observed_at": {"type": ["integer", "null"]},
+        "event_time_start": {"type": ["integer", "null"]},
+        "event_time_end": {"type": ["integer", "null"]},
+        "history_view": {"type": "boolean"},
+        "content_origin": _bounded_string(40, nullable=True),
+        "activity_type": _bounded_string(40, nullable=True),
+        "evidence_strength": _bounded_string(16, nullable=True),
+        "evidence_summary": _bounded_string(400, nullable=True),
+        "match_score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "match_level": _bounded_string(16, nullable=True),
+        "review_status": _bounded_string(32, nullable=True),
+    },
+    "additionalProperties": False,
+}
+
+BAKE_DESIGN_PAYLOAD_SCHEMA = {
+    "properties": {
+        "name": _bounded_string(200),
+        "category": _bounded_string(40, nullable=True),
+        "summary": _bounded_string(500, nullable=True),
+        "full_content": _bounded_string(8_000),
+        "details": _bounded_string(2_000, nullable=True),
+        "prompt_hint": _bounded_string(1_000, nullable=True),
+        "status": _bounded_string(24, nullable=True),
+        "tags": _bounded_string_array(16, 80),
+        "applicable_tasks": _bounded_string_array(8, 80),
+        "structure_sections": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": _bounded_string(160),
+                    "keywords": _bounded_string_array(12, 80),
+                    "notes": _bounded_string(500, nullable=True),
+                },
+                "required": ["title"],
+                "additionalProperties": False,
+            },
+        },
+        "style_phrases": _bounded_string_array(16, 160),
+        "replacement_rules": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "from": _bounded_string(160),
+                    "to": _bounded_string(160),
+                },
+                "required": ["from", "to"],
+                "additionalProperties": False,
+            },
+        },
+        "diagram_code": _bounded_string(2_000, nullable=True),
+        "evidence_summary": _bounded_string(400, nullable=True),
+        "match_score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "match_level": _bounded_string(16, nullable=True),
+        "review_status": _bounded_string(32, nullable=True),
+    },
+    "additionalProperties": False,
+}
+
+BAKE_SOP_PAYLOAD_SCHEMA = {
+    "properties": {
+        "summary": _bounded_string(200),
+        "overview": _bounded_string(600, nullable=True),
+        "details": _bounded_string(3_000),
+        "source_title": _bounded_string(200, nullable=True),
+        "trigger_keywords": _bounded_string_array(16, 80),
+        "extracted_problem": _bounded_string(800, nullable=True),
+        "steps": _bounded_string_array(20, 500),
+        "linked_knowledge_ids": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {"type": ["string", "integer"]},
+        },
+        "confidence": _bounded_string(16, nullable=True),
+        "evidence_summary": _bounded_string(400, nullable=True),
+        "match_score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "match_level": _bounded_string(16, nullable=True),
+        "review_status": _bounded_string(32, nullable=True),
+    },
+    "additionalProperties": False,
+}
+
 BAKE_BUNDLE_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "knowledge": BAKE_RESPONSE_SCHEMA,
-        "design": BAKE_RESPONSE_SCHEMA,
-        "sop": BAKE_RESPONSE_SCHEMA,
+        "knowledge": _artifact_response_schema(BAKE_KNOWLEDGE_PAYLOAD_SCHEMA),
+        "design": _artifact_response_schema(BAKE_DESIGN_PAYLOAD_SCHEMA),
+        "sop": _artifact_response_schema(BAKE_SOP_PAYLOAD_SCHEMA),
     },
     "required": ["knowledge", "design", "sop"],
     "additionalProperties": False,
 }
+
+
+def _compact_payload_schema(
+    schema: Dict[str, Any],
+    *,
+    string_limit: int,
+    array_limit: int,
+) -> Dict[str, Any]:
+    """递归收紧重试输出，避免小模型再次陷入超长字段或数组循环。"""
+    compact = json.loads(json.dumps(schema))
+
+    def visit(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        if "maxLength" in node:
+            node["maxLength"] = min(int(node["maxLength"]), string_limit)
+        if "maxItems" in node:
+            node["maxItems"] = min(int(node["maxItems"]), array_limit)
+        for value in node.values():
+            if isinstance(value, dict):
+                visit(value)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+    visit(compact)
+    return compact
+
+
+BAKE_COMPACT_BUNDLE_RESPONSE_SCHEMA = _compact_payload_schema(
+    BAKE_BUNDLE_RESPONSE_SCHEMA,
+    string_limit=1_200,
+    array_limit=8,
+)
+
+
+def _ollama_compatible_format(response_format: Any) -> Any:
+    """生成本地模型 grammar 可稳定编译的传输 Schema。
+
+    Ollama 会把 JSON Schema 的 ``maxLength`` 展开为 grammar 重复规则。多个
+    2K-8K 的长文本字段会让 grammar 初始化直接返回 400；业务提示词与输出 token
+    预算已经负责长度控制，因此传输层只移除该关键字，保留字段、类型、枚举、数值
+    范围及数组上限等结构约束。
+    """
+    if not isinstance(response_format, dict):
+        return response_format
+
+    compatible = json.loads(json.dumps(response_format))
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            node.pop("maxLength", None)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(compatible)
+    return compatible
 
 BAKE_MERGE_DOCUMENT_SCHEMA = {
     "type": "object",
@@ -526,6 +780,85 @@ BAKE_DESIGN_MARKERS = (
     "写作参考",
 )
 
+DOCUMENT_URL_MARKERS = (
+    "docs.corp",
+    "/docs/",
+    "docs.google",
+    "/document/",
+    "yuque.com",
+    "feishu.cn/docx",
+    "feishu.cn/wiki",
+    "notion.so",
+    "confluence",
+    "/wiki/",
+    "shimo.im",
+    "/d/home/",
+    "/s/home/",
+    "/k/home/",
+)
+
+DOCUMENT_TITLE_MARKERS = (
+    "云文档",
+    "在线文档",
+    "google docs",
+    "google 文档",
+    "飞书文档",
+    "语雀",
+    "notion",
+    "confluence",
+    "石墨文档",
+    ".doc",
+    ".docx",
+    ".pages",
+    ".md",
+)
+
+CHAT_APP_MARKERS = (
+    "kim",
+    "kem",
+    "微信",
+    "wechat",
+    "slack",
+    "teams",
+    "microsoft teams",
+    "钉钉",
+    "dingtalk",
+    "飞书",
+    "feishu",
+    "lark",
+)
+
+BROWSER_APP_MARKERS = (
+    "chrome",
+    "safari",
+    "arc",
+    "edge",
+    "firefox",
+    "chatgpt atlas",
+)
+
+DOCUMENT_EDITOR_APP_MARKERS = (
+    "microsoft word",
+    "word",
+    "pages",
+    "wps",
+    "libreoffice writer",
+    "obsidian",
+    "typora",
+    "cursor",
+    "visual studio code",
+    "code",
+)
+
+CODE_EDITOR_APP_MARKERS = (
+    "cursor",
+    "visual studio code",
+    "code",
+    "xcode",
+)
+
+MIN_DOCUMENT_EVIDENCE_CHARS = 200
+
 BAKE_SCORE_METADATA_KEYS = {
     "match_score",
     "match_level",
@@ -600,6 +933,7 @@ BAKE_DESIGN_PROMPT = """类别:design（用于沉淀「文档」资产）
 
 什么时候 reject:
 - 输入只是零散对话/聊天/任务清单/通知消息，没有围绕一份具体文档；
+- 聊天中只是出现文档标题、云文档卡片、链接或“查看某文档”的指令，但没有采集到该文档正文；
 - 输入只是一次性代码改动、操作流水或排查动线，且不涉及任何文档形态的内容；
 - 输入只是无意义的浏览噪声、UI 切换、应用界面观察；
 - 输入虽然涉及某个产品页面，但页面只是工具操作界面（如登录页、价格页、设置页），不承载任何文档式正文。
@@ -610,7 +944,7 @@ BAKE_DESIGN_PROMPT = """类别:design（用于沉淀「文档」资产）
 
 accepted=true 时，payload schema:
 {
-  "name": "文档名称（优先用文档自身的标题/页面 webpage_title；没有则用一句话概括其主题）",
+  "name": "文档名称（必须表示整份文档；优先用文档自身的标题/页面 webpage_title；没有则用一句话概括其主题）",
   "category": "方案|设计|汇报|总结|技术文档|运营文档|会议纪要|资料参考|其他",
   "summary": "一句话概括这份文档讲了什么、是用户产出还是参考、未来在什么场景可再用，控制在 80 字以内",
   "full_content": "文档完整正文，Markdown 格式。要求是文档**本身**的内容；如有 url_document_context 应据此尽可能还原全貌，按文档原本的章节顺序整理；列表、代码、Prompt 指令、表格用 Markdown 语法保留；无法识别完整原文时，把 capture/url_document_context 中可见的核心段落如实写入；不要写'结构参考/使用建议/写作风格'这类分析元信息。",
@@ -631,6 +965,7 @@ accepted=true 时，payload schema:
 
 约束:
 - `full_content` 是首要产出，必须基于输入证据（包括 url_document_context）如实还原文档原文，禁止生造、禁止用"## 文档概要 / ## 关键内容 / ## 结构参考 / ## 使用建议"这类分析模板替代正文
+- `name` 表示整份文档的稳定名称，禁止使用“文档增量”“新增内容”“补充内容”“更新版”等过程性前后缀
 - `summary` 必须是简洁的一句话；不要把元信息塞进 summary
 - `details` 仅用于"使用提示/借鉴点"，不是正文复述；没东西写就用空字符串 ""
 - `structure_sections` 至少 1 条；如果文档结构不清，可只放一条整体概要
@@ -695,6 +1030,18 @@ BAKE_BUNDLE_PROMPT = f"""你在执行一次性 bake bundle 提炼。输入是一
 --- sop ---
 {BAKE_SOP_PROMPT}
 """
+
+BAKE_COMPACT_BUNDLE_PROMPT = (
+    BAKE_BUNDLE_PROMPT
+    + """
+
+这是失败后的紧凑重试。必须优先保证 JSON 完整闭合：
+- 每个 Markdown 字段只保留最有证据的要点，不复述同一段内容
+- 数组只保留最重要的项目
+- 同一个 JSON 字段只输出一次；禁止重复 key、重复段落或循环扩写
+- 若内容无法在限制内可靠表达，对相应类别返回 accepted=false
+"""
+)
 
 MERGE_SYSTEM_PROMPT ="""你是一个工作片段提炼助手。以下是用户在一段连续时间内的屏幕采集记录（按时间顺序），它们属于同一个工作片段。
 
@@ -832,10 +1179,13 @@ class KnowledgeExtractorV2:
         # 测试 Ollama 是否可用
         try:
             r = requests.get(f"{self.ollama_base_url}/api/tags", timeout=5)
-            r.raise_for_status()
+            if r.status_code >= 400:
+                raise BakeModelRequestError(r.status_code, r.text)
             logger.info(f"✅ Ollama 服务连接成功，模型: {model}")
-        except Exception as e:
-            raise RuntimeError(f"Ollama 服务不可用: {e}")
+        except BakeModelRequestError:
+            raise
+        except requests.RequestException as exc:
+            raise BakeModelTransportError("无法连接本地模型服务") from exc
 
         self.embedding_model = embedding_model
         if embedding_model:
@@ -864,7 +1214,7 @@ class KnowledgeExtractorV2:
             "keep_alive": "10m",
         }
         if format:
-            payload["format"] = format
+            payload["format"] = _ollama_compatible_format(format)
         if options:
             payload["options"] = options
 
@@ -877,6 +1227,8 @@ class KnowledgeExtractorV2:
             ) as response:
                 unregister = register_current_preempt_callback(response.close)
                 try:
+                    if response.status_code >= 400:
+                        raise BakeModelRequestError(response.status_code, response.text)
                     response.raise_for_status()
                     final: Dict[str, Any] = {}
                     content_parts: list[str] = []
@@ -885,7 +1237,12 @@ class KnowledgeExtractorV2:
                         raise_if_preempted()
                         if not raw_line:
                             continue
-                        chunk = json.loads(raw_line.decode("utf-8", errors="replace"))
+                        try:
+                            chunk = json.loads(raw_line.decode("utf-8", errors="replace"))
+                        except json.JSONDecodeError as exc:
+                            raise BakeModelResponseError(
+                                "本地模型流式响应不是合法 JSON"
+                            ) from exc
                         final.update(chunk)
                         message = chunk.get("message") or {}
                         if message.get("content"):
@@ -901,9 +1258,25 @@ class KnowledgeExtractorV2:
                     unregister()
             raise_if_preempted()
             return final
-        except Exception:
+        except Exception as exc:
             if current_task_preempt_requested():
                 raise_if_preempted()
+            if isinstance(
+                exc,
+                (
+                    BakeInferenceTimeoutError,
+                    BakeModelRequestError,
+                    BakeModelTransportError,
+                    BakeModelResponseError,
+                ),
+            ):
+                raise
+            if isinstance(exc, requests.Timeout):
+                raise BakeInferenceTimeoutError("本地模型请求超时") from exc
+            if isinstance(exc, requests.ConnectionError):
+                raise BakeModelTransportError("无法连接本地模型服务") from exc
+            if isinstance(exc, requests.RequestException):
+                raise BakeModelTransportError("本地模型传输失败") from exc
             raise
 
     def _build_merge_system_prompt(self) -> str:
@@ -1168,6 +1541,7 @@ class KnowledgeExtractorV2:
         return (
             f"source_timeline_id: {candidate.get('source_timeline_id')}\n"
             f"source_capture_id: {candidate.get('source_capture_id')}\n"
+            f"timeline_category: {candidate.get('timeline_category') or ''}\n"
             f"work_item: {candidate.get('work_item') or ''}\n"
             f"work_status: {candidate.get('work_status') or ''}\n"
             f"work_progress: {candidate.get('work_progress') or ''}\n"
@@ -1188,14 +1562,118 @@ class KnowledgeExtractorV2:
             f"capture_win_title: {self._truncate_text(candidate.get('capture_win_title'), 120)}\n"
             f"capture_url: {capture_url}\n"
             f"capture_webpage_title: {webpage_title}\n"
+            f"document_evidence: {json.dumps(self._resolve_document_evidence(candidate), ensure_ascii=False)}\n"
             f"entities: {self._truncate_text(entities_text, 160)}\n\n"
             f"capture_context:\n{capture_text}"
             f"{url_block}"
         )
 
+    @staticmethod
+    def _build_document_source_text(candidate: Dict[str, Any]) -> str:
+        """只提取文档可见正文，用于确定性内容判重，不混入 timeline 元数据。"""
+        aggregated = str(candidate.get('url_aggregated_text') or '').strip()
+        if aggregated:
+            return aggregated
+        return "\n".join(
+            str(candidate.get(field) or '').strip()
+            for field in (
+                'capture_ax_text',
+                'capture_ocr_text',
+                'capture_input_text',
+                'capture_audio_text',
+            )
+            if str(candidate.get(field) or '').strip()
+        )
+
+    @staticmethod
+    def _normalize_document_dedupe_text(value: str) -> str:
+        return " ".join(str(value or '').lower().split())
+
     def _count_marker_hits(self, text: str, markers: tuple[str, ...]) -> int:
         normalized = str(text or '').lower()
         return sum(1 for marker in markers if marker and marker.lower() in normalized)
+
+    def _resolve_document_evidence(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        provided = candidate.get('document_evidence')
+        if isinstance(provided, dict) and provided.get('kind'):
+            kind = str(provided.get('kind') or 'insufficient').strip().lower()
+            allows_auto_create = provided.get('allows_auto_create')
+            if allows_auto_create is None:
+                allows_auto_create = kind != 'insufficient'
+            return {
+                'kind': kind,
+                'source_surface': str(provided.get('source_surface') or 'other').strip().lower(),
+                'has_document_url': bool(provided.get('has_document_url')),
+                'has_document_page_title': bool(provided.get('has_document_page_title')),
+                'has_substantive_document_body': bool(
+                    provided.get('has_substantive_document_body')
+                ),
+                'allows_auto_create': bool(allows_auto_create) and kind != 'insufficient',
+            }
+
+        app_name = str(candidate.get('capture_app_name') or '').strip().lower()
+        if any(marker in app_name for marker in CHAT_APP_MARKERS):
+            source_surface = 'chat'
+        elif any(marker in app_name for marker in BROWSER_APP_MARKERS):
+            source_surface = 'browser'
+        elif any(marker in app_name for marker in DOCUMENT_EDITOR_APP_MARKERS):
+            source_surface = 'document_editor'
+        else:
+            source_surface = 'other'
+
+        capture_url = str(candidate.get('capture_url') or '').strip().lower()
+        title = str(
+            candidate.get('capture_webpage_title')
+            or candidate.get('capture_win_title')
+            or ''
+        ).strip().lower()
+        has_document_url = any(marker in capture_url for marker in DOCUMENT_URL_MARKERS)
+        has_document_page_title = any(
+            marker in title for marker in DOCUMENT_TITLE_MARKERS
+        )
+        aggregated_body = str(candidate.get('url_aggregated_text') or '').strip()
+        capture_body = '\n'.join(
+            str(candidate.get(field) or '')
+            for field in (
+                'capture_ax_text',
+                'capture_ocr_text',
+                'capture_input_text',
+                'capture_audio_text',
+            )
+        )
+        has_substantive_document_body = (
+            max(
+                sum(1 for char in aggregated_body if not char.isspace()),
+                sum(1 for char in capture_body if not char.isspace()),
+            )
+            >= MIN_DOCUMENT_EVIDENCE_CHARS
+        )
+        has_meaningful_native_title = bool(title) and title != app_name
+        is_code_editor = any(marker in app_name for marker in CODE_EDITOR_APP_MARKERS)
+
+        if not has_substantive_document_body or source_surface == 'chat':
+            kind = 'insufficient'
+        elif has_document_url:
+            kind = 'document_url'
+        elif source_surface == 'browser' and has_document_page_title:
+            kind = 'browser_document'
+        elif (
+            source_surface == 'document_editor'
+            and has_meaningful_native_title
+            and (not is_code_editor or has_document_page_title)
+        ):
+            kind = 'native_document'
+        else:
+            kind = 'insufficient'
+
+        return {
+            'kind': kind,
+            'source_surface': source_surface,
+            'has_document_url': has_document_url,
+            'has_document_page_title': has_document_page_title,
+            'has_substantive_document_body': has_substantive_document_body,
+            'allows_auto_create': kind != 'insufficient',
+        }
 
     def _should_reject_template_like_knowledge(self, candidate: Dict[str, Any], payload: Dict[str, Any]) -> bool:
         candidate_text, payload_text = self._build_bake_semantic_text(candidate, payload)
@@ -1264,6 +1742,7 @@ class KnowledgeExtractorV2:
         response_schema: Dict[str, Any] = BAKE_RESPONSE_SCHEMA,
         *,
         num_predict: int = BAKE_NUM_PREDICT,
+        repeat_penalty: float = 1.0,
     ) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         from monitor.llm_tracker import LLMCallTracker, estimate_tokens
 
@@ -1284,6 +1763,7 @@ class KnowledgeExtractorV2:
                     "temperature": 0.0,
                     "num_ctx": BAKE_CONTEXT_WINDOW_TOKENS,
                     "num_predict": num_predict,
+                    "repeat_penalty": repeat_penalty,
                 },
             )
             raw_content = _extract_ollama_response_text(response)
@@ -1445,6 +1925,30 @@ class KnowledgeExtractorV2:
             }
 
         if accepted:
+            if artifact_type == 'design':
+                document_evidence = self._resolve_document_evidence(candidate)
+                if not document_evidence['allows_auto_create']:
+                    logger.info(
+                        "bake design rejected by document evidence guard caller=%s source_timeline_id=%s evidence_kind=%s source_surface=%s has_document_url=%s has_document_page_title=%s has_substantive_document_body=%s",
+                        caller_id,
+                        candidate.get('source_timeline_id'),
+                        document_evidence['kind'],
+                        document_evidence['source_surface'],
+                        document_evidence['has_document_url'],
+                        document_evidence['has_document_page_title'],
+                        document_evidence['has_substantive_document_body'],
+                    )
+                    return {
+                        'accepted': False,
+                        'reason': 'insufficient_document_evidence',
+                        'payload': None,
+                    }, {
+                        'usage': meta['usage'],
+                        'model': meta['model'],
+                        'degraded': False,
+                        'elapsed_ms': elapsed_ms,
+                    }
+
             mismatch_reason = self._resolve_bake_artifact_mismatch_reason(artifact_type, candidate, payload)
             if mismatch_reason and artifact_type == 'knowledge':
                 logger.info(
@@ -1562,6 +2066,30 @@ class KnowledgeExtractorV2:
             }
 
         if accepted:
+            if artifact_type == 'design':
+                document_evidence = self._resolve_document_evidence(candidate)
+                if not document_evidence['allows_auto_create']:
+                    logger.info(
+                        "bake design rejected by document evidence guard caller=%s source_timeline_id=%s evidence_kind=%s source_surface=%s has_document_url=%s has_document_page_title=%s has_substantive_document_body=%s",
+                        caller_id,
+                        candidate.get('source_timeline_id'),
+                        document_evidence['kind'],
+                        document_evidence['source_surface'],
+                        document_evidence['has_document_url'],
+                        document_evidence['has_document_page_title'],
+                        document_evidence['has_substantive_document_body'],
+                    )
+                    return {
+                        'accepted': False,
+                        'reason': 'insufficient_document_evidence',
+                        'payload': None,
+                    }, {
+                        'usage': usage,
+                        'model': model,
+                        'degraded': False,
+                        'elapsed_ms': elapsed_ms,
+                    }
+
             mismatch_reason = self._resolve_bake_artifact_mismatch_reason(
                 artifact_type,
                 candidate,
@@ -1749,49 +2277,31 @@ class KnowledgeExtractorV2:
     def merge_bake_document(self, existing_document: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
         """将新的 candidate capture 内容合并到已有文档，返回更新后的字段。
 
-        三层过滤 + 懒惰合并策略：
-        1. 字面去重：content_hash 完全相同 → 直接丢弃（0次LLM）
-        2. 文本相似度：embedding cosine > 0.92 → 直接追加（0次LLM）
-        3. LLM判断：仅在前两层无法确定时调用（1次LLM，合并去重+插入判断为一体）
+        两层过滤 + 懒惰合并策略：
+        1. 字面去重：可见文档正文完全相同 → 直接丢弃（0次LLM）
+        2. LLM判断：正文有任何差异时调用（1次LLM，合并去重+插入判断为一体）
+
+        不能用 embedding 高相似直接判定 no_change：同一文档的小幅修订天然高度
+        相似，但新增的数字、结论或步骤仍必须进入补丁合并。
         """
         existing_title = existing_document.get('title') or ''
         existing_content = existing_document.get('full_content') or ''
-        existing_hash = existing_document.get('content_hash') or ''
         candidate_text = self._build_bake_candidate_text(candidate)
+        candidate_source_text = self._build_document_source_text(candidate)
 
-        # Layer 1: 字面去重（完全相同的 content_hash）
-        candidate_hash = hashlib.sha256(candidate_text.encode('utf-8')).hexdigest()
-        if existing_hash and candidate_hash == existing_hash:
-            logger.info("L1去重：content_hash完全匹配 source_timeline_id=%s", candidate.get('source_timeline_id'))
+        # Layer 1: 只比较同一语义域的正文，不能再拿生成正文 hash 与带元数据的
+        # candidate prompt hash 比较；那两者天然不可能相等。
+        existing_normalized = self._normalize_document_dedupe_text(existing_content)
+        candidate_normalized = self._normalize_document_dedupe_text(candidate_source_text)
+        if existing_normalized and candidate_normalized == existing_normalized:
+            logger.info("L1去重：可见正文完全匹配 source_timeline_id=%s", candidate.get('source_timeline_id'))
             return {'no_change': True, 'title': existing_title}
 
-        # Layer 2: 快速文本相似度（embedding cosine，复用已有向量化能力）
-        try:
-            existing_short = existing_content[:2000]
-            candidate_short = candidate_text[:2000]
-
-            if len(existing_short) > 100 and len(candidate_short) > 100:
-                from sklearn.metrics.pairwise import cosine_similarity
-                import numpy as np
-
-                # 使用当前已加载的 embedding model
-                existing_vec = self.embed_model.encode([existing_short])[0] if hasattr(self, 'embed_model') else None
-                candidate_vec = self.embed_model.encode([candidate_short])[0] if hasattr(self, 'embed_model') else None
-
-                if existing_vec is not None and candidate_vec is not None:
-                    similarity = cosine_similarity([existing_vec], [candidate_vec])[0][0]
-                    if similarity > 0.92:
-                        # 高相似度：简单追加新timeline_id，不修改内容
-                        logger.info("L2去重：embedding相似度%.2f source_timeline_id=%s", similarity, candidate.get('source_timeline_id'))
-                        return {'no_change': True, 'title': existing_title}
-        except Exception as e:
-            logger.warning("L2去重失败，降级到L3 LLM判断: %s", e)
-
-        # Layer 3: LLM判断（一次调用同时完成去重+合并+插入位置判断）
+        # Layer 2: 任何非完全相同的来源正文都交给补丁合并，避免漏掉小改动。
         return self._merge_with_llm_once(existing_document, candidate, candidate_text)
 
     def _merge_with_llm_once(self, existing_document: Dict[str, Any], candidate: Dict[str, Any], candidate_text: str) -> Dict[str, Any]:
-        """让 LLM 只返回增量补丁，再在本地拼接，保证已有正文不会丢失。"""
+        """让 LLM 只返回内容补丁，再在本地合入同一条文档，保证已有正文不会丢失。"""
         existing_title = existing_document.get('title') or ''
         existing_content = existing_document.get('full_content') or ''
         existing_summary = existing_document.get('summary') or ''
@@ -1807,14 +2317,15 @@ class KnowledgeExtractorV2:
             for i, s in enumerate(sections)
         ) if sections else "（文档无章节结构）"
 
-        system_prompt = """你在执行 bake 文档增量合并。
+        system_prompt = """你在执行同一份 bake 文档的内容合并。
 
 **输入**：已有文档 + 新 capture 内容
 
 **任务**：
 1. 判断新内容是否已被文档完全覆盖（即新内容是已有内容的子集或同义复述）
-2. 如果有新信息，只输出已有文档中尚不存在的 Markdown 增量片段
-3. 不要复述已有正文，不要输出合并后的完整文档；程序会在本地保留旧正文并追加增量
+2. 如果有新信息，只输出已有文档中尚不存在的 Markdown 内容补丁
+3. 不要复述已有正文，不要输出合并后的完整文档；程序会在本地保留旧正文并合入补丁
+4. 文档标题必须保持为输入中的已有标题，不得改成“文档增量”“新增内容”“补充内容”等过程性名称
 
 **输出 JSON**：
 {
@@ -1865,7 +2376,7 @@ class KnowledgeExtractorV2:
         if bool(parsed.get('no_change')):
             parsed.pop('content_patch', None)
             parsed.pop('full_content', None)
-            parsed['title'] = parsed.get('title') or existing_title
+            parsed['title'] = existing_title
             return parsed
 
         content_patch = str(parsed.pop('content_patch', '') or '').strip()
@@ -1879,7 +2390,7 @@ class KnowledgeExtractorV2:
                 parsed['no_change'] = False
                 parsed['insert_mode'] = 'append'
                 parsed['full_content'] = merged_content
-            parsed['title'] = parsed.get('title') or existing_title
+            parsed['title'] = existing_title
             return parsed
 
         # 向后兼容旧模型偶发返回 full_content，但只有它逐字包含全部旧正文时才接受。
@@ -1890,7 +2401,7 @@ class KnowledgeExtractorV2:
             legacy_full_content,
         ):
             parsed['full_content'] = legacy_full_content
-            parsed['title'] = parsed.get('title') or existing_title
+            parsed['title'] = existing_title
             return parsed
 
         if legacy_full_content:
@@ -1943,6 +2454,7 @@ class KnowledgeExtractorV2:
         self,
         candidate: Dict[str, Any],
         preempt_check: Optional[Callable[[], bool]] = None,
+        retry_attempt: int = 0,
     ) -> Dict[str, Any]:
         """用一次 LLM 调用同时提炼 knowledge/document/SOP。"""
         bundle_started_at = time.time()
@@ -1955,36 +2467,28 @@ class KnowledgeExtractorV2:
             from inference_queue import QueueEvictedError
             raise QueueEvictedError("后台推理已让出在线咨询或创作任务")
 
-        prepared_candidate = self._prepare_bake_bundle_candidate(candidate)
+        retry_attempt = max(0, int(retry_attempt or 0))
+        compact_retry = retry_attempt > 0
+        prepared_candidate = self._prepare_bake_bundle_candidate(
+            candidate,
+            BAKE_RETRY_INPUT_TOKEN_BUDGET if compact_retry else BAKE_INPUT_TOKEN_BUDGET,
+        )
         candidate_text = self._build_bake_candidate_text(prepared_candidate)
         user_prompt = f"候选输入如下:\n\n{candidate_text}"
         caller_id = f"bundle:{source_timeline_id}"
         try:
             parsed, meta = self._call_bake_llm(
                 caller_id,
-                BAKE_BUNDLE_PROMPT,
+                BAKE_COMPACT_BUNDLE_PROMPT if compact_retry else BAKE_BUNDLE_PROMPT,
                 user_prompt,
-                response_schema=BAKE_BUNDLE_RESPONSE_SCHEMA,
+                response_schema=(
+                    BAKE_COMPACT_BUNDLE_RESPONSE_SCHEMA
+                    if compact_retry
+                    else BAKE_BUNDLE_RESPONSE_SCHEMA
+                ),
+                num_predict=BAKE_RETRY_NUM_PREDICT if compact_retry else BAKE_NUM_PREDICT,
+                repeat_penalty=BAKE_RETRY_REPEAT_PENALTY if compact_retry else 1.0,
             )
-            if not isinstance(parsed, dict) and meta.get('done_reason') == 'length':
-                retry_candidate = self._prepare_bake_bundle_candidate(
-                    candidate,
-                    BAKE_RETRY_INPUT_TOKEN_BUDGET,
-                )
-                retry_candidate_text = self._build_bake_candidate_text(retry_candidate)
-                if retry_candidate_text != candidate_text:
-                    logger.warning(
-                        "bake bundle output truncated; retrying once with smaller context caller=%s prompt_chars=%s->%s",
-                        caller_id,
-                        len(candidate_text),
-                        len(retry_candidate_text),
-                    )
-                    parsed, meta = self._call_bake_llm(
-                        caller_id,
-                        BAKE_BUNDLE_PROMPT,
-                        f"候选输入如下:\n\n{retry_candidate_text}",
-                        response_schema=BAKE_BUNDLE_RESPONSE_SCHEMA,
-                    )
         except Exception as exc:
             elapsed_ms = int((time.time() - bundle_started_at) * 1000)
             logger.error(

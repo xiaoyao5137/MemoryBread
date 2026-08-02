@@ -16,6 +16,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { ChevronDown, ExternalLink, Loader2 } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { useFetchRagHistory, useModelStatus, useRagQuery } from '../hooks/useApi'
+import { useImeCompositionGuard } from '../hooks/useImeCompositionGuard'
 import { fetchBillingBalance } from '../utils/authApi'
 import { CREATION_MODEL_DEFS, LOCAL_CREATION_MODEL_ID, REMOTE_CREATION_MODEL_ID, canUseRemoteCreationModel, getEffectiveCreationModelId, getModelDisplayName } from '../utils/modelSelection'
 import { BUILTIN_TEMPLATES, CATEGORY_COLORS, groupTemplatesByCategory } from '../data/taskTemplates'
@@ -257,6 +258,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   const [screenshotPreview, setScreenshotPreview] = useState<string | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const answerRef = useRef<HTMLDivElement>(null)
+  const queryImeGuard = useImeCompositionGuard<HTMLTextAreaElement>()
   const doQuery = useRagQuery()
   const fetchRagHistory = useFetchRagHistory()
   const { status: modelStatus, ready: modelsReady, loading: modelStatusLoading } = useModelStatus()
@@ -351,6 +353,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault()
+      if (queryImeGuard.shouldBlockSubmit()) return
       const q = inputValue.trim()
       if (!q) return
       setRagQuery(q)
@@ -366,7 +369,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
         // error is set in store by useRagQuery
       }
     },
-    [inputValue, setRagQuery, doQuery, historyPage, refreshHistory]
+    [inputValue, setRagQuery, doQuery, historyPage, refreshHistory, queryImeGuard]
   )
 
   const handleTemplateClick = useCallback(
@@ -579,7 +582,7 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
         }}>
           <div style={{ fontWeight: 600, marginBottom: 4 }}>AI 能力尚未就绪</div>
           <div style={{ marginBottom: 8 }}>
-            {!modelStatus.ollama && '本地运行环境未启动。'}
+            {!modelStatus.runtime && '本地 AI 能力尚未就绪。'}
             {!modelStatus.llm && '分析模型尚未加载。'}
             {!modelStatus.embedding && '语义索引尚未加载。'}
           </div>
@@ -603,6 +606,19 @@ const RagPanel: React.FC<RagPanelProps> = ({ className = '' }) => {
           value={inputValue}
           onChange={handleInputChange}
           onWheel={handleInputWheel}
+          onCompositionStart={queryImeGuard.onCompositionStart}
+          onCompositionEnd={queryImeGuard.onCompositionEnd}
+          onBlur={queryImeGuard.onBlur}
+          onKeyDown={(event) => {
+            if (
+              event.key === 'Enter'
+              && !event.shiftKey
+              && !queryImeGuard.isImeEvent(event)
+            ) {
+              event.preventDefault()
+              event.currentTarget.form?.requestSubmit()
+            }
+          }}
           rows={3}
           style={{ resize: 'none' }}
           disabled={ragLoading || !modelsReady}

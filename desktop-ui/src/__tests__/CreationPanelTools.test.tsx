@@ -26,7 +26,7 @@ describe('创作工具 Tab', () => {
 
   it('使用精简卡片展示必备 Tool，并可分别安装和开启可选 Tool', async () => {
     render(<CreationPanel />)
-    fireEvent.click(screen.getByRole('button', { name: '工具 (2)' }))
+    fireEvent.click(screen.getByRole('button', { name: '工具 (4)' }))
 
     expect(screen.queryByText('随 MemoryBread 默认安装并开启，保证创作具备公开信息与本地记忆两类基础上下文。')).not.toBeInTheDocument()
     expect(screen.queryByText('安装后才会进入 Agent 的可用能力列表；关闭时保留安装，但本次创作不会调用。')).not.toBeInTheDocument()
@@ -35,6 +35,10 @@ describe('创作工具 Tab', () => {
     expect(screen.getByRole('button', { name: '互联网检索 Tool已开启' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '记忆搜索 Tool已安装' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '记忆搜索 Tool已开启' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '数据检索 Tool已安装' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '数据检索 Tool已开启' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '网页爬取 Tool已安装' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '网页爬取 Tool已开启' })).toBeDisabled()
 
     const plantUmlCard = screen.getByText('PlantUML 画图 Tool').closest('article')
     expect(plantUmlCard).not.toBeNull()
@@ -63,6 +67,8 @@ describe('创作工具 Tab', () => {
     window.localStorage.setItem(CREATION_TOOLS_STORAGE_KEY, JSON.stringify([
       { id: 'internet_search', installed: true, enabled: true },
       { id: 'memory_search', installed: true, enabled: true },
+      { id: 'data_search', installed: true, enabled: true },
+      { id: 'webpage_scrape', installed: true, enabled: true },
       { id: 'github_search', installed: true, enabled: true },
     ]))
     const agentPayloads: Array<Record<string, unknown>> = []
@@ -97,6 +103,8 @@ describe('创作工具 Tab', () => {
     expect(agentPayloads[0].enabled_tools).toEqual([
       'internet_search',
       'memory_search',
+      'data_search',
+      'webpage_scrape',
       'github_search',
     ])
   })

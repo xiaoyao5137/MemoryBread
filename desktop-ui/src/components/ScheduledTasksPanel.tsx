@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
 import type { NotificationChannel, ScheduledTask, TaskExecution, TaskTemplate } from '../types'
 import { useAppStore } from '../store/useAppStore'
+import { useImeCompositionGuard } from '../hooks/useImeCompositionGuard'
 import { BUILTIN_TEMPLATES, CATEGORY_COLORS, groupTemplatesByCategory } from '../data/taskTemplates'
 import {
   FLOATING_ASSIST_ENABLED_KEY,
@@ -197,6 +198,7 @@ const ScheduledTasksPanel: React.FC = () => {
   const [autoTaskDraft, setAutoTaskDraft] = useState(() => readFloatingAssistAutoTaskConfig())
   const [autoTaskAppDraft, setAutoTaskAppDraft] = useState<FloatingAssistAutoTaskAppTarget>({ bundleId: '', appName: '' })
   const [triggerWordDraft, setTriggerWordDraft] = useState('')
+  const triggerWordImeGuard = useImeCompositionGuard<HTMLInputElement>()
 
   const [form, setForm] = useState<TaskForm>(emptyTaskForm)
   const [channelForm, setChannelForm] = useState<ChannelForm>({
@@ -682,8 +684,11 @@ const ScheduledTasksPanel: React.FC = () => {
                   <input
                     value={triggerWordDraft}
                     onChange={event => setTriggerWordDraft(event.target.value)}
+                    onCompositionStart={triggerWordImeGuard.onCompositionStart}
+                    onCompositionEnd={triggerWordImeGuard.onCompositionEnd}
+                    onBlur={triggerWordImeGuard.onBlur}
                     onKeyDown={event => {
-                      if (event.key === 'Enter') {
+                      if (event.key === 'Enter' && !triggerWordImeGuard.isImeEvent(event)) {
                         event.preventDefault()
                         handleAddTriggerWord()
                       }

@@ -74,6 +74,6 @@ describe('模型管理', () => {
     expect(screen.getByText('3.4GB')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '体验' }))
 
-    expect(screen.getByText('体验 MBCD Std v1.0')).toBeInTheDocument()
+    expect(screen.getByText('体验 MBEM v1.0')).toBeInTheDocument()
   })
 })

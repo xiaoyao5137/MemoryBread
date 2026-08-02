@@ -2,9 +2,12 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft } from 'lucide-react'
 import {
   useCreateBakeTemplate,
+  useDeleteDataSource,
   useDeleteBakeKnowledge,
   useDeleteBakeSop,
   useDeleteBakeTemplate,
+  useExtractDataSources,
+  useFetchDataSources,
   useFetchBakeKnowledge,
   useFetchBakeKnowledgeDetail,
   useFetchBakeMemories,
@@ -15,6 +18,7 @@ import {
   useFetchBakeTemplates,
   useToggleBakeTemplateStatus,
   useUpdateBakeTemplate,
+  useRefreshDataSource,
   useModelStatus,
 } from '../hooks/useApi'
 import type { BakeOverviewResponse } from '../hooks/useApi'
@@ -27,6 +31,8 @@ import type {
   BakeInventoryTrendBucket,
   BakeOverview,
   BakeTab,
+  DataExtractionSummary,
+  DataSource,
   SopCandidate,
   TimelineItem,
 } from '../types'
@@ -35,6 +41,7 @@ import BakeOverviewTab from './bake/BakeOverviewTab'
 import BakeTemplatesTab from './bake/BakeTemplatesTab'
 import BakeSopTab from './bake/BakeSopTab'
 import BakeKnowledgeTab from './bake/BakeKnowledgeTab'
+import BakeDataTab from './bake/BakeDataTab'
 import BakeTabs from './bake/BakeTabs'
 import { BakeButton } from './bake/BakeShared'
 import { parseDateInputToMs } from './bake/BakeCaptureTab'
@@ -71,6 +78,7 @@ const createDraftTemplate = (): ArticleTemplate => ({
 const defaultOverview: BakeOverview = {
   captureCount: 0,
   memoryCount: 0,
+  dataCount: 0,
   knowledgeCount: 0,
   templateCount: 0,
   sopCount: 0,
@@ -83,6 +91,7 @@ const mapBakeOverview = (data: BakeOverviewResponse): BakeOverview => {
   const overview = {
     captureCount: data.capture_count,
     memoryCount: data.memory_count,
+    dataCount: data.data_count ?? 0,
     knowledgeCount: data.knowledge_count,
     templateCount: data.template_count,
     sopCount: data.sop_count ?? 0,
@@ -267,6 +276,10 @@ const BakePanel: React.FC = () => {
   const fetchSops = useFetchBakeSops()
   const fetchSop = useFetchBakeSop()
   const deleteSop = useDeleteBakeSop()
+  const fetchDataSources = useFetchDataSources()
+  const extractDataSources = useExtractDataSources()
+  const refreshDataSource = useRefreshDataSource()
+  const deleteDataSource = useDeleteDataSource()
 
   const [overview, setOverview] = useState<BakeOverview>(defaultOverview)
   const [knowledgeItems, setKnowledgeItems] = useState<BakeKnowledgeItem[]>([])
@@ -276,6 +289,20 @@ const BakePanel: React.FC = () => {
   const [templateTotal, setTemplateTotal] = useState(0)
   const [sopCandidates, setSopCandidates] = useState<SopCandidate[]>([])
   const [sopTotal, setSopTotal] = useState(0)
+  const [dataItems, setDataItems] = useState<DataSource[]>([])
+  const [dataTotal, setDataTotal] = useState(0)
+  const [pendingDataItems, setPendingDataItems] = useState<DataSource[]>([])
+  const [pendingDataTotal, setPendingDataTotal] = useState(0)
+  const [dataQuery, setDataQuery] = useState('')
+  const [draftDataQuery, setDraftDataQuery] = useState('')
+  const [dataOffset, setDataOffset] = useState(0)
+  const [dataLimit, setDataLimit] = useState(PAGE_SIZE)
+  const [selectedDataId, setSelectedDataId] = useState<number | null>(null)
+  const [dataLoading, setDataLoading] = useState(false)
+  const [dataExtracting, setDataExtracting] = useState(false)
+  const [refreshingDataId, setRefreshingDataId] = useState<number | null>(null)
+  const [deletingDataId, setDeletingDataId] = useState<number | null>(null)
+  const [lastDataExtraction, setLastDataExtraction] = useState<DataExtractionSummary | null>(null)
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
   const [draftKnowledgeQuery, setDraftKnowledgeQuery] = useState(bakeKnowledgeQuery)
   const [draftKnowledgeFrom, setDraftKnowledgeFrom] = useState(bakeKnowledgeFrom)
@@ -303,11 +330,12 @@ const BakePanel: React.FC = () => {
     let cancelled = false
 
     const loadOverviewTrend = async () => {
-      const [memoriesResult, knowledgeResult, templatesResult, sopsResult] = await Promise.allSettled([
+      const [memoriesResult, knowledgeResult, templatesResult, sopsResult, dataResult] = await Promise.allSettled([
         fetchMemories({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
         fetchKnowledge({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
         fetchTemplates({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
         fetchSops({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
+        fetchDataSources({ limit: 1, offset: 0 }),
       ])
       if (cancelled) return
 
@@ -328,6 +356,7 @@ const BakePanel: React.FC = () => {
         knowledgeCount: knowledgeResult.status === 'fulfilled' ? knowledgeResult.value.total : prev.knowledgeCount,
         templateCount: templatesResult.status === 'fulfilled' ? templatesResult.value.total : prev.templateCount,
         sopCount: sopsResult.status === 'fulfilled' ? sopsResult.value.total : prev.sopCount,
+        dataCount: dataResult.status === 'fulfilled' ? dataResult.value.total : prev.dataCount,
         inventoryTrend: inventoryTrend.length > 0 ? inventoryTrend : prev.inventoryTrend,
       }))
     }
@@ -336,7 +365,33 @@ const BakePanel: React.FC = () => {
     return () => {
       cancelled = true
     }
-  }, [bakeTab, fetchKnowledge, fetchMemories, fetchSops, fetchTemplates])
+  }, [bakeTab, fetchDataSources, fetchKnowledge, fetchMemories, fetchSops, fetchTemplates])
+
+  useEffect(() => {
+    if (bakeTab !== 'data') return
+    let cancelled = false
+    setDataLoading(true)
+    void fetchDataSources({
+      q: dataQuery.trim() || undefined,
+      limit: dataLimit,
+      offset: dataOffset,
+    }).then((data) => {
+      if (cancelled) return
+      setDataItems(data.items)
+      setDataTotal(data.total)
+      setPendingDataItems(data.pending_items ?? [])
+      setPendingDataTotal(data.pending_total ?? 0)
+      const selectableItems = [...data.items, ...(data.pending_items ?? [])]
+      setSelectedDataId(current => selectableItems.some(item => item.id === current)
+        ? current
+        : (data.items[0]?.id ?? data.pending_items?.[0]?.id ?? null))
+    }).catch((error) => {
+      if (!cancelled) setStatusMessage(toUserFacingError(error, '数据来源加载失败'))
+    }).finally(() => {
+      if (!cancelled) setDataLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [bakeTab, dataLimit, dataOffset, dataQuery, fetchDataSources])
 
   useEffect(() => {
     if (!['templates', 'knowledge', 'sop'].includes(bakeTab)) return
@@ -555,6 +610,22 @@ const BakePanel: React.FC = () => {
     setSopTotal(data.total)
   }
 
+  const refreshData = async (offset = dataOffset) => {
+    const data = await fetchDataSources({
+      q: dataQuery.trim() || undefined,
+      limit: dataLimit,
+      offset,
+    })
+    setDataItems(data.items)
+    setDataTotal(data.total)
+    setPendingDataItems(data.pending_items ?? [])
+    setPendingDataTotal(data.pending_total ?? 0)
+    const selectableItems = [...data.items, ...(data.pending_items ?? [])]
+    setSelectedDataId(current => selectableItems.some(item => item.id === current)
+      ? current
+      : (data.items[0]?.id ?? data.pending_items?.[0]?.id ?? null))
+  }
+
   const currentNavigationTarget = () => ({
     windowMode: 'bake' as const,
     bakeTab,
@@ -674,6 +745,82 @@ const BakePanel: React.FC = () => {
       bakeSopTo: '',
       bakeSopOffset: 0,
     })
+  }
+
+  const handleSearchData = () => {
+    setDataOffset(0)
+    setDataQuery(draftDataQuery)
+  }
+
+  const handleClearDataSearch = () => {
+    setDraftDataQuery('')
+    setDataQuery('')
+    setDataOffset(0)
+  }
+
+  const handleExtractData = async () => {
+    setDataExtracting(true)
+    try {
+      const summary = await extractDataSources()
+      setLastDataExtraction(summary)
+      setDataOffset(0)
+      await refreshData(0)
+      await refreshOverview()
+      setStatusMessage(`数据识别完成：新增 ${summary.source_created_count} 个数据源，生成 ${summary.snapshot_created_count} 个快照`)
+    } catch (error) {
+      setStatusMessage(toUserFacingError(error, '数据识别失败'))
+    } finally {
+      setDataExtracting(false)
+    }
+  }
+
+  const handleRefreshData = async (sourceId: number) => {
+    setRefreshingDataId(sourceId)
+    try {
+      const result = await refreshDataSource(sourceId, 'auto')
+      await refreshData()
+      const browserLabels: Record<string, string> = {
+        chrome: 'Chrome',
+        chrome_canary: 'Chrome Canary',
+        edge: 'Edge',
+        brave: 'Brave',
+        chromium: 'Chromium',
+        vivaldi: 'Vivaldi',
+        safari: 'Safari',
+      }
+      const channel = result.collector === 'browser_attach' || result.collector === 'chrome_attach'
+        ? `${browserLabels[result.browser ?? ''] ?? '浏览器'}登录会话`
+        : '直接网页访问'
+      setStatusMessage(`已通过${channel}刷新数据`)
+    } catch (error) {
+      setStatusMessage(toUserFacingError(error, '数据刷新失败'))
+    } finally {
+      setRefreshingDataId(null)
+    }
+  }
+
+  const handleDeleteData = async (sourceId: number) => {
+    if (!window.confirm('确认删除这条数据？删除后不会影响来源时间线和采集记录。')) return
+    setDeletingDataId(sourceId)
+    try {
+      await deleteDataSource(sourceId)
+      const removesDataRecord = dataItems.some(item => item.id === sourceId)
+      const nextOffset = removesDataRecord
+        ? getFallbackOffsetAfterRemoval(dataItems.length, dataOffset, dataLimit)
+        : dataOffset
+      if (nextOffset !== dataOffset) {
+        setDataOffset(nextOffset)
+      } else {
+        await refreshData(nextOffset)
+      }
+      if (selectedDataId === sourceId) setSelectedDataId(null)
+      setStatusMessage('已删除数据')
+      await refreshOverview()
+    } catch (error) {
+      setStatusMessage(toUserFacingError(error, '删除数据失败'))
+    } finally {
+      setDeletingDataId(null)
+    }
   }
 
   const handleBakeTabChange = (tab: BakeTab) => {
@@ -910,7 +1057,7 @@ const BakePanel: React.FC = () => {
         }}>
           <div style={{ fontWeight: 600, marginBottom: 4 }}>AI 能力尚未就绪</div>
           <div style={{ marginBottom: 8 }}>
-            {!modelStatus.ollama && '本地运行环境未启动。'}
+            {!modelStatus.runtime && '本地 AI 能力尚未就绪。'}
             {!modelStatus.llm && '分析模型尚未加载。'}
             {!modelStatus.embedding && '语义索引尚未加载。'}
           </div>
@@ -968,6 +1115,36 @@ const BakePanel: React.FC = () => {
               setSelectedCaptureId(captureId)
               setStatusMessage('已切换到关联采集记录')
             }}
+          />
+        )}
+        {bakeTab === 'data' && (
+          <BakeDataTab
+            items={dataItems}
+            total={dataTotal}
+            pendingItems={pendingDataItems}
+            pendingTotal={pendingDataTotal}
+            offset={dataOffset}
+            limit={dataLimit}
+            draftQuery={draftDataQuery}
+            selectedId={selectedDataId}
+            loading={dataLoading}
+            extracting={dataExtracting}
+            refreshingId={refreshingDataId}
+            deletingId={deletingDataId}
+            lastExtraction={lastDataExtraction}
+            onDraftQueryChange={setDraftDataQuery}
+            onSearch={handleSearchData}
+            onClearSearch={handleClearDataSearch}
+            onSelect={setSelectedDataId}
+            onPageChange={setDataOffset}
+            onLimitChange={(limit) => {
+              setDataLimit(limit)
+              setDataOffset(0)
+            }}
+            onExtract={handleExtractData}
+            onRefresh={handleRefreshData}
+            onDelete={handleDeleteData}
+            onViewTimeline={(timelineId) => handleViewSourceMemory(String(timelineId))}
           />
         )}
         {bakeTab === 'templates' && (

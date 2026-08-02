@@ -24,8 +24,9 @@ use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use memory_bread_core::storage::models::{EventType, NewCapture};
 use memory_bread_core::{
-    api::{state::DebugLogSpec, AppState},
-    storage::{NewBakeSop, NewKnowledgeEntry, StorageManager},
+    api::{error::ApiError, state::DebugLogSpec, AppState},
+    services::bake_service::BakeService,
+    storage::{NewBakeSop, NewTimeline, StorageManager},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -119,7 +120,11 @@ fn make_bake_error_response(status_line: &str, body: &str) -> String {
 }
 
 fn make_bake_state(sm: StorageManager, sidecar_url: String) -> Arc<AppState> {
-    AppState::with_config(sm, sidecar_url, vec![])
+    let state = AppState::with_config(sm, sidecar_url, vec![]);
+    state
+        .capture_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state
 }
 
 async fn spawn_failing_sidecar() -> String {
@@ -171,7 +176,7 @@ fn seed_knowledge_entry(
     let capture_id = seed_capture(sm);
     if category == "bake_sop" {
         let source_id = sm
-            .insert_knowledge_entry(&NewKnowledgeEntry {
+            .insert_timeline_entry(&NewTimeline {
                 capture_id,
                 summary: summary.to_string(),
                 overview: Some(overview.to_string()),
@@ -213,7 +218,7 @@ fn seed_knowledge_entry(
             .unwrap();
     }
 
-    sm.insert_knowledge_entry(&NewKnowledgeEntry {
+    sm.insert_timeline_entry(&NewTimeline {
         capture_id,
         summary: summary.to_string(),
         overview: Some(overview.to_string()),
@@ -1560,38 +1565,32 @@ async fn test_bake_run_pipeline_malformed_json_does_not_advance_watermark() {
         ),
     ])
     .await;
-    let router = memory_bread_core::api::create_router(make_bake_state(sm, sidecar_url));
+    let service = BakeService::new(sm.clone(), sidecar_url);
 
-    let (first_status, first_json, first_body) = run_bake(router.clone(), "manual_debug").await;
-    assert_eq!(
-        first_status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "body: {first_body}"
-    );
-    assert_eq!(first_json["error"], "INTERNAL_ERROR");
-    assert!(first_json["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("解析 bake sidecar 响应失败"));
+    let first_error = service
+        .run_bake_pipeline("manual_debug", 10)
+        .await
+        .expect_err("损坏的 200 响应应进入候选有界重试");
+    match first_error {
+        ApiError::Upstream { status, code, .. } => {
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(code, "BAKE_SIDECAR_RESPONSE_INVALID");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert!(sm.get_bake_watermark("unified").unwrap().is_none());
 
-    let (second_status, second_json, second_body) = run_bake(router.clone(), "manual_debug").await;
-    assert_eq!(second_status, StatusCode::OK, "body: {second_body}");
-    assert_eq!(second_json["processed_episode_count"], 1);
-    assert_eq!(second_json["knowledge_created_count"], 1);
-
-    let knowledge_req = Request::builder()
-        .uri("/api/bake/knowledge")
-        .body(Body::empty())
-        .unwrap();
-    let (knowledge_status, knowledge_body) = oneshot(router, knowledge_req).await;
-    assert_eq!(knowledge_status, StatusCode::OK, "body: {knowledge_body}");
-    let knowledge_json: serde_json::Value = serde_json::from_str(&knowledge_body).unwrap();
-    assert_eq!(knowledge_json["items"].as_array().unwrap().len(), 1);
-    assert_eq!(knowledge_json["items"][0]["summary"], "重试后成功知识");
+    let second = service
+        .run_bake_pipeline("manual_debug", 10)
+        .await
+        .expect("第二次合法响应应处理同一候选");
+    assert_eq!(second.processed_episode_count, 1);
+    assert_eq!(second.knowledge_created_count, 1);
+    assert_eq!(sm.count_bake_knowledge().unwrap(), 1);
 }
 
 #[tokio::test]
-async fn test_bake_run_pipeline_maps_sidecar_http_errors() {
+async fn test_bake_run_pipeline_bounds_unstructured_5xx_and_advances_watermark() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("test.db");
     let sm = StorageManager::open(&db).unwrap();
@@ -1602,24 +1601,50 @@ async fn test_bake_run_pipeline_maps_sidecar_http_errors() {
         "应返回 BAD_GATEWAY",
         serde_json::json!({}),
     );
-    let sidecar_url = spawn_bake_sidecar(vec![make_bake_error_response(
-        "502 Bad Gateway",
-        r#"{"error":"boom"}"#,
-    )])
+    let sidecar_url = spawn_bake_sidecar(vec![
+        make_bake_error_response("502 Bad Gateway", r#"{"error":"boom one"}"#),
+        make_bake_error_response("502 Bad Gateway", r#"{"error":"boom two"}"#),
+        make_bake_error_response(
+            "502 Bad Gateway",
+            r#"{"error":"provider-model secret response"}"#,
+        ),
+    ])
     .await;
-    let router = memory_bread_core::api::create_router(make_bake_state(sm, sidecar_url));
+    let service = BakeService::new(sm, sidecar_url);
 
-    let (status, json, body) = run_bake(router.clone(), "manual_debug").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
-    assert_eq!(json["error"], "BAD_GATEWAY");
-    assert!(json["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("bake 提炼服务返回错误"));
+    for attempt in 1..=2 {
+        let error = service
+            .run_bake_pipeline("manual_debug", 10)
+            .await
+            .expect_err("前两次裸 502 应进入有界重试");
+        match error {
+            ApiError::Upstream {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "attempt={attempt}");
+                assert_eq!(code, "BAKE_UNCLASSIFIED_UPSTREAM_ERROR");
+                assert!(!message.contains("provider-model"));
+            }
+            other => panic!("attempt={attempt} unexpected error: {other}"),
+        }
+    }
 
-    let (retry_status, retry_json, retry_body) = run_bake(router, "manual_debug").await;
-    assert_eq!(retry_status, StatusCode::BAD_GATEWAY, "body: {retry_body}");
-    assert_eq!(retry_json["error"], "BAD_GATEWAY");
+    let terminal = service
+        .run_bake_pipeline("manual_debug", 10)
+        .await
+        .expect("第三次裸 502 应把毒丸候选转为终态");
+    assert_eq!(terminal.status, "completed");
+    assert_eq!(terminal.processed_episode_count, 1);
+    assert_eq!(terminal.discarded_count, 1);
+
+    // 毒丸候选达到上限后已推进 watermark；后续 run 不再被同一 5xx 卡住。
+    let next = service
+        .run_bake_pipeline("manual_debug", 10)
+        .await
+        .expect("毒丸候选终态后后续 run 应正常完成");
+    assert_eq!(next.processed_episode_count, 0);
 }
 
 // ── /debug/log-files ──────────────────────────────────────────────────────────
@@ -2029,7 +2054,7 @@ async fn test_knowledge_api_returns_semantic_fields() {
     let sm = StorageManager::open(&db).unwrap();
     let capture_id = seed_capture(&sm);
 
-    sm.insert_knowledge_entry(&NewKnowledgeEntry {
+    sm.insert_timeline_entry(&NewTimeline {
         capture_id,
         summary: "今天回看飞书消息".to_string(),
         overview: Some("今天回看飞书消息".to_string()),

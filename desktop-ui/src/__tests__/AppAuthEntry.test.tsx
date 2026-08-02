@@ -253,17 +253,14 @@ describe('App auth entry', () => {
     expect(useAppStore.getState().captureBackTarget).toBeNull()
   })
 
-  it('悬浮助手窗口也必须通过实时初始化质检后才能显示', async () => {
+  it('悬浮助手窗口不依赖 sidecar 初始化状态即可显示视觉主体', () => {
     window.history.replaceState({}, '', '/?view=floating-assist')
-    initializationMocks.fetchInitializationStatus.mockResolvedValue(initializationStatus('not_started'))
+    initializationMocks.fetchInitializationStatus.mockClear()
+    initializationMocks.fetchInitializationStatus.mockRejectedValue(new Error('sidecar unavailable'))
 
-    const first = render(<App />)
-    await waitFor(() => expect(initializationMocks.fetchInitializationStatus).toHaveBeenCalled())
-    expect(screen.queryByTestId('floating-assist')).not.toBeInTheDocument()
-    first.unmount()
-
-    initializationMocks.fetchInitializationStatus.mockResolvedValue(initializationStatus('completed'))
     render(<App />)
-    expect(await screen.findByTestId('floating-assist')).toBeInTheDocument()
+
+    expect(screen.getByTestId('floating-assist')).toBeInTheDocument()
+    expect(initializationMocks.fetchInitializationStatus).not.toHaveBeenCalled()
   })
 })

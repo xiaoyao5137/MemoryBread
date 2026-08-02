@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     api::{error::ApiError, state::AppState},
     capture::engine::{ocr_backfill_metrics_snapshot, OcrBackfillMetricsSnapshot},
+    services::bake_service::MAX_BAKE_RETRY_FAILURES,
 };
 
 const SELF_GENERATED_APP_KEYWORDS: [&str; 2] = ["memory-bread", "记忆面包"];
@@ -110,7 +111,7 @@ fn load_pipeline_backlog_metrics(
                     'bake_article', 'bake_knowledge', 'bake_sop', 'legacy_bake_candidate'
                   )
               AND t.is_self_generated = 0
-              AND COALESCE(r.failure_count, 0) < 1
+              AND COALESCE(r.failure_count, 0) < ?1
               AND (
                     t.importance >= 4
                  OR t.user_verified = 1
@@ -201,18 +202,53 @@ fn load_pipeline_backlog_metrics(
         )
         SELECT COUNT(*), MIN(candidate_ts) FROM pending
     "#;
-    let (pending_bake_count, oldest_pending_bake_at_ms) =
-        conn.query_row(pending_bake_sql, [], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
-        })?;
+    let (pending_bake_count, oldest_pending_bake_at_ms) = conn.query_row(
+        pending_bake_sql,
+        rusqlite::params![MAX_BAKE_RETRY_FAILURES],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+    )?;
 
-    let bake_retry_exhausted_count = conn
+    let (
+        bake_retry_pending_count,
+        bake_retry_exhausted_count,
+        bake_timeout_failure_count,
+        bake_truncated_failure_count,
+        bake_other_failure_count,
+    ) = conn
         .query_row(
-            "SELECT COUNT(*) FROM bake_retry_state WHERE failure_count >= 1",
-            [],
-            |row| row.get(0),
+            "SELECT
+                COALESCE(SUM(failure_count < ?1), 0),
+                COALESCE(SUM(failure_count >= ?1), 0),
+                COALESCE(SUM(
+                    failure_count >= ?1
+                    AND last_error LIKE 'upstream error (504%'
+                ), 0),
+                COALESCE(SUM(
+                    failure_count >= ?1
+                    AND (
+                        last_error LIKE '%BAKE_OUTPUT_TRUNCATED%'
+                        OR last_error LIKE '%truncated_json%'
+                    )
+                ), 0),
+                COALESCE(SUM(
+                    failure_count >= ?1
+                    AND last_error NOT LIKE 'upstream error (504%'
+                    AND last_error NOT LIKE '%BAKE_OUTPUT_TRUNCATED%'
+                    AND last_error NOT LIKE '%truncated_json%'
+                ), 0)
+             FROM bake_retry_state",
+            rusqlite::params![MAX_BAKE_RETRY_FAILURES],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
-        .unwrap_or(0);
+        .unwrap_or((0, 0, 0, 0, 0));
     let running_bake_count = conn
         .query_row(
             "SELECT COUNT(*) FROM bake_runs
@@ -278,7 +314,11 @@ fn load_pipeline_backlog_metrics(
         oldest_pending_extraction_at_ms,
         pending_bake_count,
         oldest_pending_bake_at_ms,
+        bake_retry_pending_count,
         bake_retry_exhausted_count,
+        bake_timeout_failure_count,
+        bake_truncated_failure_count,
+        bake_other_failure_count,
         running_bake_count,
         stale_bake_run_count,
         bake_watermark_updated_at_ms,
@@ -431,6 +471,25 @@ fn system_bucket_ms(range: &str) -> i64 {
         "24h" => 60 * 1000,
         "1d" => 60 * 1000,
         _ => 60 * 1000,
+    }
+}
+
+fn public_llm_model_name(model: &str) -> String {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized == "unavailable" {
+        return normalized;
+    }
+    if normalized.contains("plus") || normalized.contains("opus") {
+        return "MBCD Plus v1.0".to_string();
+    }
+    "MBEM v1.0".to_string()
+}
+
+fn public_model_event_name(model_type: &str, model_name: &str) -> String {
+    match model_type {
+        "llm" => public_llm_model_name(model_name),
+        "embedding" => "MBEMB V1.0".to_string(),
+        _ => model_name.to_string(),
     }
 }
 
@@ -716,7 +775,13 @@ pub struct KnowledgeFlow {
     /// 全量库存：已有 timeline、尚未生成任一 bake 产物的高价值候选。
     pub pending_bake_count: i64,
     pub oldest_pending_bake_at_ms: Option<i64>,
+    /// 已失败但仍在有界退避重试范围内的候选。
+    pub bake_retry_pending_count: i64,
+    /// 达到最大尝试次数、需要人工关注的候选。
     pub bake_retry_exhausted_count: i64,
+    pub bake_timeout_failure_count: i64,
+    pub bake_truncated_failure_count: i64,
+    pub bake_other_failure_count: i64,
     pub running_bake_count: i64,
     pub stale_bake_run_count: i64,
     pub by_time: Vec<KnowledgeTimePoint>,
@@ -735,7 +800,11 @@ struct PipelineBacklogMetrics {
     oldest_pending_extraction_at_ms: Option<i64>,
     pending_bake_count: i64,
     oldest_pending_bake_at_ms: Option<i64>,
+    bake_retry_pending_count: i64,
     bake_retry_exhausted_count: i64,
+    bake_timeout_failure_count: i64,
+    bake_truncated_failure_count: i64,
+    bake_other_failure_count: i64,
     running_bake_count: i64,
     stale_bake_run_count: i64,
     bake_watermark_updated_at_ms: Option<i64>,
@@ -910,7 +979,7 @@ pub async fn monitor_overview(
              FROM llm_usage_logs WHERE ts >= ?1
              GROUP BY model_name ORDER BY COALESCE(SUM(total_tokens),0) DESC LIMIT 8"
         )?;
-        let by_model: Vec<ModelUsage> = by_model_stmt
+        let mut by_model: Vec<ModelUsage> = by_model_stmt
             .query_map(rusqlite::params![from_ms], |r| {
                 Ok(ModelUsage {
                     model: r.get::<_, String>(0)?,
@@ -982,6 +1051,12 @@ pub async fn monitor_overview(
                 calls: item.calls,
                 trend: model_trend,
             });
+        }
+        for item in &mut by_model {
+            item.model = public_llm_model_name(&item.model);
+        }
+        for item in &mut trend_by_model {
+            item.model = public_llm_model_name(&item.model);
         }
         let bake_distribution = load_bake_token_distribution(conn, from_ms)?;
 
@@ -1220,7 +1295,11 @@ pub async fn monitor_overview(
                 oldest_pending_extraction_at_ms: backlog.oldest_pending_extraction_at_ms,
                 pending_bake_count: backlog.pending_bake_count,
                 oldest_pending_bake_at_ms: backlog.oldest_pending_bake_at_ms,
+                bake_retry_pending_count: backlog.bake_retry_pending_count,
                 bake_retry_exhausted_count: backlog.bake_retry_exhausted_count,
+                bake_timeout_failure_count: backlog.bake_timeout_failure_count,
+                bake_truncated_failure_count: backlog.bake_truncated_failure_count,
+                bake_other_failure_count: backlog.bake_other_failure_count,
                 running_bake_count: backlog.running_bake_count,
                 stale_bake_run_count: backlog.stale_bake_run_count,
                 by_time: knowledge_by_time,
@@ -1525,7 +1604,11 @@ pub struct ExtractionLiveResponse {
     pub oldest_pending_extraction_at_ms: Option<i64>,
     pub pending_bake_count: i64,
     pub oldest_pending_bake_at_ms: Option<i64>,
+    pub bake_retry_pending_count: i64,
     pub bake_retry_exhausted_count: i64,
+    pub bake_timeout_failure_count: i64,
+    pub bake_truncated_failure_count: i64,
+    pub bake_other_failure_count: i64,
     pub running_bake_count: i64,
     pub stale_bake_run_count: i64,
     pub bake_watermark_updated_at_ms: Option<i64>,
@@ -1622,7 +1705,11 @@ pub async fn monitor_extraction_live(
         oldest_pending_extraction_at_ms: backlog.oldest_pending_extraction_at_ms,
         pending_bake_count: backlog.pending_bake_count,
         oldest_pending_bake_at_ms: backlog.oldest_pending_bake_at_ms,
+        bake_retry_pending_count: backlog.bake_retry_pending_count,
         bake_retry_exhausted_count: backlog.bake_retry_exhausted_count,
+        bake_timeout_failure_count: backlog.bake_timeout_failure_count,
+        bake_truncated_failure_count: backlog.bake_truncated_failure_count,
+        bake_other_failure_count: backlog.bake_other_failure_count,
         running_bake_count: backlog.running_bake_count,
         stale_bake_run_count: backlog.stale_bake_run_count,
         by_time: Vec::new(),
@@ -1646,7 +1733,11 @@ pub async fn monitor_extraction_live(
         oldest_pending_extraction_at_ms: backlog.oldest_pending_extraction_at_ms,
         pending_bake_count: backlog.pending_bake_count,
         oldest_pending_bake_at_ms: backlog.oldest_pending_bake_at_ms,
+        bake_retry_pending_count: backlog.bake_retry_pending_count,
         bake_retry_exhausted_count: backlog.bake_retry_exhausted_count,
+        bake_timeout_failure_count: backlog.bake_timeout_failure_count,
+        bake_truncated_failure_count: backlog.bake_truncated_failure_count,
+        bake_other_failure_count: backlog.bake_other_failure_count,
         running_bake_count: backlog.running_bake_count,
         stale_bake_run_count: backlog.stale_bake_run_count,
         bake_watermark_updated_at_ms: backlog.bake_watermark_updated_at_ms,
@@ -1783,7 +1874,7 @@ fn runtime_label(key: &str) -> String {
     match key {
         "sidecar_local_runtime" => "AI Sidecar 本地运行时".to_string(),
         "model_api_runtime" => "Model API / RAG 运行时".to_string(),
-        "ollama_runtime" => "Ollama".to_string(),
+        "ollama_runtime" => "本地 AI 引擎".to_string(),
         _ => key.to_string(),
     }
 }
@@ -1794,10 +1885,10 @@ fn sidecar_model_type_label(model_type: &str, model_name: &str) -> String {
     }
     match model_type {
         "ocr" => format!("OCR · {model_name}"),
-        "embedding" => format!("Embedding · {model_name}"),
+        "embedding" => "Embedding · MBEMB V1.0".to_string(),
         "asr" => format!("ASR · {model_name}"),
         "vlm" => format!("VLM · {model_name}"),
-        "llm" => format!("LLM · {model_name}"),
+        "llm" => format!("LLM · {}", public_llm_model_name(model_name)),
         _ => model_name.to_string(),
     }
 }
@@ -2505,11 +2596,13 @@ pub async fn monitor_system(
             )?;
             let model_events: Vec<ModelEventItem> = ev_stmt
                 .query_map(rusqlite::params![from_ms], |r| {
+                    let model_type = r.get::<_, String>(2)?;
+                    let model_name = r.get::<_, String>(3)?;
                     Ok(ModelEventItem {
                         ts: r.get(0)?,
                         event_type: r.get(1)?,
-                        model_type: r.get(2)?,
-                        model_name: r.get(3)?,
+                        model_type: model_type.clone(),
+                        model_name: public_model_event_name(&model_type, &model_name),
                         duration_ms: r.get(4)?,
                         memory_mb: r.get(5)?,
                         mem_before_mb: r.get(6)?,
@@ -2571,11 +2664,11 @@ pub async fn monitor_system(
 // 阶段定义：
 //   capture   → 采集（pending = 已采集但还没生成 timeline 的 capture）
 //   timeline  → 预提炼（pending = 已 timeline 但下游 bake_* 都为空）
-//   knowledge / sop / document → 自动入库产物，不再维护人工确认队列
+//   knowledge / sop / document / data → 自动入库产物，不再维护人工确认队列
 // in-progress：
 //   capture：sidecar status.json 中正在提炼的 capture（来自 enrich_extractor_status）
-//   timeline / knowledge / sop / document：当前 running bake run 的活跃批次数，并复用待处理
-//                                          timeline 作为详情占位，避免总数和抽屉列表脱节。
+//   timeline / knowledge / sop / document / data：当前 running bake run 的活跃批次数，并复用
+//                                                 待处理 timeline 作为详情占位，避免总数和抽屉列表脱节。
 
 const DAG_ITEM_LIMIT: i64 = 20;
 const DAG_TIMELINE_PENDING_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
@@ -2650,7 +2743,11 @@ pub async fn monitor_pipeline_dag(
         oldest_pending_extraction_at_ms: None,
         pending_bake_count: 0,
         oldest_pending_bake_at_ms: None,
+        bake_retry_pending_count: 0,
         bake_retry_exhausted_count: 0,
+        bake_timeout_failure_count: 0,
+        bake_truncated_failure_count: 0,
+        bake_other_failure_count: 0,
         running_bake_count: 0,
         stale_bake_run_count: 0,
         by_time: Vec::new(),
@@ -2663,7 +2760,7 @@ pub async fn monitor_pipeline_dag(
     let extracting_captures = tmp_flow.extracting;
     let extractor_status = tmp_flow.extractor_status;
 
-    // 2. SQL 聚合：把 5 个 stage 的数字 + 每个 stage 的 pending 列表一次性查出来
+    // 2. SQL 聚合：把 6 个 stage 的数字 + 每个 stage 的 pending 列表一次性查出来
     let extracting_ids: Vec<i64> = extracting_captures.iter().map(|c| c.id).collect();
 
     let aggregated = state
@@ -2915,6 +3012,11 @@ pub async fn monitor_pipeline_dag(
                 )
                 .unwrap_or(0);
 
+            // ── data ──────────────────────────────────────────────────────
+            // 只统计已经生成快照的数据项；仅识别出报表 URL、尚未采集正文的来源
+            // 仍属于待采集来源，不能作为已完成的数据产物。
+            let data_completed_today = load_data_completed_today(conn, day_start_ms)?;
+
             // ── 当前 running 的 bake_run（全部，支持并发显示）─────────────────
             let fresh_running_after_ms = now_ms - DAG_RUNNING_BAKE_STALE_MS;
             let mut running_stmt = conn.prepare(
@@ -2967,6 +3069,9 @@ pub async fn monitor_pipeline_dag(
                 document_pending_count: 0,
                 document_pending_items: Vec::new(),
                 document_completed_today,
+                data_pending_count: 0,
+                data_pending_items: Vec::new(),
+                data_completed_today,
                 running_runs,
                 bake_watermark_lag_ms,
             })
@@ -3076,6 +3181,17 @@ pub async fn monitor_pipeline_dag(
             in_progress_items: Vec::new(),
             pending_items: aggregated.document_pending_items,
         },
+        DagStage {
+            key: "data".to_string(),
+            label: "数据".to_string(),
+            in_progress_label: "生成中".to_string(),
+            pending_label: "".to_string(),
+            in_progress_count: 0,
+            pending_count: aggregated.data_pending_count,
+            completed_today: aggregated.data_completed_today,
+            in_progress_items: Vec::new(),
+            pending_items: aggregated.data_pending_items,
+        },
     ];
 
     let first_run = aggregated.running_runs.first().cloned();
@@ -3107,9 +3223,29 @@ struct DagAggregated {
     document_pending_count: i64,
     document_pending_items: Vec<DagItem>,
     document_completed_today: i64,
+    data_pending_count: i64,
+    data_pending_items: Vec<DagItem>,
+    data_completed_today: i64,
     running_runs: Vec<DagRunningRun>,
     /// 兼容字段：最老一条待烘焙 timeline 的实际等待时长（ms），0 表示无库存。
     bake_watermark_lag_ms: i64,
+}
+
+fn load_data_completed_today(
+    conn: &rusqlite::Connection,
+    day_start_ms: i64,
+) -> Result<i64, crate::storage::error::StorageError> {
+    conn.query_row(
+        "SELECT COUNT(DISTINCT source.id)
+         FROM data_sources source
+         JOIN data_snapshots snapshot ON snapshot.source_id = source.id
+         WHERE source.deleted_at IS NULL
+           AND source.status != 'disabled'
+           AND snapshot.created_at >= ?1",
+        rusqlite::params![day_start_ms],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 // stage 取值：'bake_knowledge' → 表 bake_knowledge / kind 'bake_knowledge'
@@ -3194,6 +3330,38 @@ fn load_candidate_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_stage_counts_only_non_deleted_snapshot_sources_from_today() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE data_sources (
+                id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                deleted_at INTEGER
+             );
+             CREATE TABLE data_snapshots (
+                id INTEGER PRIMARY KEY,
+                source_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+             );
+             INSERT INTO data_sources VALUES
+                (1, 'active', NULL),
+                (2, 'active', NULL),
+                (3, 'disabled', NULL),
+                (4, 'active', 2500),
+                (5, 'unavailable', NULL);
+             INSERT INTO data_snapshots VALUES
+                (1, 1, 2500),
+                (2, 3, 2600),
+                (3, 4, 2700),
+                (4, 5, 2800);",
+        )
+        .unwrap();
+
+        assert_eq!(load_data_completed_today(&conn, 2000).unwrap(), 2);
+        assert_eq!(load_data_completed_today(&conn, 3000).unwrap(), 0);
+    }
 
     #[test]
     fn bake_stall_requires_old_backlog_and_no_recent_progress() {
@@ -3285,6 +3453,19 @@ mod tests {
                 .find(|bucket| bucket.label == "≥20K")
                 .map(|bucket| bucket.count),
             Some(1),
+        );
+    }
+
+    #[test]
+    fn provider_model_names_are_branded_before_monitor_serialization() {
+        assert_eq!(public_llm_model_name("provider-local-model"), "MBEM v1.0");
+        assert_eq!(
+            public_llm_model_name("provider-plus-model"),
+            "MBCD Plus v1.0"
+        );
+        assert_eq!(
+            public_model_event_name("embedding", "provider-vector-model"),
+            "MBEMB V1.0"
         );
     }
 }

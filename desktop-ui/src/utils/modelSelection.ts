@@ -14,9 +14,9 @@ export const CREATION_MODEL_DEFS = [
   },
   {
     id: LOCAL_CREATION_MODEL_ID,
-    name: 'MBCD Std v1.0',
-    shortName: 'Std',
-    description: '本地创作与咨询',
+    name: 'MBEM v1.0',
+    shortName: 'MBEM',
+    description: '本地理解、提炼、创作与咨询',
     remote: false,
   },
 ] as const
@@ -38,11 +38,11 @@ export function canUseRemoteCreationModel(currentUser: unknown, balance: CloudBa
 }
 
 export function getModelDisplayName(modelId?: string | null): string {
-  if (!modelId) return 'MBCD Std v1.0'
+  if (!modelId) return 'MBEM v1.0'
   if (modelId === REMOTE_CREATION_MODEL_ID || modelId.includes('plus') || modelId.includes('opus')) {
     return 'MBCD Plus v1.0'
   }
-  return 'MBCD Std v1.0'
+  return 'MBEM v1.0'
 }
 
 export function getEffectiveCreationModelId(

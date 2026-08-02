@@ -1,7 +1,7 @@
 # MemoryBread 创作功能 Agent 架构设计方案
 
 > 状态：已落地
-> 日期：2026-07-28
+> 日期：2026-08-01
 > 协议版本：`creation.agent.v1`
 
 ## 1. 摘要
@@ -9,10 +9,11 @@
 创作功能已从“一次输入、一次生成”的单模型调用升级为目标驱动的 Loop Agent：
 
 - 创作 Agent 维护目标、验收条件、环境、动态计划和执行游标；
-- 数据分析、行业调研、方案设计、文档撰写、质量审校等子 Agent 各自只负责一个专业结果；
-- 记忆搜索 Tool 与互联网检索 Tool 为 Agent 提供可追溯证据；
+- 数据分析、行业调研、方案设计、章节设计、文档撰写、质量审校和五类专项润色 Agent 各自只负责一个专业结果；
+- 记忆搜索、互联网检索、数据检索与网页爬取 Tool 为 Agent 提供可追溯证据；
 - 已安装的技能同时提供触发描述、执行工作流和风格指纹；首个命中 Skill 的有序步骤可以编排受控 Agent、已启用 Tool 和本轮协同 Skill；
 - 每次 Agent、Tool、Skill 完成后都会把结果写回环境、递增目标修订号，再由创作 Agent 执行或插入下一步；
+- 初稿前先由章节设计 Agent 生成章节蓝图；初稿后质量审校输出结构化问题，Harness 按问题动态追加依赖、专项润色与再次质检，最多自动优化三轮；
 - 会话把首轮完整要求固化为 `root_request`；客户端遗漏上下文时，Core 也会按 `session_id` 从本地历史恢复原始需求、最近文档和对话；
 - 后续“补充、修改、删除”会先形成可解释的编辑意图，再由 Writer 在完整文档上下文中判断所有受影响位置；目标章节只是线索，目录、摘要、编号、交叉引用、方案、计划、风险和验收可在同一轮联动修订；
 - 修订完成后由 Sidecar 计算逐行差异，Patch 同时记录新增、修改、删除的章节与行号，页面据此标出本轮改动；
@@ -53,21 +54,37 @@ flowchart LR
     MAIN --> DATA["数据分析 Agent"]
     MAIN --> RESEARCH["行业调研 Agent"]
     MAIN --> DESIGN["方案设计 Agent"]
+    MAIN --> CHAPTER["章节设计 Agent"]
     MAIN --> WRITER["文档撰写 Agent"]
     MAIN --> REVIEW["质量审校 Agent"]
+    MAIN --> DETAIL["细节润色 Agent"]
+    MAIN --> TABLE["表格润色 Agent"]
+    MAIN --> IMAGE["图片润色 Agent"]
+    MAIN --> NATURAL["去 AI 味 Agent"]
+    MAIN --> TYPE["字体润色 Agent"]
 
     MAIN --> MEMORY["记忆搜索 Tool"]
     MAIN --> WEB["互联网检索 Tool"]
+    MAIN --> DATASEARCH["数据检索 Tool"]
+    MAIN --> SCRAPE["网页爬取 Tool"]
     MAIN --> SKILLS["技能集"]
 
     MEMORY --> ENV["创作环境"]
     WEB --> ENV
+    DATASEARCH --> ENV
+    SCRAPE --> ENV
     SKILLS --> ENV
     DATA --> ENV
     RESEARCH --> ENV
     DESIGN --> ENV
+    CHAPTER --> ENV
     WRITER --> ENV
     REVIEW --> ENV
+    DETAIL --> ENV
+    TABLE --> ENV
+    IMAGE --> ENV
+    NATURAL --> ENV
+    TYPE --> ENV
     ENV -->|目标 revision + 1| MAIN
 
     LOOP -->|SSE 事件| CORE
@@ -97,13 +114,19 @@ flowchart LR
 | Agent | 触发条件 | 输入 | 输出到环境 | 完成标准 |
 | --- | --- | --- | --- | --- |
 | 创作 Agent | 每轮必选 | 用户本轮要求、当前文档、选项、Skill | `plan_summary`、目标状态 | 形成剩余能力计划 |
-| 数据分析 Agent | 指令包含数据、指标、分析、统计、趋势、成本或收益 | 目标、资料、现有文档 | `data_analysis` | 给出口径、结论、证据缺口，不编造数字 |
+| 数据分析 Agent | 数据型文档，或指令包含数据、指标、分析、统计、趋势、成本或收益 | 数据检索与网页刷新结果、目标、资料、现有文档 | `data_analysis` | 核对口径、周期、采集时间和 `can_use`，给出结论与证据缺口，不编造数字 |
 | 行业调研 Agent | 开启互联网检索或任务需要最新信息 | Web Tool 结果、目标 | `industry_research` | 结论保留来源 URL，标出待核验信息 |
 | 方案设计 Agent | 指令或文档类型包含方案、架构、PRD、设计、规划、建设 | 约束、参考、分析、Skill | `solution_design` | 明确边界、关键决策、组件、步骤、风险和验证 |
+| 章节设计 Agent | 首次创作，位于首个 Writer 之前 | 目标、读者、文档类型、证据、Skill | `chapter_design` | 每章包含目的、问题、证据、形式和完成标准 |
 | 文档撰写 Agent | 每轮必选 | 原始需求、编辑意图、完整现有文档、分析结论 | `document` 和 `last_document_patch` | 首轮输出完整 Markdown；后续输出联动修订后的完整 Markdown |
-| 质量审校 Agent | 每次文档完成后必选 | 文档、修订基线、目标和验收条件 | `quality_review` | 检查内容、结构保留、有效差异和目标章节位置 |
+| 质量审校 Agent | 每次文档完成后必选 | 文档、修订基线、目标和验收条件 | `quality_review`、`quality_issues` | 输出布尔指标、问题代码、目标 Agent、证据和依赖能力 |
+| 去 AI 味 Agent | 命中模板词、机械衔接、装饰性引号或长句堆叠 | 完整文档、风格信号、Skill 语气 | 完整 Markdown 与 Patch | 表达自然且事实、来源、语义强度不变 |
+| 细节润色 Agent | 章节过短、存在占位或观点缺少依据与动作 | 完整文档、短章节、证据与分析 | 完整 Markdown 与 Patch | 补齐对象、边界、依据、动作、结果或验证 |
+| 表格润色 Agent | 表格结构损坏，或比较型内容缺少表格 | 完整文档、表格问题 | 完整 Markdown 与 Patch | 输出列数一致的标准 Markdown 表格 |
+| 字体润色 Agent | 长文没有重点，或粗体覆盖过多 | 完整文档、强调密度 | 完整 Markdown 与 Patch | 只对关键结论、数字、风险和行动项使用 `**重点**` |
+| 图片润色 Agent | 架构、流程、状态或时序关系缺少图示 | 完整文档、PlantUML 约束 | 完整 Markdown 与 Patch | 输出正文已有对象组成的 PlantUML 或 Mermaid 代码图 |
 
-质量审校未通过时，创作 Agent 会动态在当前计划中插入一次“文档撰写 Agent → 质量审校 Agent”修订回路。当前限制最多自动修订一次，并用全局最大 64 步防止失控循环；单个 Skill 步骤最多编排四个 Agent 与 Tool，因此十二步契约连同 Skill 应用和质量收口仍位于安全上限内。
+质量审校不再只给“通过/失败”。每个问题都声明 `code`、`severity`、`agent_id`、`evidence` 和 `required_capabilities`。Harness 先动态激活匹配的已应用 Skill，再补齐 Tool/Agent 依赖，随后按内容与形式顺序调用专项 Agent，最后再次质检。Skill 激活会产生可观察的 `skill.completed` 事件，并把能力标签、问题代码和质量轮次写回环境。自动质量优化最多三轮；正文缺失、结构缺失或修订无差异只允许一次 Writer 重试；全局仍以 64 步防止失控循环。
 
 ### 4.2 为什么保留确定性创作 Agent
 
@@ -125,6 +148,8 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | 记忆搜索 Tool | 复用 `CreationService.retrieve_references` | 用户要求、任务画像、权重、最大参考数 | 本地文档摘要、来源、相关性和质量分 | `references`、`reference_summaries` |
 | 互联网检索 Tool | 复用 `CreationService.collect_web_context` | 用户要求、任务画像 | 标题、URL、摘要 | `web_results` |
+| 数据检索 Tool | 调用 Core Engine `/api/tools/data-search` | 用户要求、任务画像、实时性要求 | 数据源、快照摘要、时效与来源证据 | `data_results` |
+| 网页爬取 Tool | 调用 Core Engine 数据源刷新端点 | 数据检索返回的过期可刷新报表 | 浏览器会话/HTTP 刷新状态与新快照 | `webpage_scrapes`、更新后的 `data_results` |
 
 ### 5.2 Tool 统一契约
 
@@ -156,6 +181,8 @@ ToolResult {
 - 专业 Agent 只能基于 Tool 结果形成结论，并明确证据缺口；
 - 文档撰写 Agent 被要求不得编造政策编号、指标和来源；
 - “没有证据”本身是可写回环境的有效结果，不会阻断后续文档产出。
+- 数据、文档、知识、操作和互联网资料是平权证据，不因模块类型获得额外优先级；数据模块内部的新鲜度只用于判断数据能否作为当前事实。
+- 日报、周报、项目总结和数据分析类文档可先执行数据检索探针；Harness 根据 `refresh_required`、快照内容和失败码动态追加网页刷新或数据分析，过期或刷新失败的数据只能作为历史参考或待核验内容。
 
 ## 6. Skill 设计
 
@@ -205,7 +232,7 @@ Creation Agent 只使用首个命中 Skill 作为主工作流，避免多个完�
 4. 步骤目标、预期产出和协同 Skill 会随计划项进入检索查询或专业 Agent 提示；
 5. 同一步内的重复资源去重，但同一 Agent/Tool 可以在不同步骤再次执行，以支持“初查 → 复核”等真实流程；
 6. 没有 Agent/Tool 的逻辑步骤仍生成可观察的 Skill 步骤事件，并把目标、产出和协同 Skill 写回环境；
-7. 若工作流没有文档撰写或质量审校，运行时自动追加这两个收口步骤；
+7. 若工作流没有文档撰写或质量审校，运行时自动追加收口步骤；首次创作还会把章节设计 Agent 统一放在首个 Writer 之前；
 8. 没有 `execution_steps` 的旧 Skill 继续使用原有意图启发式计划。
 
 因此 Skill 本身仍不绕过 Creation Agent 直接执行模型或访问网络；它声明的是可审计的计划配方，真正执行仍受能力注册表、用户开关、每步资源上限、全局六十四步上限和现有事件协议约束。
@@ -237,7 +264,8 @@ LoopState
 ├── plan[]
 ├── cursor
 ├── pending_model_step
-└── writer_revisions
+├── writer_revisions
+└── quality_cycles
 ```
 
 `LoopState` 可以完整 JSON 序列化。外部模型模式每次暂停都把它作为 continuation 返回，恢复时不重新规划已经完成的步骤。
@@ -256,9 +284,13 @@ LoopState
 - `data_analysis`：数据分析结论；
 - `industry_research`：行业调研结论；
 - `solution_design`：方案设计结论；
+- `chapter_design`：章节顺序、每章目的、证据和完成标准；
 - `document`：当前完整文档；
 - `last_document_patch`：本轮操作、用户要求线索、实际改动章节、逐行 `changes[]`、前后哈希和保留范围；
-- `quality_review`：质量门禁结果。
+- `quality_review`：布尔质检指标、轮次和问题摘要；
+- `quality_issues`：可路由的问题代码、严重度、目标 Agent、证据和依赖能力；
+- `harness_decisions`：每次根据 Tool 或质检反馈形成的追加、跳过和停止决策；
+- `quality_mutations`：专项润色 Agent、问题代码、轮次和结果哈希。
 
 每个能力完成时执行以下原子语义：
 
@@ -305,8 +337,16 @@ while cursor < plan.length and steps < 64:
     更新 goal revision 与 remaining_steps
     发送 <kind>.completed
 
-    如果质量不通过且尚未修订：
-        在当前 cursor 插入 writer + reviewer
+    如果 Tool 或质量审校产生反馈：
+        生成 harness.decision
+        校验能力白名单、Tool 开关、已完成步骤和预算
+        在当前 cursor 动态插入依赖、专项 Agent 与 reviewer
+
+    如果质量无可执行问题：
+        结束质量循环
+
+    如果质量循环达到 3 轮：
+        停止追加步骤，保留问题代码
 
 全部完成：
     goal.status = complete
@@ -320,12 +360,21 @@ while cursor < plan.length and steps < 64:
 | --- | --- |
 | `enable_rag=true` | 记忆搜索 Tool |
 | `enable_web_search=true` 或任务画像要求最新信息 | 互联网检索 Tool、行业调研 Agent |
-| 指令包含数据类意图 | 数据分析 Agent |
+| 指令包含数据证据需求 | 数据检索 Tool；后续能力由 Tool 反馈决定 |
+| 数据检索返回过期可刷新报表 | 网页爬取 Tool |
+| 数据检索或网页刷新后存在可分析快照 | 数据分析 Agent |
+| 数据检索无结果或只有无快照元数据 | 跳过网页刷新和数据分析，保留证据缺口 |
 | 指令或文档类型包含方案、架构、PRD、设计、规划、建设 | 方案设计 Agent |
 | 命中已安装 Skill | 对应市场/个人 Skill |
 | 命中内置模板触发词 | 得分最高的模板 Skill |
-| 任意创作轮次 | 创作 Agent、文档撰写 Agent、质量审校 Agent |
-| 质量检查失败 | 动态插入一次撰写与审校修订 |
+| 首次创作 | 创作 Agent；首个文档撰写 Agent 前强制加入章节设计 Agent；文档完成后加入质量审校 Agent |
+| 质检发现正文或结构硬失败 | 最多一次文档撰写 Agent，再次质量审校 |
+| 质检发现章节细节不足 | 细节润色 Agent；数据型问题可先追加数据检索或数据分析 |
+| 质检发现表格缺失或损坏 | 表格润色 Agent |
+| 质检发现复杂关系缺少图示 | PlantUML Tool（已启用时）、图片润色 Agent |
+| 质检发现模板化表达 | 去 AI 味 Agent |
+| 质检发现重点不足或强调过量 | 字体润色 Agent |
+| 专项润色完成 | 再次质量审校，直到通过或达到三轮预算 |
 | 初始要求去空白后少于 8 个字符 | 暂停并请求用户确认 |
 
 规则不是固定流水线：不同目标会得到不同计划，质量结果还可以在执行中改变后续计划。
@@ -435,8 +484,9 @@ sequenceDiagram
 1. 用户输入目标，可附加文件并通过 `@` 选择 Skill；
 2. 点击“开始创作”；
 3. 页面逐条展示 Agent、Tool、Skill 执行情况；
-4. 文档撰写 Agent 流式生成或完整替换文档；
-5. 质量审校结束后保存会话、文档、轨迹、目标和参考资料。
+4. 章节设计 Agent 先写入章节蓝图，文档撰写 Agent 再流式生成或完整替换初稿；
+5. 质量审校把可执行问题交回 Harness，按需完成专项润色并再次质检；
+6. 通过或达到循环预算后保存会话、文档、轨迹、目标和参考资料。
 
 ### 11.2 后续轮次
 
@@ -585,7 +635,8 @@ Core Engine 同时包含兼容修复：即使旧版本曾错误地把迁移标�
 | 目标太短 | `confirmation.required` 后安全暂停 |
 | 外部模型未返回 continuation | 客户端拒绝盲目续跑并报错 |
 | Loop 超过 64 步 | 目标标记 failed，发送 `run.failed` |
-| 质量不通过 | 最多插入一次自动修订，避免无限循环 |
+| 正文或结构硬失败 | 最多插入一次 Writer 重试，再失败则保留硬问题 |
+| 专项质量问题未清除 | 最多三轮自动优化，完成事件返回剩余 `quality_warnings` |
 | 新客户端连接旧 Core | Agent 接口 404 时回退到旧生成链路 |
 
 运行失败时不清空已经生成的当前文档，用户可以修改要求后重新发送。
@@ -617,12 +668,14 @@ Core Engine 同时包含兼容修复：即使旧版本曾错误地把迁移标�
 - `edit_operation` / `requested_sections` / `target_sections`：本轮修改方式、要求线索与实际影响范围；
 - `changes[]` / `change_count`：新增、修改、删除发生的章节与结果行号；
 - `base_hash` / `result_hash`：证明局部操作基于哪个版本并产生何种结果；
+- `issue_count` / `issue_codes` / `quality_cycle`：质检问题数量、类型和当前轮次；
+- `harness.decision.reason_code` / `scheduled[]`：反馈触发的判断原因和追加能力；
 - `latency_ms` 和品牌模型 ID：写入创作历史。
 
 建议后续增加的聚合指标：
 
 - 各 Agent/Tool 平均耗时和失败率；
-- 首次质量通过率与自动修订率；
+- 首次质量通过率、专项 Agent 调用率和三轮预算耗尽率；
 - 用户确认率；
 - 单会话平均轮次；
 - Skill 命中率与用户继续修改率；
@@ -634,10 +687,10 @@ Core Engine 同时包含兼容修复：即使旧版本曾错误地把迁移标�
 
 | 范围 | 覆盖 | 结果 |
 | --- | --- | --- |
-| Sidecar 创作 | 动态 Agent/Tool/Skill、根需求保留、章节增删改 Patch、目标 revision、外部模型暂停恢复、用户确认、P0 创作队列 | 17 项通过 |
+| Sidecar 创作 | 动态 Agent/Tool/Skill、章节设计、质检问题路由、去 AI 味信号、根需求保留、Patch、外部模型暂停恢复 | 定向测试通过 |
 | Core Engine 创作 | 服务端会话补全、长对话和重复指令、修订谱系、Patch 元数据、旧迁移修复 | 13 项通过 |
-| Desktop Agent Loop | 首轮轨迹、多轮局部修订、意图/判断摘要、确认、品牌模型暂停恢复、历史脱敏 | 3 项通过 |
-| Desktop 全量 Vitest | 创作及其他页面回归 | 42 个测试文件、242 项通过 |
+| Desktop Agent Loop | 首轮轨迹、多轮局部修订、专项 Agent 流式替换、Harness 决策、历史脱敏 | 定向测试通过 |
+| Desktop Skill | 章节设计与专项 Agent 白名单、默认工作流、旧记录归一化 | 定向测试通过 |
 | TypeScript | `npx tsc --noEmit` | 通过 |
 | Desktop 生产构建 | `npx vite build` | 通过 |
 
@@ -692,6 +745,7 @@ npx vite build
 | 创作历史仓储 | `core-engine/src/storage/repo/creation_history.rs` |
 | 共享数据库迁移 | `shared/db-schema/migrations/055_add_creation_agent_history.sql`、`056_creation_revision_context.sql` |
 | 多轮页面和 Agent 轨迹 | `desktop-ui/src/components/CreationPanel.tsx` |
+| 创作 Skill Agent 目录与默认章节步骤 | `desktop-ui/src/utils/creationSkills.ts` |
 | 创作页响应式与轨迹样式 | `desktop-ui/src/components/CreationPanel.css` |
 | 会话和轨迹前端状态 | `desktop-ui/src/store/useAppStore.ts` |
 | Sidecar 测试 | `ai-sidecar/tests/test_creation_agent_loop.py`、`test_creation_queue.py` |
@@ -720,18 +774,9 @@ Capability {
 
 创作 Agent 只能选择注册过的能力。这样可以安全增加财务分析 Agent、合规审查 Agent、图表生成 Tool 等能力。
 
-### 20.2 基于质量指标的路由
+### 20.2 质量指标的后续增强
 
-把当前结构门禁扩展为：
-
-- 目标覆盖率；
-- 事实可追溯率；
-- Skill 结构遵循度；
-- 引用完整性；
-- 文档差异范围；
-- 用户定义的验收规则。
-
-只有失败项对应的 Agent 被重新调用，避免整篇重复生成。
+当前已按正文、结构、修订差异、自然表达、章节细节、表格、强调与图示做确定性路由。后续可增加事实可追溯率、Skill 结构遵循度、引用完整性和用户定义验收规则；新增指标仍需输出证据、目标能力和阈值，不能只给一个不透明总分。
 
 ### 20.3 人机协作检查点
 
@@ -754,7 +799,9 @@ Capability {
 - 子 Agent、Tool、Skill 均有可观察事件；
 - 对话框展示意图、判断摘要、能力调用、结果摘要和局部变更范围，同时不暴露私有思维链；
 - 每个执行结果写回环境并更新目标；
-- 质量结果能够动态改变后续计划；
+- 初稿前固定经过章节设计，Writer 消费章节蓝图；
+- 质量结果能够按缺陷类型动态追加 Tool、专业 Agent、专项润色与再次质检；
+- 去 AI 味、细节、表格、字体和图片润色均有独立责任、提示和 Patch；
 - 本地和品牌模型共用可暂停、可恢复 Loop；
 - 页面支持多轮对话、确认、轨迹、参考资料、历史和 Skill；
 - 原始需求独立持久化，客户端丢失前文时 Core 可按会话恢复；

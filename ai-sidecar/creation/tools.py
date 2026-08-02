@@ -6,12 +6,16 @@ from typing import Any, Iterable
 
 INTERNET_SEARCH_TOOL_ID = "internet_search"
 MEMORY_SEARCH_TOOL_ID = "memory_search"
+DATA_SEARCH_TOOL_ID = "data_search"
+WEBPAGE_SCRAPE_TOOL_ID = "webpage_scrape"
 PLANTUML_DIAGRAM_TOOL_ID = "plantuml_diagram"
 GITHUB_SEARCH_TOOL_ID = "github_search"
 
 REQUIRED_CREATION_TOOL_IDS = (
     INTERNET_SEARCH_TOOL_ID,
     MEMORY_SEARCH_TOOL_ID,
+    DATA_SEARCH_TOOL_ID,
+    WEBPAGE_SCRAPE_TOOL_ID,
 )
 OPTIONAL_CREATION_TOOL_IDS = (
     PLANTUML_DIAGRAM_TOOL_ID,
@@ -21,6 +25,14 @@ KNOWN_CREATION_TOOL_IDS = (
     *REQUIRED_CREATION_TOOL_IDS,
     *OPTIONAL_CREATION_TOOL_IDS,
 )
+
+
+class CreationToolExecutionError(RuntimeError):
+    """携带稳定错误码的 Tool 失败；消息不得包含正文、URL 或凭据。"""
+
+    def __init__(self, error_code: str, message: str):
+        super().__init__(message)
+        self.error_code = error_code
 
 
 def normalize_creation_tool_ids(value: Any) -> tuple[str, ...]:
@@ -57,6 +69,71 @@ def should_use_internet_search(text: str, requirement: dict[str, Any]) -> bool:
             "趋势",
             "价格",
         ),
+    )
+
+
+def should_use_data_tools(text: str, requirement: dict[str, Any]) -> bool:
+    doc_type = str(requirement.get("doc_type") or "")
+    evidence = f"{text}\n{doc_type}".lower()
+    document_markers = (
+        "日报",
+        "周报",
+        "月报",
+        "季报",
+        "年报",
+        "项目总结",
+        "工作总结",
+        "经营分析",
+        "数据分析",
+        "指标分析",
+        "数据报告",
+        "业绩报告",
+        "运营报告",
+        "daily report",
+        "weekly report",
+        "project summary",
+        "data analysis",
+    )
+    if any(marker in evidence for marker in document_markers):
+        return True
+
+    # 方案类任务只要明确围绕可量化对象，也需要先探测本地数据源。否则像
+    # “治理 GPU 利用率”这样的请求会只命中旧文档，即使其中引用了可实时
+    # 刷新的运营看板，也不会进入 data_search -> webpage_scrape 反馈链路。
+    metric_markers = (
+        "gpu",
+        "利用率",
+        "使用率",
+        "成本",
+        "用量",
+        "资源池",
+        "吞吐",
+        "延迟",
+        "可用性",
+        "qps",
+        "token",
+        "指标",
+        "看板",
+        "报表",
+    )
+    evidence_intent_markers = (
+        "方案",
+        "治理",
+        "分析",
+        "复盘",
+        "总结",
+        "报告",
+        "现状",
+        "基线",
+        "目标",
+        "优化",
+        "plan",
+        "analysis",
+        "review",
+        "baseline",
+    )
+    return any(marker in evidence for marker in metric_markers) and any(
+        marker in evidence for marker in evidence_intent_markers
     )
 
 

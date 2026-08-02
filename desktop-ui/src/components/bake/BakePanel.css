@@ -512,6 +512,12 @@
   gap: 12px;
 }
 
+.bake-grid-overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+
 .bake-split-overview {
   display: grid;
   grid-template-columns: 1.25fr 1fr;
@@ -1435,6 +1441,332 @@ button.bake-list-item.bake-list-item--active {
   word-break: break-word;
 }
 
+.bake-data-content,
+.bake-data-json {
+  max-height: 360px;
+  overflow: auto;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #1F2937;
+  font: inherit;
+}
+
+.bake-data-json {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+}
+
+.bake-data-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.bake-data-overview__item {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #F8F9FB;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.bake-data-overview__item span {
+  color: #6E6E73;
+  font-size: 11px;
+}
+
+.bake-data-overview__item strong {
+  color: #111111;
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.bake-data-overview__item .bake-data-overview__time {
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.bake-data-list-card,
+.bake-data-detail-card {
+  min-height: 480px;
+}
+
+.bake-data-list-sections,
+.bake-data-list-group,
+.bake-data-list-group__heading,
+.bake-data-pending__list,
+.bake-data-detail-heading,
+.bake-data-facts {
+  display: grid;
+}
+
+.bake-data-list-sections {
+  gap: 16px;
+}
+
+.bake-data-list-group {
+  gap: 10px;
+}
+
+.bake-data-list-group__heading {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  color: #3A3A3C;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.bake-data-list-group__heading span:last-child,
+.bake-data-pending > summary span {
+  min-width: 24px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #F2F2F7;
+  color: #6E6E73;
+  font-size: 11px;
+  text-align: center;
+}
+
+.bake-data-record-item {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  text-align: left;
+}
+
+.bake-data-record-item__summary {
+  color: #111111;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.bake-data-record-item__eyebrow {
+  color: #A15C19;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+}
+
+.bake-data-record-item__source {
+  color: #6E6E73;
+  font-size: 11px;
+}
+
+.bake-data-pending {
+  padding-top: 12px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.bake-data-pending > summary,
+.bake-data-disclosure > summary {
+  cursor: pointer;
+  color: #3A3A3C;
+  font-size: 12px;
+  font-weight: 700;
+  list-style-position: inside;
+}
+
+.bake-data-pending > summary span {
+  display: inline-block;
+  margin-left: 4px;
+}
+
+.bake-data-pending__list {
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.bake-data-source-item {
+  width: 100%;
+  text-align: left;
+}
+
+.bake-data-detail-heading {
+  gap: 6px;
+  padding: 2px 2px 6px;
+}
+
+.bake-data-detail-heading__label {
+  color: #6E6E73;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.bake-data-detail-heading__summary {
+  color: #111111;
+  font-size: 20px;
+  font-weight: 750;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.bake-knowledge-detail__section.bake-data-detail-section {
+  white-space: normal;
+}
+
+.bake-data-facts {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.bake-data-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  margin-top: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 10px;
+  background: #FFFFFF;
+}
+
+.bake-data-table {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  color: #1F2937;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bake-data-table th,
+.bake-data-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+  text-align: left;
+  vertical-align: top;
+}
+
+.bake-data-table thead th {
+  position: sticky;
+  top: 0;
+  background: #F8F9FB;
+  color: #6E6E73;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.bake-data-table tbody th {
+  color: #111111;
+  font-weight: 700;
+}
+
+.bake-data-table tbody tr:last-child th,
+.bake-data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.bake-data-table__value {
+  color: #A15C19;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.bake-data-timeline-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.bake-data-fact {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 9px;
+  background: #FFFFFF;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.bake-data-fact--statement {
+  grid-column: 1 / -1;
+}
+
+.bake-data-fact__label {
+  color: #6E6E73;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.bake-data-fact__value {
+  color: #111111;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.bake-data-fact--statement .bake-data-fact__value {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.bake-data-source-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+  margin: 8px 0 0;
+}
+
+.bake-data-source-meta > div {
+  min-width: 0;
+}
+
+.bake-data-source-meta dt {
+  color: #6E6E73;
+  font-size: 11px;
+}
+
+.bake-data-source-meta dd {
+  margin: 2px 0 0;
+  color: #1F2937;
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.bake-data-source-note {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.bake-data-source-url {
+  margin-top: 10px;
+  color: #6E6E73;
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.bake-data-error {
+  margin-top: 8px;
+  color: #B42318;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.bake-data-disclosure {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #F8F9FB;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.bake-data-disclosure[open] > summary {
+  margin-bottom: 10px;
+}
+
 .bake-capture-detail__meta-grid {
   align-items: stretch;
 }
@@ -1759,6 +2091,9 @@ button.bake-list-item.bake-list-item--active {
 
 @media (max-width: 768px) {
   .bake-grid-4,
+  .bake-data-overview,
+  .bake-data-facts,
+  .bake-data-source-meta,
   .bake-split-list-detail,
   .bake-split-list-detail--memories-fixed,
   .bake-split-list-detail--knowledge,
@@ -1767,6 +2102,10 @@ button.bake-list-item.bake-list-item--active {
   .bake-split-list-detail--sop,
   .bake-list-toolbar__filters {
     grid-template-columns: 1fr;
+  }
+
+  .bake-data-list-card {
+    position: static;
   }
 
   .bake-list-toolbar__actions {
@@ -1816,6 +2155,10 @@ button.bake-list-item.bake-list-item--active {
   .bake-trend-range {
     max-width: 100%;
     overflow-x: auto;
+  }
+
+  .bake-data-fact--statement {
+    grid-column: auto;
   }
 }
 
@@ -2047,6 +2390,85 @@ button.bake-list-item.bake-list-item--active {
     background: rgba(10, 132, 255, 0.16);
     border-color: #0A84FF;
     box-shadow: 0 12px 28px rgba(10, 132, 255, 0.18);
+  }
+
+  .bake-data-overview__item,
+  .bake-data-disclosure {
+    background: #232326;
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .bake-data-overview__item span,
+  .bake-data-detail-heading__label,
+  .bake-data-record-item__source,
+  .bake-data-fact__label,
+  .bake-data-source-meta dt,
+  .bake-data-source-url {
+    color: #9CA3AF;
+  }
+
+  .bake-data-overview__item strong,
+  .bake-data-record-item__summary,
+  .bake-data-detail-heading__summary,
+  .bake-data-fact__value,
+  .bake-data-source-meta dd,
+  .bake-data-content,
+  .bake-data-json {
+    color: #F3F4F6;
+  }
+
+  .bake-data-list-group__heading,
+  .bake-data-pending > summary,
+  .bake-data-disclosure > summary {
+    color: #D1D5DB;
+  }
+
+  .bake-data-list-group__heading span:last-child,
+  .bake-data-pending > summary span {
+    background: rgba(255, 255, 255, 0.08);
+    color: #D1D5DB;
+  }
+
+  .bake-data-pending,
+  .bake-data-source-note {
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .bake-data-fact {
+    background: #1C1C1E;
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .bake-data-record-item__eyebrow,
+  .bake-data-table__value {
+    color: #E5A15E;
+  }
+
+  .bake-data-table-wrap {
+    background: #1C1C1E;
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .bake-data-table {
+    color: #E5E7EB;
+  }
+
+  .bake-data-table th,
+  .bake-data-table td {
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .bake-data-table thead th {
+    background: #232326;
+    color: #9CA3AF;
+  }
+
+  .bake-data-table tbody th {
+    color: #F3F4F6;
+  }
+
+  .bake-data-error {
+    color: #FFB4B4;
   }
 }
 

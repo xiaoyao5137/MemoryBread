@@ -83,7 +83,11 @@ const EMPTY_OVERVIEW: MonitorOverview = {
     oldest_pending_extraction_at_ms: null,
     pending_bake_count: 0,
     oldest_pending_bake_at_ms: null,
+    bake_retry_pending_count: 0,
     bake_retry_exhausted_count: 0,
+    bake_timeout_failure_count: 0,
+    bake_truncated_failure_count: 0,
+    bake_other_failure_count: 0,
     running_bake_count: 0,
     stale_bake_run_count: 0,
     by_time: [],
@@ -127,10 +131,8 @@ function formatLlmModelName(model?: string | null): string {
   const name = (model || '').trim()
   if (!name || name === 'unavailable') return '模型状态待确认'
   if (/embed|bge|vector/i.test(name)) return 'MBEMB V1.0'
-  if (name === 'qwen3.5:4b' || name === 'mbem-v1-local') return 'MBEM v1.0'
-  if (name === 'mbcd-plus-v1') return 'MBCD Plus v1.0'
-  if (/^(?:MBEM|MBCD|MBVD|MBID)[\s-]/i.test(name)) return name
-  return '本地分析模型'
+  if (/plus|opus/i.test(name)) return 'MBCD Plus v1.0'
+  return 'MBEM v1.0'
 }
 
 function fmt(n: number): string {
@@ -781,10 +783,20 @@ const BakeQueueCard: React.FC<{
   oldestPendingAtMs: number | null | undefined
   runningCount: number
   staleRunCount: number
+  retryPendingCount: number
   retryExhaustedCount: number
   stalled: boolean
   paused: boolean
-}> = ({ pending, oldestPendingAtMs, runningCount, staleRunCount, retryExhaustedCount, stalled, paused }) => {
+}> = ({
+  pending,
+  oldestPendingAtMs,
+  runningCount,
+  staleRunCount,
+  retryPendingCount,
+  retryExhaustedCount,
+  stalled,
+  paused,
+}) => {
   const oldestAge = oldestQueueAge(oldestPendingAtMs)
   const color = paused
     ? '#8E8E93'
@@ -796,9 +808,11 @@ const BakeQueueCard: React.FC<{
     : pending > 0
     ? `最老已等待 ${fmtDurationMs(oldestAge)} · 运行 ${runningCount}`
     : `当前无待烘焙内容 · 运行 ${runningCount}`
-  const detail = retryExhaustedCount > 0
-    ? `${sub} · 永久失败 ${retryExhaustedCount}`
-    : sub
+  const retryParts = [
+    retryPendingCount > 0 ? `退避重试 ${retryPendingCount}` : '',
+    retryExhaustedCount > 0 ? `需处理 ${retryExhaustedCount}` : '',
+  ].filter(Boolean)
+  const detail = retryParts.length > 0 ? `${sub} · ${retryParts.join(' · ')}` : sub
   return (
     <div
       className="monitor-stat-card"
@@ -838,7 +852,6 @@ const PipelineBacklogAlert: React.FC<{
   bakePending: number
   bakeOldestAtMs: number | null | undefined
   staleBakeRuns: number
-  retryExhausted: number
   bakeStalled: boolean
   recentBakeFailures: number
   recentBakeDeferred: number
@@ -851,7 +864,6 @@ const PipelineBacklogAlert: React.FC<{
   bakePending,
   bakeOldestAtMs,
   staleBakeRuns,
-  retryExhausted,
   bakeStalled,
   recentBakeFailures,
   recentBakeDeferred,
@@ -882,7 +894,6 @@ const PipelineBacklogAlert: React.FC<{
     issues.push(`时间线队列 ${capturePending} 条，最老等待 ${fmtDurationMs(captureAge)}`)
   }
   if (staleBakeRuns > 0) issues.push(`${staleBakeRuns} 个烘焙批次运行超过 35 分钟`)
-  if (retryExhausted > 0) issues.push(`${retryExhausted} 条候选已永久失败`)
   if (bakeStalled) {
     issues.push(`烘焙队列 ${bakePending} 条，最老等待 ${fmtDurationMs(bakeAge)}，水位超过 15 分钟未推进`)
   }
@@ -910,6 +921,41 @@ const PipelineBacklogAlert: React.FC<{
       fontWeight: 600,
     }}>
       流水线积压告警：{issues.join('；')}
+    </div>
+  )
+}
+
+const BakeFailureAlert: React.FC<{
+  retryPending: number
+  exhausted: number
+  timeoutFailures: number
+  truncatedFailures: number
+  otherFailures: number
+}> = ({ retryPending, exhausted, timeoutFailures, truncatedFailures, otherFailures }) => {
+  if (retryPending === 0 && exhausted === 0) return null
+  const parts: string[] = []
+  if (retryPending > 0) parts.push(`${retryPending} 条正在退避重试`)
+  if (exhausted > 0) {
+    const reasons = [
+      timeoutFailures > 0 ? `超时 ${timeoutFailures}` : '',
+      truncatedFailures > 0 ? `输出截断 ${truncatedFailures}` : '',
+      otherFailures > 0 ? `其他 ${otherFailures}` : '',
+    ].filter(Boolean)
+    parts.push(`${exhausted} 条达到最大尝试次数${reasons.length > 0 ? `（${reasons.join('、')}）` : ''}`)
+  }
+  const color = exhausted > 0 ? '#FF3B30' : '#FF9500'
+  return (
+    <div style={{
+      marginBottom: 10,
+      padding: '10px 12px',
+      borderRadius: 10,
+      background: `${color}10`,
+      border: `1px solid ${color}30`,
+      color,
+      fontSize: 12,
+      fontWeight: 600,
+    }}>
+      候选处理状态：{parts.join('；')}。失败候选不会删除原始时间线。
     </div>
   )
 }
@@ -1124,8 +1170,20 @@ const OverviewContent: React.FC<{
     oldest_pending_bake_at_ms: liveData?.oldest_pending_bake_at_ms
       ?? data?.knowledge_flow?.oldest_pending_bake_at_ms
       ?? null,
+    bake_retry_pending_count: liveData?.bake_retry_pending_count
+      ?? data?.knowledge_flow?.bake_retry_pending_count
+      ?? 0,
     bake_retry_exhausted_count: liveData?.bake_retry_exhausted_count
       ?? data?.knowledge_flow?.bake_retry_exhausted_count
+      ?? 0,
+    bake_timeout_failure_count: liveData?.bake_timeout_failure_count
+      ?? data?.knowledge_flow?.bake_timeout_failure_count
+      ?? 0,
+    bake_truncated_failure_count: liveData?.bake_truncated_failure_count
+      ?? data?.knowledge_flow?.bake_truncated_failure_count
+      ?? 0,
+    bake_other_failure_count: liveData?.bake_other_failure_count
+      ?? data?.knowledge_flow?.bake_other_failure_count
       ?? 0,
     running_bake_count: liveData?.running_bake_count
       ?? data?.knowledge_flow?.running_bake_count
@@ -1167,13 +1225,19 @@ const OverviewContent: React.FC<{
         bakePending={knowledge_flow.pending_bake_count}
         bakeOldestAtMs={knowledge_flow.oldest_pending_bake_at_ms}
         staleBakeRuns={knowledge_flow.stale_bake_run_count}
-        retryExhausted={knowledge_flow.bake_retry_exhausted_count}
         bakeStalled={liveData?.bake_stalled ?? false}
         recentBakeFailures={liveData?.recent_bake_failed_count ?? 0}
         recentBakeDeferred={liveData?.recent_bake_deferred_count ?? 0}
         recentBakeRuns={liveData?.recent_bake_run_count ?? 0}
         captureEnabled={knowledge_flow.capture_enabled}
         inferenceQueue={liveData?.inference_queue}
+      />
+      <BakeFailureAlert
+        retryPending={knowledge_flow.bake_retry_pending_count}
+        exhausted={knowledge_flow.bake_retry_exhausted_count}
+        timeoutFailures={knowledge_flow.bake_timeout_failure_count}
+        truncatedFailures={knowledge_flow.bake_truncated_failure_count}
+        otherFailures={knowledge_flow.bake_other_failure_count}
       />
       <div className="monitor-metric-grid">
         <StatCard label="Token 用量" value={fmt(token_usage.total_period)}
@@ -1196,6 +1260,7 @@ const OverviewContent: React.FC<{
           oldestPendingAtMs={knowledge_flow.oldest_pending_bake_at_ms}
           runningCount={knowledge_flow.running_bake_count}
           staleRunCount={knowledge_flow.stale_bake_run_count}
+          retryPendingCount={knowledge_flow.bake_retry_pending_count}
           retryExhaustedCount={knowledge_flow.bake_retry_exhausted_count}
           stalled={liveData?.bake_stalled ?? false}
           paused={!knowledge_flow.capture_enabled}

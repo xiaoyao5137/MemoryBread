@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import CreationPanel from '../components/CreationPanel'
 import { useAppStore } from '../store/useAppStore'
+
+const CHAT_MESSAGE_CREATED_AT = new Date(2020, 7, 2, 14, 7).getTime()
 
 describe('创作新会话', () => {
   beforeEach(() => {
@@ -30,7 +32,7 @@ describe('创作新会话', () => {
         id: 'message-1',
         role: 'user',
         content: '设计 Agent 架构方案',
-        createdAt: 1,
+        createdAt: CHAT_MESSAGE_CREATED_AT,
       }],
       agentEvents: [{
         schema_version: 'creation.agent.v1',
@@ -59,6 +61,18 @@ describe('创作新会话', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+  })
+
+  it('像 IM 软件一样展示每条消息的发言时间', async () => {
+    render(<CreationPanel />)
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    const timestamp = screen.getByLabelText('用户消息').querySelector('time')
+    expect(timestamp).toHaveTextContent('2020年8月2日 14:07')
+    expect(timestamp).toHaveAttribute('datetime', new Date(CHAT_MESSAGE_CREATED_AT).toISOString())
+    expect(timestamp).toHaveAttribute('title', '发送于 2020年8月2日 14:07')
   })
 
   it('从页面开启新会话，并保留创作偏好', async () => {

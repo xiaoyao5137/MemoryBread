@@ -1,5 +1,6 @@
 import { Check, ChevronDown, Search } from 'lucide-react'
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useImeCompositionGuard } from '../hooks/useImeCompositionGuard'
 import type { CreationSkillCategoryOption } from '../utils/creationSkills'
 
 interface CreationSkillCategoryComboboxProps {
@@ -34,6 +35,7 @@ const CreationSkillCategoryCombobox = ({
   const listboxId = useId()
   const rootRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const inputImeGuard = useImeCompositionGuard<HTMLInputElement>()
   const [query, setQuery] = useState('')
   const [open, setOpen] = useState(false)
   const [activeIndex, setActiveIndex] = useState(0)
@@ -93,6 +95,7 @@ const CreationSkillCategoryCombobox = ({
       setOpen(true)
       setActiveIndex(current => open ? Math.max(current - 1, 0) : 0)
     } else if (event.key === 'Enter' && open) {
+      if (inputImeGuard.isImeEvent(event)) return
       event.preventDefault()
       const activeOption = filteredOptions[activeIndex]
       if (activeOption) selectOption(activeOption.option.id)
@@ -129,6 +132,9 @@ const CreationSkillCategoryCombobox = ({
             onChange('')
             setOpen(true)
           }}
+          onCompositionStart={inputImeGuard.onCompositionStart}
+          onCompositionEnd={inputImeGuard.onCompositionEnd}
+          onBlur={inputImeGuard.onBlur}
           onKeyDown={handleKeyDown}
         />
         <ChevronDown className={open ? 'is-open' : ''} size={16} aria-hidden="true" />

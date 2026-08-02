@@ -21,6 +21,7 @@ const createBucket = (day: number, memoryCount: number): BakeInventoryTrendBucke
 const overview: BakeOverview = {
   captureCount: 0,
   memoryCount: 12,
+  dataCount: 2,
   knowledgeCount: 4,
   templateCount: 3,
   sopCount: 2,

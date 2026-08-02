@@ -169,6 +169,31 @@ const parseError = async (response: Response, fallback: string) => {
   return payload?.error?.message || payload?.message || fallback
 }
 
+const CREATION_SKILL_ANALYSIS_RETRY_DELAY_MS = 750
+const CREATION_SKILL_MARKET_TIMEOUT_MS = 8_000
+const RETRYABLE_CREATION_SKILL_ANALYSIS_ERRORS = new Set([
+  'CREATION_SKILL_ANALYZER_UNAVAILABLE',
+  'CREATION_SKILL_ANALYSIS_FAILED',
+])
+
+const isTransientCreationSkillNetworkError = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error)
+  return error instanceof TypeError
+    || /failed to fetch|networkerror|load failed|connection refused|econnrefused/i.test(message)
+}
+
+const waitForCreationSkillAnalysisRetry = () => new Promise<void>((resolve) => {
+  window.setTimeout(resolve, CREATION_SKILL_ANALYSIS_RETRY_DELAY_MS)
+})
+
+const readCreationSkillAnalysisError = async (response: Response) => {
+  const payload = await response.json().catch(() => null)
+  return {
+    code: String(payload?.error || ''),
+    message: String(payload?.message || '沉淀技能失败'),
+  }
+}
+
 export const DEFAULT_CREATION_SKILL_SECTION_HEADINGS: CreationSkillSectionHeadings = {
   commonTitles: '标题设计风格',
   titleStyle: '标题设计风格',
@@ -191,13 +216,21 @@ export const CREATION_SKILL_AGENT_OPTIONS = [
   { id: 'industry_research_agent', label: '行业调研 Agent' },
   { id: 'data_analysis_agent', label: '数据分析 Agent' },
   { id: 'solution_design_agent', label: '方案设计 Agent' },
+  { id: 'chapter_design_agent', label: '章节设计 Agent' },
   { id: 'document_writer_agent', label: '文档撰写 Agent' },
+  { id: 'anti_ai_style_agent', label: '去 AI 味 Agent' },
+  { id: 'detail_polish_agent', label: '细节润色 Agent' },
+  { id: 'table_polish_agent', label: '表格润色 Agent' },
+  { id: 'typography_polish_agent', label: '字体润色 Agent' },
+  { id: 'image_polish_agent', label: '图片润色 Agent' },
   { id: 'quality_review_agent', label: '质量审校 Agent' },
 ] as const
 
 export const CREATION_SKILL_TOOL_OPTIONS = [
   { id: 'memory_search', label: '记忆搜索 Tool' },
   { id: 'internet_search', label: '互联网检索 Tool' },
+  { id: 'data_search', label: '数据检索 Tool' },
+  { id: 'webpage_scrape', label: '网页爬取 Tool' },
   { id: 'github_search', label: 'GitHub 检索 Tool' },
   { id: 'plantuml_diagram', label: 'PlantUML 画图 Tool' },
 ] as const
@@ -317,7 +350,7 @@ function defaultCreationSkillExecutionSteps(
       output: '数据判断、口径说明和证据缺口',
       agents: ['data_analysis_agent'],
       skills: [],
-      tools: [],
+      tools: ['data_search', 'webpage_scrape'],
     })
   }
   if (/方案|架构|设计|规划|建设|实施/.test(text)) {
@@ -332,6 +365,15 @@ function defaultCreationSkillExecutionSteps(
     })
   }
   steps.push(
+    {
+      id: 'design-chapters',
+      title: '设计章节蓝图',
+      objective: '先确定章节顺序、每章要回答的问题、可用证据和完成标准。',
+      output: '供初稿使用的章节蓝图',
+      agents: ['chapter_design_agent'],
+      skills: [],
+      tools: [],
+    },
     {
       id: 'draft-document',
       title: '撰写完整文档',
@@ -556,9 +598,18 @@ export async function importCodexSkillPackage(
         tools: [],
       },
       {
-        id: 'execute-workflow',
+        id: 'design-chapters',
+        title: '设计章节蓝图',
+        objective: '按照 SKILL.md 的交付要求先确定章节顺序、证据位置和完成标准。',
+        output: '符合技能要求的章节蓝图',
+        agents: ['chapter_design_agent'],
+        skills: [metadata.name],
+        tools: [],
+      },
+      {
+        id: 'write-document',
         title: '执行技能工作流',
-        objective: '按照 SKILL.md 的先后顺序完成分析、创作和必要的工具调用。',
+        objective: '按照章节蓝图和 SKILL.md 的先后顺序完成分析、创作和必要的工具调用。',
         output: '符合技能要求的完整草稿',
         agents: ['document_writer_agent'],
         skills: [metadata.name],
@@ -578,7 +629,7 @@ export async function importCodexSkillPackage(
     titleStyle: '遵循 SKILL.md 中的标题与输出要求。',
     textStyle: metadata.instructions || '严格遵循 SKILL.md 中定义的工作流与输出要求。',
     diagramStyle: '仅在 SKILL.md 或引用文件明确要求时生成图示。',
-    structurePattern: ['读取 SKILL.md', '按需读取引用文件', '执行技能工作流', '核对输出要求'],
+    structurePattern: ['读取 SKILL.md', '按需读取引用文件', '设计章节蓝图', '执行技能工作流', '核对输出要求'],
     writingGuidelines: ['优先遵循 SKILL.md；引用其他文件时使用技能根目录相对路径。'],
     distinctiveSections: [],
     sectionHeadings: { ...DEFAULT_CREATION_SKILL_SECTION_HEADINGS },
@@ -910,83 +961,114 @@ async function requestCreationSkillAnalysis(
   apiBaseUrl: string,
   source: CreationSkillSource,
 ): Promise<CreationSkillAnalysis> {
-  try {
-    const response = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/creation/skills/analyze`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        source_kind: source.kind,
-        source_id: source.id,
-        document_title: source.title,
-        document_content: source.content,
-        doc_type: source.docType,
-      }),
-    })
-    if (!response.ok) throw new Error(await parseError(response, '沉淀技能失败'))
-    const data = await response.json()
-    if (!data.section_headings || !data.field_examples || !String(data.example_document || '').trim()) {
+  const requestInit: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      source_kind: source.kind,
+      source_id: source.id,
+      document_title: source.title,
+      document_content: source.content,
+      doc_type: source.docType,
+    }),
+  }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let response: Response
+    try {
+      response = await fetchWithLocalhostFallback(
+        `${apiBaseUrl}/api/creation/skills/analyze`,
+        requestInit,
+      )
+    } catch (error) {
+      if (attempt === 0 && isTransientCreationSkillNetworkError(error)) {
+        await waitForCreationSkillAnalysisRetry()
+        continue
+      }
+      return buildClientCreationSkillFallback(source, 'analysis_request_failed')
+    }
+
+    if (!response.ok) {
+      const failure = await readCreationSkillAnalysisError(response)
+      if (
+        attempt === 0
+        && RETRYABLE_CREATION_SKILL_ANALYSIS_ERRORS.has(failure.code)
+      ) {
+        await waitForCreationSkillAnalysisRetry()
+        continue
+      }
+      return buildClientCreationSkillFallback(source, 'analysis_request_failed')
+    }
+
+    let data: any
+    try {
+      data = await response.json()
+      if (!data.section_headings || !data.field_examples || !String(data.example_document || '').trim()) {
+        return buildClientCreationSkillFallback(source, 'invalid_service_response')
+      }
+      const fallback = buildClientCreationSkillFallback(source)
+      const fieldExamples = mapFieldExamples(data.field_examples)
+      const headingExamples = repairCreationSkillHeadingExamples(
+        fieldExamples.commonTitles,
+        fallback.fieldExamples.commonTitles,
+      )
+      fieldExamples.commonTitles = headingExamples
+      fieldExamples.titleStyle = [...headingExamples]
+      const commonTitles = distinctCreationSkillItems([
+        ...(Array.isArray(data.common_titles)
+          ? data.common_titles.map((item: unknown) => coerceCreationSkillStringItem(item, 'common_titles'))
+          : []),
+        ...fallback.commonTitles,
+      ], 8)
+      return {
+        title: normalizeCreationSkillTitle(data.title, source),
+        summary: data.summary,
+        skillDescription: mapSkillDescription(
+          data.skill_description,
+          normalizeCreationSkillTitle(data.title, source),
+          String(data.summary || fallback.summary),
+          source.docType,
+          fallback.skillDescription.domains,
+        ),
+        executionSteps: mapExecutionSteps(
+          data.execution_steps,
+          normalizeCreationSkillTitle(data.title, source),
+          `${source.docType}\n${source.title}\n${source.content.slice(0, 8_000)}`,
+        ),
+        commonTitles,
+        titleStyle: commonTitles.join('；'),
+        textStyle: mergeCreationSkillTextStyle(data.text_style, fallback.textStyle),
+        diagramStyle: mergeCreationSkillDiagramStyle(data.diagram_style, fallback.diagramStyle),
+        structurePattern: Array.isArray(data.structure_pattern)
+          ? data.structure_pattern
+            .map((item: unknown) => coerceCreationSkillStringItem(item, 'structure_pattern'))
+            .filter(Boolean)
+          : fallback.structurePattern,
+        writingGuidelines: mergeCreationSkillWritingGuidelines(
+          data.writing_guidelines,
+          fallback.writingGuidelines,
+        ),
+        distinctiveSections: mapDistinctiveSections(
+          data.distinctive_sections,
+          fallback.distinctiveSections || [],
+        ),
+        sectionHeadings: mapSectionHeadings(data.section_headings),
+        fieldExamples,
+        exampleDocument: isCompleteCreationSkillExampleDocument(data.example_document)
+          ? data.example_document.trim()
+          : fallback.exampleDocument,
+        suggestedCategoryKeywords: data.suggested_category_keywords || [],
+        analysisMode: data.analysis_mode || 'local_model',
+        fallbackReason: typeof data.fallback_reason === 'string'
+          ? data.fallback_reason
+          : undefined,
+      }
+    } catch {
       return buildClientCreationSkillFallback(source, 'invalid_service_response')
     }
-    const fallback = buildClientCreationSkillFallback(source)
-    const fieldExamples = mapFieldExamples(data.field_examples)
-    const headingExamples = repairCreationSkillHeadingExamples(
-      fieldExamples.commonTitles,
-      fallback.fieldExamples.commonTitles,
-    )
-    fieldExamples.commonTitles = headingExamples
-    fieldExamples.titleStyle = [...headingExamples]
-    const commonTitles = distinctCreationSkillItems([
-      ...(Array.isArray(data.common_titles)
-        ? data.common_titles.map((item: unknown) => coerceCreationSkillStringItem(item, 'common_titles'))
-        : []),
-      ...fallback.commonTitles,
-    ], 8)
-    return {
-      title: normalizeCreationSkillTitle(data.title, source),
-      summary: data.summary,
-      skillDescription: mapSkillDescription(
-        data.skill_description,
-        normalizeCreationSkillTitle(data.title, source),
-        String(data.summary || fallback.summary),
-        source.docType,
-        fallback.skillDescription.domains,
-      ),
-      executionSteps: mapExecutionSteps(
-        data.execution_steps,
-        normalizeCreationSkillTitle(data.title, source),
-        `${source.docType}\n${source.title}\n${source.content.slice(0, 8_000)}`,
-      ),
-      commonTitles,
-      titleStyle: commonTitles.join('；'),
-      textStyle: mergeCreationSkillTextStyle(data.text_style, fallback.textStyle),
-      diagramStyle: mergeCreationSkillDiagramStyle(data.diagram_style, fallback.diagramStyle),
-      structurePattern: Array.isArray(data.structure_pattern)
-        ? data.structure_pattern
-          .map((item: unknown) => coerceCreationSkillStringItem(item, 'structure_pattern'))
-          .filter(Boolean)
-        : fallback.structurePattern,
-      writingGuidelines: mergeCreationSkillWritingGuidelines(
-        data.writing_guidelines,
-        fallback.writingGuidelines,
-      ),
-      distinctiveSections: mapDistinctiveSections(
-        data.distinctive_sections,
-        fallback.distinctiveSections || [],
-      ),
-      sectionHeadings: mapSectionHeadings(data.section_headings),
-      fieldExamples,
-      exampleDocument: isCompleteCreationSkillExampleDocument(data.example_document)
-        ? data.example_document.trim()
-        : fallback.exampleDocument,
-      suggestedCategoryKeywords: data.suggested_category_keywords || [],
-      analysisMode: data.analysis_mode || 'local_model',
-      fallbackReason: typeof data.fallback_reason === 'string'
-        ? data.fallback_reason
-        : undefined,
-    }
-  } catch {
-    return buildClientCreationSkillFallback(source, 'analysis_request_failed')
   }
+
+  return buildClientCreationSkillFallback(source, 'analysis_request_failed')
 }
 
 export function analyzeCreationSkill(
@@ -1089,18 +1171,33 @@ export async function searchCreationSkillMarket(
   if (query.categoryId) search.set('category_id', query.categoryId)
   search.set('limit', String(query.limit ?? 24))
   search.set('offset', String(query.offset ?? 0))
-  const response = await fetch(`${adminApiBaseUrl}/v1/creation-skills?${search}`, {
-    headers: serviceEnvironmentHeaders(),
-  })
-  if (!response.ok) throw new Error(await parseError(response, '读取技能市场失败'))
-  const payload = await response.json()
-  return {
-    items: Array.isArray(payload?.data?.items)
-      ? payload.data.items.map(mapMarketSkill)
-      : [],
-    total: Number(payload?.data?.total || 0),
-    limit: Number(payload?.data?.limit || query.limit || 24),
-    offset: Number(payload?.data?.offset || query.offset || 0),
+  const controller = new AbortController()
+  const timeout = globalThis.setTimeout(
+    () => controller.abort(),
+    CREATION_SKILL_MARKET_TIMEOUT_MS,
+  )
+  try {
+    const response = await fetch(`${adminApiBaseUrl}/v1/creation-skills?${search}`, {
+      headers: serviceEnvironmentHeaders(),
+      signal: controller.signal,
+    })
+    if (!response.ok) throw new Error(await parseError(response, '读取技能市场失败'))
+    const payload = await response.json()
+    return {
+      items: Array.isArray(payload?.data?.items)
+        ? payload.data.items.map(mapMarketSkill)
+        : [],
+      total: Number(payload?.data?.total || 0),
+      limit: Number(payload?.data?.limit || query.limit || 24),
+      offset: Number(payload?.data?.offset || query.offset || 0),
+    }
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error('技能市场请求超时，请稍后重试')
+    }
+    throw error
+  } finally {
+    globalThis.clearTimeout(timeout)
   }
 }
 

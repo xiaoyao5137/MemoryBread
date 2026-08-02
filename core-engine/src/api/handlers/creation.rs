@@ -505,7 +505,12 @@ fn default_true() -> bool {
 }
 
 fn default_creation_tool_ids() -> Vec<String> {
-    vec!["internet_search".to_string(), "memory_search".to_string()]
+    vec![
+        "internet_search".to_string(),
+        "memory_search".to_string(),
+        "data_search".to_string(),
+        "webpage_scrape".to_string(),
+    ]
 }
 
 fn normalize_creation_tool_ids(tool_ids: Vec<String>) -> Vec<String> {
@@ -867,6 +872,8 @@ pub struct SaveHistoryRequest {
     pub edit_operation: Option<String>,
     #[serde(default)]
     pub document_patch: Option<serde_json::Value>,
+    #[serde(default)]
+    pub evidence: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -882,6 +889,17 @@ pub async fn save_history(
         .storage
         .with_conn(|conn| {
             let references_json = serde_json::to_string(&req.references)?;
+            let evidence_ids = req
+                .evidence
+                .iter()
+                .filter(|item| {
+                    item.get("validation_status")
+                        .and_then(|value| value.as_str())
+                        == Some("verified")
+                })
+                .filter_map(|item| item.get("id").and_then(|value| value.as_str()))
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
             let agent_trace_json = serde_json::to_string(&req.agent_trace)?;
             let goal_json = req.goal.as_ref().map(serde_json::to_string).transpose()?;
             let session_id = req
@@ -927,6 +945,24 @@ pub async fn save_history(
                         }
                     })
             };
+            let mut merged_evidence = prior
+                .as_ref()
+                .and_then(|context| context.latest.evidence_json.as_deref())
+                .and_then(|value| serde_json::from_str::<Vec<serde_json::Value>>(value).ok())
+                .unwrap_or_default();
+            for evidence in &req.evidence {
+                let evidence_id = evidence.get("id").and_then(|value| value.as_str());
+                if let Some(index) = evidence_id.and_then(|id| {
+                    merged_evidence.iter().position(|existing| {
+                        existing.get("id").and_then(|value| value.as_str()) == Some(id)
+                    })
+                }) {
+                    merged_evidence[index] = evidence.clone();
+                } else {
+                    merged_evidence.push(evidence.clone());
+                }
+            }
+            let evidence_json = serde_json::to_string(&merged_evidence)?;
             let root_request = req
                 .root_request
                 .as_deref()
@@ -975,7 +1011,8 @@ pub async fn save_history(
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
-            if let (Some(context), Some(session_id)) = (prior.as_ref(), session_id) {
+            let history_id = if let (Some(context), Some(session_id)) = (prior.as_ref(), session_id)
+            {
                 crate::storage::repo::creation_history::update_session(
                     conn,
                     context.latest.id,
@@ -996,7 +1033,7 @@ pub async fn save_history(
                     edit_operation,
                     document_patch_json.as_deref(),
                 )?;
-                Ok(context.latest.id)
+                context.latest.id
             } else {
                 crate::storage::repo::creation_history::insert(
                     conn,
@@ -1017,9 +1054,19 @@ pub async fn save_history(
                     revision_no,
                     edit_operation,
                     document_patch_json.as_deref(),
-                )
-                .map_err(Into::into)
-            }
+                )?
+            };
+            crate::storage::repo::creation_history::set_evidence_json(
+                conn,
+                history_id,
+                &evidence_json,
+            )?;
+            crate::storage::repo::creation_evidence::attach_to_history(
+                conn,
+                history_id,
+                &evidence_ids,
+            )?;
+            Ok(history_id)
         })
         .map_err(|e| {
             error!("保存创作记录失败: {}", e);
@@ -1250,6 +1297,8 @@ mod tests {
             vec![
                 "internet_search".to_string(),
                 "memory_search".to_string(),
+                "data_search".to_string(),
+                "webpage_scrape".to_string(),
                 "plantuml_diagram".to_string(),
             ]
         );

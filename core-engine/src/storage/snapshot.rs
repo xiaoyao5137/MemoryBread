@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::storage::{db::current_ts_ms, error::StorageError, StorageManager};
 
 pub const ASSET_SNAPSHOT_FORMAT_VERSION: i32 = 1;
-pub const ASSET_SNAPSHOT_SCHEMA_VERSION: i32 = 2;
+pub const ASSET_SNAPSHOT_SCHEMA_VERSION: i32 = 3;
 
 const EXCLUDED_RAW_CAPTURE_COLUMNS: &[&str] = &[
     "ax_text",
@@ -61,6 +61,7 @@ const EXCLUDED_TABLES: &[&str] = &[
     "bake_sops_fts",
     "bake_templates",
     "creation_history",
+    "creation_evidence_assets",
     "designs_fts",
     "episodic_memories_fts",
     "knowledge_fts",
@@ -69,6 +70,7 @@ const EXCLUDED_TABLES: &[&str] = &[
     "llm_usage_logs",
     "model_events",
     "data_cleanup_log",
+    "data_extraction_state",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +103,18 @@ const ASSET_TABLES: &[AssetTableSpec] = &[
     AssetTableSpec {
         name: "creation_skills",
         identity_columns: &["client_skill_key"],
+    },
+    AssetTableSpec {
+        name: "data_sources",
+        identity_columns: &["canonical_key"],
+    },
+    AssetTableSpec {
+        name: "data_snapshots",
+        identity_columns: &["id"],
+    },
+    AssetTableSpec {
+        name: "data_source_links",
+        identity_columns: &["source_ref_key"],
     },
 ];
 
@@ -383,18 +397,23 @@ fn export_capture_refs(conn: &Connection) -> Result<Vec<JsonRow>, StorageError> 
     }
 
     let mut stmt = conn.prepare(
-        "SELECT
-            t.capture_id AS id,
+        "WITH referenced_captures(id) AS (
+            SELECT capture_id FROM timelines WHERE capture_id IS NOT NULL
+            UNION
+            SELECT capture_id FROM data_source_links WHERE capture_id IS NOT NULL
+         )
+         SELECT
+            refs.id AS id,
             COALESCE(MAX(c.ts), MAX(t.created_at_ms), MAX(t.start_time), MAX(t.observed_at), 0) AS ts,
             MAX(c.app_name) AS app_name,
             MAX(c.app_bundle_id) AS app_bundle_id,
             MAX(c.win_title) AS win_title,
             COALESCE(MAX(c.event_type), 'snapshot_ref') AS event_type
-         FROM timelines t
-         LEFT JOIN captures c ON c.id = t.capture_id
-         WHERE t.capture_id IS NOT NULL
-         GROUP BY t.capture_id
-         ORDER BY t.capture_id ASC",
+         FROM referenced_captures refs
+         LEFT JOIN captures c ON c.id = refs.id
+         LEFT JOIN timelines t ON t.capture_id = refs.id
+         GROUP BY refs.id
+         ORDER BY refs.id ASC",
     )?;
     let column_names = stmt
         .column_names()
@@ -931,6 +950,41 @@ mod tests {
                      )",
                     [],
                 )?;
+                conn.execute(
+                    "INSERT INTO data_sources (
+                        id, canonical_key, title, source_kind, source_url, access_mode,
+                        refresh_policy, realtime_level, first_seen_at, last_seen_at,
+                        last_collected_at, last_success_at, status, created_at, updated_at
+                     ) VALUES (
+                        91, 'report:https://bi.example.com/dashboard', '经营看板',
+                        'report_url', 'https://bi.example.com/dashboard', 'browser_session',
+                        'on_demand', 'live', 1700000000000, 1700000000000,
+                        1700000000000, 1700000000000, 'active', 1700000000000, 1700000000000
+                     )",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO data_snapshots (
+                        id, source_id, collected_at, observed_at, collector, content_text,
+                        structured_data, content_hash, freshness_ttl_seconds, provenance,
+                        source_capture_ids, source_timeline_ids, status, created_at
+                     ) VALUES (
+                        92, 91, 1700000000000, 1700000000000, 'chrome_attach',
+                        '本周订单 1200', '{}', 'snapshot-hash', 900,
+                        '{\"local_only\":true}', '[42]', '[7]', 'success', 1700000000000
+                     )",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO data_source_links (
+                        id, source_id, source_ref_key, capture_id, timeline_id,
+                        link_kind, observed_at, created_at
+                     ) VALUES (
+                        93, 91, 'capture:42:active_url:test', 42, 7,
+                        'active_url', 1700000000000, 1700000000000
+                     )",
+                    [],
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -960,6 +1014,9 @@ mod tests {
                 | "bake_document_sections"
                 | "bake_sops"
                 | "creation_skills"
+                | "data_sources"
+                | "data_snapshots"
+                | "data_source_links"
         )));
         assert_eq!(snapshot.capture_refs.len(), 1);
         assert!(snapshot.capture_refs[0].get("ax_text").is_none());
@@ -1008,6 +1065,9 @@ mod tests {
 
         assert_eq!(timeline_count, 1);
         assert_eq!(knowledge_count, 1);
+        assert_eq!(count_table(&target, "data_sources"), 1);
+        assert_eq!(count_table(&target, "data_snapshots"), 1);
+        assert_eq!(count_table(&target, "data_source_links"), 1);
         assert_eq!(restored_skill.title, "架构文档写作法");
         assert_eq!(restored_skill.package_files.len(), 1);
         assert_eq!(restored_skill.package_files[0].path, "SKILL.md");

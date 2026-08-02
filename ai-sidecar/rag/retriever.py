@@ -17,6 +17,8 @@ from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from rag.query_planner import ArtifactQueryPlan, build_artifact_query_plan
+
 logger = logging.getLogger(__name__)
 
 _NOISE_OVERVIEW_PREFIX = "低价值工作片段（"
@@ -1150,106 +1152,128 @@ class KnowledgeFts5Retriever:
         top_k: int,
         entity_terms: list[str] | None,
     ) -> list[RetrievedChunk]:
-        terms = list(dict.fromkeys([*(entity_terms or []), *_extract_query_terms(query)]))
-        if not terms:
+        plan = build_artifact_query_plan(cursor, query, entity_terms)
+        if not plan.candidate_terms and not plan.source_types:
             return []
 
         chunks: list[RetrievedChunk] = []
-        chunks.extend(self._search_document_artifacts(cursor, terms, top_k))
-        chunks.extend(self._search_knowledge_artifacts(cursor, terms, top_k))
-        chunks.extend(self._search_operation_artifacts(cursor, terms, top_k))
-        return _rank_keyword_chunks(chunks, terms, prefer_url=_is_link_lookup_query(query))[:top_k]
+        chunks.extend(self._search_document_artifacts(cursor, plan, top_k))
+        chunks.extend(self._search_knowledge_artifacts(cursor, plan, top_k))
+        chunks.extend(self._search_operation_artifacts(cursor, plan, top_k))
+        return _rank_keyword_chunks(
+            chunks,
+            plan.ranking_terms,
+            prefer_url=_is_link_lookup_query(query),
+        )[:top_k]
 
     def _search_document_artifacts(
         self,
         cursor: sqlite3.Cursor,
-        terms: list[str],
+        plan: ArtifactQueryPlan,
         top_k: int,
     ) -> list[RetrievedChunk]:
+        if (
+            not plan.candidate_terms
+            and plan.source_types
+            and "document" not in plan.source_types
+        ):
+            return []
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bake_documents'")
         if not cursor.fetchone():
             return []
 
+        terms = plan.candidate_terms
         clause, params = _build_like_clauses(
             "LOWER(COALESCE(title, '') || ' ' || COALESCE(doc_type, '') || ' ' || COALESCE(summary, '') || ' ' || COALESCE(full_content, '') || ' ' || COALESCE(sections_json, '') || ' ' || COALESCE(source_url, ''))",
             terms,
         )
-        if not clause:
-            return []
+        candidate_filter = clause or "1=1"
 
         sql = f"""
             SELECT
                 id, title, doc_type, summary, full_content, sections_json, source_url,
                 source_memory_ids, linked_knowledge_ids, updated_at
             FROM bake_documents
-            WHERE deleted_at IS NULL AND {clause}
+            WHERE deleted_at IS NULL AND {candidate_filter}
             ORDER BY updated_at DESC
             LIMIT ?
         """
         cursor.execute(sql, [*params, max(top_k * 40, 300)])
         rows = cursor.fetchall()
-        chunks = [self._document_row_to_chunk(row, terms) for row in rows]
+        chunks = [self._document_row_to_chunk(row, plan) for row in rows]
         return chunks
 
     def _search_knowledge_artifacts(
         self,
         cursor: sqlite3.Cursor,
-        terms: list[str],
+        plan: ArtifactQueryPlan,
         top_k: int,
     ) -> list[RetrievedChunk]:
+        if (
+            not plan.candidate_terms
+            and plan.source_types
+            and "knowledge" not in plan.source_types
+        ):
+            return []
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bake_knowledge'")
         if not cursor.fetchone():
             return []
 
+        terms = plan.candidate_terms
         clause, params = _build_like_clauses(
             "LOWER(COALESCE(title, '') || ' ' || COALESCE(summary, '') || ' ' || COALESCE(content, '') || ' ' || COALESCE(detailed_content, '') || ' ' || COALESCE(entities, ''))",
             terms,
         )
-        if not clause:
-            return []
+        candidate_filter = clause or "1=1"
 
         sql = f"""
             SELECT
                 id, title, summary, content, detailed_content, timeline_id,
                 source_timeline_ids, source_capture_ids, importance, user_verified, updated_at_ms
             FROM bake_knowledge
-            WHERE {clause}
+            WHERE {candidate_filter}
             ORDER BY COALESCE(updated_at_ms, 0) DESC
             LIMIT ?
         """
         cursor.execute(sql, [*params, max(top_k * 40, 300)])
         rows = cursor.fetchall()
-        return [self._knowledge_artifact_row_to_chunk(row, terms) for row in rows]
+        return [self._knowledge_artifact_row_to_chunk(row, plan) for row in rows]
 
     def _search_operation_artifacts(
         self,
         cursor: sqlite3.Cursor,
-        terms: list[str],
+        plan: ArtifactQueryPlan,
         top_k: int,
     ) -> list[RetrievedChunk]:
+        if (
+            not plan.candidate_terms
+            and plan.source_types
+            and "operation" not in plan.source_types
+        ):
+            return []
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bake_sops'")
         if not cursor.fetchone():
             return []
 
+        terms = plan.candidate_terms
         clause, params = _build_like_clauses(
             "LOWER(COALESCE(title, '') || ' ' || COALESCE(summary, '') || ' ' || COALESCE(content, '') || ' ' || COALESCE(detailed_content, '') || ' ' || COALESCE(entities, ''))",
             terms,
         )
-        if not clause:
-            return []
+        candidate_filter = clause or "1=1"
 
         sql = f"""
             SELECT
                 id, title, summary, content, detailed_content, timeline_id,
                 source_capture_ids, importance, user_verified, updated_at_ms
             FROM bake_sops
-            WHERE {clause}
+            WHERE {candidate_filter}
             ORDER BY COALESCE(updated_at_ms, 0) DESC
             LIMIT ?
         """
         cursor.execute(sql, [*params, max(top_k * 40, 300)])
         rows = cursor.fetchall()
-        return [self._operation_artifact_row_to_chunk(row, terms) for row in rows]
+        return [self._operation_artifact_row_to_chunk(row, plan) for row in rows]
 
     @staticmethod
     def _json_ids(value: str | None) -> list[str]:
@@ -1270,52 +1294,56 @@ class KnowledgeFts5Retriever:
         return float(sum(1 for term in terms if term.lower() in lowered))
 
     @staticmethod
-    def _document_artifact_score(row: sqlite3.Row, terms: list[str], text: str) -> float:
-        base = KnowledgeFts5Retriever._keyword_score(text, terms) + 50.0
+    def _document_artifact_score(
+        row: sqlite3.Row,
+        plan: ArtifactQueryPlan,
+        text: str,
+    ) -> float:
+        terms = plan.ranking_terms
+        base = 50.0
         title = str(row["title"] or "").lower()
         summary = str(row["summary"] or "").lower()
-        doc_type = str(row["doc_type"] or "").lower()
-        full = f"{title} {summary}"
-
-        title_hits = sum(1 for term in terms if term.lower() in title)
-        summary_hits = sum(1 for term in terms if term.lower() in summary)
-        score = base + title_hits * 8.0 + summary_hits * 2.0
-
-        meaningful_terms = [term.lower() for term in terms if len(term) >= 2]
-        title_coverage = title_hits / max(1, min(len(meaningful_terms), 12))
-        long_title_hits = sum(1 for term in meaningful_terms if len(term) >= 3 and term in title)
-        full_coverage = sum(1 for term in meaningful_terms if term in full) / max(1, min(len(meaningful_terms), 12))
-        if title_hits:
-            score += 12.0 + title_coverage * 32.0 + long_title_hits * 3.0
-        if full_coverage:
-            score += full_coverage * 10.0
-        if any(term.lower() in {"文档", "资料", "报告", "方案", "doc", "document"} for term in terms):
-            score += 14.0
-            if "文档" in doc_type or "报告" in doc_type or "方案" in doc_type:
-                score += 6.0
+        lowered_text = text.lower()
+        score = base
+        for term in terms:
+            lowered = term.lower()
+            weight = plan.weight_for(lowered)
+            if lowered in lowered_text:
+                score += weight
+            if lowered in summary:
+                score += weight * 2.0
+            if lowered in title:
+                score += weight * 6.0
         return score
 
     @staticmethod
-    def _bake_artifact_score(row: sqlite3.Row, terms: list[str], text: str) -> float:
-        base = KnowledgeFts5Retriever._keyword_score(text, terms) + 24.0
+    def _bake_artifact_score(
+        row: sqlite3.Row,
+        plan: ArtifactQueryPlan,
+        text: str,
+    ) -> float:
+        terms = plan.ranking_terms
+        base = 24.0
         title = str(row["title"] or "").lower()
         summary = str(row["summary"] or "").lower()
-        full = f"{title} {summary}"
-
-        title_hits = sum(1 for term in terms if term.lower() in title)
-        summary_hits = sum(1 for term in terms if term.lower() in summary)
-        score = base + title_hits * 8.0 + summary_hits * 2.0
-
-        meaningful_terms = [term.lower() for term in terms if len(term) >= 2]
-        title_coverage = title_hits / max(1, min(len(meaningful_terms), 12))
-        full_coverage = sum(1 for term in meaningful_terms if term in full) / max(1, min(len(meaningful_terms), 12))
-        if title_hits:
-            score += 8.0 + title_coverage * 24.0
-        if full_coverage:
-            score += full_coverage * 8.0
+        lowered_text = text.lower()
+        score = base
+        for term in terms:
+            lowered = term.lower()
+            weight = plan.weight_for(lowered)
+            if lowered in lowered_text:
+                score += weight
+            if lowered in summary:
+                score += weight * 2.0
+            if lowered in title:
+                score += weight * 6.0
         return score
 
-    def _document_row_to_chunk(self, row: sqlite3.Row, terms: list[str]) -> RetrievedChunk:
+    def _document_row_to_chunk(
+        self,
+        row: sqlite3.Row,
+        plan: ArtifactQueryPlan,
+    ) -> RetrievedChunk:
         artifact_id = int(row["id"])
         doc_key = (
             _document_url_doc_key(row["source_url"])
@@ -1327,7 +1355,7 @@ class KnowledgeFts5Retriever:
         return RetrievedChunk(
             capture_id=0,
             text=text,
-            score=self._document_artifact_score(row, terms, text),
+            score=self._document_artifact_score(row, plan, text),
             source="document",
             doc_key=doc_key,
             metadata={
@@ -1350,7 +1378,11 @@ class KnowledgeFts5Retriever:
             },
         )
 
-    def _knowledge_artifact_row_to_chunk(self, row: sqlite3.Row, terms: list[str]) -> RetrievedChunk:
+    def _knowledge_artifact_row_to_chunk(
+        self,
+        row: sqlite3.Row,
+        plan: ArtifactQueryPlan,
+    ) -> RetrievedChunk:
         artifact_id = int(row["id"])
         doc_key = _artifact_doc_key("bake_knowledge", artifact_id)
         source_timeline_ids = self._json_ids(row["source_timeline_ids"])
@@ -1360,7 +1392,7 @@ class KnowledgeFts5Retriever:
         return RetrievedChunk(
             capture_id=0,
             text=text,
-            score=self._bake_artifact_score(row, terms, text),
+            score=self._bake_artifact_score(row, plan, text),
             source="bake_knowledge",
             doc_key=doc_key,
             metadata={
@@ -1380,7 +1412,11 @@ class KnowledgeFts5Retriever:
             },
         )
 
-    def _operation_artifact_row_to_chunk(self, row: sqlite3.Row, terms: list[str]) -> RetrievedChunk:
+    def _operation_artifact_row_to_chunk(
+        self,
+        row: sqlite3.Row,
+        plan: ArtifactQueryPlan,
+    ) -> RetrievedChunk:
         artifact_id = int(row["id"])
         doc_key = _artifact_doc_key("operation", artifact_id)
         source_timeline_ids = [str(row["timeline_id"])] if row["timeline_id"] else []
@@ -1388,7 +1424,7 @@ class KnowledgeFts5Retriever:
         return RetrievedChunk(
             capture_id=0,
             text=text,
-            score=self._bake_artifact_score(row, terms, text),
+            score=self._bake_artifact_score(row, plan, text),
             source="operation",
             doc_key=doc_key,
             metadata={
