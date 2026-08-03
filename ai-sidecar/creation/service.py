@@ -13,7 +13,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import Any, Optional, Union, AsyncIterator
 from urllib.parse import quote_plus, urlparse
 
 import httpx
@@ -244,8 +244,8 @@ class CreationService:
     def __init__(
         self,
         ollama_base_url: str = "http://localhost:11434",
-        db_path: str | None = None,
-        model: str | None = None,
+        db_path: Optional[str] = None,
+        model: Optional[str] = None,
         enable_vector_recall: bool = True,
     ):
         self.ollama_base_url = ollama_base_url
@@ -318,8 +318,8 @@ class CreationService:
         query: str,
         parsed_requirement: dict,
         limit: int = 3,
-        run_id: str | None = None,
-        session_id: str | None = None,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> dict:
         """创作时刷新 Top-K 报表源，并生成经 OCR/DOM 校验的通用截图证据。"""
         report_sources = [
@@ -333,7 +333,7 @@ class CreationService:
             return {"scrapes": [], "refreshed_data": data_results}
 
         scrapes: list[dict] = []
-        first_error_code: str | None = None
+        first_error_code: Optional[str] = None
         async with httpx.AsyncClient(timeout=45.0) as client:
             for item in report_sources:
                 source_id = int(item["source_id"])
@@ -1419,7 +1419,7 @@ JSON 类型硬约束：
                     fallback_text,
                 )
 
-            def resources(key: str, allowed: set[str] | None = None) -> list[str]:
+            def resources(key: str, allowed: Optional[set[str]] = None) -> list[str]:
                 raw = item.get(key)
                 source = raw if isinstance(raw, list) else fallback_step.get(key, [])
                 result = []
@@ -2155,7 +2155,7 @@ JSON 类型硬约束：
                     "完成证据：释放动作必须留下可观察结果，无法确认时回到复核状态。",
                 ],
             )
-        if re.search(r"```(?:plantuml|mermaid)", content, re.I):
+        if re.search(r"```(?: Union[plantuml, mermaid])", content, re.I):
             add(
                 "代码图示与正文同词复现",
                 "源文档把可执行图示代码放在解释之后，并让节点、分组和连线继续使用正文已经建立的术语，图不是独立装饰。",
@@ -2490,7 +2490,7 @@ JSON 类型硬约束：
             plain: str,
             detail: str,
             question: str,
-            parallel: str | None = None,
+            parallel: Optional[str] = None,
         ) -> str:
             if question_style:
                 return question
@@ -2656,7 +2656,7 @@ flowchart LR
         response_text: str,
         latency_ms: int,
         status: str,
-        error_msg: str | None = None,
+        error_msg: Optional[str] = None,
     ) -> None:
         """记录创作模型 token 用量，失败不影响主生成链路。"""
         try:

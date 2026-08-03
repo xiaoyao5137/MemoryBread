@@ -7,8 +7,10 @@
 3. 敏感政策信息过滤 (policy)
 """
 
+from __future__ import annotations
+
 import re
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 

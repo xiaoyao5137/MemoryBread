@@ -8,4 +8,6 @@ RAG 服务模块
 - LLM 推理
 """
 
+from __future__ import annotations
+
 __version__ = "0.1.0"

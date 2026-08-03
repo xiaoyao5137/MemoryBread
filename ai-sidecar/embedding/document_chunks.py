@@ -45,7 +45,7 @@ class DocumentSnapshot:
 @dataclass(frozen=True)
 class BakeDocumentSnapshot:
     document_id: int
-    canonical_url: str | None
+    canonical_url: Optional[str]
     doc_key: str
     title: str
     body: str
@@ -53,7 +53,7 @@ class BakeDocumentSnapshot:
     chunks: list[str]
 
 
-def _canonicalize_url(url: str | None) -> str | None:
+def _canonicalize_url(url: Optional[str]) -> str | None:
     value = str(url or "").strip()
     if not value:
         return None
@@ -75,7 +75,7 @@ def _canonicalize_url(url: str | None) -> str | None:
     )
 
 
-def canonicalize_document_url(url: str | None) -> str | None:
+def canonicalize_document_url(url: Optional[str]) -> str | None:
     """Return a query/fragment-free URL suitable for document identity."""
     value = str(url or "").strip()
     if not value or not _is_document_url(value):

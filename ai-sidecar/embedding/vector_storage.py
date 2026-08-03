@@ -4,11 +4,13 @@
 负责将向量写入 Qdrant 和 SQLite vector_index 表
 """
 
+from __future__ import annotations
+
 import logging
 import sqlite3
 import time
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Any, Optional
 from pathlib import Path
 
 logger = logging.getLogger(__name__)

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class AsrWorker:
     """异步 ASR 转录任务 Worker"""
 
-    def __init__(self, model: AsrModel | None = None) -> None:
+    def __init__(self, model: Optional[AsrModel] = None) -> None:
         self._model = model or AsrModel.create_default()
 
     async def handle(self, req: IpcRequest) -> IpcResponse:

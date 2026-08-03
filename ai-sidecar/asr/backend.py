@@ -45,7 +45,7 @@ class AsrBackend(ABC):
         """当前环境是否可用"""
 
     @abstractmethod
-    def transcribe(self, audio_path: str, language: str | None = None) -> AsrOutput:
+    def transcribe(self, audio_path: str, language: Optional[str] = None) -> AsrOutput:
         """
         将音频文件转录为文本。
 

@@ -12,7 +12,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Any, AsyncIterator, Optional
+from typing import Any, Optional, Union, AsyncIterator
 from uuid import uuid4
 
 from .service import CreationOptions, CreationService, ReferenceDocument
@@ -225,20 +225,20 @@ class CreationAgentLoop:
         self,
         *,
         user_message: str,
-        root_request: str | None = None,
+        root_request: Optional[str] = None,
         current_document: str,
         conversation: list[dict[str, str]],
         selected_skills: list[dict[str, Any]],
         options: CreationOptions,
         model_mode: str = "local",
-        session_id: str | None = None,
-        run_id: str | None = None,
+        session_id: Optional[str] = None,
+        run_id: Optional[str] = None,
         confirmed: bool = False,
         resume_state: dict[str, Any] | None = None,
-        model_result: str | None = None,
-        creation_model: str | None = None,
-        creation_api_key: str | None = None,
-        creation_base_url: str | None = None,
+        model_result: Optional[str] = None,
+        creation_model: Optional[str] = None,
+        creation_api_key: Optional[str] = None,
+        creation_base_url: Optional[str] = None,
     ) -> AsyncIterator[dict[str, Any]]:
         if resume_state:
             state = LoopState.restore(resume_state)
@@ -329,7 +329,7 @@ class CreationAgentLoop:
             state.cursor += 1
             state.goal.remaining_steps = [item["name"] for item in state.plan[state.cursor:]]
             step_status = "completed"
-            error_code: str | None = None
+            error_code: Optional[str] = None
             try:
                 async for event in self._execute_step(
                     state,
@@ -462,14 +462,14 @@ class CreationAgentLoop:
         self,
         *,
         user_message: str,
-        root_request: str | None,
+        root_request: Optional[str],
         current_document: str,
         conversation: list[dict[str, str]],
         selected_skills: list[dict[str, Any]],
         options: CreationOptions,
         model_mode: str,
-        session_id: str | None,
-        run_id: str | None,
+        session_id: Optional[str],
+        run_id: Optional[str],
     ) -> LoopState:
         message = user_message.strip()
         normalized_conversation = self._normalize_conversation(conversation)
@@ -534,7 +534,7 @@ class CreationAgentLoop:
 
     @staticmethod
     def _resolve_root_request(
-        root_request: str | None,
+        root_request: Optional[str],
         conversation: list[dict[str, str]],
         user_message: str,
     ) -> str:
@@ -817,7 +817,7 @@ class CreationAgentLoop:
         step: dict[str, Any],
         *,
         status: str,
-        error_code: str | None = None,
+        error_code: Optional[str] = None,
     ) -> dict[str, Any] | None:
         """Harness 只依据可观察 Tool 反馈追加下一步，不预演固定链路。"""
         step_id = str(step.get("id") or "")
@@ -1376,9 +1376,9 @@ class CreationAgentLoop:
         state: LoopState,
         step: dict[str, Any],
         *,
-        creation_model: str | None,
-        creation_api_key: str | None,
-        creation_base_url: str | None,
+        creation_model: Optional[str],
+        creation_api_key: Optional[str],
+        creation_base_url: Optional[str],
     ) -> AsyncIterator[dict[str, Any]]:
         actor = self._actor(step["kind"], step["id"], step["name"])
         yield self._event(
@@ -1942,7 +1942,7 @@ class CreationAgentLoop:
 
         short_sections = self._short_detail_sections(document)
         placeholder_count = len(
-            re.findall(r"(?i)\b(?:TODO|TBD)\b|待补充|此处补充|后续完善", prose)
+            re.findall(r"(?i)\b(?: Union[TODO, TBD])\b|待补充|此处补充|后续完善", prose)
         )
         detail_incomplete = (
             len(document.strip()) >= 500
@@ -2034,7 +2034,7 @@ class CreationAgentLoop:
             )
 
         has_diagram = bool(
-            re.search(r"```\s*(?:plantuml|mermaid)\b", document, re.IGNORECASE)
+            re.search(r"```\s*(?: Union[plantuml, mermaid])\b", document, re.IGNORECASE)
         )
         visual_expected = bool(
             state.environment.get("requirement", {}).get("needs_images")
@@ -2070,8 +2070,8 @@ class CreationAgentLoop:
         severity: str,
         agent_id: str,
         summary: str,
-        evidence: Any | None = None,
-        required_capabilities: list[str] | None = None,
+        evidence: Optional[Any] = None,
+        required_capabilities: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         return {
             "code": code,
@@ -2714,7 +2714,7 @@ class CreationAgentLoop:
         text = result.strip()
         if not text:
             return ""
-        fenced = re.fullmatch(r"```(?:markdown|md)?\s*\n([\s\S]*?)\n```", text)
+        fenced = re.fullmatch(r"```(?: Union[markdown, md])?\s*\n([\s\S]*?)\n```", text)
         if fenced:
             text = fenced.group(1).strip()
 
@@ -3027,7 +3027,7 @@ class CreationAgentLoop:
                 continue
             validation = evidence.get("validation") or {}
             claims = validation.get("verified_claims") or []
-            matched_index: int | None = None
+            matched_index: Optional[int] = None
             for index in range(0, len(blocks), 2):
                 block = blocks[index]
                 normalized_block = cls._normalize_evidence_match_text(block)

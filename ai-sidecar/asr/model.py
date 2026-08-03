@@ -19,7 +19,7 @@ class AsrModel:
     默认使用 WhisperBackend，支持通过构造函数注入自定义后端。
     """
 
-    def __init__(self, backend: AsrBackend | None = None) -> None:
+    def __init__(self, backend: Optional[AsrBackend] = None) -> None:
         self._backend = backend or WhisperBackend()
 
     @classmethod
@@ -27,7 +27,7 @@ class AsrModel:
         """创建默认配置（whisper-base）"""
         return cls(backend=WhisperBackend())
 
-    def transcribe(self, audio_path: str, language: str | None = None) -> AsrOutput:
+    def transcribe(self, audio_path: str, language: Optional[str] = None) -> AsrOutput:
         """
         转录音频文件。
 

@@ -42,7 +42,7 @@ class WhisperBackend(AsrBackend):
         except ImportError:
             return False
 
-    def transcribe(self, audio_path: str, language: str | None = None) -> AsrOutput:
+    def transcribe(self, audio_path: str, language: Optional[str] = None) -> AsrOutput:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"音频文件不存在: {audio_path}")
 

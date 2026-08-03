@@ -7,6 +7,8 @@ ai-sidecar OCR 模块
 - OcrBackend, OcrBox, OcrOutput : 后端接口与数据类型
 """
 
+from __future__ import annotations
+
 from .engine          import OcrEngine
 from .worker          import OcrWorker
 from .backends.base   import OcrBackend, OcrBox, OcrOutput

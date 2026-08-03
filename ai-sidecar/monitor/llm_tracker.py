@@ -5,6 +5,8 @@ LLM 用量埋点工具
 在调用后通过此模块记录 token 用量到 llm_usage_logs 表。
 """
 
+from __future__ import annotations
+
 import sqlite3
 import time
 import logging

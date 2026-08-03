@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+from __future__ import annotations
+
 """启动创作服务"""
 import sys
 import uvicorn

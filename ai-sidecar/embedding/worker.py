@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class EmbedWorker:
     """异步 Embedding 任务 Worker"""
 
-    def __init__(self, model: EmbeddingModel | None = None) -> None:
+    def __init__(self, model: Optional[EmbeddingModel] = None) -> None:
         self._model = model or EmbeddingModel.create_default()
 
     async def handle(self, req: IpcRequest) -> IpcResponse:

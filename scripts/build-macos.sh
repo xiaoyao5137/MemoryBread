@@ -99,6 +99,11 @@ prepare_python_helper() {
   done
   hidden_args+=(--collect-submodules memory_bread_ipc)
 
+  # Explicitly include rag.llm submodules (PyInstaller sometimes misses them)
+  for module in rag.llm rag.llm.base rag.llm.ollama rag.llm.openai_compat rag.llm.cloud; do
+    hidden_args+=(--hidden-import "$module")
+  done
+
   if [ "${MEMORY_BREAD_REUSE_PYINSTALLER:-0}" = "1" ] \
     && [ -x "$frozen_executable" ]; then
     echo "[macOS build] 复用已有 PyInstaller 产物（仅用于本地重试）..."
@@ -117,6 +122,7 @@ prepare_python_helper() {
       --specpath "$spec_dir" \
       --paths "$SIDECAR_DIR" \
       --paths "$PROJECT_ROOT/shared/ipc-protocol/python" \
+      --additional-hooks-dir "$SIDECAR_DIR/pyinstaller-hooks" \
       --add-data "$SIDECAR_DIR/migrations:migrations" \
       --add-data "$SIDECAR_DIR/Modelfile:." \
       "${hidden_args[@]}" \

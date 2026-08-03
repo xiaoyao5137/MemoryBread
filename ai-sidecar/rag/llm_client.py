@@ -4,8 +4,10 @@ LLM 客户端
 支持本地 Ollama 和云端 API（通义千问、文心一言等）
 """
 
+from __future__ import annotations
+
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Any, Optional
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)

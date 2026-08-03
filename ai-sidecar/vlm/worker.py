@@ -36,7 +36,7 @@ _SCENE_MAP: dict[SceneType, IpcSceneType] = {
 class VlmWorker:
     """异步 VLM 截图分析任务 Worker"""
 
-    def __init__(self, model: VlmModel | None = None) -> None:
+    def __init__(self, model: Optional[VlmModel] = None) -> None:
         self._model = model or VlmModel.create_default()
 
     async def handle(self, req: IpcRequest) -> IpcResponse:

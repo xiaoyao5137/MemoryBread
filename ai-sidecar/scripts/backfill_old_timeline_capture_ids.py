@@ -59,7 +59,7 @@ UPDATE_SQL = """
 """
 
 
-def build_segment(cap_id: int, cap_ts: int, summary: str | None) -> dict:
+def build_segment(cap_id: int, cap_ts: int, summary: Optional[str]) -> dict:
     """构造单段 key_timestamps 元素，结构与前端 TimelineItem.keyTimestamps 一致。"""
     return {
         "capture_ids": [cap_id],
@@ -69,7 +69,7 @@ def build_segment(cap_id: int, cap_ts: int, summary: str | None) -> dict:
     }
 
 
-def parse_source_timeline_id(details: str | None) -> int | None:
+def parse_source_timeline_id(details: Optional[str]) -> int | None:
     if not details:
         return None
     try:
@@ -83,7 +83,7 @@ def parse_source_timeline_id(details: str | None) -> int | None:
         return None
 
 
-def normalize_details(details: str | None, source_id: int | None, source_details: str | None) -> str | None:
+def normalize_details(details: Optional[str], source_id: Optional[int], source_details: Optional[str]) -> str | None:
     if not details:
         return details
     try:

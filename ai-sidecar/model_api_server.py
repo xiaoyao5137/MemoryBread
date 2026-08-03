@@ -2,6 +2,8 @@
 模型管理 API - 提供模型列表、下载、配置等接口
 """
 
+from __future__ import annotations
+
 from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
 from werkzeug.exceptions import BadGateway, ServiceUnavailable
@@ -59,7 +61,7 @@ class FloatingAssistIntent:
     core_question: str = ""
     retrieval_query: str = ""
     screen_context_summary: str = ""
-    answer_requirements: list[str] | None = None
+    answer_requirements: Optional[list[str]] = None
     confidence: float = 0.0
     needs_rag: bool = True
     source: str = "fallback"
@@ -284,7 +286,7 @@ def get_bake_extractor():
     return _bake_extractor
 
 
-def _with_floating_assist_context(contexts: list[dict], metadata: dict | None = None) -> list[dict]:
+def _with_floating_assist_context(contexts: list[dict], metadata: Optional[dict] = None) -> list[dict]:
     saved_contexts = list(contexts or [])
     metadata = metadata or {}
     has_floating_context = any(
@@ -328,7 +330,7 @@ def _extract_floating_assist_question(ocr_text: str) -> str:
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     question_markers = ('?', '？', '是什么', '怎么样', '多少', '如何', '怎么', '哪些', '为什么', '有没有', '能否')
-    domain_pattern = re.compile(r'(?i)(?:^|[\s/])[\w.-]+\.(?:com|cn|net|org|io|dev|app|local)(?:[/:?#]|$)')
+    domain_pattern = re.compile(r'(?i)(?:^|[\s/])[\w.-]+\.(?: Union[com, cn, net, org, io, dev, app, local])(?:[/:?#]|$)')
     noise_tokens = (
         '显示器 ', 'http://', 'https://', '发送/', '换行', '发送', '搜索', '登录', '注册账号',
         '安全与隐私', '用户控制台', '菜单', '窗口', '帮助', 'File', 'Edit', 'View', 'Window'
@@ -360,7 +362,7 @@ def _extract_floating_assist_ocr_from_query(raw_query: str) -> str:
     return text.split(marker, 1)[1].strip()
 
 
-def _floating_assist_metadata(raw_query: str, metadata: dict | None = None) -> dict:
+def _floating_assist_metadata(raw_query: str, metadata: Optional[dict] = None) -> dict:
     data = dict(metadata or {})
     if data.get('source') != 'floating_assist' and '工作场景助手' in (raw_query or '') and '当前屏幕 OCR' in (raw_query or ''):
         data['source'] = 'floating_assist'
@@ -414,7 +416,7 @@ def _parse_json_object(text: str) -> dict | None:
     return None
 
 
-def _fallback_floating_assist_intent(raw_query: str, metadata: dict | None = None) -> FloatingAssistIntent:
+def _fallback_floating_assist_intent(raw_query: str, metadata: Optional[dict] = None) -> FloatingAssistIntent:
     metadata = _floating_assist_metadata(raw_query, metadata)
     if metadata.get('source') != 'floating_assist':
         return FloatingAssistIntent(source='none')
@@ -466,7 +468,7 @@ def _build_floating_assist_intent_prompt(raw_query: str, metadata: dict) -> tupl
     return prompt, system
 
 
-def _analyze_floating_assist_intent(raw_query: str, metadata: dict | None, llm) -> FloatingAssistIntent:
+def _analyze_floating_assist_intent(raw_query: str, metadata: Optional[dict], llm) -> FloatingAssistIntent:
     metadata = _floating_assist_metadata(raw_query, metadata)
     if metadata.get('source') != 'floating_assist':
         return FloatingAssistIntent(source='none')
@@ -538,7 +540,7 @@ def _build_floating_assist_rag_query_from_intent(raw_query: str, intent: Floatin
     )
 
 
-def _build_floating_assist_rag_query(raw_query: str, metadata: dict | None = None) -> str:
+def _build_floating_assist_rag_query(raw_query: str, metadata: Optional[dict] = None) -> str:
     metadata = _floating_assist_metadata(raw_query, metadata)
     intent = _fallback_floating_assist_intent(raw_query, metadata)
     return _build_floating_assist_rag_query_from_intent(raw_query, intent)
@@ -551,7 +553,7 @@ def _ensure_rag_session_model_column(cursor) -> None:
         cursor.execute("ALTER TABLE rag_sessions ADD COLUMN model TEXT")
 
 
-def _brand_model_id(model_name: str | None) -> str:
+def _brand_model_id(model_name: Optional[str]) -> str:
     raw = (model_name or '').lower()
     if 'plus' in raw or 'opus' in raw:
         return 'mbcd-plus-v1'
@@ -567,7 +569,7 @@ def _runtime_model_name(model_id: str) -> str:
     return model.model_id if model is not None else model_id
 
 
-def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[dict], latency_ms: int, metadata: dict | None = None, model: str | None = None) -> int | None:
+def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[dict], latency_ms: int, metadata: Optional[dict] = None, model: Optional[str] = None) -> int | None:
     try:
         metadata = metadata or {}
         saved_contexts = _with_floating_assist_context(contexts, metadata)

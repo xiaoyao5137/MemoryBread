@@ -19,7 +19,7 @@ WeightedResultList = tuple[list[RetrievedChunk], float]
 
 
 def reciprocal_rank_fusion(
-    result_lists: list[list[RetrievedChunk]] | list[WeightedResultList],
+    result_lists: Union[list[list[RetrievedChunk]], list[WeightedResultList]],
     top_k:        int = 10,
     k:            int = 60,
     min_score:    float = 0.0,
@@ -75,7 +75,7 @@ def reciprocal_rank_fusion(
     ]
 
 
-def _normalize_result_list(entry: list[RetrievedChunk] | WeightedResultList) -> WeightedResultList:
+def _normalize_result_list(entry: Union[list[RetrievedChunk], WeightedResultList]) -> WeightedResultList:
     if (
         isinstance(entry, tuple)
         and len(entry) == 2

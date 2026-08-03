@@ -5,6 +5,8 @@ RAG Worker - 处理 RAG 查询任务
 这个 Worker 主要负责查询（未来扩展）
 """
 
+from __future__ import annotations
+
 import logging
 import time
 from memory_bread_ipc import IpcRequest, IpcResponse

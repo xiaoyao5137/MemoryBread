@@ -5,6 +5,8 @@
 支持串行加载，同时最多加载 1-2 个模型。
 """
 
+from __future__ import annotations
+
 import asyncio
 import gc
 import logging

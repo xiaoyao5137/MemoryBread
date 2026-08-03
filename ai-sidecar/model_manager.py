@@ -6,6 +6,8 @@
 2. 向量模型（Embedding）- 用于语义搜索
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os

@@ -102,13 +102,13 @@ class InitializationFailure(RuntimeError):
 class InitializationManager:
     """持久化、可判重的一键初始化任务。"""
 
-    def __init__(self, base_dir: Path | None = None):
+    def __init__(self, base_dir: Optional[Path] = None):
         self.base_dir = (base_dir or (Path.home() / ".memory-bread")).resolve()
         self.normal_state_path = self.base_dir / "initialization" / "state.json"
         self.mode_path = self.base_dir / "initialization" / "test-mode.json"
         self.sandbox_root = (self.base_dir / "initialization-sandbox").resolve()
         self._lock = threading.RLock()
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
         self._processes: dict[str, subprocess.Popen] = {}
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._mark_interrupted_runs()
@@ -121,7 +121,7 @@ class InitializationManager:
             state["test_mode_enabled"] = self._test_mode_enabled()
             return self._public_state(state)
 
-    def start(self, mode: str | None = None) -> dict[str, Any]:
+    def start(self, mode: Optional[str] = None) -> dict[str, Any]:
         with self._lock:
             active_mode = "sandbox" if self._test_mode_enabled() else "normal"
             requested_mode = mode or active_mode
@@ -621,7 +621,7 @@ class InitializationManager:
         url = os.environ.get("MEMORY_BREAD_OLLAMA_DOWNLOAD_URL", MANAGED_OLLAMA_URL)
         expected_sha = os.environ.get("MEMORY_BREAD_OLLAMA_SHA256", MANAGED_OLLAMA_SHA256).lower()
 
-        last_error: Exception | None = None
+        last_error: Optional[Exception] = None
         for attempt in range(3):
             downloaded = archive.stat().st_size if archive.exists() else 0
             headers = {"User-Agent": "MemoryBread-Initializer/1"}
@@ -747,7 +747,7 @@ class InitializationManager:
             headers={"Content-Type": "application/json"},
         )
         stage_id = "capture_model" if model_name == _CAPTURE_MODEL_NAME else "vector_model"
-        last_error: Exception | None = None
+        last_error: Optional[Exception] = None
         for attempt in range(3):
             try:
                 with urllib.request.urlopen(request, timeout=3600) as response:
@@ -866,7 +866,7 @@ class InitializationManager:
 
     def _probe_capture(self, mode: str) -> None:
         db_path = self._database_path(mode)
-        capture_id: int | None = None
+        capture_id: Optional[int] = None
         try:
             with sqlite3.connect(db_path, timeout=10) as conn:
                 cursor = conn.execute(
@@ -1369,7 +1369,7 @@ class InitializationManager:
         return any(item == expected or item.split(":")[0] == expected_base for item in installed)
 
     @staticmethod
-    def _http_json(url: str, payload: bytes | None = None, timeout: int = 30) -> dict[str, Any]:
+    def _http_json(url: str, payload: Optional[bytes] = None, timeout: int = 30) -> dict[str, Any]:
         request = urllib.request.Request(
             url,
             data=payload,
@@ -1690,7 +1690,7 @@ class InitializationManager:
         return redacted
 
     @staticmethod
-    def _quality_check(check_id: str, passed: bool, error_code: str | None = None) -> dict[str, Any]:
+    def _quality_check(check_id: str, passed: bool, error_code: Optional[str] = None) -> dict[str, Any]:
         return {
             "id": check_id,
             "status": "passed" if passed else "failed",

@@ -4,6 +4,8 @@
 定义所有可用模型的元数据，并提供基于硬件的选型建议。
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 

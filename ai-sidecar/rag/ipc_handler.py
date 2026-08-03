@@ -4,6 +4,8 @@ IPC Embed 任务处理器
 处理来自 core-engine 的 Embedding 请求
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Dict, Any
 from .embedding import get_embedding_service

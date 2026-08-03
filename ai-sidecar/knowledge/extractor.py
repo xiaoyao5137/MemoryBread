@@ -2,6 +2,8 @@
 时间线提炼模块（旧版） - 使用 Qwen3.5-4B 从 OCR 文本中提取结构化知识
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import re

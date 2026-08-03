@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .base   import OcrBackend, OcrBox, OcrOutput
 from .paddle import PaddleBackend
 from .vision import AppleVisionBackend

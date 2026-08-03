@@ -5,6 +5,8 @@
 核心原则：不依赖应用/窗口切换判断任务边界，而是用内容语义判断。
 """
 
+from __future__ import annotations
+
 import re
 import logging
 import numpy as np

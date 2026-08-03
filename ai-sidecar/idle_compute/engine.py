@@ -4,6 +4,8 @@
 协调闲时检测器、任务调度器和模型管理器，实现完整的闲时计算流程。
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 from typing import Optional

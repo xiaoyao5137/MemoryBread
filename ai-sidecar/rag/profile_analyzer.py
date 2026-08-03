@@ -7,6 +7,8 @@
 3. 智能合并增量画像到存量
 """
 
+from __future__ import annotations
+
 import json
 import sqlite3
 from datetime import datetime

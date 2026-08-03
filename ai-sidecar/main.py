@@ -39,7 +39,7 @@ _RUNTIME_STATE: dict = {
 _STATE_DIR = Path.home() / ".memory-bread" / "state"
 _RUNTIME_STATUS_FILE = _STATE_DIR / "sidecar_runtime_status.json"
 _INSTANCE_LOCK_FILE = _STATE_DIR / "sidecar.instance.lock"
-_RUNTIME_STATUS_CACHE: dict | None = None
+_RUNTIME_STATUS_CACHE: Optional[dict] = None
 _RUNTIME_STATUS_LOCK = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,8 +61,8 @@ def _write_runtime_status(
     background_processor_running: bool,
     critical_checks_passed: bool,
     embedding_ok: bool,
-    issues: list[str] | None = None,
-    checks: dict | None = None,
+    issues: Optional[list[str]] = None,
+    checks: Optional[dict] = None,
 ) -> None:
     """写入关键后台能力状态，供 Core Engine 监控页读取。"""
     global _RUNTIME_STATUS_CACHE
@@ -137,7 +137,7 @@ def _start_vector_search_server() -> None:
         _vs_app = Flask("vector_search_internal")
         logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
-        def build_qdrant_filter(raw_filters: dict | None):
+        def build_qdrant_filter(raw_filters: Optional[dict]):
             if not raw_filters:
                 return None
             conditions = []

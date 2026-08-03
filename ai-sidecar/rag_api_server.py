@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+from __future__ import annotations
+
 """
 RAG 查询 HTTP 服务
 在端口 7071 上提供 RAG 查询 API

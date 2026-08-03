@@ -1,4 +1,7 @@
 """创作服务 FastAPI 应用"""
+
+from __future__ import annotations
+
 import asyncio
 import queue
 import threading

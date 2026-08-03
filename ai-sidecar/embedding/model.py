@@ -23,7 +23,7 @@ class EmbeddingModel:
     默认使用 OllamaEmbeddingBackend（bge-small-zh-v1.5 量化模型），可通过构造函数注入自定义后端。
     """
 
-    def __init__(self, backend: EmbeddingBackend | None = None) -> None:
+    def __init__(self, backend: Optional[EmbeddingBackend] = None) -> None:
         self._backend = backend or OllamaEmbeddingBackend()
 
     # ── 工厂方法 ──────────────────────────────────────────────────────────────

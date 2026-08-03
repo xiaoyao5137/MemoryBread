@@ -36,7 +36,7 @@ class OcrWorker:
     避免阻塞 asyncio 事件循环。
     """
 
-    def __init__(self, engine: OcrEngine | None = None, enable_privacy_filter: bool = False) -> None:
+    def __init__(self, engine: Optional[OcrEngine] = None, enable_privacy_filter: bool = False) -> None:
         self._engine = engine or OcrEngine.create_default()
         self._privacy_filter = PrivacyFilter() if enable_privacy_filter else None
         # Vision/Paddle 都是同步且资源密集的实现。独立的单线程执行器提供硬并发上限，

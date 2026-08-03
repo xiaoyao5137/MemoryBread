@@ -248,7 +248,7 @@ class CloudChatBackend(LlmBackend):
     def _post_json(self, url: str, payload: dict, headers: dict) -> dict:
         body = json.dumps(payload).encode("utf-8")
         attempts = self._retries + 1
-        last_exc: BaseException | None = None
+        last_exc: Optional[BaseException] = None
 
         for attempt in range(attempts):
             req = urllib.request.Request(
@@ -304,7 +304,7 @@ class CloudChatBackend(LlmBackend):
         return any(marker in text for marker in retry_markers)
 
     @staticmethod
-    def _network_error_detail(exc: BaseException | None) -> str:
+    def _network_error_detail(exc: Optional[BaseException]) -> str:
         if exc is None:
             return "unknown network error"
         if isinstance(exc, urllib.error.URLError):

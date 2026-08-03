@@ -8,6 +8,8 @@
 4. 距离上次执行 > 1 小时（可配置）
 """
 
+from __future__ import annotations
+
 import time
 import psutil
 import logging

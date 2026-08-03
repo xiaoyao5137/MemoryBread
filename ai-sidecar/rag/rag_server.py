@@ -5,9 +5,11 @@ RAG HTTP 服务器
 端口：7071
 """
 
+from __future__ import annotations
+
 import logging
 import os
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn

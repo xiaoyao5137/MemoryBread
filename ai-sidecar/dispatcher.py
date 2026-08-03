@@ -29,11 +29,11 @@ class Dispatcher:
     """将 IPC 请求路由到对应 Worker 的分发器"""
 
     def __init__(self) -> None:
-        self._ocr_worker:   object | None = None   # 懒加载
-        self._embed_worker: object | None = None   # 懒加载
-        self._asr_worker:   object | None = None   # 懒加载
-        self._vlm_worker:   object | None = None   # 懒加载
-        self._rag_worker:   object | None = None   # 懒加载
+        self._ocr_worker: Optional[object] = None   # 懒加载
+        self._embed_worker: Optional[object] = None   # 懒加载
+        self._asr_worker: Optional[object] = None   # 懒加载
+        self._vlm_worker: Optional[object] = None   # 懒加载
+        self._rag_worker: Optional[object] = None   # 懒加载
 
     # ── 公共接口 ──────────────────────────────────────────────────────────────
 

@@ -8,6 +8,8 @@
 4. 将结果写入 task_executions 表
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from abc         import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 
 @dataclass
@@ -15,7 +15,7 @@ class LlmResponse:
     text:   str
     model:  str
     tokens: int = 0
-    done_reason: str | None = None
+    done_reason: Optional[str] = None
 
 
 class LlmBackend(ABC):

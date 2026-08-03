@@ -2,6 +2,8 @@
 时间线提炼与 bake 提炼模块 V2 - 强制使用 LLM，支持去重和出现次数统计
 """
 
+from __future__ import annotations
+
 import ast
 import json
 import logging
@@ -1155,7 +1157,7 @@ SYSTEM_PROMPT = """你是一个专业的工作记录提炼助手。你的任务�
 class KnowledgeExtractorV2:
     """时间线提炼器 V2 - 强制使用 LLM"""
 
-    def __init__(self, model: str | None = None, embedding_model=None, user_identity: str = ""):
+    def __init__(self, model: Optional[str] = None, embedding_model=None, user_identity: str = ""):
         """
         初始化时间线提炼器
 

@@ -2,10 +2,12 @@
 知识库管理模块 - 负责知识条目的 CRUD 操作
 """
 
+from __future__ import annotations
+
 import sqlite3
 import json
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Any, Optional
 from datetime import datetime
 from pathlib import Path
 

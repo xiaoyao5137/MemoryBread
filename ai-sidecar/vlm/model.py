@@ -19,7 +19,7 @@ class VlmModel:
     默认使用 MiniCPM-V，支持后端注入（用于测试）。
     """
 
-    def __init__(self, backend: VlmBackend | None = None) -> None:
+    def __init__(self, backend: Optional[VlmBackend] = None) -> None:
         self._backend = backend or MiniCpmVBackend()
 
     @classmethod

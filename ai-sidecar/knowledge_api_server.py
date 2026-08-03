@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+from __future__ import annotations
+
 """
 临时知识库 API 服务器
 在 Core Engine 端口 7070 上提供知识库 API

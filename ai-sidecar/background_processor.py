@@ -6,6 +6,8 @@
 2. 时间线提炼（Timeline Extraction）
 """
 
+from __future__ import annotations
+
 import asyncio
 import fcntl
 import json
@@ -64,7 +66,7 @@ def _check_preempt_signal() -> bool:
     return os.path.exists("/tmp/memory-bread-preempt.signal")
 
 
-def _is_self_generated_capture(app_name: str | None, window_title: str | None) -> bool:
+def _is_self_generated_capture(app_name: Optional[str], window_title: Optional[str]) -> bool:
     app_lower = (app_name or "").lower()
     title_lower = (window_title or "").lower()
     return any(keyword in app_lower for keyword in _SELF_GENERATED_APP_KEYWORDS) or any(
@@ -203,7 +205,7 @@ class BackgroundProcessor:
         self._extracting_lock = threading.Lock()
         self._extracting_groups: dict[int, dict] = {}  # group_id -> {captures, started_at}
         self._next_group_id = 0
-        self._last_extraction_at_ms: int | None = None
+        self._last_extraction_at_ms: Optional[int] = None
         self._status_file = Path.home() / ".memory-bread" / "state" / "extraction_status.json"
         self._status_file.parent.mkdir(parents=True, exist_ok=True)
         # 初始化时立即写一次，保证 core-engine 拿得到 running=true 信号

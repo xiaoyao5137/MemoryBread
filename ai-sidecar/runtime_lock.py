@@ -5,7 +5,7 @@ from __future__ import annotations
 import errno
 import os
 from pathlib import Path
-from typing import TextIO
+from typing import Optional, TextIO
 
 
 class SidecarAlreadyRunningError(RuntimeError):
@@ -20,7 +20,7 @@ class SidecarInstanceLock:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._handle: TextIO | None = None
+        self._handle: Optional[TextIO] = None
 
     def acquire(self) -> None:
         if self._handle is not None:

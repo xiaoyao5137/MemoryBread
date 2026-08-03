@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .backend import AsrBackend, AsrSegment, AsrOutput
 from .whisper  import WhisperBackend
 from .model    import AsrModel

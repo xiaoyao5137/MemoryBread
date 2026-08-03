@@ -4,6 +4,8 @@ Qdrant 向量库管理
 负责向量的存储、检索和管理
 """
 
+from __future__ import annotations
+
 import logging
 import uuid
 from typing import List, Optional, Dict, Any

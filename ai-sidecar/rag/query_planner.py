@@ -180,7 +180,7 @@ def _valid_cjk_candidate(value: str) -> bool:
 
 def _surface_terms(
     query: str,
-    entity_terms: list[str] | None,
+    entity_terms: Optional[list[str]],
 ) -> tuple[list[str], list[str], list[str], frozenset[str]]:
     lowered = query.lower()
     working = lowered
@@ -365,7 +365,7 @@ def _prefer_non_redundant(terms: list[PlannedTerm], limit: int) -> list[PlannedT
 def build_artifact_query_plan(
     cursor: sqlite3.Cursor,
     query: str,
-    entity_terms: list[str] | None = None,
+    entity_terms: Optional[list[str]] = None,
 ) -> ArtifactQueryPlan:
     candidates, explicit_types, instructions, source_types = _surface_terms(query, entity_terms)
     corpus_size, frequencies = _cached_document_frequencies(cursor, candidates)

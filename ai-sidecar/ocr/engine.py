@@ -37,8 +37,8 @@ class OcrEngine:
 
     def __init__(
         self,
-        primary:  OcrBackend | None = None,
-        fallback: OcrBackend | None = None,
+        primary: Optional[OcrBackend] = None,
+        fallback: Optional[OcrBackend] = None,
     ) -> None:
         self._primary  = primary
         self._fallback = fallback

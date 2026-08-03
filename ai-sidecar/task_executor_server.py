@@ -4,6 +4,8 @@
 Rust 调度器通过 HTTP POST /tasks/execute 触发任务执行。
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from pathlib import Path

@@ -6,6 +6,8 @@ Embedding 向量化服务
 消除 PyTorch 本地加载带来的 ~1GB 内存开销。
 """
 
+from __future__ import annotations
+
 import logging
 from typing import List
 

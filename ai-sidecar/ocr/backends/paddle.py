@@ -30,7 +30,7 @@ class PaddleBackend(OcrBackend):
     def __init__(self, lang: str = "ch", use_gpu: bool = False) -> None:
         self._lang    = lang
         self._use_gpu = use_gpu
-        self._ocr: object | None = None  # 懒加载，避免启动延迟
+        self._ocr: Optional[object] = None  # 懒加载，避免启动延迟
         self._ocr_lock = threading.Lock()
 
     # ── 公共接口 ──────────────────────────────────────────────────────────────

@@ -4,6 +4,8 @@
 负责管理闲时任务队列，按优先级调度任务。
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 from dataclasses import dataclass, field

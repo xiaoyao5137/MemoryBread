@@ -2,6 +2,8 @@
 知识库 REST API - 提供知识条目的 HTTP 接口
 """
 
+from __future__ import annotations
+
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any

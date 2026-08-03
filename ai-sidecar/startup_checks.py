@@ -2,6 +2,8 @@
 启动前置检查 - 确保必要的模型已安装
 """
 
+from __future__ import annotations
+
 import logging
 import sqlite3
 import sys
@@ -38,7 +40,7 @@ def check_ollama_running() -> bool:
     return bool(detail.get('ollama_running'))
 
 
-def check_model_available(model_name: str | None = None) -> bool:
+def check_model_available(model_name: Optional[str] = None) -> bool:
     """检查指定模型是否已下载。model_name 为 None 时检查用户配置的 active_llm。"""
     if model_name is None:
         # 读取用户配置的 active_llm

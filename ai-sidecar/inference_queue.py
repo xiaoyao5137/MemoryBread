@@ -447,7 +447,7 @@ class InferenceQueue:
             return 1 << 30  # 拿不到就当作"内存充足"，fail-open
 
     def _worker_loop(self) -> None:
-        _low_mem_since: float | None = None
+        _low_mem_since: Optional[float] = None
         while True:
             task: Optional[_Task] = None
             with self._cv:

@@ -27,20 +27,20 @@ _MAX_FALLBACK_TERMS = 12
 
 @dataclass
 class VectorSearchFilter:
-    start_ts: int | None = None
-    end_ts: int | None = None
-    source_types: list[str] | None = None
-    app_names: list[str] | None = None
-    category: str | None = None
-    observed_start_ts: int | None = None
-    observed_end_ts: int | None = None
-    event_start_ts: int | None = None
-    event_end_ts: int | None = None
-    activity_types: list[str] | None = None
-    content_origins: list[str] | None = None
-    history_view: bool | None = None
-    is_self_generated: bool | None = None
-    evidence_strengths: list[str] | None = None
+    start_ts: Optional[int] = None
+    end_ts: Optional[int] = None
+    source_types: Optional[list[str]] = None
+    app_names: Optional[list[str]] = None
+    category: Optional[str] = None
+    observed_start_ts: Optional[int] = None
+    observed_end_ts: Optional[int] = None
+    event_start_ts: Optional[int] = None
+    event_end_ts: Optional[int] = None
+    activity_types: Optional[list[str]] = None
+    content_origins: Optional[list[str]] = None
+    history_view: Optional[bool] = None
+    is_self_generated: Optional[bool] = None
+    evidence_strengths: Optional[list[str]] = None
 
 
 
@@ -156,7 +156,7 @@ def _artifact_doc_key(source_type: str, artifact_id: int) -> str:
     return f"{source_type}:{artifact_id}"
 
 
-def _canonical_document_url(url: str | None) -> str:
+def _canonical_document_url(url: Optional[str]) -> str:
     value = str(url or "").strip()
     if not value:
         return ""
@@ -178,7 +178,7 @@ def _canonical_document_url(url: str | None) -> str:
     )
 
 
-def _document_url_doc_key(url: str | None) -> str:
+def _document_url_doc_key(url: Optional[str]) -> str:
     canonical = _canonical_document_url(url)
     return f"document_url:{canonical}" if canonical else ""
 
@@ -258,7 +258,7 @@ class RetrievedChunk:
     score: float = 0.0
     source: str = "unknown"  # vector / fts5 / knowledge / merged
     metadata: dict[str, Any] | None = None
-    doc_key: str | None = None
+    doc_key: Optional[str] = None
 
     def __post_init__(self):
         if self.metadata is None:
@@ -289,7 +289,7 @@ class VectorRetriever:
         self._use_internal_http: Optional[bool] = None  # None=未探测
 
     @staticmethod
-    def _filters_to_payload(filters: VectorSearchFilter | None) -> dict[str, Any] | None:
+    def _filters_to_payload(filters: Optional[VectorSearchFilter]) -> dict[str, Any] | None:
         if filters is None:
             return None
         return {
@@ -318,7 +318,7 @@ class VectorRetriever:
         query_vector: list[float],
         top_k: int,
         score_threshold: float,
-        filters: VectorSearchFilter | None,
+        filters: Optional[VectorSearchFilter],
     ) -> Optional[list]:
         """尝试通过 sidecar 内部 HTTP 服务做向量搜索，避免 Qdrant 文件锁冲突。"""
         try:
@@ -371,7 +371,7 @@ class VectorRetriever:
         query_vector: list[float],
         top_k: int = 10,
         score_threshold: float = 0.3,
-        filters: VectorSearchFilter | None = None,
+        filters: Optional[VectorSearchFilter] = None,
     ) -> list[RetrievedChunk]:
         """向量相似度搜索"""
         if not query_vector:
@@ -459,7 +459,7 @@ class VectorRetriever:
             raise RuntimeError(f"向量检索失败: {e}") from e
 
     @staticmethod
-    def _build_qdrant_filter(filters: VectorSearchFilter | None):
+    def _build_qdrant_filter(filters: Optional[VectorSearchFilter]):
         if filters is None:
             return None
 
@@ -541,9 +541,9 @@ class Fts5Retriever:
         self,
         query: str,
         top_k: int = 10,
-        start_ts: int | None = None,
-        end_ts: int | None = None,
-        entity_terms: list[str] | None = None,
+        start_ts: Optional[int] = None,
+        end_ts: Optional[int] = None,
+        entity_terms: Optional[list[str]] = None,
     ) -> list[RetrievedChunk]:
         """FTS5 全文检索"""
         try:
@@ -580,9 +580,9 @@ class Fts5Retriever:
         cursor: sqlite3.Cursor,
         query: str,
         top_k: int,
-        start_ts: int | None,
-        end_ts: int | None,
-        entity_terms: list[str] | None,
+        start_ts: Optional[int],
+        end_ts: Optional[int],
+        entity_terms: Optional[list[str]],
     ) -> list[RetrievedChunk]:
         sql = """
             SELECT
@@ -628,9 +628,9 @@ class Fts5Retriever:
         cursor: sqlite3.Cursor,
         query: str,
         top_k: int,
-        start_ts: int | None,
-        end_ts: int | None,
-        entity_terms: list[str] | None,
+        start_ts: Optional[int],
+        end_ts: Optional[int],
+        entity_terms: Optional[list[str]],
     ) -> list[RetrievedChunk]:
         terms = list(dict.fromkeys([*(entity_terms or []), *_extract_query_terms(query)]))
         if not terms:
@@ -731,21 +731,21 @@ class KnowledgeFts5Retriever:
         self,
         query: str,
         top_k: int = 10,
-        start_ts: int | None = None,
-        end_ts: int | None = None,
-        entity_terms: list[str] | None = None,
-        observed_start_ts: int | None = None,
-        observed_end_ts: int | None = None,
-        event_start_ts: int | None = None,
-        event_end_ts: int | None = None,
-        activity_types: list[str] | None = None,
-        content_origins: list[str] | None = None,
-        history_view: bool | None = None,
-        is_self_generated: bool | None = None,
-        evidence_strengths: list[str] | None = None,
+        start_ts: Optional[int] = None,
+        end_ts: Optional[int] = None,
+        entity_terms: Optional[list[str]] = None,
+        observed_start_ts: Optional[int] = None,
+        observed_end_ts: Optional[int] = None,
+        event_start_ts: Optional[int] = None,
+        event_end_ts: Optional[int] = None,
+        activity_types: Optional[list[str]] = None,
+        content_origins: Optional[list[str]] = None,
+        history_view: Optional[bool] = None,
+        is_self_generated: Optional[bool] = None,
+        evidence_strengths: Optional[list[str]] = None,
         query_mode: str = "lookup",
-        created_start_ts: int | None = None,
-        created_end_ts: int | None = None,
+        created_start_ts: Optional[int] = None,
+        created_end_ts: Optional[int] = None,
     ) -> list[RetrievedChunk]:
         try:
             conn = sqlite3.connect(self.db_path)
@@ -820,21 +820,21 @@ class KnowledgeFts5Retriever:
         cursor: sqlite3.Cursor,
         query: str,
         top_k: int,
-        start_ts: int | None,
-        end_ts: int | None,
-        entity_terms: list[str] | None,
-        observed_start_ts: int | None,
-        observed_end_ts: int | None,
-        event_start_ts: int | None,
-        event_end_ts: int | None,
-        activity_types: list[str] | None,
-        content_origins: list[str] | None,
-        history_view: bool | None,
-        is_self_generated: bool | None,
-        evidence_strengths: list[str] | None,
+        start_ts: Optional[int],
+        end_ts: Optional[int],
+        entity_terms: Optional[list[str]],
+        observed_start_ts: Optional[int],
+        observed_end_ts: Optional[int],
+        event_start_ts: Optional[int],
+        event_end_ts: Optional[int],
+        activity_types: Optional[list[str]],
+        content_origins: Optional[list[str]],
+        history_view: Optional[bool],
+        is_self_generated: Optional[bool],
+        evidence_strengths: Optional[list[str]],
         query_mode: str,
-        created_start_ts: int | None = None,
-        created_end_ts: int | None = None,
+        created_start_ts: Optional[int] = None,
+        created_end_ts: Optional[int] = None,
     ) -> list[RetrievedChunk]:
         fts_terms = list(dict.fromkeys([*(entity_terms or []), query.strip()]))
         fts_query = _build_fts_or_query(fts_terms if query_mode == "summary" else [query.strip(), *(entity_terms or [])])
@@ -942,21 +942,21 @@ class KnowledgeFts5Retriever:
         cursor: sqlite3.Cursor,
         query: str,
         top_k: int,
-        start_ts: int | None,
-        end_ts: int | None,
-        entity_terms: list[str] | None,
-        observed_start_ts: int | None,
-        observed_end_ts: int | None,
-        event_start_ts: int | None,
-        event_end_ts: int | None,
-        activity_types: list[str] | None,
-        content_origins: list[str] | None,
-        history_view: bool | None,
-        is_self_generated: bool | None,
-        evidence_strengths: list[str] | None,
+        start_ts: Optional[int],
+        end_ts: Optional[int],
+        entity_terms: Optional[list[str]],
+        observed_start_ts: Optional[int],
+        observed_end_ts: Optional[int],
+        event_start_ts: Optional[int],
+        event_end_ts: Optional[int],
+        activity_types: Optional[list[str]],
+        content_origins: Optional[list[str]],
+        history_view: Optional[bool],
+        is_self_generated: Optional[bool],
+        evidence_strengths: Optional[list[str]],
         query_mode: str,
-        created_start_ts: int | None = None,
-        created_end_ts: int | None = None,
+        created_start_ts: Optional[int] = None,
+        created_end_ts: Optional[int] = None,
     ) -> list[RetrievedChunk]:
         terms = entity_terms or _extract_query_terms(query)
         if query_mode == "summary":
@@ -1150,7 +1150,7 @@ class KnowledgeFts5Retriever:
         cursor: sqlite3.Cursor,
         query: str,
         top_k: int,
-        entity_terms: list[str] | None,
+        entity_terms: Optional[list[str]],
     ) -> list[RetrievedChunk]:
         plan = build_artifact_query_plan(cursor, query, entity_terms)
         if not plan.candidate_terms and not plan.source_types:
@@ -1276,7 +1276,7 @@ class KnowledgeFts5Retriever:
         return [self._operation_artifact_row_to_chunk(row, plan) for row in rows]
 
     @staticmethod
-    def _json_ids(value: str | None) -> list[str]:
+    def _json_ids(value: Optional[str]) -> list[str]:
         if not value:
             return []
         try:
@@ -1513,7 +1513,7 @@ class KnowledgeFts5Retriever:
 
 
 
-def _format_ts(ts: int | None) -> str:
+def _format_ts(ts: Optional[int]) -> str:
     if not ts:
         return ""
     try:

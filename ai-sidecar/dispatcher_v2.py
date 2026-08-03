@@ -42,16 +42,16 @@ logger = logging.getLogger(__name__)
 class Dispatcher:
     """将 IPC 请求路由到对应 Worker 的分发器（集成闲时计算）"""
 
-    def __init__(self, ocr_worker: object | None = None) -> None:
+    def __init__(self, ocr_worker: Optional[object] = None) -> None:
         # 传统 Worker（懒加载）
-        self._ocr_worker: object | None = ocr_worker   # 实时处理；主进程可注入共享单例
-        self._rag_worker: object | None = None   # 按需处理
+        self._ocr_worker: Optional[object] = ocr_worker   # 实时处理；主进程可注入共享单例
+        self._rag_worker: Optional[object] = None   # 按需处理
 
         # 闲时计算系统
-        self._idle_detector: IdleDetector | None = None
-        self._task_scheduler: TaskScheduler | None = None
-        self._model_manager: ModelManager | None = None
-        self._idle_engine: IdleComputeEngine | None = None
+        self._idle_detector: Optional[IdleDetector] = None
+        self._task_scheduler: Optional[TaskScheduler] = None
+        self._model_manager: Optional[ModelManager] = None
+        self._idle_engine: Optional[IdleComputeEngine] = None
         self._idle_engine_started = False
 
         # 任务结果缓存（用于异步任务）

@@ -158,11 +158,11 @@ class RagResult:
     contexts: list[RetrievedChunk] = field(default_factory=list)
     model: str = ""
     tokens: int = 0
-    done_reason: str | None = None
+    done_reason: Optional[str] = None
     output_truncated: bool = False
 
 
-def _is_output_truncated(done_reason: str | None) -> bool:
+def _is_output_truncated(done_reason: Optional[str]) -> bool:
     reason = str(done_reason or "").lower()
     if not reason:
         return False
@@ -176,25 +176,25 @@ def _is_output_truncated(done_reason: str | None) -> bool:
 
 @dataclass
 class QueryIntent:
-    start_ts: int | None = None
-    end_ts: int | None = None
-    observed_start_ts: int | None = None
-    observed_end_ts: int | None = None
-    event_start_ts: int | None = None
-    event_end_ts: int | None = None
+    start_ts: Optional[int] = None
+    end_ts: Optional[int] = None
+    observed_start_ts: Optional[int] = None
+    observed_end_ts: Optional[int] = None
+    event_start_ts: Optional[int] = None
+    event_end_ts: Optional[int] = None
     entity_terms: list[str] = field(default_factory=list)
     app_names: list[str] = field(default_factory=list)
     source_types: list[str] = field(default_factory=list)
-    category: str | None = None
+    category: Optional[str] = None
     target_time_semantics: str = "either"
     query_mode: str = "lookup"
     activity_types: list[str] = field(default_factory=list)
     content_origins: list[str] = field(default_factory=list)
-    history_view: bool | None = None
-    is_self_generated: bool | None = None
+    history_view: Optional[bool] = None
+    is_self_generated: Optional[bool] = None
     evidence_strengths: list[str] = field(default_factory=list)
     # 任务型意图：weekly_report | daily_report | project_summary | project_weekly_report | None
-    task_type: str | None = None
+    task_type: Optional[str] = None
     # 是否启用 OKR/KPI/专项量化模式
     kpi_mode: bool = False
 
@@ -213,10 +213,10 @@ class RagPipeline:
         vector_retriever: VectorRetriever,
         fts5_retriever: Fts5Retriever,
         llm: LlmBackend,
-        knowledge_retriever: KnowledgeFts5Retriever | None = None,
+        knowledge_retriever: Optional[KnowledgeFts5Retriever] = None,
         top_k: int = 5,
         system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
-        db_path: str | None = None,
+        db_path: Optional[str] = None,
     ) -> None:
         self._embed = embedding_model
         self._vector = vector_retriever
@@ -263,7 +263,7 @@ class RagPipeline:
     def query(
         self,
         user_query: str,
-        top_k: int | None = None,
+        top_k: Optional[int] = None,
         llm=None,
         references_only: bool = False,
         on_contexts: Callable[[list[RetrievedChunk]], None] | None = None,
@@ -904,7 +904,7 @@ class RagPipeline:
         return user_verified_score + strength_score + importance_score + recency_score
 
     @staticmethod
-    def _build_context(chunks: list[RetrievedChunk], strip_user_subject: bool = False, user_names: list[str] | None = None) -> str:
+    def _build_context(chunks: list[RetrievedChunk], strip_user_subject: bool = False, user_names: Optional[list[str]] = None) -> str:
         if not chunks:
             return "（无相关工作记录）"
         parts = []
@@ -1039,14 +1039,14 @@ class RagPipeline:
     def _parse_query_intent(user_query: str) -> QueryIntent:
         lowered = user_query.lower()
         now_ms = int(time.time() * 1000)
-        start_ts: int | None = None
-        end_ts: int | None = now_ms
-        observed_start_ts: int | None = None
-        observed_end_ts: int | None = None
-        event_start_ts: int | None = None
-        event_end_ts: int | None = None
+        start_ts: Optional[int] = None
+        end_ts: Optional[int] = now_ms
+        observed_start_ts: Optional[int] = None
+        observed_end_ts: Optional[int] = None
+        event_start_ts: Optional[int] = None
+        event_end_ts: Optional[int] = None
         target_time_semantics = "either"
-        task_type: str | None = None
+        task_type: Optional[str] = None
 
         # ── 任务型意图检测（优先级最高）──────────────────────────────────
         _PROJECT_WEEKLY_REPORT_TOKENS = (
@@ -1141,8 +1141,8 @@ class RagPipeline:
 
         activity_types: list[str] = []
         content_origins: list[str] = []
-        history_view: bool | None = None
-        is_self_generated: bool | None = False
+        history_view: Optional[bool] = None
+        is_self_generated: Optional[bool] = False
         evidence_strengths: list[str] = []
         query_mode = "lookup"
 
@@ -1433,7 +1433,7 @@ def _looks_like_document_url(url: str) -> bool:
     )
 
 
-def _source_priority(source_type: str | None) -> int:
+def _source_priority(source_type: Optional[str]) -> int:
     return {
         "document": 0,
         "pending_document": 1,
@@ -1722,7 +1722,7 @@ def _strip_report_metadata(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _strip_user_subject(text: str, user_names: list[str] | None = None) -> str:
+def _strip_user_subject(text: str, user_names: Optional[list[str]] = None) -> str:
     """从知识条目文本中去掉多余的人物主语（用户/姓名/他/她），适用于报告生成。"""
     import re
     lines = text.split("\n")
@@ -1777,7 +1777,7 @@ def _month_start_ms() -> int:
 
 
 
-def _format_ts(ts: int | None) -> str:
+def _format_ts(ts: Optional[int]) -> str:
     if not ts:
         return ""
     try:

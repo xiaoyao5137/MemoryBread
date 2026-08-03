@@ -5,6 +5,8 @@
 在闲时计算期间加密采样（每 10 秒一次），便于定位卡顿原因。
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -14,7 +16,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import psutil
 
@@ -22,12 +24,12 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = str(Path.home() / ".memory-bread" / "memory-bread.db")
 _PROCESS = psutil.Process(os.getpid())
-_GPU_NAME_CACHE: str | None | bool = False
-_GPU_IOREG_CLASS_CACHE: str | None | bool = False
-_GPU_PERCENT_CACHE: tuple[float, float] | None = None
+_GPU_NAME_CACHE: Union[str, None, bool] = False
+_GPU_IOREG_CLASS_CACHE: Union[str, None, bool] = False
+_GPU_PERCENT_CACHE: Optional[tuple[float, float]] = None
 _GPU_SAMPLE_CACHE_TTL_SECONDS = 5.0
 _PREV_PROCESS_CPU_TIMES: dict[int, tuple[float, float, float]] = {}
-_PROCESS_SCAN_CACHE: tuple[float, tuple[set[int], dict[str, set[int]], list[str]]] | None = None
+_PROCESS_SCAN_CACHE: Optional[tuple[float, tuple[set[int], dict[str, set[int]], list[str]]]] = None
 _PROCESS_SCAN_CACHE_TTL_SECONDS = 20.0
 LOG_DIR = Path.home() / ".memory-bread" / "logs"
 SIDECAR_PID_FILE = LOG_DIR / "sidecar.pid"
@@ -71,8 +73,8 @@ class SystemSnapshot:
     mem_percent: float
     disk_read_mb: float
     disk_write_mb: float
-    gpu_percent: float | None
-    gpu_name: str | None
+    gpu_percent: Optional[float]
+    gpu_name: Optional[str]
 
 
 def _run_command(command: list[str], timeout: int = 3) -> str:
@@ -334,7 +336,7 @@ def _sample_process_metrics(
     target_name: str,
     scope: str,
     coverage_status: str = "exact",
-    coverage_note: str | None = None,
+    coverage_note: Optional[str] = None,
 ) -> tuple[ScopeMetrics, dict[int, tuple[float, float, float]]]:
     cpu_percent = 0.0
     mem_process_mb = 0
@@ -377,7 +379,7 @@ def _sample_process_metrics(
     return metrics, current_times
 
 
-def _aggregate_processes(pids: set[int], target_name: str, scope: str, coverage_status: str = "exact", coverage_note: str | None = None) -> ScopeMetrics:
+def _aggregate_processes(pids: set[int], target_name: str, scope: str, coverage_status: str = "exact", coverage_note: Optional[str] = None) -> ScopeMetrics:
     global _PREV_PROCESS_CPU_TIMES
 
     metrics, current_times = _sample_process_metrics(pids, target_name, scope, coverage_status, coverage_note)
