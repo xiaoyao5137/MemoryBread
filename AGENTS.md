@@ -269,6 +269,7 @@ The project memory and development context is defined in @.Codex/MEMORY.md.
         <technical>
             <rule>引入新的外部依赖库需要向用户说明理由并获得批准。</rule>
             <rule>进行重大变更时必须考虑向后兼容性，或明确指出破坏性变更。</rule>
+            <rule>客户端内会被运行或 PyInstaller 打包的 Python 代码以 Python 3.9 语法为兼容基线，必须可在 Python 3.10 以下的 Intel macOS 构建环境解析和运行。禁止使用 `X | Y` 类型联合、`match/case` 等 Python 3.10+ 语法；使用 `typing.Optional` / `typing.Union` 表达联合类型。即使文件包含 `from __future__ import annotations` 也不得放宽此规则。修改 Python 后必须先完成 Python 3.9 兼容性检查，再执行 DMG 打包。</rule>
         </technical>
         <operational>
             <rule>总是优先调用 `commands/` 目录下的专用脚本来处理复杂任务。</rule>
@@ -340,4 +341,3 @@ The project memory and development context is defined in @.Codex/MEMORY.md.
     </ultrathink_protocol>
 
 </claude_configuration>
-

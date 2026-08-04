@@ -12,7 +12,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Optional
 
 from embedding.model import EmbeddingModel
 
@@ -266,8 +266,8 @@ class RagPipeline:
         top_k: Optional[int] = None,
         llm=None,
         references_only: bool = False,
-        on_contexts: Callable[[list[RetrievedChunk]], None] | None = None,
-        on_delta: Callable[[str], None] | None = None,
+        on_contexts: Optional[Callable[[list[RetrievedChunk]], None]] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> RagResult:
         """执行完整 RAG 查询，返回 LLM 答案及引用的上下文片段。"""
         effective_top_k = top_k or self._top_k
@@ -411,6 +411,37 @@ class RagPipeline:
             if query_vector else []
         )
         vector_finished = time.perf_counter()
+
+        promote_linked_documents = getattr(
+            type(self._knowledge),
+            "promote_documents_linked_to_knowledge",
+            None,
+        )
+        if callable(promote_linked_documents):
+            try:
+                linked_document_results = promote_linked_documents(
+                    self._knowledge,
+                    [*knowledge_results, *vector_results],
+                    retrieval_query,
+                    top_k=effective_top_k,
+                    entity_terms=knowledge_entity_terms,
+                )
+            except Exception as exc:
+                logger.warning("关联知识反向提升文档失败，保留原召回结果: %s", exc)
+                linked_document_results = []
+            if linked_document_results:
+                promoted_keys = {
+                    chunk.doc_key for chunk in linked_document_results if chunk.doc_key
+                }
+                knowledge_results = [
+                    *linked_document_results,
+                    *(
+                        chunk
+                        for chunk in knowledge_results
+                        if not chunk.doc_key or chunk.doc_key not in promoted_keys
+                    ),
+                ][:knowledge_top_k]
+                logger.info("关联知识反向提升文档: %s 条", len(linked_document_results))
 
         keyword_weight = _KEYWORD_RRF_WEIGHT if vector_results else 1.0
         min_rrf_score = (

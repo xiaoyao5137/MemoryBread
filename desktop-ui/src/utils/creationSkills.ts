@@ -170,6 +170,8 @@ const parseError = async (response: Response, fallback: string) => {
 }
 
 const CREATION_SKILL_ANALYSIS_RETRY_DELAY_MS = 750
+const CREATION_SKILL_ANALYSIS_JOB_TIMEOUT_MS = 6 * 60 * 1000
+const CREATION_SKILL_ANALYSIS_MAX_POLL_FAILURES = 3
 const CREATION_SKILL_MARKET_TIMEOUT_MS = 8_000
 const RETRYABLE_CREATION_SKILL_ANALYSIS_ERRORS = new Set([
   'CREATION_SKILL_ANALYZER_UNAVAILABLE',
@@ -957,21 +959,92 @@ function isCompleteCreationSkillExampleDocument(value: unknown) {
   return bodyBlocks.length >= 8
 }
 
-async function requestCreationSkillAnalysis(
+const creationSkillAnalysisRequest = (source: CreationSkillSource): RequestInit => ({
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    source_kind: source.kind,
+    source_id: source.id,
+    document_title: source.title,
+    document_content: source.content,
+    doc_type: source.docType,
+  }),
+})
+
+function mapCreationSkillAnalysis(data: any, source: CreationSkillSource): CreationSkillAnalysis {
+  if (!data?.section_headings || !data?.field_examples || !String(data?.example_document || '').trim()) {
+    throw new Error('技能分析结果格式不完整')
+  }
+  const fallback = buildClientCreationSkillFallback(source)
+  const fieldExamples = mapFieldExamples(data.field_examples)
+  const headingExamples = repairCreationSkillHeadingExamples(
+    fieldExamples.commonTitles,
+    fallback.fieldExamples.commonTitles,
+  )
+  fieldExamples.commonTitles = headingExamples
+  fieldExamples.titleStyle = [...headingExamples]
+  const commonTitles = distinctCreationSkillItems([
+    ...(Array.isArray(data.common_titles)
+      ? data.common_titles.map((item: unknown) => coerceCreationSkillStringItem(item, 'common_titles'))
+      : []),
+    ...fallback.commonTitles,
+  ], 8)
+  return {
+    title: normalizeCreationSkillTitle(data.title, source),
+    summary: data.summary,
+    skillDescription: mapSkillDescription(
+      data.skill_description,
+      normalizeCreationSkillTitle(data.title, source),
+      String(data.summary || fallback.summary),
+      source.docType,
+      fallback.skillDescription.domains,
+    ),
+    executionSteps: mapExecutionSteps(
+      data.execution_steps,
+      normalizeCreationSkillTitle(data.title, source),
+      `${source.docType}\n${source.title}\n${source.content.slice(0, 8_000)}`,
+    ),
+    commonTitles,
+    titleStyle: commonTitles.join('；'),
+    textStyle: mergeCreationSkillTextStyle(data.text_style, fallback.textStyle),
+    diagramStyle: mergeCreationSkillDiagramStyle(data.diagram_style, fallback.diagramStyle),
+    structurePattern: Array.isArray(data.structure_pattern)
+      ? data.structure_pattern
+        .map((item: unknown) => coerceCreationSkillStringItem(item, 'structure_pattern'))
+        .filter(Boolean)
+      : fallback.structurePattern,
+    writingGuidelines: mergeCreationSkillWritingGuidelines(
+      data.writing_guidelines,
+      fallback.writingGuidelines,
+    ),
+    distinctiveSections: mapDistinctiveSections(
+      data.distinctive_sections,
+      fallback.distinctiveSections || [],
+    ),
+    sectionHeadings: mapSectionHeadings(data.section_headings),
+    fieldExamples,
+    exampleDocument: isCompleteCreationSkillExampleDocument(data.example_document)
+      ? data.example_document.trim()
+      : fallback.exampleDocument,
+    suggestedCategoryKeywords: data.suggested_category_keywords || [],
+    analysisMode: data.analysis_mode || 'local_model',
+    fallbackReason: typeof data.fallback_reason === 'string'
+      ? data.fallback_reason
+      : undefined,
+  }
+}
+
+const creationSkillFallbackReasonForCode = (code: string) => (
+  code === 'INVALID_CREATION_SKILL_ANALYSIS' || code === 'INCOMPLETE_CREATION_SKILL_ANALYSIS'
+    ? 'invalid_service_response'
+    : 'analysis_request_failed'
+)
+
+async function requestCreationSkillAnalysisLegacy(
   apiBaseUrl: string,
   source: CreationSkillSource,
 ): Promise<CreationSkillAnalysis> {
-  const requestInit: RequestInit = {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      source_kind: source.kind,
-      source_id: source.id,
-      document_title: source.title,
-      document_content: source.content,
-      doc_type: source.docType,
-    }),
-  }
+  const requestInit = creationSkillAnalysisRequest(source)
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let response: Response
@@ -1003,69 +1076,116 @@ async function requestCreationSkillAnalysis(
     let data: any
     try {
       data = await response.json()
-      if (!data.section_headings || !data.field_examples || !String(data.example_document || '').trim()) {
-        return buildClientCreationSkillFallback(source, 'invalid_service_response')
-      }
-      const fallback = buildClientCreationSkillFallback(source)
-      const fieldExamples = mapFieldExamples(data.field_examples)
-      const headingExamples = repairCreationSkillHeadingExamples(
-        fieldExamples.commonTitles,
-        fallback.fieldExamples.commonTitles,
-      )
-      fieldExamples.commonTitles = headingExamples
-      fieldExamples.titleStyle = [...headingExamples]
-      const commonTitles = distinctCreationSkillItems([
-        ...(Array.isArray(data.common_titles)
-          ? data.common_titles.map((item: unknown) => coerceCreationSkillStringItem(item, 'common_titles'))
-          : []),
-        ...fallback.commonTitles,
-      ], 8)
-      return {
-        title: normalizeCreationSkillTitle(data.title, source),
-        summary: data.summary,
-        skillDescription: mapSkillDescription(
-          data.skill_description,
-          normalizeCreationSkillTitle(data.title, source),
-          String(data.summary || fallback.summary),
-          source.docType,
-          fallback.skillDescription.domains,
-        ),
-        executionSteps: mapExecutionSteps(
-          data.execution_steps,
-          normalizeCreationSkillTitle(data.title, source),
-          `${source.docType}\n${source.title}\n${source.content.slice(0, 8_000)}`,
-        ),
-        commonTitles,
-        titleStyle: commonTitles.join('；'),
-        textStyle: mergeCreationSkillTextStyle(data.text_style, fallback.textStyle),
-        diagramStyle: mergeCreationSkillDiagramStyle(data.diagram_style, fallback.diagramStyle),
-        structurePattern: Array.isArray(data.structure_pattern)
-          ? data.structure_pattern
-            .map((item: unknown) => coerceCreationSkillStringItem(item, 'structure_pattern'))
-            .filter(Boolean)
-          : fallback.structurePattern,
-        writingGuidelines: mergeCreationSkillWritingGuidelines(
-          data.writing_guidelines,
-          fallback.writingGuidelines,
-        ),
-        distinctiveSections: mapDistinctiveSections(
-          data.distinctive_sections,
-          fallback.distinctiveSections || [],
-        ),
-        sectionHeadings: mapSectionHeadings(data.section_headings),
-        fieldExamples,
-        exampleDocument: isCompleteCreationSkillExampleDocument(data.example_document)
-          ? data.example_document.trim()
-          : fallback.exampleDocument,
-        suggestedCategoryKeywords: data.suggested_category_keywords || [],
-        analysisMode: data.analysis_mode || 'local_model',
-        fallbackReason: typeof data.fallback_reason === 'string'
-          ? data.fallback_reason
-          : undefined,
-      }
+      return mapCreationSkillAnalysis(data, source)
     } catch {
       return buildClientCreationSkillFallback(source, 'invalid_service_response')
     }
+  }
+
+  return buildClientCreationSkillFallback(source, 'analysis_request_failed')
+}
+
+async function requestCreationSkillAnalysis(
+  apiBaseUrl: string,
+  source: CreationSkillSource,
+): Promise<CreationSkillAnalysis> {
+  const deadline = Date.now() + CREATION_SKILL_ANALYSIS_JOB_TIMEOUT_MS
+  jobAttempts: for (let attempt = 0; attempt < 2; attempt += 1) {
+    let createResponse: Response
+    try {
+      createResponse = await fetchWithLocalhostFallback(
+        `${apiBaseUrl}/api/creation/skills/analyze/jobs`,
+        creationSkillAnalysisRequest(source),
+      )
+    } catch (error) {
+      if (attempt === 0 && isTransientCreationSkillNetworkError(error)) {
+        await waitForCreationSkillAnalysisRetry()
+        continue
+      }
+      return requestCreationSkillAnalysisLegacy(apiBaseUrl, source)
+    }
+
+    // 旧 Core Engine 尚未提供异步任务时继续使用原同步接口。
+    if (createResponse.status === 404 || createResponse.status === 405) {
+      return requestCreationSkillAnalysisLegacy(apiBaseUrl, source)
+    }
+    if (!createResponse.ok) {
+      const failure = await readCreationSkillAnalysisError(createResponse)
+      if (
+        attempt === 0
+        && RETRYABLE_CREATION_SKILL_ANALYSIS_ERRORS.has(failure.code)
+      ) {
+        await waitForCreationSkillAnalysisRetry()
+        continue
+      }
+      return buildClientCreationSkillFallback(
+        source,
+        creationSkillFallbackReasonForCode(failure.code),
+      )
+    }
+
+    const created = await createResponse.json().catch(() => null)
+    const jobId = String(created?.job_id || '').trim()
+    if (!jobId) return buildClientCreationSkillFallback(source, 'invalid_service_response')
+
+    let pollFailures = 0
+    while (Date.now() < deadline) {
+      await waitForCreationSkillAnalysisRetry()
+      let statusResponse: Response
+      try {
+        statusResponse = await fetchWithLocalhostFallback(
+          `${apiBaseUrl}/api/creation/skills/analyze/jobs/${encodeURIComponent(jobId)}`,
+        )
+        pollFailures = 0
+      } catch (error) {
+        pollFailures += 1
+        if (
+          pollFailures < CREATION_SKILL_ANALYSIS_MAX_POLL_FAILURES
+          && isTransientCreationSkillNetworkError(error)
+        ) {
+          continue
+        }
+        return buildClientCreationSkillFallback(source, 'analysis_request_failed')
+      }
+
+      if (!statusResponse.ok) {
+        const failure = await readCreationSkillAnalysisError(statusResponse)
+        if (
+          attempt === 0
+          && RETRYABLE_CREATION_SKILL_ANALYSIS_ERRORS.has(failure.code)
+        ) {
+          await waitForCreationSkillAnalysisRetry()
+          continue jobAttempts
+        }
+        return buildClientCreationSkillFallback(
+          source,
+          creationSkillFallbackReasonForCode(failure.code),
+        )
+      }
+      const job = await statusResponse.json().catch(() => null)
+      if (job?.status === 'succeeded') {
+        try {
+          return mapCreationSkillAnalysis(job.result, source)
+        } catch {
+          return buildClientCreationSkillFallback(source, 'invalid_service_response')
+        }
+      }
+      if (job?.status === 'failed') {
+        const code = String(job.error_code || '')
+        if (
+          attempt === 0
+          && RETRYABLE_CREATION_SKILL_ANALYSIS_ERRORS.has(code)
+        ) {
+          await waitForCreationSkillAnalysisRetry()
+          continue jobAttempts
+        }
+        return buildClientCreationSkillFallback(
+          source,
+          creationSkillFallbackReasonForCode(code),
+        )
+      }
+    }
+    return buildClientCreationSkillFallback(source, 'analysis_request_failed')
   }
 
   return buildClientCreationSkillFallback(source, 'analysis_request_failed')

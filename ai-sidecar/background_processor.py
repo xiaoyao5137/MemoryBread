@@ -382,10 +382,13 @@ class BackgroundProcessor:
             f"LOWER(COALESCE(c.win_title, '')) NOT LIKE '%{k}%'" for k in win_kws
         )
         cursor.execute(f"""
-            SELECT c.id, c.ts, c.app_name, c.win_title, c.ocr_text, c.ax_text, c.url
+            SELECT c.id, c.ts, c.app_name, c.win_title,
+                   c.ocr_text, c.ax_text, c.input_text, c.audio_text, c.url
             FROM captures c
-            WHERE ((c.ocr_text IS NOT NULL AND c.ocr_text != '')
-               OR (c.ax_text IS NOT NULL AND c.ax_text != ''))
+            WHERE (COALESCE(c.ocr_text, '') != ''
+               OR COALESCE(c.ax_text, '') != ''
+               OR COALESCE(c.input_text, '') != ''
+               OR COALESCE(c.audio_text, '') != '')
               AND c.timeline_id IS NULL
               AND c.is_sensitive = 0
               AND ({app_not_like})
@@ -398,7 +401,7 @@ class BackgroundProcessor:
             {
                 'id': r[0], 'ts': r[1], 'app_name': r[2],
                 'window_title': r[3], 'ocr_text': r[4], 'ax_text': r[5],
-                'url': r[6],
+                'input_text': r[6], 'audio_text': r[7], 'url': r[8],
             }
             for r in rows
         ]
@@ -419,8 +422,10 @@ class BackgroundProcessor:
                 row = conn.execute(f"""
                     SELECT COUNT(*)
                     FROM captures c
-                    WHERE ((c.ocr_text IS NOT NULL AND c.ocr_text != '')
-                       OR (c.ax_text IS NOT NULL AND c.ax_text != ''))
+                    WHERE (COALESCE(c.ocr_text, '') != ''
+                       OR COALESCE(c.ax_text, '') != ''
+                       OR COALESCE(c.input_text, '') != ''
+                       OR COALESCE(c.audio_text, '') != '')
                       AND c.timeline_id IS NULL
                       AND c.is_sensitive = 0
                       AND ({app_not_like})
@@ -442,6 +447,21 @@ class BackgroundProcessor:
             return base_limit
         return min(max(base_limit, int(pending_count)), _CHARGING_CATCHUP_MAX_BATCH_SIZE)
 
+    @staticmethod
+    def _should_continue_charging_catchup(
+        profile,
+        pending_before: int,
+        pending_after: int,
+        batch_result: dict,
+    ) -> bool:
+        """仅在本轮确实消费了片段时加速追赶，避免等待静默期间每秒空转。"""
+        return (
+            profile.mode in {"charging", "unrestricted"}
+            and pending_before > profile.timeline_batch_size
+            and pending_after > profile.timeline_batch_size
+            and int(batch_result.get("processed_count", 0)) > 0
+        )
+
     # 跨批上下文回溯条数：用于判断新 batch 开头是否与前一批末尾属于同一件事
     _CROSS_BATCH_CONTEXT_N = 5
 
@@ -454,7 +474,9 @@ class BackgroundProcessor:
         win_not_like = " AND ".join(f"LOWER(COALESCE(c.win_title, '')) NOT LIKE '%{k}%'" for k in win_kws)
         cursor = conn.cursor()
         cursor.execute(f"""
-            SELECT c.id, c.ts, c.app_name, c.win_title, c.ocr_text, c.ax_text, c.timeline_id, c.url
+            SELECT c.id, c.ts, c.app_name, c.win_title,
+                   c.ocr_text, c.ax_text, c.input_text, c.audio_text,
+                   c.timeline_id, c.url
             FROM captures c
             WHERE c.timeline_id IS NOT NULL
               AND c.ts < ?
@@ -470,7 +492,8 @@ class BackgroundProcessor:
             {
                 'id': r[0], 'ts': r[1], 'app_name': r[2],
                 'window_title': r[3], 'ocr_text': r[4], 'ax_text': r[5],
-                'timeline_id': r[6], 'url': r[7], '_is_context': True,  # 标记为前缀上下文
+                'input_text': r[6], 'audio_text': r[7],
+                'timeline_id': r[8], 'url': r[9], '_is_context': True,  # 标记为前缀上下文
             }
             for r in reversed(rows)
         ]
@@ -2355,7 +2378,12 @@ class BackgroundProcessor:
                     _last_periodic_bake_ts = time.monotonic()
                 if maximum_throughput and pending_before > profile.timeline_batch_size:
                     pending_after = await asyncio.to_thread(self._count_unprocessed_captures)
-                    if pending_after > profile.timeline_batch_size:
+                    if self._should_continue_charging_catchup(
+                        profile,
+                        pending_before,
+                        pending_after,
+                        batch_result,
+                    ):
                         sleep_secs = _CHARGING_CATCHUP_SLEEP_SECS
 
                 # 周期性检查：即使本轮没有新 capture，也要尝试消化积压的 pending timeline

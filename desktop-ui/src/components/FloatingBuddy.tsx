@@ -78,6 +78,12 @@ const MENU_GROUPS: MenuGroup[] = [
         testId: 'diary-btn',
         icon: 'profile'
       },
+      {
+        mode: 'integration',
+        label: '集成',
+        testId: 'integration-btn',
+        icon: 'integration'
+      },
     ]
   },
   {

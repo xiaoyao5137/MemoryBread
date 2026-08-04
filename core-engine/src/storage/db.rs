@@ -276,6 +276,10 @@ static MIGRATIONS: &[(&str, &str)] = &[
         "066_creation_evidence_latest_data",
         include_str!("../../../shared/db-schema/migrations/066_creation_evidence_latest_data.sql"),
     ),
+    (
+        "067_integration_skill_runs",
+        include_str!("migrations/067_integration_skill_runs.sql"),
+    ),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,4 +1,12 @@
-use std::{fs, path::PathBuf, process::Command, sync::Arc, time::Duration};
+use std::{
+    fs,
+    io::BufWriter,
+    path::PathBuf,
+    process::{Command, Output, Stdio},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -131,6 +139,8 @@ pub struct RefreshDataSourceRequest {
     pub run_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub preview_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +172,13 @@ struct PendingEvidenceCapture {
     run_id: String,
     session_id: String,
     full_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct BrowserWindowSession {
+    apple_script_id: String,
+    preview_token: String,
+    launched_browser: bool,
 }
 
 #[derive(Debug)]
@@ -329,6 +346,7 @@ pub async fn refresh_data_source(
         Some(prepare_evidence_capture(
             body.run_id.as_deref(),
             body.session_id.as_deref(),
+            body.preview_id.as_deref(),
         )?)
     } else {
         None
@@ -505,6 +523,21 @@ pub async fn get_creation_evidence_image(
         .map_err(|error| ApiError::Internal(error.to_string()))
 }
 
+pub async fn get_browser_preview_image(Path(id): Path<String>) -> Result<Response, ApiError> {
+    let id = Uuid::parse_str(id.trim())
+        .map_err(|_| ApiError::BadRequest("浏览器预览标识无效".to_string()))?
+        .to_string();
+    let bytes = tokio::fs::read(evidence_dir().join(format!("{id}.jpg")))
+        .await
+        .map_err(|_| ApiError::NotFound("浏览器预览尚未生成".to_string()))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "private, no-store, max-age=0")
+        .body(Body::from(bytes))
+        .map_err(|error| ApiError::Internal(error.to_string()))
+}
+
 pub async fn validate_creation_evidence(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -563,46 +596,48 @@ fn scrape_with_browser(
 
     #[cfg(target_os = "macos")]
     {
-        let adapter = browser_candidates(browser_preference, source_app_name)
-            .into_iter()
-            .find(|adapter| browser_is_running(*adapter))
-            .ok_or_else(|| {
-                DataToolError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "BROWSER_ATTACH_UNAVAILABLE",
-                    "请先打开并登录受支持的浏览器",
-                )
-            })?;
+        let (adapter, launched_browser) =
+            resolve_browser_adapter(browser_candidates(browser_preference, source_app_name))?;
         let javascript = browser_extraction_javascript();
         let readiness_javascript = browser_readiness_javascript();
         let evidence_path_string = evidence_path.map(|path| path.to_string_lossy().into_owned());
-        let script = match adapter.script_kind {
-            BrowserScriptKind::Chromium => build_chromium_scrape_script(
-                adapter,
-                url,
-                &readiness_javascript,
-                &javascript,
-                evidence_path_string.as_deref(),
-            ),
-            BrowserScriptKind::Safari => build_safari_scrape_script(
-                adapter,
-                url,
-                &readiness_javascript,
-                &javascript,
-                evidence_path_string.as_deref(),
-            ),
+        let output = if let (Some(evidence_path), Some(preview_token)) = (
+            evidence_path,
+            evidence_path
+                .and_then(|path| path.file_stem())
+                .and_then(|value| value.to_str()),
+        ) {
+            let session =
+                start_background_browser_window(adapter, url, preview_token, launched_browser)?;
+            let capture_result = (|| {
+                // 页面刚进入专用窗口后先生成一次运行中预览；最终 DOM 稳定后会原子覆盖。
+                thread::sleep(Duration::from_millis(350));
+                let _ = capture_background_browser_window(adapter, &session, evidence_path);
+                let script = build_background_browser_extract_script(
+                    adapter,
+                    &session.apple_script_id,
+                    &readiness_javascript,
+                    &javascript,
+                );
+                let output = run_browser_script(&script)?;
+                if output.status.success() {
+                    capture_background_browser_window(adapter, &session, evidence_path)?;
+                }
+                Ok::<_, DataToolError>(output)
+            })();
+            cleanup_background_browser_window(adapter, &session);
+            capture_result?
+        } else {
+            let script = match adapter.script_kind {
+                BrowserScriptKind::Chromium => {
+                    build_chromium_scrape_script(adapter, url, &readiness_javascript, &javascript)
+                }
+                BrowserScriptKind::Safari => {
+                    build_safari_scrape_script(adapter, url, &readiness_javascript, &javascript)
+                }
+            };
+            run_browser_script(&script)?
         };
-        let output = Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()
-            .map_err(|_| {
-                DataToolError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "BROWSER_ATTACH_UNAVAILABLE",
-                    "无法附加本机浏览器会话",
-                )
-            })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
             if browser_scripting_is_disabled(&stderr) {
@@ -655,7 +690,7 @@ fn scrape_with_browser(
             collector: "browser_attach",
             browser: Some(adapter.id),
             interaction_mode: if screenshot.is_some() {
-                "temporary_foreground_tab"
+                "background_browser_window"
             } else {
                 "background_tab"
             },
@@ -687,6 +722,7 @@ fn cleanup_pending_evidence(capture: Option<&PendingEvidenceCapture>) {
 fn prepare_evidence_capture(
     run_id: Option<&str>,
     session_id: Option<&str>,
+    preview_id: Option<&str>,
 ) -> Result<PendingEvidenceCapture, DataToolError> {
     let run_id = run_id.map(str::trim).filter(|value| !value.is_empty());
     let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
@@ -697,7 +733,7 @@ fn prepare_evidence_capture(
             "创作截图需要 run_id 与 session_id",
         ));
     };
-    let id = Uuid::new_v4().to_string();
+    let id = normalize_preview_id(preview_id)?;
     let relative_path = format!("{id}.jpg");
     let directory = evidence_dir();
     fs::create_dir_all(&directory).map_err(|_| internal_scrape_error())?;
@@ -707,6 +743,17 @@ fn prepare_evidence_capture(
         session_id: clip_text(session_id, 128),
         full_path: directory.join(&relative_path),
     })
+}
+
+fn normalize_preview_id(preview_id: Option<&str>) -> Result<String, DataToolError> {
+    match preview_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => Uuid::parse_str(value)
+            .map(|id| id.to_string())
+            .map_err(|_| {
+                DataToolError::new(StatusCode::BAD_REQUEST, "BAD_REQUEST", "浏览器预览标识无效")
+            }),
+        None => Ok(Uuid::new_v4().to_string()),
+    }
 }
 
 fn read_browser_screenshot(path: &std::path::Path) -> Result<BrowserScreenshot, DataToolError> {
@@ -789,9 +836,259 @@ fn browser_id_for_app_name(app_name: &str) -> Option<&'static str> {
 fn browser_is_running(adapter: BrowserAdapter) -> bool {
     Command::new("pgrep")
         .args(["-x", adapter.process_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_browser_adapter(
+    candidates: Vec<BrowserAdapter>,
+) -> Result<(BrowserAdapter, bool), DataToolError> {
+    if let Some(adapter) = candidates
+        .iter()
+        .copied()
+        .find(|adapter| browser_is_running(*adapter))
+    {
+        return Ok((adapter, false));
+    }
+
+    // Chromium 的 --no-startup-window 会复用默认本机配置，但不创建前台窗口。
+    // Safari 没有等价的后台启动方式，因此只在已经运行时附加。
+    for adapter in candidates
+        .into_iter()
+        .filter(|adapter| adapter.script_kind == BrowserScriptKind::Chromium)
+    {
+        let installed = Command::new("open")
+            .args(["-Ra", adapter.app_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !installed {
+            continue;
+        }
+        let launched = Command::new("open")
+            .args([
+                "-gj",
+                "-a",
+                adapter.app_name,
+                "--args",
+                "--no-startup-window",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !launched {
+            continue;
+        }
+        for _ in 0..40 {
+            if browser_is_running(adapter) {
+                return Ok((adapter, true));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    Err(DataToolError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "BROWSER_ATTACH_UNAVAILABLE",
+        "无法在后台启动或附加受支持的浏览器",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn run_browser_script(script: &str) -> Result<Output, DataToolError> {
+    Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|_| {
+            DataToolError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BROWSER_ATTACH_UNAVAILABLE",
+                "无法附加本机浏览器会话",
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn start_background_browser_window(
+    adapter: BrowserAdapter,
+    url: &str,
+    preview_token: &str,
+    launched_browser: bool,
+) -> Result<BrowserWindowSession, DataToolError> {
+    let preview_token = Uuid::parse_str(preview_token)
+        .map_err(|_| internal_scrape_error())?
+        .to_string();
+    let output = match run_browser_script(&build_background_browser_start_script(
+        adapter,
+        url,
+        &preview_token,
+    )) {
+        Ok(output) => output,
+        Err(error) => {
+            cleanup_orphaned_background_browser_window(adapter, &preview_token, launched_browser);
+            return Err(error);
+        }
+    };
+    if !output.status.success() {
+        cleanup_orphaned_background_browser_window(adapter, &preview_token, launched_browser);
+        return Err(DataToolError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BROWSER_ATTACH_UNAVAILABLE",
+            "无法创建后台浏览器预览窗口",
+        ));
+    }
+    let apple_script_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if apple_script_id.is_empty()
+        || !apple_script_id
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+    {
+        cleanup_orphaned_background_browser_window(adapter, &preview_token, launched_browser);
+        return Err(internal_scrape_error());
+    }
+    Ok(BrowserWindowSession {
+        apple_script_id,
+        preview_token,
+        launched_browser,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_background_browser_window(adapter: BrowserAdapter, session: &BrowserWindowSession) {
+    let _ = run_browser_script(&build_background_browser_cleanup_script(
+        adapter,
+        &session.apple_script_id,
+        session.launched_browser,
+    ));
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_orphaned_background_browser_window(
+    adapter: BrowserAdapter,
+    preview_token: &str,
+    launched_browser: bool,
+) {
+    let _ = run_browser_script(&build_background_browser_orphan_cleanup_script(
+        adapter,
+        preview_token,
+        launched_browser,
+    ));
+}
+
+#[cfg(target_os = "macos")]
+fn capture_background_browser_window(
+    adapter: BrowserAdapter,
+    session: &BrowserWindowSession,
+    path: &std::path::Path,
+) -> Result<(), DataToolError> {
+    use image::{codecs::jpeg::JpegEncoder, DynamicImage};
+    use xcap::Window;
+
+    let mut last_error = String::new();
+    for _ in 0..12 {
+        let windows = Window::all().map_err(|error| {
+            DataToolError::new(
+                StatusCode::BAD_GATEWAY,
+                "SCREENSHOT_FAILED",
+                if error.to_string().is_empty() {
+                    "无法枚举后台浏览器窗口"
+                } else {
+                    "请检查系统录屏权限"
+                },
+            )
+        })?;
+        let mut title_matches = Vec::new();
+        let mut bounds_matches = Vec::new();
+        for window in windows {
+            if window.app_name().ok().as_deref() != Some(adapter.app_name)
+                || window.is_minimized().unwrap_or(false)
+            {
+                continue;
+            }
+            let title = window.title().unwrap_or_default();
+            if title.contains(&session.preview_token) {
+                title_matches.push(window);
+                continue;
+            }
+            let geometry_matches = window
+                .x()
+                .ok()
+                .zip(window.y().ok())
+                .zip(window.width().ok())
+                .zip(window.height().ok())
+                .map(|(((x, y), width), height)| {
+                    (x - 80).abs() <= 4
+                        && (y - 80).abs() <= 40
+                        && width.abs_diff(1200) <= 8
+                        && height.abs_diff(740) <= 40
+                })
+                .unwrap_or(false);
+            if geometry_matches {
+                bounds_matches.push(window);
+            }
+        }
+        let candidate = if title_matches.len() == 1 {
+            title_matches.pop()
+        } else if title_matches.is_empty() && bounds_matches.len() == 1 {
+            bounds_matches.pop()
+        } else {
+            None
+        };
+        if let Some(window) = candidate {
+            match window.capture_image() {
+                Ok(image) => {
+                    let parent = path.parent().ok_or_else(internal_scrape_error)?;
+                    fs::create_dir_all(parent).map_err(|_| internal_scrape_error())?;
+                    let temporary_path = parent.join(format!(
+                        ".{}.{}.tmp.jpg",
+                        session.preview_token,
+                        Uuid::new_v4()
+                    ));
+                    let file =
+                        fs::File::create(&temporary_path).map_err(|_| internal_scrape_error())?;
+                    let mut encoder = JpegEncoder::new_with_quality(BufWriter::new(file), 82);
+                    let encode_result = encoder.encode_image(&DynamicImage::ImageRgba8(image));
+                    drop(encoder);
+                    if encode_result.is_err() {
+                        let _ = fs::remove_file(&temporary_path);
+                        return Err(internal_scrape_error());
+                    }
+                    if fs::rename(&temporary_path, path).is_err() {
+                        let _ = fs::remove_file(&temporary_path);
+                        return Err(internal_scrape_error());
+                    }
+                    return Ok(());
+                }
+                Err(error) => last_error = error.to_string(),
+            }
+        } else {
+            last_error = "未找到唯一的 MemoryBread 后台浏览器窗口".to_string();
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    tracing::warn!(browser = adapter.id, error = %last_error, "后台浏览器窗口截图失败");
+    Err(DataToolError::new(
+        StatusCode::BAD_GATEWAY,
+        "SCREENSHOT_FAILED",
+        "后台页面已读取，但缩略预览截图失败",
+    ))
+}
+
+fn applescript_window_id_literal(value: &str) -> String {
+    if value.chars().all(|character| character.is_ascii_digit()) {
+        value.to_string()
+    } else {
+        format!("\"{}\"", escape_applescript_string(value))
+    }
 }
 
 fn browser_extraction_javascript() -> String {
@@ -813,14 +1110,18 @@ fn browser_extraction_javascript() -> String {
                 .map(function(node) {{ return clean(node.innerText || node.textContent); }})
                 .filter(function(value) {{ return value.length >= 6 && value.length <= 500; }})
                 .slice(0, 500);
-            return JSON.stringify({{title: clean(document.title), url: location.href, text: text, structured_data: {{tables: tables, metric_labels: labels, text_blocks: textBlocks}}}});
+            var loadingMarkerCount = (text.match(/加载中|数据加载中|loading(?:\.\.\.)?/ig) || []).length;
+            var numericTokenCount = (text.match(/[+-]?\d[\d,]*(?:\.\d+)?%?/g) || []).length;
+            return JSON.stringify({{title: clean(document.title), url: location.href, text: text, structured_data: {{tables: tables, metric_labels: labels, text_blocks: textBlocks, page_state: {{loading_marker_count: loadingMarkerCount, numeric_token_count: numericTokenCount, likely_loading: loadingMarkerCount > 0}}}}}});
         }})()"#,
         max_chars = MAX_SCRAPED_CHARS,
     )
 }
 
 fn browser_readiness_javascript() -> String {
-    "(function(){var text=String(document.body ? (document.body.innerText || document.body.textContent || '') : '').replace(/\\s+/g,' ').trim();return text.length;})()".to_string()
+    // SPA 报表往往先渲染数千字菜单壳层，再异步加载指标。仅按文字长度
+    // 判断会在“加载中”阶段提前截图；仍返回数字以保持 AppleScript 简单。
+    "(function(){var text=String(document.body ? (document.body.innerText || document.body.textContent || '') : '').replace(/\\s+/g,' ').trim();var loading=(text.match(/加载中|数据加载中|loading(?:\\.\\.\\.)?/ig)||[]).length;return loading>0?0:text.length;})()".to_string()
 }
 
 fn build_chromium_scrape_script(
@@ -828,17 +1129,7 @@ fn build_chromium_scrape_script(
     url: &str,
     readiness_javascript: &str,
     javascript: &str,
-    evidence_path: Option<&str>,
 ) -> String {
-    if let Some(evidence_path) = evidence_path {
-        return build_chromium_evidence_script(
-            adapter,
-            url,
-            readiness_javascript,
-            javascript,
-            evidence_path,
-        );
-    }
     format!(
         r#"
         tell application "{app_name}"
@@ -896,17 +1187,7 @@ fn build_safari_scrape_script(
     url: &str,
     readiness_javascript: &str,
     javascript: &str,
-    evidence_path: Option<&str>,
 ) -> String {
-    if let Some(evidence_path) = evidence_path {
-        return build_safari_evidence_script(
-            adapter,
-            url,
-            readiness_javascript,
-            javascript,
-            evidence_path,
-        );
-    }
     format!(
         r#"
         tell application "{app_name}"
@@ -961,29 +1242,19 @@ fn build_safari_scrape_script(
     )
 }
 
-fn build_chromium_evidence_script(
+fn build_background_browser_extract_script(
     adapter: BrowserAdapter,
-    url: &str,
+    apple_script_id: &str,
     readiness_javascript: &str,
     javascript: &str,
-    evidence_path: &str,
 ) -> String {
-    format!(
-        r#"
-        tell application "System Events"
-            set previous_front_app to name of first application process whose frontmost is true
-        end tell
-        set captured_error to ""
-        tell application "{app_name}"
-            if (count of windows) is 0 then error "BROWSER_ATTACH_UNAVAILABLE"
-            set target_window to front window
-            set original_active_index to active tab index of target_window
-            set report_tab to missing value
-            try
-                set report_tab to make new tab at end of tabs of target_window with properties {{URL:"about:blank"}}
-                set active tab index of target_window to (count of tabs of target_window)
-                set URL of report_tab to "{url}"
-                activate
+    let window_id = applescript_window_id_literal(apple_script_id);
+    match adapter.script_kind {
+        BrowserScriptKind::Chromium => format!(
+            r#"
+            tell application "{app_name}"
+                set target_window to first window whose id is {window_id}
+                set report_tab to active tab of target_window
                 repeat 80 times
                     if loading of report_tab is false then exit repeat
                     delay 0.25
@@ -1003,59 +1274,19 @@ fn build_chromium_evidence_script(
                     set last_text_length to current_text_length
                     delay 0.5
                 end repeat
-                set payload to execute report_tab javascript "{javascript}"
-                delay 0.5
-                set browser_window_id to id of target_window as text
-                do shell script "/usr/sbin/screencapture -x -o -t jpg -l" & browser_window_id & " " & quoted form of "{evidence_path}"
-                close report_tab
-                set active tab index of target_window to original_active_index
-            on error error_message
-                try
-                    if report_tab is not missing value then close report_tab
-                    set active tab index of target_window to original_active_index
-                end try
-                set captured_error to error_message
-            end try
-        end tell
-        tell application "System Events"
-            try
-                set frontmost of first application process whose name is previous_front_app to true
-            end try
-        end tell
-        if captured_error is not "" then error captured_error
-        return payload
-        "#,
-        app_name = adapter.app_name,
-        url = escape_applescript_string(url),
-        readiness_javascript = escape_applescript_string(readiness_javascript),
-        javascript = escape_applescript_string(javascript),
-        evidence_path = escape_applescript_string(evidence_path),
-    )
-}
-
-fn build_safari_evidence_script(
-    adapter: BrowserAdapter,
-    url: &str,
-    readiness_javascript: &str,
-    javascript: &str,
-    evidence_path: &str,
-) -> String {
-    format!(
-        r#"
-        tell application "System Events"
-            set previous_front_app to name of first application process whose frontmost is true
-        end tell
-        set captured_error to ""
-        tell application "{app_name}"
-            if (count of windows) is 0 then error "BROWSER_ATTACH_UNAVAILABLE"
-            set target_window to front window
-            set original_tab to current tab of target_window
-            set report_tab to missing value
-            try
-                set report_tab to make new tab at end of tabs of target_window with properties {{URL:"about:blank"}}
-                set current tab of target_window to report_tab
-                set URL of report_tab to "{url}"
-                activate
+                return execute report_tab javascript "{javascript}"
+            end tell
+            "#,
+            app_name = adapter.app_name,
+            window_id = window_id,
+            readiness_javascript = escape_applescript_string(readiness_javascript),
+            javascript = escape_applescript_string(javascript),
+        ),
+        BrowserScriptKind::Safari => format!(
+            r#"
+            tell application "{app_name}"
+                set target_window to first window whose id is {window_id}
+                set report_tab to current tab of target_window
                 repeat 80 times
                     try
                         if (do JavaScript "document.readyState" in report_tab) is "complete" then exit repeat
@@ -1077,34 +1308,146 @@ fn build_safari_evidence_script(
                     set last_text_length to current_text_length
                     delay 0.5
                 end repeat
-                set payload to do JavaScript "{javascript}" in report_tab
-                delay 0.5
-                set browser_window_id to id of target_window as text
-                do shell script "/usr/sbin/screencapture -x -o -t jpg -l" & browser_window_id & " " & quoted form of "{evidence_path}"
-                close report_tab
-                set current tab of target_window to original_tab
-            on error error_message
+                return do JavaScript "{javascript}" in report_tab
+            end tell
+            "#,
+            app_name = adapter.app_name,
+            window_id = window_id,
+            readiness_javascript = escape_applescript_string(readiness_javascript),
+            javascript = escape_applescript_string(javascript),
+        ),
+    }
+}
+
+fn build_background_browser_start_script(
+    adapter: BrowserAdapter,
+    url: &str,
+    preview_token: &str,
+) -> String {
+    match adapter.script_kind {
+        BrowserScriptKind::Chromium => format!(
+            r#"
+            tell application "System Events"
+                set previous_front_app to name of first application process whose frontmost is true
+            end tell
+            tell application "{app_name}"
+                set original_front_window to missing value
+                if (count of windows) is greater than 0 then set original_front_window to front window
+                set preview_window to make new window with properties {{visible:false, bounds:{{80, 80, 1280, 820}}}}
+                set given name of preview_window to "MemoryBread Preview {preview_token}"
+                set URL of active tab of preview_window to "{url}"
+                set visible of preview_window to true
+                if original_front_window is not missing value then set index of original_front_window to 1
+                set preview_window_id to id of preview_window as text
+            end tell
+            tell application "System Events"
                 try
-                    if report_tab is not missing value then close report_tab
-                    set current tab of target_window to original_tab
+                    set frontmost of first application process whose name is previous_front_app to true
                 end try
-                set captured_error to error_message
-            end try
-        end tell
-        tell application "System Events"
+            end tell
+            return preview_window_id
+            "#,
+            app_name = adapter.app_name,
+            preview_token = escape_applescript_string(preview_token),
+            url = escape_applescript_string(url),
+        ),
+        BrowserScriptKind::Safari => format!(
+            r#"
+            tell application "System Events"
+                set previous_front_app to name of first application process whose frontmost is true
+            end tell
+            tell application "{app_name}"
+                set original_front_window to missing value
+                if (count of windows) is greater than 0 then set original_front_window to front window
+                make new document with properties {{URL:"about:blank"}}
+                set preview_window to front window
+                set visible of preview_window to false
+                set bounds of preview_window to {{80, 80, 1280, 820}}
+                set URL of current tab of preview_window to "{url}"
+                set visible of preview_window to true
+                if original_front_window is not missing value then set index of original_front_window to 1
+                set preview_window_id to id of preview_window as text
+            end tell
+            tell application "System Events"
+                try
+                    set frontmost of first application process whose name is previous_front_app to true
+                end try
+            end tell
+            return preview_window_id
+            "#,
+            app_name = adapter.app_name,
+            url = escape_applescript_string(url),
+        ),
+    }
+}
+
+fn build_background_browser_cleanup_script(
+    adapter: BrowserAdapter,
+    apple_script_id: &str,
+    launched_browser: bool,
+) -> String {
+    let window_id = applescript_window_id_literal(apple_script_id);
+    let quit_if_empty = if launched_browser {
+        "if (count of windows) is 0 then quit"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+        tell application "{app_name}"
             try
-                set frontmost of first application process whose name is previous_front_app to true
+                close first window whose id is {window_id}
             end try
+            {quit_if_empty}
         end tell
-        if captured_error is not "" then error captured_error
-        return payload
         "#,
         app_name = adapter.app_name,
-        url = escape_applescript_string(url),
-        readiness_javascript = escape_applescript_string(readiness_javascript),
-        javascript = escape_applescript_string(javascript),
-        evidence_path = escape_applescript_string(evidence_path),
+        window_id = window_id,
+        quit_if_empty = quit_if_empty,
     )
+}
+
+fn build_background_browser_orphan_cleanup_script(
+    adapter: BrowserAdapter,
+    preview_token: &str,
+    launched_browser: bool,
+) -> String {
+    let quit_if_empty = if launched_browser {
+        "if (count of windows) is 0 then quit"
+    } else {
+        ""
+    };
+    match adapter.script_kind {
+        BrowserScriptKind::Chromium => format!(
+            r#"
+            tell application "{app_name}"
+                repeat with candidate_window in windows
+                    try
+                        if (given name of candidate_window) contains "{preview_token}" then
+                            close candidate_window
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+                {quit_if_empty}
+            end tell
+            "#,
+            app_name = adapter.app_name,
+            preview_token = escape_applescript_string(preview_token),
+            quit_if_empty = quit_if_empty,
+        ),
+        // Safari 窗口没有可写的专用名称。启动失败后仅处理“本轮后台启动且没有
+        // 窗口”的进程，不能只凭通用边界去关闭一个可能属于用户的窗口。
+        BrowserScriptKind::Safari => format!(
+            r#"
+            tell application "{app_name}"
+                {quit_if_empty}
+            end tell
+            "#,
+            app_name = adapter.app_name,
+            quit_if_empty = quit_if_empty,
+        ),
+    }
 }
 
 fn browser_scripting_is_disabled(stderr: &str) -> bool {
@@ -1422,14 +1765,12 @@ mod tests {
             "https://example.com",
             &readiness_javascript,
             &javascript,
-            None,
         );
         let safari = build_safari_scrape_script(
             *BROWSER_ADAPTERS.last().unwrap(),
             "https://example.com",
             &readiness_javascript,
             &javascript,
-            None,
         );
 
         assert!(chromium.contains("last window"));
@@ -1441,40 +1782,92 @@ mod tests {
             .contains("if current tab of target_window is not report_tab then close report_tab"));
         assert!(chromium.contains("stable_read_count"));
         assert!(safari.contains("stable_read_count"));
+        assert!(javascript.contains("loading_marker_count"));
+        assert!(javascript.contains("likely_loading"));
+        assert!(readiness_javascript.contains("loading>0?0"));
     }
 
     #[test]
-    fn evidence_scripts_capture_the_browser_window_and_restore_focus() {
+    fn evidence_scripts_use_a_dedicated_background_window_and_restore_focus() {
         let javascript = browser_extraction_javascript();
         let readiness_javascript = browser_readiness_javascript();
-        let chromium = build_chromium_scrape_script(
+        let preview_id = "2d870d80-e2a2-4424-a732-069e174f2796";
+        let chromium_start = build_background_browser_start_script(
             BROWSER_ADAPTERS[0],
             "https://example.com/dashboard",
-            &readiness_javascript,
-            &javascript,
-            Some("/tmp/memorybread-evidence.jpg"),
+            preview_id,
         );
-        let safari = build_safari_scrape_script(
+        let safari_start = build_background_browser_start_script(
             *BROWSER_ADAPTERS.last().unwrap(),
             "https://example.com/dashboard",
+            preview_id,
+        );
+        let chromium_extract = build_background_browser_extract_script(
+            BROWSER_ADAPTERS[0],
+            "12345",
             &readiness_javascript,
             &javascript,
-            Some("/tmp/memorybread-evidence.jpg"),
+        );
+        let safari_extract = build_background_browser_extract_script(
+            *BROWSER_ADAPTERS.last().unwrap(),
+            "54321",
+            &readiness_javascript,
+            &javascript,
+        );
+        let chromium_cleanup =
+            build_background_browser_cleanup_script(BROWSER_ADAPTERS[0], "12345", false);
+        let safari_cleanup = build_background_browser_cleanup_script(
+            *BROWSER_ADAPTERS.last().unwrap(),
+            "54321",
+            false,
+        );
+        let chromium_orphan_cleanup =
+            build_background_browser_orphan_cleanup_script(BROWSER_ADAPTERS[0], preview_id, true);
+        let safari_orphan_cleanup = build_background_browser_orphan_cleanup_script(
+            *BROWSER_ADAPTERS.last().unwrap(),
+            preview_id,
+            true,
         );
 
-        for script in [&chromium, &safari] {
-            assert!(script.contains("screencapture -x -o -t jpg -l"));
+        for script in [&chromium_start, &safari_start] {
             assert!(script.contains("previous_front_app"));
-            assert!(script.contains("close report_tab"));
             assert!(script.contains("frontmost of first application process"));
+            assert!(script.contains("set index of original_front_window to 1"));
+            assert!(!script.contains("activate"));
         }
-        assert!(chromium.contains("set active tab index of target_window to original_active_index"));
-        assert!(safari.contains("set current tab of target_window to original_tab"));
+        assert!(chromium_start.contains("visible:false"));
+        assert!(chromium_start.contains("MemoryBread Preview"));
+        assert!(safari_start.contains("set visible of preview_window to false"));
+        for script in [&chromium_extract, &safari_extract] {
+            assert!(script.contains("first window whose id is"));
+            assert!(script.contains("stable_read_count"));
+            assert!(!script.contains("front window"));
+            assert!(!script.contains("screencapture"));
+            assert!(!script.contains("activate"));
+        }
+        assert!(chromium_cleanup.contains("close first window whose id is 12345"));
+        assert!(safari_cleanup.contains("close first window whose id is 54321"));
+        assert!(chromium_orphan_cleanup.contains("given name of candidate_window"));
+        assert!(!safari_orphan_cleanup.contains("close candidate_window"));
+        assert!(chromium_orphan_cleanup.contains("then quit"));
+        assert!(safari_orphan_cleanup.contains("then quit"));
 
         #[cfg(target_os = "macos")]
         {
             let output_dir = tempfile::tempdir().unwrap();
-            for (index, script) in [&chromium, &safari].into_iter().enumerate() {
+            for (index, script) in [
+                &chromium_start,
+                &safari_start,
+                &chromium_extract,
+                &safari_extract,
+                &chromium_cleanup,
+                &safari_cleanup,
+                &chromium_orphan_cleanup,
+                &safari_orphan_cleanup,
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let output_path = output_dir.path().join(format!("evidence-{index}.scpt"));
                 let output = Command::new("/usr/bin/osacompile")
                     .args(["-e", script, "-o"])
@@ -1488,5 +1881,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn evidence_capture_reuses_a_valid_preview_id_and_rejects_invalid_values() {
+        let preview_id = "2d870d80-e2a2-4424-a732-069e174f2796";
+        assert_eq!(normalize_preview_id(Some(preview_id)).unwrap(), preview_id);
+        assert!(normalize_preview_id(Some("../bad")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "需要本机 Chrome、Apple Events JavaScript 与录屏权限"]
+    fn background_browser_window_keeps_front_app_and_user_tab_unchanged() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            let body = format!(
+                "<html><head><title>MemoryBread 后台预览自测</title></head><body><h1>经营看板</h1><p>{}</p></body></html>",
+                "本周订单 1200，环比增长 8%。".repeat(80)
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let browser_context = || {
+            let script = r#"
+                tell application "System Events" to set front_app to name of first application process whose frontmost is true
+                tell application "Google Chrome"
+                    if (count of windows) is 0 then return front_app & "|no-window"
+                    return front_app & "|" & (id of front window as text) & "|" & (active tab index of front window as text)
+                end tell
+            "#;
+            let output = run_browser_script(script).unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let before = browser_context();
+        let output_dir = tempfile::tempdir().unwrap();
+        let evidence_path = output_dir
+            .path()
+            .join("2d870d80-e2a2-4424-a732-069e174f2796.jpg");
+        let result = scrape_with_browser(
+            &format!("http://{address}/dashboard"),
+            Some("chrome"),
+            Some("Google Chrome"),
+            Some(&evidence_path),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result.interaction_mode, "background_browser_window");
+        assert_eq!(result.title, "MemoryBread 后台预览自测");
+        assert!(result.content_text.contains("本周订单 1200"));
+        assert!(result.screenshot.is_some());
+        assert!(evidence_path.is_file());
+        assert_eq!(browser_context(), before);
     }
 }

@@ -13,8 +13,9 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union, AsyncIterator
+from typing import AsyncIterator, Optional
 from urllib.parse import quote_plus, urlparse
+from uuid import uuid4
 
 import httpx
 
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 CORE_ENGINE_DEFAULT_BASE_URL = "http://127.0.0.1:7070"
+MAX_REPORT_REFRESH_SOURCES = 5
 
 CREATION_SKILL_ANALYSIS_SCHEMA = {
     "type": "object",
@@ -317,9 +319,10 @@ class CreationService:
         data_results: list[dict],
         query: str,
         parsed_requirement: dict,
-        limit: int = 3,
+        limit: int = MAX_REPORT_REFRESH_SOURCES,
         run_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        preview_ids: Optional[dict[int, str]] = None,
     ) -> dict:
         """创作时刷新 Top-K 报表源，并生成经 OCR/DOM 校验的通用截图证据。"""
         report_sources = [
@@ -328,15 +331,18 @@ class CreationService:
             if item.get("source_kind") == "report_url"
             and item.get("source_url")
             and item.get("source_id") is not None
-        ][: max(1, min(int(limit), 5))]
+        ][: max(1, min(int(limit), MAX_REPORT_REFRESH_SOURCES))]
         if not report_sources:
             return {"scrapes": [], "refreshed_data": data_results}
 
         scrapes: list[dict] = []
-        first_error_code: Optional[str] = None
+        payload_by_source: dict[int, dict] = {}
+        evidence_by_source: dict[int, dict] = {}
         async with httpx.AsyncClient(timeout=45.0) as client:
             for item in report_sources:
                 source_id = int(item["source_id"])
+                preview_id = str((preview_ids or {}).get(source_id) or uuid4())
+                preview_url = f"/api/creation/browser-previews/{preview_id}/image"
                 try:
                     response = await client.post(
                         f"{self.core_engine_base_url}/api/data/sources/{source_id}/refresh",
@@ -345,11 +351,23 @@ class CreationService:
                             "capture_evidence": True,
                             "run_id": run_id,
                             "session_id": session_id,
+                            "preview_id": preview_id,
                         },
                     )
                     if response.is_success:
                         payload = response.json()
-                        evidence = await self._validate_scrape_evidence(client, payload)
+                        payload_by_source[source_id] = payload
+                        evidence = await self._validate_scrape_evidence(
+                            client,
+                            payload,
+                            require_metric=True,
+                        )
+                        evidence_by_source[source_id] = evidence
+                        verified_claims = (
+                            evidence.get("validation", {}).get("verified_claims", [])
+                            if isinstance(evidence, dict)
+                            else []
+                        )
                         scrapes.append(
                             {
                                 "source_id": source_id,
@@ -362,7 +380,17 @@ class CreationService:
                                 "collected_at": payload.get("collected_at"),
                                 "title": payload.get("title"),
                                 "url": payload.get("url"),
+                                "browser": payload.get("browser"),
+                                "interaction_mode": payload.get("interaction_mode"),
+                                "preview_id": preview_id,
+                                "preview_url": preview_url,
                                 "evidence": evidence,
+                                "validation_reason": (
+                                    evidence.get("validation", {}).get("reason")
+                                    if isinstance(evidence, dict)
+                                    else "evidence_missing"
+                                ),
+                                "verified_claim_count": len(verified_claims),
                             }
                         )
                         continue
@@ -370,41 +398,81 @@ class CreationService:
                     error_code = str(error_payload.get("error") or "SCRAPE_FAILED")
                 except Exception:
                     error_code = "SCRAPE_FAILED"
-                first_error_code = first_error_code or error_code
                 scrapes.append(
                     {
                         "source_id": source_id,
                         "status": "failed",
                         "error_code": error_code,
+                        "preview_id": preview_id,
+                        "preview_url": preview_url,
                     }
                 )
 
-        completed = [item for item in scrapes if item.get("status") == "completed"]
-        if not completed:
-            raise CreationToolExecutionError(
-                first_error_code or "EVIDENCE_VALIDATION_FAILED",
-                "实时报表虽可能已刷新，但截图与页面数据未通过一致性校验",
-            )
-        refreshed = await self.retrieve_data_context(query, parsed_requirement, limit=6)
-        evidence_by_source = {
-            int(item["source_id"]): item.get("evidence")
-            for item in completed
-            if item.get("source_id") is not None and isinstance(item.get("evidence"), dict)
-        }
-        for item in refreshed:
-            source_id = item.get("source_id")
-            evidence = evidence_by_source.get(int(source_id)) if source_id is not None else None
-            if evidence:
-                item["creation_evidence"] = evidence
-                item["can_use"] = True
-            elif item.get("source_kind") == "report_url":
-                item["can_use"] = False
+        # 保留最初 Top-K 的身份与顺序，直接把本轮浏览器响应合并回候选。
+        # 这里不能重新检索，否则刚刷新的 URL 可能因内容或时间分变化而掉出 Top-K，
+        # 最终出现“浏览器打开了页面，但 Writer 看不到这次采集”的断链。
+        refreshed = self._merge_scrape_results(
+            data_results,
+            payload_by_source,
+            evidence_by_source,
+            {int(item["source_id"]) for item in report_sources},
+        )
         return {"scrapes": scrapes, "refreshed_data": refreshed}
+
+    @staticmethod
+    def _merge_scrape_results(
+        data_results: list[dict],
+        payload_by_source: dict[int, dict],
+        evidence_by_source: dict[int, dict],
+        attempted_source_ids: set[int],
+    ) -> list[dict]:
+        merged: list[dict] = []
+        for original in data_results:
+            item = dict(original)
+            source_id_value = item.get("source_id")
+            source_id = int(source_id_value) if source_id_value is not None else None
+            payload = payload_by_source.get(source_id) if source_id is not None else None
+            evidence = evidence_by_source.get(source_id) if source_id is not None else None
+            if payload is not None:
+                collected_at = payload.get("collected_at")
+                item.update(
+                    {
+                        "title": payload.get("title") or item.get("title"),
+                        "source_url": payload.get("url") or item.get("source_url"),
+                        "collected_at": collected_at,
+                        "observed_at": collected_at,
+                        "freshness_class": "fresh",
+                        "freshness_score": 1.0,
+                        "refresh_required": False,
+                        "content_excerpt": payload.get("content_text"),
+                        "structured_data": payload.get("structured_data"),
+                        "provenance": {
+                            "collector": payload.get("collector"),
+                            "browser": payload.get("browser"),
+                            "interaction_mode": payload.get("interaction_mode"),
+                            "collected_at": collected_at,
+                        },
+                    }
+                )
+                if (
+                    isinstance(evidence, dict)
+                    and evidence.get("validation_status") == "verified"
+                ):
+                    item["creation_evidence"] = evidence
+                    item["can_use"] = True
+                else:
+                    item["can_use"] = False
+            elif item.get("source_kind") == "report_url" and source_id in attempted_source_ids:
+                item["can_use"] = False
+            merged.append(item)
+        return merged
 
     async def _validate_scrape_evidence(
         self,
         client: httpx.AsyncClient,
         scrape_payload: dict,
+        *,
+        require_metric: bool = False,
     ) -> dict:
         evidence = scrape_payload.get("evidence")
         if not isinstance(evidence, dict) or not evidence.get("id"):
@@ -429,6 +497,16 @@ class CreationService:
                 self._ocr_engine = OcrEngine.create_default()
             output = await asyncio.to_thread(self._ocr_engine.process, temp_path)
             validation = self._compare_scrape_with_ocr(scrape_payload, output.text)
+            if require_metric:
+                metric_claims = [
+                    claim
+                    for claim in validation.get("verified_claims", [])
+                    if isinstance(claim, dict)
+                    and str(claim.get("value") or "").strip()
+                ]
+                validation["verified_claims"] = metric_claims
+                if not metric_claims:
+                    validation["reason"] = "no_verified_metric"
             validation["ocr_confidence"] = round(float(output.confidence), 4)
         except Exception as exc:
             logger.warning("创作证据 OCR 失败: %s", exc)
@@ -536,20 +614,46 @@ class CreationService:
                     continue
                 cells = [str(cell).strip() for cell in row if str(cell).strip()]
                 row_text = " ".join(cells)
+                if cls._is_scrape_noise(row_text):
+                    continue
                 values = re.findall(r"(?<!\w)[+-]?\d[\d,]*(?:\.\d+)?%?", row_text)
                 label = " ".join(cell for cell in cells if not re.fullmatch(r"[+-]?[\d,.]+%?", cell))
                 for value in values:
-                    candidates.append({"label": label[:240], "value": value, "statement": row_text[:500]})
+                    if cls._is_unhelpful_metric_value(value):
+                        continue
+                    candidates.append(
+                        {
+                            "claim_type": "metric",
+                            "label": label[:240],
+                            "value": value,
+                            "statement": row_text[:500],
+                        }
+                    )
         labels = structured.get("metric_labels", []) if isinstance(structured, dict) else []
         for item in labels if isinstance(labels, list) else []:
             text = str(item).strip()
+            if cls._is_scrape_noise(text):
+                continue
             for value in re.findall(r"(?<!\w)[+-]?\d[\d,]*(?:\.\d+)?%?", text):
+                if cls._is_unhelpful_metric_value(value):
+                    continue
                 label = text.replace(value, " ").strip(" :-—")
-                candidates.append({"label": label[:240], "value": value, "statement": text[:500]})
+                candidates.append(
+                    {
+                        "claim_type": "metric",
+                        "label": label[:240],
+                        "value": value,
+                        "statement": text[:500],
+                    }
+                )
         text_blocks = structured.get("text_blocks", []) if isinstance(structured, dict) else []
         for item in text_blocks if isinstance(text_blocks, list) else []:
             text = " ".join(str(item).split()).strip()
-            if not 8 <= len(text) <= 240 or re.search(r"\d", text):
+            if (
+                not 8 <= len(text) <= 240
+                or re.search(r"\d", text)
+                or cls._is_scrape_noise(text)
+            ):
                 continue
             tokens = cls._evidence_match_tokens(text)
             if len(tokens) < 2:
@@ -562,13 +666,104 @@ class CreationService:
                     "statement": text,
                 }
             )
-        if not candidates:
-            for line in str(scrape_payload.get("content_text") or "").splitlines()[:500]:
-                values = re.findall(r"(?<!\w)[+-]?\d[\d,]*(?:\.\d+)?%?", line)
-                if values:
-                    for value in values[:4]:
-                        candidates.append({"label": line.replace(value, " ")[:240], "value": value, "statement": line[:500]})
-        return candidates[:500]
+
+        # BI 指标卡经常不是 table/aria-label，而是“指标名 → 日期 → 数值”的
+        # 相邻 DOM 文本。无论页面里是否还有缓存设置表，都必须额外解析正文，
+        # 否则真正业务指标会被界面噪声遮蔽。
+        content_lines = [
+            " ".join(line.split()).strip()
+            for line in str(scrape_payload.get("content_text") or "").splitlines()[:800]
+            if " ".join(line.split()).strip()
+        ]
+        statistical_period = cls._content_statistical_period(content_lines)
+        date_pattern = re.compile(r"^20\d{2}[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?$")
+        value_pattern = re.compile(
+            r"^[+-]?\d[\d,]*(?:\.\d+)?(?:%|亿|万|千|百|卡|个|次|元|秒|ms|s)?$",
+            re.IGNORECASE,
+        )
+        for index, line in enumerate(content_lines):
+            if not value_pattern.fullmatch(line) or date_pattern.fullmatch(line):
+                continue
+            if cls._is_unhelpful_metric_value(line):
+                continue
+            label = ""
+            nearest_date = ""
+            for previous in reversed(content_lines[max(0, index - 4) : index]):
+                if date_pattern.fullmatch(previous):
+                    nearest_date = nearest_date or previous
+                    continue
+                if value_pattern.fullmatch(previous) or previous in {"至", "到", "-", "—"}:
+                    continue
+                if cls._is_scrape_noise(previous):
+                    continue
+                label = previous
+                break
+            if not label:
+                continue
+            period = statistical_period or nearest_date
+            statement = " ".join(part for part in (label, period, line) if part)
+            candidates.append(
+                {
+                    "claim_type": "metric",
+                    "label": label[:240],
+                    "value": line,
+                    "statement": statement[:500],
+                    "statistical_period": period,
+                }
+            )
+
+        deduplicated: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for candidate in candidates:
+            key = (
+                cls._normalize_evidence_text(str(candidate.get("label") or "")),
+                cls._normalize_evidence_text(str(candidate.get("value") or "")),
+                str(candidate.get("claim_type") or "metric"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduplicated.append(candidate)
+        return deduplicated[:500]
+
+    @staticmethod
+    def _content_statistical_period(lines: list[str]) -> str:
+        date_pattern = re.compile(r"^20\d{2}[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?$")
+        for index in range(len(lines) - 2):
+            if (
+                date_pattern.fullmatch(lines[index])
+                and lines[index + 1] in {"至", "到", "-", "—"}
+                and date_pattern.fullmatch(lines[index + 2])
+            ):
+                return f"{lines[index]} 至 {lines[index + 2]}"
+        return ""
+
+    @staticmethod
+    def _is_unhelpful_metric_value(value: str) -> bool:
+        normalized = value.strip().replace(",", "").lower()
+        return normalized in {"0", "0.0", "0%", "0.0%"}
+
+    @staticmethod
+    def _is_scrape_noise(value: str) -> bool:
+        normalized = " ".join(value.lower().split())
+        return any(
+            marker in normalized
+            for marker in (
+                "加载中",
+                "loading",
+                "缓存命中",
+                "开启缓存",
+                "未开启缓存",
+                "未发起查询",
+                "当前看板内无图表",
+                "开始创建图表",
+                "图表名称",
+                "筛选器关联",
+                "权限设置",
+                "告警设置",
+                "异步查询列表",
+            )
+        )
 
     @staticmethod
     def _normalize_evidence_text(value: str) -> str:
@@ -2155,7 +2350,7 @@ JSON 类型硬约束：
                     "完成证据：释放动作必须留下可观察结果，无法确认时回到复核状态。",
                 ],
             )
-        if re.search(r"```(?: Union[plantuml, mermaid])", content, re.I):
+        if re.search(r"```(?:plantuml|mermaid)", content, re.I):
             add(
                 "代码图示与正文同词复现",
                 "源文档把可执行图示代码放在解释之后，并让节点、分组和连线继续使用正文已经建立的术语，图不是独立装饰。",

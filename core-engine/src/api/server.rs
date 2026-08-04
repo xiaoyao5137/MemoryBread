@@ -31,18 +31,25 @@ use super::{
             generate_document, list_history, preview_references, run_creation_agent, save_history,
         },
         creation_skill::{
-            analyze_creation_skill, delete_creation_skill, get_creation_skill,
-            list_creation_skills, save_creation_skill, update_creation_skill,
+            analyze_creation_skill, create_creation_skill_analysis_job, delete_creation_skill,
+            get_creation_skill, get_creation_skill_analysis_job, list_creation_skills,
+            save_creation_skill, update_creation_skill,
         },
         data::{
-            delete_data_source, extract_data_sources, get_creation_evidence_image, get_data_source,
-            list_data_sources, refresh_data_source, search_data, validate_creation_evidence,
+            delete_data_source, extract_data_sources, get_browser_preview_image,
+            get_creation_evidence_image, get_data_source, list_data_sources, refresh_data_source,
+            search_data, validate_creation_evidence,
         },
         debug::{
             clear_extraction_queue, debug_log_content, debug_log_files, system_stats, vector_status,
         },
         diary::{get_diary, get_latest_diary, list_diaries, update_diary},
         health::health_handler,
+        integration_skill::{
+            download_integration_skill_bundle, download_integration_skill_file,
+            get_integration_skill, get_integration_skill_run, list_integration_skill_runs,
+            list_integration_skills, start_integration_skill_run,
+        },
         knowledge::{
             delete_knowledge, extract_knowledge, get_knowledge, list_knowledge, verify_knowledge,
         },
@@ -149,10 +156,22 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_creation_evidence_image),
         )
         .route(
+            "/api/creation/browser-previews/:id/image",
+            get(get_browser_preview_image),
+        )
+        .route(
             "/api/creation/evidence/:id/validate",
             post(validate_creation_evidence),
         )
         .route("/api/creation/skills/analyze", post(analyze_creation_skill))
+        .route(
+            "/api/creation/skills/analyze/jobs",
+            post(create_creation_skill_analysis_job),
+        )
+        .route(
+            "/api/creation/skills/analyze/jobs/:job_id",
+            get(get_creation_skill_analysis_job),
+        )
         .route(
             "/api/creation/skills",
             get(list_creation_skills)
@@ -165,6 +184,31 @@ pub fn create_router(state: Arc<AppState>) -> Router {
                 .put(update_creation_skill)
                 .delete(delete_creation_skill)
                 .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/api/integration-skills", get(list_integration_skills))
+        .route(
+            "/api/integration-skills/runs",
+            get(list_integration_skill_runs),
+        )
+        .route(
+            "/api/integration-skills/runs/:run_id",
+            get(get_integration_skill_run),
+        )
+        .route(
+            "/api/integration-skills/:skill_id/file",
+            get(download_integration_skill_file),
+        )
+        .route(
+            "/api/integration-skills/:skill_id/bundle",
+            get(download_integration_skill_bundle),
+        )
+        .route(
+            "/api/integration-skills/:skill_id/runs",
+            post(start_integration_skill_run).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route(
+            "/api/integration-skills/:skill_id",
+            get(get_integration_skill),
         )
         .route("/api/vector/status", get(vector_status))
         .route("/api/stats", get(system_stats))

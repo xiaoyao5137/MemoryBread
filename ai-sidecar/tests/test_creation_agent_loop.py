@@ -15,6 +15,7 @@ class FakeCreationService:
         self.reference_queries = []
         self.data_results = []
         self.scrape_outcome = None
+        self.scrape_kwargs = {}
 
     def analyze_requirement(self, message, options):
         return {
@@ -50,6 +51,7 @@ class FakeCreationService:
         return list(self.data_results)
 
     async def scrape_data_context(self, data_results, *_args, **_kwargs):
+        self.scrape_kwargs = dict(_kwargs)
         if self.scrape_outcome is not None:
             return self.scrape_outcome
         return {"scrapes": [], "refreshed_data": list(data_results)}
@@ -224,6 +226,175 @@ def test_evidence_validation_also_supports_document_style_pages():
     )
 
     assert matched["verified_claims"][0]["claim_type"] == "text"
+
+
+def test_dashboard_metric_cards_are_extracted_even_when_cache_table_exists():
+    payload = {
+        "title": "LangBridge 模型中心运营看板",
+        "url": "https://bi.example.com/dashboard/gpu",
+        "collected_at": 1770000000000,
+        "content_text": """日期
+2026-07-24
+至
+2026-07-30
+资源总览
+年化总额度
+2026-07-30
+1,747
+已交付额度(求和)
+2026-07-30
+1,736
+未纳管
+2026-07-30
+387
+资源管理进度
+99.37%""",
+        "structured_data": {
+            "tables": [
+                [["图表名称", "缓存开启情况", "缓存命中情况"], ["资源总览", "未开启缓存", "0%"]]
+            ],
+            "text_blocks": ["当前页面共有共计 71 个图表"],
+        },
+        "evidence": {
+            "page_title": "LangBridge 模型中心运营看板",
+            "source_url": "https://bi.example.com/dashboard/gpu",
+            "captured_at": 1770000000000,
+        },
+    }
+
+    matched = CreationService._compare_scrape_with_ocr(
+        payload,
+        "LangBridge 模型中心运营看板\n日期 2026-07-24 至 2026-07-30\n"
+        "年化总额度 1,747\n已交付额度 1,736\n未纳管 387\n资源管理进度 99.37%",
+    )
+
+    metric_claims = [
+        claim
+        for claim in matched["verified_claims"]
+        if str(claim.get("value") or "").strip()
+    ]
+    assert {claim["value"] for claim in metric_claims} >= {
+        "1,747",
+        "1,736",
+        "387",
+        "99.37%",
+    }
+    assert all(claim.get("statistical_period") == "2026-07-24 至 2026-07-30" for claim in metric_claims)
+    assert "0%" not in {claim["value"] for claim in metric_claims}
+
+
+def test_refreshed_browser_payload_is_merged_without_second_top_k_search():
+    evidence = {
+        "id": "evidence-live",
+        "validation_status": "verified",
+        "validation": {
+            "verified_claims": [
+                {"label": "订单", "value": "1200", "statement": "订单 1200"}
+            ]
+        },
+    }
+    merged = CreationService._merge_scrape_results(
+        [
+            {
+                "source_id": 1,
+                "title": "经营看板",
+                "source_kind": "report_url",
+                "source_url": "https://bi.example.com/report",
+                "refresh_required": True,
+                "can_use": False,
+            },
+            {
+                "source_id": 2,
+                "title": "周会记录",
+                "source_kind": "work_memory",
+                "can_use": True,
+                "content_excerpt": "历史结论",
+            },
+        ],
+        {
+            1: {
+                "title": "经营看板",
+                "url": "https://bi.example.com/report",
+                "collector": "browser_attach",
+                "browser": "chrome",
+                "interaction_mode": "temporary_foreground_tab",
+                "collected_at": 1770000000000,
+                "content_text": "订单 1200",
+                "structured_data": {"metric_labels": ["订单 1200"]},
+            }
+        },
+        {1: evidence},
+        {1},
+    )
+
+    assert [item["source_id"] for item in merged] == [1, 2]
+    assert merged[0]["content_excerpt"] == "订单 1200"
+    assert merged[0]["creation_evidence"] == evidence
+    assert merged[0]["can_use"] is True
+    assert merged[0]["refresh_required"] is False
+    assert merged[1]["content_excerpt"] == "历史结论"
+
+
+def test_data_citation_guard_replaces_guessed_source_with_supporting_memory():
+    document = """# GPU 治理方案
+
+| 维度 | GPUTL | SMACT |
+|---|---:|---:|
+| 国内 | 42% | 25% |
+| 海外 | 47% | 25% |
+| 充分利用阈值 | - | 80% |
+
+*数据来源：LangBridge 模型中心运营看板，采集时间 2026-07-30*
+"""
+    data_results = [
+        {
+            "source_id": 55,
+            "title": "阅读并分析了容器云 GPU 指标采集项目的技术文档",
+            "source_kind": "work_memory",
+            "source_url": None,
+            "can_use": True,
+            "collected_at": 1770000000000,
+            "observed_at": 1770000000000,
+            "content_excerpt": (
+                "容器云 GPU 指标采集项目：国内日均 42%，海外 47%，"
+                "SMACT 约 25%，英伟达认为达到 80% 才算充分利用。"
+            ),
+            "structured_data": {},
+        }
+    ]
+
+    updated, audit = CreationAgentLoop._guard_data_citations(document, data_results)
+
+    assert audit[0]["status"] == "corrected"
+    assert audit[0]["source_id"] == 55
+    assert "LangBridge 模型中心运营看板" not in updated
+    assert "容器云 GPU 指标采集项目" in updated
+    assert "工作记忆采集时间" in updated
+
+
+def test_data_citation_guard_marks_unsupported_numbers_instead_of_guessing():
+    document = """# 周报
+
+本周 GPU 利用率达到 65%。
+
+*数据来源：某实时看板，采集时间 2026-07-30*
+"""
+    updated, audit = CreationAgentLoop._guard_data_citations(
+        document,
+        [
+            {
+                "source_id": 1,
+                "title": "GPU 看板",
+                "source_kind": "report_url",
+                "can_use": False,
+                "content_excerpt": None,
+            }
+        ],
+    )
+
+    assert audit[0]["status"] == "unsupported"
+    assert "某实时看板" not in updated
+    assert "未与本轮可用证据逐项匹配" in updated
 
 
 def test_verified_evidence_card_is_inserted_below_the_claim_block():
@@ -644,6 +815,75 @@ async def test_harness_replans_during_the_run_from_fresh_data_feedback():
         for event in events
     )
     assert events[-1]["type"] == "run.completed"
+
+
+@pytest.mark.asyncio
+async def test_webpage_scrape_streams_background_browser_preview_metadata():
+    service = FakeCreationService()
+    evidence = {
+        "id": "evidence-preview",
+        "image_url": "/api/creation/evidence/evidence-preview/image",
+        "validation_status": "verified",
+        "captured_at": 1_720_000_000_000,
+        "source_url": "https://bi.example.com/report",
+        "validation": {
+            "verified_claims": [
+                {"statement": "本周订单 1200", "label": "订单", "value": "1200"}
+            ]
+        },
+    }
+    report = {
+        "source_id": 7,
+        "source_kind": "report_url",
+        "source_url": "https://bi.example.com/report",
+        "title": "经营看板",
+        "refresh_required": True,
+        "can_use": False,
+    }
+    service.data_results = [report]
+    service.scrape_outcome = {
+        "scrapes": [
+            {
+                "source_id": 7,
+                "status": "completed",
+                "title": "经营看板",
+                "browser": "chrome",
+                "interaction_mode": "background_browser_window",
+                "evidence": evidence,
+            }
+        ],
+        "refreshed_data": [
+            {
+                **report,
+                "refresh_required": False,
+                "can_use": True,
+                "creation_evidence": evidence,
+            }
+        ],
+    }
+
+    events = await collect_events(
+        CreationAgentLoop(service).run(
+            user_message="生成本周经营周报，并分析核心指标变化",
+            current_document="",
+            conversation=[],
+            selected_skills=[],
+            options=CreationOptions(enabled_tools=()),
+        )
+    )
+
+    started = next(event for event in events if event["type"] == "browser.preview.started")
+    completed = next(
+        event for event in events if event["type"] == "browser.preview.completed"
+    )
+    preview = started["data"]["previews"][0]
+    assert preview["source_id"] == 7
+    assert preview["title"] == "经营看板"
+    assert preview["image_url"].endswith(f"/{preview['id']}/image")
+    assert "source_url" not in preview
+    assert service.scrape_kwargs["preview_ids"] == {7: preview["id"]}
+    assert completed["data"]["previews"][0]["image_url"] == evidence["image_url"]
+    assert completed["data"]["previews"][0]["interaction_mode"] == "background_browser_window"
 
 
 def test_primary_skill_workflow_drives_agent_tool_order_and_step_context():

@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{atomic::Ordering, Arc},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     extract::{Path, Query, State},
@@ -9,7 +13,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    api::{error::ApiError, state::AppState},
+    api::{
+        error::ApiError,
+        state::{AppState, CreationSkillAnalysisJobRecord},
+    },
     storage::repo::creation_skill::{
         CreationSkillDescription, CreationSkillDistinctiveSection, CreationSkillExecutionStep,
         CreationSkillFieldExamples, CreationSkillRecord, CreationSkillSectionHeadings,
@@ -17,7 +24,7 @@ use crate::{
     },
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AnalyzeCreationSkillRequest {
     pub source_kind: String,
     pub source_id: String,
@@ -63,6 +70,23 @@ pub struct CreationSkillAnalysis {
     pub analysis_mode: String,
     #[serde(default)]
     pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreationSkillAnalysisJobCreateResponse {
+    pub job_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreationSkillAnalysisJobStatusResponse {
+    pub id: String,
+    pub status: String,
+    pub result: Option<serde_json::Value>,
+    pub error_code: Option<String>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 fn default_analysis_example_document() -> String {
@@ -137,8 +161,109 @@ pub struct CreationSkillQuery {
 }
 
 pub async fn analyze_creation_skill(
+    State(state): State<Arc<AppState>>,
     Json(request): Json<AnalyzeCreationSkillRequest>,
 ) -> Result<Json<CreationSkillAnalysis>, ApiError> {
+    validate_analysis_request(&request)?;
+    Ok(Json(
+        call_creation_skill_analyzer(&state.creation_sidecar_url, &request).await?,
+    ))
+}
+
+pub async fn create_creation_skill_analysis_job(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AnalyzeCreationSkillRequest>,
+) -> Result<Json<CreationSkillAnalysisJobCreateResponse>, ApiError> {
+    validate_analysis_request(&request)?;
+
+    let seq = state
+        .creation_skill_analysis_job_seq
+        .fetch_add(1, Ordering::Relaxed);
+    let created_at_ms = now_ms();
+    let job_id = format!("creation-skill-analysis-{created_at_ms}-{seq}");
+    let record = CreationSkillAnalysisJobRecord {
+        id: job_id.clone(),
+        status: "pending".to_string(),
+        result: None,
+        error_code: None,
+        error: None,
+        created_at_ms,
+        updated_at_ms: created_at_ms,
+    };
+
+    {
+        let mut jobs = state
+            .creation_skill_analysis_jobs
+            .lock()
+            .map_err(|_| ApiError::Internal("技能分析任务状态锁异常".to_string()))?;
+        jobs.insert(job_id.clone(), record);
+    }
+
+    let state_for_task = state.clone();
+    let job_id_for_task = job_id.clone();
+    let creation_sidecar_url = state.creation_sidecar_url.clone();
+    tokio::spawn(async move {
+        set_creation_skill_analysis_job(
+            &state_for_task,
+            &job_id_for_task,
+            "running",
+            None,
+            None,
+            None,
+        );
+        match call_creation_skill_analyzer(&creation_sidecar_url, &request).await {
+            Ok(analysis) => set_creation_skill_analysis_job(
+                &state_for_task,
+                &job_id_for_task,
+                "succeeded",
+                serde_json::to_value(analysis).ok(),
+                None,
+                None,
+            ),
+            Err(error) => {
+                let (code, message) = creation_skill_analysis_error(&error);
+                set_creation_skill_analysis_job(
+                    &state_for_task,
+                    &job_id_for_task,
+                    "failed",
+                    None,
+                    Some(code),
+                    Some(message),
+                );
+            }
+        }
+    });
+
+    Ok(Json(CreationSkillAnalysisJobCreateResponse {
+        job_id,
+        status: "pending".to_string(),
+    }))
+}
+
+pub async fn get_creation_skill_analysis_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<CreationSkillAnalysisJobStatusResponse>, ApiError> {
+    let jobs = state
+        .creation_skill_analysis_jobs
+        .lock()
+        .map_err(|_| ApiError::Internal("技能分析任务状态锁异常".to_string()))?;
+    let job = jobs
+        .get(&job_id)
+        .ok_or_else(|| ApiError::NotFound("技能分析任务不存在或已过期".to_string()))?;
+
+    Ok(Json(CreationSkillAnalysisJobStatusResponse {
+        id: job.id.clone(),
+        status: job.status.clone(),
+        result: job.result.clone(),
+        error_code: job.error_code.clone(),
+        error: job.error.clone(),
+        created_at_ms: job.created_at_ms,
+        updated_at_ms: job.updated_at_ms,
+    }))
+}
+
+fn validate_analysis_request(request: &AnalyzeCreationSkillRequest) -> Result<(), ApiError> {
     validate_source(&request.source_kind, &request.source_id)?;
     let title = request.document_title.trim();
     let content = request.document_content.trim();
@@ -152,9 +277,20 @@ pub async fn analyze_creation_skill(
             "文档内容需要在 20 到 80000 个字符之间".into(),
         ));
     }
+    Ok(())
+}
 
+async fn call_creation_skill_analyzer(
+    creation_sidecar_url: &str,
+    request: &AnalyzeCreationSkillRequest,
+) -> Result<CreationSkillAnalysis, ApiError> {
+    let title = request.document_title.trim();
+    let content = request.document_content.trim();
     let response = reqwest::Client::new()
-        .post("http://127.0.0.1:8001/creation/skills/analyze")
+        .post(format!(
+            "{}/creation/skills/analyze",
+            creation_sidecar_url.trim_end_matches('/')
+        ))
         .json(&AnalyzeCreationSkillPayload {
             document_title: title,
             document_content: content,
@@ -188,7 +324,43 @@ pub async fn analyze_creation_skill(
             message: format!("本地技能分析结果格式错误: {error}"),
         })?;
     validate_analysis(&analysis)?;
-    Ok(Json(analysis))
+    Ok(analysis)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn creation_skill_analysis_error(error: &ApiError) -> (String, String) {
+    match error {
+        ApiError::Upstream { code, message, .. } => (code.to_string(), message.clone()),
+        ApiError::BadRequest(message) => ("BAD_REQUEST".to_string(), message.clone()),
+        ApiError::NotFound(message) => ("NOT_FOUND".to_string(), message.clone()),
+        ApiError::Internal(message) => ("INTERNAL_ERROR".to_string(), message.clone()),
+        ApiError::Storage(_) => ("STORAGE_ERROR".to_string(), "数据库操作失败".to_string()),
+    }
+}
+
+fn set_creation_skill_analysis_job(
+    state: &Arc<AppState>,
+    job_id: &str,
+    status: &str,
+    result: Option<serde_json::Value>,
+    error_code: Option<String>,
+    error: Option<String>,
+) {
+    if let Ok(mut jobs) = state.creation_skill_analysis_jobs.lock() {
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.status = status.to_string();
+            job.result = result;
+            job.error_code = error_code;
+            job.error = error;
+            job.updated_at_ms = now_ms();
+        }
+    }
 }
 
 pub async fn list_creation_skills(
@@ -747,6 +919,103 @@ fn valid_distinctive_sections(sections: &[CreationSkillDistinctiveSection]) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use crate::storage::StorageManager;
+
+    async fn spawn_delayed_creation_skill_analyzer(delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "title": "技术方案写作法",
+            "summary": "用于把目标、约束和验证路径组织成完整技术方案。",
+            "common_titles": ["背景与目标", "方案如何落到执行"],
+            "title_style": "标题直接说明章节角色。",
+            "text_style": "先界定范围，再说明方案与验证。",
+            "diagram_style": "仅在关系复杂时使用流程图。",
+            "structure_pattern": ["背景与目标", "方案设计", "验证与验收"],
+            "section_headings": CreationSkillSectionHeadings::default(),
+            "field_examples": CreationSkillFieldExamples::default(),
+            "example_document": "示例正文".repeat(30),
+            "analysis_mode": "local_model"
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            tokio::time::sleep(delay).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            let _ = stream.shutdown().await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn analysis_job_returns_before_slow_model_and_keeps_result_for_polling() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StorageManager::open(&temp.path().join("test.db")).unwrap();
+        let creation_sidecar_url =
+            spawn_delayed_creation_skill_analyzer(Duration::from_millis(80)).await;
+        let state = AppState::with_service_urls(
+            storage,
+            "http://127.0.0.1:7071".to_string(),
+            creation_sidecar_url,
+            vec![],
+        );
+        let request = AnalyzeCreationSkillRequest {
+            source_kind: "bake_document".to_string(),
+            source_id: "document-1".to_string(),
+            document_title: "示例技术方案".to_string(),
+            document_content: "# 背景与目标\n说明目标与约束。\n## 方案设计\n说明实施和验证路径。"
+                .to_string(),
+            doc_type: "技术方案".to_string(),
+        };
+
+        let created = create_creation_skill_analysis_job(State(state.clone()), Json(request))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(created.status, "pending");
+
+        let initial =
+            get_creation_skill_analysis_job(State(state.clone()), Path(created.job_id.clone()))
+                .await
+                .unwrap()
+                .0;
+        assert!(matches!(initial.status.as_str(), "pending" | "running"));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let completed = loop {
+            let status =
+                get_creation_skill_analysis_job(State(state.clone()), Path(created.job_id.clone()))
+                    .await
+                    .unwrap()
+                    .0;
+            if status.status == "succeeded" || status.status == "failed" {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "技能分析任务未在测试时限内完成");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(completed.status, "succeeded");
+        assert_eq!(
+            completed
+                .result
+                .and_then(|value| value.get("analysis_mode").cloned()),
+            Some(serde_json::Value::String("local_model".to_string()))
+        );
+    }
 
     #[test]
     fn only_allows_known_document_sources() {

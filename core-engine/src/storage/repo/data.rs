@@ -13,6 +13,7 @@ use crate::storage::{
 
 const REPORT_FRESH_SECONDS: i64 = 15 * 60;
 const DATA_TEXT_MAX_CHARS: usize = 80_000;
+const DATA_MEMORY_VERSION: &str = "data-memory.v11";
 
 #[derive(Debug)]
 struct CaptureCandidate {
@@ -32,7 +33,6 @@ struct CaptureCandidate {
 
 #[derive(Debug)]
 struct TimelineDataContext {
-    content: String,
     capture_ids: Vec<i64>,
     observed_at: i64,
     metric_statements: Vec<Value>,
@@ -50,9 +50,36 @@ struct SemanticMetricRow {
 
 #[derive(Debug, Clone)]
 struct SemanticDataView {
+    title: String,
+    subject: String,
+    identity: String,
     summary: String,
     rows: Vec<SemanticMetricRow>,
     statements: Vec<Value>,
+    latest_observed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SemanticSubject {
+    display: String,
+    identity: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HistoricalRegenerationSummary {
+    regenerated_count: usize,
+    merged_count: usize,
+    rejected_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DataSourceLinkRecord {
+    source_ref_key: String,
+    capture_id: Option<i64>,
+    timeline_id: Option<i64>,
+    link_kind: String,
+    observed_at: i64,
+    created_at: i64,
 }
 
 impl StorageManager {
@@ -78,7 +105,8 @@ impl StorageManager {
                 candidates.push(row?);
             }
             for record in &mut candidates {
-                record.latest_snapshot = latest_snapshot(conn, record.id)?;
+                let latest = latest_snapshot(conn, record)?;
+                record.latest_snapshot = latest;
             }
             candidates.retain(is_presentable_data_source);
             if let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) {
@@ -135,7 +163,8 @@ impl StorageManager {
                 )
                 .optional()?;
             if let Some(record) = &mut record {
-                record.latest_snapshot = latest_snapshot(conn, record.id)?;
+                let latest = latest_snapshot(conn, record)?;
+                record.latest_snapshot = latest;
             }
             Ok(record)
         })
@@ -151,17 +180,35 @@ impl StorageManager {
         collected_at: i64,
     ) -> Result<DataSnapshotRecord, StorageError> {
         self.with_conn(|conn| {
-            let source_exists = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM data_sources
-                     WHERE id = ?1 AND deleted_at IS NULL",
-                [source_id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !source_exists {
-                return Err(StorageError::NotFound(format!("data source {source_id}")));
-            }
+            let mut source = conn
+                .query_row(
+                    "SELECT id, title, source_kind, source_url, access_mode, refresh_policy,
+                            realtime_level, source_app_name, source_window_title, tags,
+                            first_seen_at, last_seen_at, last_collected_at, last_success_at,
+                            last_error_code, status, created_at, updated_at
+                     FROM data_sources WHERE id = ?1 AND deleted_at IS NULL",
+                    [source_id],
+                    map_data_source_row,
+                )
+                .optional()?
+                .ok_or_else(|| StorageError::NotFound(format!("data source {source_id}")))?;
             let normalized_content = clip_text(content_text, DATA_TEXT_MAX_CHARS);
-            let structured_json = serde_json::to_string(structured_data)?;
+            let mut enriched_structured = structured_data.clone();
+            let semantic_context = semantic_context_for_source(
+                &source,
+                title.map(str::trim).filter(|value| !value.is_empty()),
+                None,
+            );
+            let semantic = semantic_view_for_content(
+                &normalized_content,
+                &enriched_structured,
+                Some(collected_at),
+                &semantic_context,
+            )
+            .map(semantic_view_to_json)
+            .unwrap_or_else(|| rejected_semantic_view_json("no_semantic_metric"));
+            merge_semantic_view(&mut enriched_structured, semantic);
+            let structured_json = serde_json::to_string(&enriched_structured)?;
             let content_hash = hash_text(&format!("{normalized_content}\n{structured_json}"));
             let provenance = json!({
                 "collector": collector,
@@ -199,11 +246,12 @@ impl StorageManager {
                 ],
             )?;
             if let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) {
+                source.title = clip_text(title, 240);
                 conn.execute(
                     "UPDATE data_sources SET title = ?2, last_collected_at = ?3,
                             last_success_at = ?3, last_error_code = NULL, status = 'active',
                             updated_at = ?3 WHERE id = ?1",
-                    params![source_id, clip_text(title, 240), collected_at],
+                    params![source_id, &source.title, collected_at],
                 )?;
             } else {
                 conn.execute(
@@ -213,7 +261,7 @@ impl StorageManager {
                     params![source_id, collected_at],
                 )?;
             }
-            latest_snapshot(conn, source_id)?.ok_or_else(|| {
+            latest_snapshot(conn, &source)?.ok_or_else(|| {
                 StorageError::NotFound(format!("data snapshot for source {source_id}"))
             })
         })
@@ -252,10 +300,14 @@ impl StorageManager {
         limit: usize,
     ) -> Result<DataExtractionSummary, StorageError> {
         self.with_conn(|conn| {
+            let regeneration = regenerate_legacy_data_memories(conn, limit.clamp(1, 5000))?;
             let (candidates, newest_capture_id, backfill_before_capture_id) =
                 load_capture_candidates(conn, limit.clamp(1, 5000))?;
             let mut summary = DataExtractionSummary {
                 scanned_count: candidates.len(),
+                historical_regenerated_count: regeneration.regenerated_count,
+                historical_merged_count: regeneration.merged_count,
+                historical_rejected_count: regeneration.rejected_count,
                 ..DataExtractionSummary::default()
             };
             let mut handled_work_timelines = HashSet::new();
@@ -299,12 +351,62 @@ impl StorageManager {
                     if !handled_work_timelines.contains(&timeline_id) {
                         handled_work_timelines.insert(timeline_id);
                         let context = load_timeline_data_context(conn, &candidate, timeline_id)?;
-                        if !context.metric_statements.is_empty() {
-                            let (created, snapshot_created) =
-                                upsert_work_memory(conn, &candidate, timeline_id, &context)?;
-                            summary.source_created_count += usize::from(created);
-                            summary.source_updated_count += usize::from(!created);
-                            summary.snapshot_created_count += usize::from(snapshot_created);
+                        let mut semantic_context = [
+                            candidate.timeline_summary.as_deref(),
+                            candidate.timeline_overview.as_deref(),
+                            candidate.timeline_details.as_deref(),
+                            candidate.webpage_title.as_deref(),
+                            candidate.win_title.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                        if let Some(timeline_topic) = candidate
+                            .timeline_overview
+                            .as_deref()
+                            .or(candidate.timeline_summary.as_deref())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            semantic_context
+                                .push_str(&format!("\ntimeline_topic:{timeline_topic}"));
+                        }
+                        if let Some(window_title) = candidate
+                            .webpage_title
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .or_else(|| {
+                                candidate
+                                    .win_title
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                            })
+                        {
+                            semantic_context.push_str(&format!("\nwindow_title:{window_title}"));
+                        }
+                        if let Some(app_name) = candidate.app_name.as_deref() {
+                            semantic_context.push_str(&format!("\napplication:{app_name}"));
+                        }
+                        let views = semantic_views_from_statements(
+                            &context.metric_statements,
+                            &semantic_context,
+                        );
+                        if !views.is_empty() {
+                            for view in views {
+                                let (created, snapshot_created) = upsert_work_memory_view(
+                                    conn,
+                                    &candidate,
+                                    timeline_id,
+                                    &context,
+                                    &view,
+                                )?;
+                                summary.source_created_count += usize::from(created);
+                                summary.source_updated_count += usize::from(!created);
+                                summary.snapshot_created_count += usize::from(snapshot_created);
+                            }
                             candidate_created = true;
                         }
                     }
@@ -316,6 +418,21 @@ impl StorageManager {
             }
             save_data_extraction_cursor(conn, newest_capture_id, backfill_before_capture_id)?;
             Ok(summary)
+        })
+    }
+
+    pub fn regenerate_historical_data_memories(
+        &self,
+        limit: usize,
+    ) -> Result<DataExtractionSummary, StorageError> {
+        self.with_conn(|conn| {
+            let regeneration = regenerate_legacy_data_memories(conn, limit.clamp(1, 5000))?;
+            Ok(DataExtractionSummary {
+                historical_regenerated_count: regeneration.regenerated_count,
+                historical_merged_count: regeneration.merged_count,
+                historical_rejected_count: regeneration.rejected_count,
+                ..DataExtractionSummary::default()
+            })
         })
     }
 
@@ -346,6 +463,446 @@ impl StorageManager {
         results.truncate(limit.clamp(1, 20));
         Ok(results)
     }
+}
+
+fn regenerate_legacy_data_memories(
+    conn: &Connection,
+    limit: usize,
+) -> Result<HistoricalRegenerationSummary, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT source.id
+         FROM data_sources source
+         WHERE source.deleted_at IS NULL
+           AND COALESCE(json_extract((
+               SELECT snapshot.structured_data
+               FROM data_snapshots snapshot
+               WHERE snapshot.source_id = source.id
+               ORDER BY snapshot.collected_at DESC, snapshot.id DESC
+               LIMIT 1
+           ), '$.extraction_version'), '') <> ?1
+         ORDER BY source.id ASC
+         LIMIT ?2",
+    )?;
+    let source_ids = stmt
+        .query_map(params![DATA_MEMORY_VERSION, limit as i64], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    if source_ids.is_empty() {
+        return Ok(HistoricalRegenerationSummary::default());
+    }
+
+    conn.execute_batch("SAVEPOINT regenerate_data_memory")?;
+    let result = regenerate_legacy_data_memories_inner(conn, &source_ids);
+    match result {
+        Ok(summary) => {
+            conn.execute_batch("RELEASE SAVEPOINT regenerate_data_memory")?;
+            Ok(summary)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT regenerate_data_memory;
+                 RELEASE SAVEPOINT regenerate_data_memory;",
+            );
+            Err(error)
+        }
+    }
+}
+
+fn regenerate_legacy_data_memories_inner(
+    conn: &Connection,
+    source_ids: &[i64],
+) -> Result<HistoricalRegenerationSummary, StorageError> {
+    let mut summary = HistoricalRegenerationSummary::default();
+    for source_id in source_ids {
+        let source = conn.query_row(
+            "SELECT id, title, source_kind, source_url, access_mode, refresh_policy,
+                    realtime_level, source_app_name, source_window_title, tags,
+                    first_seen_at, last_seen_at, last_collected_at, last_success_at,
+                    last_error_code, status, created_at, updated_at
+             FROM data_sources WHERE id = ?1 AND deleted_at IS NULL",
+            [source_id],
+            map_data_source_row,
+        )?;
+        let Some(snapshot) = raw_latest_snapshot(conn, *source_id)? else {
+            continue;
+        };
+        let previous_subject = snapshot
+            .structured_data
+            .get("semantic_subject")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let semantic_context = semantic_context_for_source(&source, None, previous_subject);
+        let views = semantic_views_for_content(
+            &snapshot.content_text,
+            &snapshot.structured_data,
+            snapshot.observed_at,
+            &semantic_context,
+        );
+        if source.source_kind == "work_memory" {
+            let best_view = views.into_iter().max_by_key(semantic_view_quality_score);
+            let Some(best_view) = best_view else {
+                persist_rejected_snapshot(conn, &snapshot)?;
+                summary.regenerated_count += 1;
+                summary.rejected_count += 1;
+                continue;
+            };
+            let merged = regenerate_work_memory_source(conn, &source, &snapshot, &[best_view])?;
+            summary.regenerated_count += 1;
+            summary.merged_count += merged;
+        } else {
+            let semantic = views
+                .into_iter()
+                .max_by_key(|view| view.rows.len() * 100 + view.summary.chars().count().min(260));
+            if let Some(view) = semantic {
+                persist_enriched_snapshot(conn, &snapshot, semantic_view_to_json(view))?;
+            } else {
+                persist_rejected_snapshot(conn, &snapshot)?;
+                summary.rejected_count += 1;
+            }
+            summary.regenerated_count += 1;
+        }
+    }
+    Ok(summary)
+}
+
+fn semantic_view_quality_score(view: &SemanticDataView) -> usize {
+    let dimension_count = view
+        .rows
+        .iter()
+        .filter(|row| !row.dimension.is_empty())
+        .count();
+    view.rows.len() * 1000
+        + dimension_count * 100
+        + view.title.chars().count().min(80)
+        + view.summary.chars().count().min(260)
+}
+
+fn regenerate_work_memory_source(
+    conn: &Connection,
+    source: &DataSourceRecord,
+    snapshot: &DataSnapshotRecord,
+    views: &[SemanticDataView],
+) -> Result<usize, StorageError> {
+    let links = load_data_source_links(conn, source.id)?;
+    let now = current_ts_ms();
+    let mut reused_legacy_source = false;
+    let mut merged_count = 0;
+    let mut first_target_id = None;
+    let mut first_target_snapshot_id = None;
+
+    for (index, view) in views.iter().enumerate() {
+        let scope = semantic_source_scope(
+            source.source_window_title.as_deref(),
+            source.source_app_name.as_deref(),
+            &format!("legacy-source:{}", source.id),
+        );
+        let identity_hash = hash_text(&format!("{scope}|{}", view.identity));
+        let key = format!("memory:semantic:{DATA_MEMORY_VERSION}:{identity_hash}");
+        let existing_target = conn
+            .query_row(
+                "SELECT id FROM data_sources WHERE canonical_key = ?1",
+                [&key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let target_id = if index == 0 && existing_target == Some(source.id) {
+            reused_legacy_source = true;
+            source.id
+        } else if index == 0 && existing_target.is_none() {
+            conn.execute(
+                "UPDATE data_sources SET canonical_key = ?2, updated_at = ?3 WHERE id = ?1",
+                params![source.id, key, now],
+            )?;
+            reused_legacy_source = true;
+            source.id
+        } else {
+            conn.execute(
+                "INSERT INTO data_sources (
+                    canonical_key, title, source_kind, source_url, access_mode,
+                    refresh_policy, realtime_level, source_app_name, source_window_title,
+                    tags, first_seen_at, last_seen_at, last_collected_at, last_success_at,
+                    last_error_code, status, created_at, updated_at
+                 ) VALUES (?1, ?2, 'work_memory', NULL, 'memory_only', 'never', 'observed',
+                           ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(canonical_key) DO UPDATE SET
+                    title = CASE
+                                WHEN excluded.last_seen_at >= data_sources.last_seen_at
+                                THEN excluded.title ELSE data_sources.title
+                            END,
+                    source_app_name = CASE
+                                WHEN excluded.last_seen_at >= data_sources.last_seen_at
+                                THEN excluded.source_app_name ELSE data_sources.source_app_name
+                            END,
+                    source_window_title = CASE
+                                WHEN excluded.last_seen_at >= data_sources.last_seen_at
+                                THEN excluded.source_window_title ELSE data_sources.source_window_title
+                            END,
+                    first_seen_at = MIN(data_sources.first_seen_at, excluded.first_seen_at),
+                    last_seen_at = MAX(data_sources.last_seen_at, excluded.last_seen_at),
+                    last_collected_at = MAX(COALESCE(data_sources.last_collected_at, 0), COALESCE(excluded.last_collected_at, 0)),
+                    last_success_at = MAX(COALESCE(data_sources.last_success_at, 0), COALESCE(excluded.last_success_at, 0)),
+                    updated_at = excluded.updated_at",
+                params![
+                    key,
+                    source.title,
+                    source.source_app_name,
+                    source.source_window_title,
+                    serde_json::to_string(&source.tags)?,
+                    source.first_seen_at,
+                    source.last_seen_at,
+                    source.last_collected_at,
+                    source.last_success_at,
+                    source.last_error_code,
+                    source.status,
+                    source.created_at,
+                    now,
+                ],
+            )?;
+            let target_id = source_id_for_key(conn, &key)?;
+            if existing_target.is_some() && target_id != source.id {
+                merged_count += 1;
+            }
+            target_id
+        };
+
+        if target_id != source.id {
+            duplicate_data_source_links(conn, target_id, &identity_hash, &links)?;
+        }
+        let target_snapshot_id = upsert_regenerated_work_snapshot(conn, target_id, snapshot, view)?;
+        if index == 0 {
+            first_target_id = Some(target_id);
+            first_target_snapshot_id = Some(target_snapshot_id);
+        }
+    }
+
+    if !reused_legacy_source {
+        if let (Some(target_id), Some(target_snapshot_id)) =
+            (first_target_id, first_target_snapshot_id)
+        {
+            conn.execute(
+                "UPDATE creation_evidence_assets
+                 SET source_id = ?2,
+                     data_snapshot_id = CASE WHEN data_snapshot_id = ?3 THEN ?4 ELSE data_snapshot_id END,
+                     updated_at = ?5
+                 WHERE source_id = ?1 OR data_snapshot_id = ?3",
+                params![source.id, target_id, snapshot.id, target_snapshot_id, now],
+            )?;
+        }
+        conn.execute(
+            "UPDATE data_sources
+             SET status = 'disabled', deleted_at = ?2, updated_at = ?2
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![source.id, now],
+        )?;
+    }
+    Ok(merged_count)
+}
+
+fn load_data_source_links(
+    conn: &Connection,
+    source_id: i64,
+) -> Result<Vec<DataSourceLinkRecord>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT source_ref_key, capture_id, timeline_id, link_kind, observed_at, created_at
+         FROM data_source_links WHERE source_id = ?1 ORDER BY id ASC",
+    )?;
+    let links = stmt
+        .query_map([source_id], |row| {
+            Ok(DataSourceLinkRecord {
+                source_ref_key: row.get(0)?,
+                capture_id: row.get(1)?,
+                timeline_id: row.get(2)?,
+                link_kind: row.get(3)?,
+                observed_at: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(links)
+}
+
+fn duplicate_data_source_links(
+    conn: &Connection,
+    target_id: i64,
+    identity_hash: &str,
+    links: &[DataSourceLinkRecord],
+) -> Result<(), StorageError> {
+    for link in links {
+        let ref_key = format!("{}:semantic:{}", link.source_ref_key, identity_hash);
+        let capture_id = match link.capture_id {
+            Some(capture_id)
+                if conn.query_row(
+                    "SELECT COUNT(*) > 0 FROM captures WHERE id = ?1",
+                    [capture_id],
+                    |row| row.get::<_, bool>(0),
+                )? =>
+            {
+                Some(capture_id)
+            }
+            _ => None,
+        };
+        let timeline_id = match link.timeline_id {
+            Some(timeline_id)
+                if conn.query_row(
+                    "SELECT COUNT(*) > 0 FROM timelines WHERE id = ?1",
+                    [timeline_id],
+                    |row| row.get::<_, bool>(0),
+                )? =>
+            {
+                Some(timeline_id)
+            }
+            _ => None,
+        };
+        conn.execute(
+            "INSERT OR IGNORE INTO data_source_links (
+                source_id, source_ref_key, capture_id, timeline_id, link_kind, observed_at, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                target_id,
+                ref_key,
+                capture_id,
+                timeline_id,
+                link.link_kind,
+                link.observed_at,
+                link.created_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn upsert_regenerated_work_snapshot(
+    conn: &Connection,
+    target_id: i64,
+    source_snapshot: &DataSnapshotRecord,
+    view: &SemanticDataView,
+) -> Result<i64, StorageError> {
+    let content = clip_text(&semantic_view_content(view), DATA_TEXT_MAX_CHARS);
+    let structured = semantic_view_to_json(view.clone());
+    let content_hash = hash_text(&format!("{content}\n{structured}"));
+    let observed_at = view
+        .latest_observed_at
+        .into_iter()
+        .chain(source_snapshot.observed_at)
+        .chain(std::iter::once(source_snapshot.collected_at))
+        .max()
+        .unwrap_or(source_snapshot.collected_at);
+    let mut provenance = source_snapshot.provenance.clone();
+    if !provenance.is_object() {
+        provenance = json!({});
+    }
+    if let Some(object) = provenance.as_object_mut() {
+        object.insert(
+            "generation_version".to_string(),
+            Value::String(DATA_MEMORY_VERSION.to_string()),
+        );
+        object.insert(
+            "semantic_identity".to_string(),
+            Value::String(view.identity.clone()),
+        );
+        object.insert("history_regenerated".to_string(), Value::Bool(true));
+    }
+    conn.execute(
+        "INSERT INTO data_snapshots (
+            source_id, collected_at, observed_at, collector, content_text, structured_data,
+            content_hash, freshness_ttl_seconds, provenance, source_capture_ids,
+            source_timeline_ids, status, created_at
+         ) VALUES (?1, ?2, ?3, 'memory_extract', ?4, ?5, ?6, 0, ?7, ?8, ?9, 'success', ?10)
+         ON CONFLICT(source_id) DO UPDATE SET
+            collected_at = excluded.collected_at,
+            observed_at = excluded.observed_at,
+            collector = excluded.collector,
+            content_text = excluded.content_text,
+            structured_data = excluded.structured_data,
+            content_hash = excluded.content_hash,
+            freshness_ttl_seconds = excluded.freshness_ttl_seconds,
+            provenance = excluded.provenance,
+            source_capture_ids = excluded.source_capture_ids,
+            source_timeline_ids = excluded.source_timeline_ids,
+            status = excluded.status,
+            created_at = excluded.created_at
+         WHERE excluded.observed_at >= COALESCE(data_snapshots.observed_at, data_snapshots.collected_at)",
+        params![
+            target_id,
+            observed_at,
+            observed_at,
+            content,
+            structured.to_string(),
+            content_hash,
+            provenance.to_string(),
+            serde_json::to_string(&source_snapshot.source_capture_ids)?,
+            serde_json::to_string(&source_snapshot.source_timeline_ids)?,
+            current_ts_ms(),
+        ],
+    )?;
+    conn.query_row(
+        "SELECT id FROM data_snapshots WHERE source_id = ?1 LIMIT 1",
+        [target_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(Into::into)
+}
+
+fn persist_enriched_snapshot(
+    conn: &Connection,
+    snapshot: &DataSnapshotRecord,
+    semantic: Value,
+) -> Result<(), StorageError> {
+    let mut structured = snapshot.structured_data.clone();
+    merge_semantic_view(&mut structured, semantic);
+    let content_hash = hash_text(&format!("{}\n{}", snapshot.content_text, structured));
+    conn.execute(
+        "UPDATE data_snapshots SET structured_data = ?2, content_hash = ?3 WHERE id = ?1",
+        params![snapshot.id, structured.to_string(), content_hash],
+    )?;
+    Ok(())
+}
+
+fn persist_rejected_snapshot(
+    conn: &Connection,
+    snapshot: &DataSnapshotRecord,
+) -> Result<(), StorageError> {
+    persist_enriched_snapshot(
+        conn,
+        snapshot,
+        rejected_semantic_view_json("no_semantic_metric"),
+    )
+}
+
+fn raw_latest_snapshot(
+    conn: &Connection,
+    source_id: i64,
+) -> Result<Option<DataSnapshotRecord>, StorageError> {
+    conn.query_row(
+        "SELECT id, source_id, collected_at, observed_at, collector, content_text,
+                structured_data, content_hash, freshness_ttl_seconds, provenance,
+                source_capture_ids, source_timeline_ids, status
+         FROM data_snapshots WHERE source_id = ?1
+         ORDER BY collected_at DESC, id DESC LIMIT 1",
+        [source_id],
+        |row| {
+            Ok(DataSnapshotRecord {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                collected_at: row.get(2)?,
+                observed_at: row.get(3)?,
+                collector: row.get(4)?,
+                content_text: row.get(5)?,
+                structured_data: parse_json_value(row.get::<_, String>(6)?, json!({})),
+                content_hash: row.get(7)?,
+                freshness_ttl_seconds: row.get(8)?,
+                provenance: parse_json_value(row.get::<_, String>(9)?, json!({})),
+                source_capture_ids: parse_json_i64(row.get::<_, String>(10)?),
+                source_timeline_ids: parse_json_i64(row.get::<_, String>(11)?),
+                status: row.get(12)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn load_capture_candidates(
@@ -536,15 +1093,27 @@ fn upsert_report_source(
     Ok(!existed)
 }
 
-fn upsert_work_memory(
+fn upsert_work_memory_view(
     conn: &Connection,
     candidate: &CaptureCandidate,
     timeline_id: i64,
     context: &TimelineDataContext,
+    view: &SemanticDataView,
 ) -> Result<(bool, bool), StorageError> {
-    let key = format!("memory:timeline:{timeline_id}");
+    let scope = semantic_source_scope(
+        candidate
+            .webpage_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .or(candidate.win_title.as_deref()),
+        candidate.app_name.as_deref(),
+        &format!("timeline:{timeline_id}"),
+    );
+    let identity_hash = hash_text(&format!("{scope}|{}", view.identity));
+    let key = format!("memory:semantic:{DATA_MEMORY_VERSION}:{identity_hash}");
     let existed = source_exists(conn, &key)?;
-    let title = clip_text(
+    let source_title = clip_text(
         candidate
             .timeline_summary
             .as_deref()
@@ -560,12 +1129,24 @@ fn upsert_work_memory(
          ) VALUES (?1, ?2, 'work_memory', 'memory_only', 'never', 'observed',
                    ?3, ?4, '[\"work_memory\"]', ?5, ?5, 'active', ?6, ?6)
          ON CONFLICT(canonical_key) DO UPDATE SET
-            title = excluded.title,
+            title = CASE
+                        WHEN excluded.last_seen_at >= data_sources.last_seen_at
+                        THEN excluded.title ELSE data_sources.title
+                    END,
+            source_app_name = CASE
+                        WHEN excluded.last_seen_at >= data_sources.last_seen_at
+                        THEN excluded.source_app_name ELSE data_sources.source_app_name
+                    END,
+            source_window_title = CASE
+                        WHEN excluded.last_seen_at >= data_sources.last_seen_at
+                        THEN excluded.source_window_title ELSE data_sources.source_window_title
+                    END,
+            first_seen_at = MIN(data_sources.first_seen_at, excluded.first_seen_at),
             last_seen_at = MAX(data_sources.last_seen_at, excluded.last_seen_at),
             updated_at = excluded.updated_at",
         params![
             key,
-            title,
+            source_title,
             candidate.app_name,
             candidate.win_title,
             candidate.ts,
@@ -574,7 +1155,7 @@ fn upsert_work_memory(
     )?;
     let source_id = source_id_for_key(conn, &key)?;
     for capture_id in &context.capture_ids {
-        let ref_key = format!("timeline:{timeline_id}:work_memory:{capture_id}");
+        let ref_key = format!("timeline:{timeline_id}:work_memory:{identity_hash}:{capture_id}");
         conn.execute(
             "INSERT OR IGNORE INTO data_source_links (
                 source_id, source_ref_key, capture_id, timeline_id, link_kind, observed_at, created_at
@@ -589,10 +1170,8 @@ fn upsert_work_memory(
             ],
         )?;
     }
-    let content = clip_text(&context.content, DATA_TEXT_MAX_CHARS);
-    let structured = semantic_view_from_statements(&context.metric_statements)
-        .map(semantic_view_to_json)
-        .unwrap_or_else(|| json!({}));
+    let content = clip_text(&semantic_view_content(view), DATA_TEXT_MAX_CHARS);
+    let structured = semantic_view_to_json(view.clone());
     let content_hash = hash_text(&format!("{content}\n{structured}"));
     let previous_hash = conn
         .query_row(
@@ -619,25 +1198,43 @@ fn upsert_work_memory(
             source_capture_ids = excluded.source_capture_ids,
             source_timeline_ids = excluded.source_timeline_ids,
             status = excluded.status,
-            created_at = excluded.created_at",
+            created_at = excluded.created_at
+         WHERE excluded.observed_at >= COALESCE(data_snapshots.observed_at, data_snapshots.collected_at)",
         params![
             source_id,
-            context.observed_at,
+            view.latest_observed_at.unwrap_or(context.observed_at),
             content,
             structured.to_string(),
             content_hash,
-            json!({"source": "timeline", "observed_at_is_lower_bound": true}).to_string(),
+            json!({
+                "source": "timeline",
+                "observed_at_is_lower_bound": true,
+                "semantic_subject": view.subject,
+        "semantic_identity": view.identity,
+                "semantic_scope": scope,
+                "generation_version": DATA_MEMORY_VERSION,
+            })
+            .to_string(),
             serde_json::to_string(&context.capture_ids)?,
             serde_json::to_string(&vec![timeline_id])?,
             now,
         ],
     )?;
-    let snapshot_changed = previous_hash.as_deref() != Some(content_hash.as_str());
+    let current_hash = conn.query_row(
+        "SELECT content_hash FROM data_snapshots WHERE source_id = ?1 LIMIT 1",
+        [source_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    let snapshot_changed = previous_hash.as_deref() != Some(current_hash.as_str());
     conn.execute(
         "UPDATE data_sources SET last_collected_at = MAX(COALESCE(last_collected_at, 0), ?2),
                 last_success_at = MAX(COALESCE(last_success_at, 0), ?2), updated_at = ?3
          WHERE id = ?1",
-        params![source_id, context.observed_at, now],
+        params![
+            source_id,
+            view.latest_observed_at.unwrap_or(context.observed_at),
+            now
+        ],
     )?;
     Ok((!existed, snapshot_changed))
 }
@@ -657,11 +1254,6 @@ fn load_timeline_data_context(
     .filter(|part| !part.trim().is_empty())
     .collect::<Vec<_>>()
     .join("\n");
-    let mut content_parts = if timeline_text.is_empty() {
-        Vec::new()
-    } else {
-        vec![timeline_text.clone()]
-    };
     let timeline_observed_at = candidate.timeline_updated_at_ms.unwrap_or(candidate.ts);
     let mut statements = metric_statements(&timeline_text, timeline_observed_at);
     let mut observed_at = if statements.is_empty() {
@@ -696,9 +1288,6 @@ fn load_timeline_data_context(
     for row in rows {
         let (capture_id, capture_ts, text) = row?;
         capture_ids.push(capture_id);
-        if !text.trim().is_empty() {
-            content_parts.push(text.clone());
-        }
         let mut capture_statements = metric_statements(&text, capture_ts);
         if !capture_statements.is_empty() {
             observed_at = observed_at.max(capture_ts);
@@ -709,7 +1298,6 @@ fn load_timeline_data_context(
     capture_ids.dedup();
     statements.truncate(80);
     Ok(TimelineDataContext {
-        content: content_parts.join("\n"),
         capture_ids,
         observed_at,
         metric_statements: statements,
@@ -748,57 +1336,1140 @@ fn data_source_matches_query(source: &DataSourceRecord, query: &str) -> bool {
     .contains(&query)
 }
 
-fn semantic_view_from_statements(statements: &[Value]) -> Option<SemanticDataView> {
-    let mut rows = Vec::new();
-    let mut accepted_statements = Vec::new();
-    let mut best_summary = String::new();
-    let mut best_score = 0_usize;
-
+fn semantic_views_from_statements(
+    statements: &[Value],
+    semantic_context: &str,
+) -> Vec<SemanticDataView> {
+    let mut views: Vec<SemanticDataView> = Vec::new();
     for statement_value in statements.iter().take(160) {
         let statement = statement_value
             .as_str()
             .or_else(|| statement_value.get("statement").and_then(Value::as_str))
             .unwrap_or_default();
         let observed_at = statement_value.get("observed_at").and_then(Value::as_i64);
-        let Some((statement_rows, summary)) = semantic_statement(statement, observed_at) else {
+        let Some((statement_rows, _)) = semantic_statement(statement, observed_at) else {
             continue;
         };
-        let summary_score = statement_rows.len() * 10 + summary.chars().count().min(180);
-        if summary_score > best_score {
-            best_score = summary_score;
-            best_summary = summary;
+        let subject = semantic_subject(statement, semantic_context, &statement_rows);
+        if rows_require_subject(&statement_rows) && subject.display.is_empty() {
+            continue;
         }
-        for row in statement_rows {
-            if !rows.iter().any(|existing: &SemanticMetricRow| {
-                existing.dimension.eq_ignore_ascii_case(&row.dimension)
-                    && existing.metric.eq_ignore_ascii_case(&row.metric)
-                    && existing.value.eq_ignore_ascii_case(&row.value)
-            }) {
-                rows.push(row);
-            }
+        let identity = semantic_identity_for_rows(&statement_rows, &subject.identity);
+        if identity.is_empty() {
+            continue;
         }
-        accepted_statements.push(json!({
+        let title = semantic_title_for_rows(&statement_rows, &subject.display);
+        let accepted_statement = json!({
             "statement": clip_text(statement, 500),
             "observed_at": observed_at,
-        }));
+        });
+        if let Some(existing) = views.iter_mut().find(|view| view.identity == identity) {
+            merge_semantic_rows(&mut existing.rows, statement_rows);
+            if !existing
+                .statements
+                .iter()
+                .any(|item| item == &accepted_statement)
+            {
+                existing.statements.push(accepted_statement);
+            }
+            existing.latest_observed_at = existing.latest_observed_at.max(observed_at);
+            existing.title = semantic_title_for_rows(&existing.rows, &existing.subject);
+            let insight = existing
+                .rows
+                .iter()
+                .find_map(|row| (!row.note.is_empty()).then_some(row.note.as_str()));
+            existing.summary = semantic_summary(&existing.title, &existing.rows, insight);
+        } else {
+            views.push(SemanticDataView {
+                title: title.clone(),
+                subject: subject.display,
+                identity,
+                summary: semantic_summary(&title, &statement_rows, None),
+                rows: statement_rows,
+                statements: vec![accepted_statement],
+                latest_observed_at: observed_at,
+            });
+        }
+    }
+    for view in &mut views {
+        view.rows.truncate(120);
+        view.statements.truncate(80);
+        let insight = view
+            .rows
+            .iter()
+            .find_map(|row| (!row.note.is_empty()).then_some(row.note.as_str()));
+        view.title = clip_text(&semantic_title_for_rows(&view.rows, &view.subject), 80);
+        view.summary = clip_text(&semantic_summary(&view.title, &view.rows, insight), 260);
+    }
+    // 最终质量门禁：提炼结果必须能脱离来源卡片独立说明“什么对象的什么指标、
+    // 值是多少”。尤其不能让“两类合计占比”这类缺少分类母体的标题直接通过。
+    views.retain(semantic_view_is_self_contained);
+    views.sort_by(|left, right| {
+        right
+            .latest_observed_at
+            .cmp(&left.latest_observed_at)
+            .then_with(|| right.rows.len().cmp(&left.rows.len()))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    views
+}
+
+fn semantic_view_is_self_contained(view: &SemanticDataView) -> bool {
+    if view.rows.is_empty() || view.title.trim().is_empty() || view.summary.trim().is_empty() {
+        return false;
+    }
+    if rows_require_subject(&view.rows) && view.subject.trim().is_empty() {
+        return false;
     }
 
-    if rows.is_empty() || best_summary.trim().is_empty() {
+    let title_and_summary = normalize_identity_text(&format!("{} {}", view.title, view.summary));
+    if !view.subject.trim().is_empty()
+        && !title_and_summary.contains(&normalize_identity_text(&view.subject))
+    {
+        return false;
+    }
+
+    let Some(first_row) = view.rows.first() else {
+        return false;
+    };
+    view.rows.iter().all(semantic_metric_row_is_plausible)
+        && title_and_summary.contains(&normalize_identity_text(&first_row.metric))
+        && title_and_summary.contains(&normalize_identity_text(&first_row.value))
+}
+
+fn semantic_metric_row_is_plausible(row: &SemanticMetricRow) -> bool {
+    let metric = row.metric.trim();
+    let value = row.value.trim().to_lowercase();
+    if metric.is_empty()
+        || metric.chars().count() > 36
+        || [
+            "此外",
+            "还涉及",
+            "提及了",
+            "用户随后",
+            "返回首页",
+            "个人中心",
+        ]
+        .iter()
+        .any(|marker| metric.contains(marker))
+    {
+        return false;
+    }
+
+    let metric_lower = metric.to_lowercase();
+    if metric_lower.contains("cpu")
+        && metric_lower.contains("内存")
+        && ["、", "及", "和"]
+            .iter()
+            .any(|separator| metric_lower.contains(separator))
+    {
+        return false;
+    }
+    let is_ratio = ["占比", "比例", "率", "增幅", "降幅", "同比", "环比"]
+        .iter()
+        .any(|marker| metric_lower.contains(marker));
+    if is_ratio
+        && !["%", "％", "百分点", "倍"]
+            .iter()
+            .any(|unit| value.contains(unit))
+        && !value_is_unit_interval(&value)
+    {
+        return false;
+    }
+
+    let is_money = [
+        "成本",
+        "收入",
+        "营收",
+        "gmv",
+        "销售额",
+        "利润",
+        "预算",
+        "金额",
+        "余额",
+        "资损",
+    ]
+    .iter()
+    .any(|marker| metric_lower.contains(marker));
+    if is_money
+        && !value.contains("元/秒")
+        && ["秒", "分钟", "小时", "gb", "tb", "mb", "kb"]
+            .iter()
+            .any(|unit| value.contains(unit))
+    {
+        return false;
+    }
+    if metric_lower.contains("成本") && value.ends_with('人') {
+        return false;
+    }
+    if ["耗时", "时长", "响应时间", "等待时间"]
+        .iter()
+        .any(|marker| metric_lower.contains(marker))
+        && !["毫秒", "秒", "分钟", "小时", "天", "倍"]
+            .iter()
+            .any(|unit| value.contains(unit))
+    {
+        return false;
+    }
+    true
+}
+
+fn value_is_unit_interval(value: &str) -> bool {
+    value
+        .trim()
+        .trim_start_matches(['+', '-'])
+        .parse::<f64>()
+        .is_ok_and(|number| (0.0..=1.0).contains(&number))
+}
+
+fn merge_semantic_rows(target: &mut Vec<SemanticMetricRow>, rows: Vec<SemanticMetricRow>) {
+    for row in rows {
+        if let Some(existing) = target.iter_mut().find(|existing| {
+            existing.dimension.eq_ignore_ascii_case(&row.dimension)
+                && existing.metric.eq_ignore_ascii_case(&row.metric)
+        }) {
+            if row.observed_at >= existing.observed_at {
+                *existing = row;
+            }
+        } else {
+            target.push(row);
+        }
+    }
+}
+
+fn semantic_identity_for_rows(rows: &[SemanticMetricRow], subject: &str) -> String {
+    let mut metrics = rows
+        .iter()
+        .map(|row| canonical_identity_metric(&row.metric))
+        .filter(|metric| !metric.is_empty())
+        .collect::<Vec<_>>();
+    metrics.sort();
+    metrics.dedup();
+    let metric_identity = metrics.join("|");
+    let subject_identity = normalize_identity_text(subject);
+    if subject_identity.is_empty() {
+        metric_identity
+    } else {
+        format!("{subject_identity}|{metric_identity}")
+    }
+}
+
+fn canonical_identity_metric(metric: &str) -> String {
+    let canonical = canonical_metric_label(metric);
+    let mut normalized = canonical.trim();
+    for prefix in [
+        "本周",
+        "上周",
+        "前一周",
+        "上一周",
+        "本月",
+        "上月",
+        "本季度",
+        "上季度",
+        "今年",
+        "去年",
+        "当前",
+        "整体",
+        "平均",
+        "日均",
+    ] {
+        if let Some(stripped) = normalized.strip_prefix(prefix) {
+            normalized = stripped.trim();
+            break;
+        }
+    }
+    normalize_identity_text(normalized)
+}
+
+fn semantic_title_for_rows(rows: &[SemanticMetricRow], subject: &str) -> String {
+    let metric_title = semantic_metric_title(rows);
+    if subject.is_empty() || metric_title.contains(subject) {
+        metric_title
+    } else if rows_describe_category_distribution(rows) && subject.ends_with("分类") {
+        format!("{subject}中{metric_title}")
+    } else {
+        format!("{subject} {metric_title}")
+    }
+}
+
+fn semantic_metric_title(rows: &[SemanticMetricRow]) -> String {
+    let mut metrics = rows
+        .iter()
+        .map(|row| canonical_metric_label(row.metric.trim()))
+        .filter(|metric| !metric.is_empty())
+        .collect::<Vec<_>>();
+    metrics.sort();
+    metrics.dedup();
+    let joined = metrics.join(" ").to_lowercase();
+    let has_comparison = rows
+        .iter()
+        .filter(|row| !row.dimension.trim().is_empty())
+        .map(|row| row.dimension.trim())
+        .collect::<HashSet<_>>()
+        .len()
+        >= 2;
+
+    if metrics.len() == 1 {
+        match canonical_identity_metric(&metrics[0]).as_str() {
+            "内存" => return "内存占用".to_string(),
+            "cpu" => return "CPU 使用情况".to_string(),
+            "存储" => return "存储占用".to_string(),
+            _ => {}
+        }
+    }
+
+    if joined.contains("gpu") && joined.contains("利用率") {
+        return if has_comparison {
+            "GPU 利用率对比".to_string()
+        } else {
+            "GPU 资源利用情况".to_string()
+        };
+    }
+    if joined.contains("cpu") && joined.contains("利用率") {
+        return if has_comparison {
+            "CPU 利用率对比".to_string()
+        } else {
+            "CPU 资源利用情况".to_string()
+        };
+    }
+    let change_metrics = metrics
+        .iter()
+        .filter(|metric| is_change_metric(metric))
+        .collect::<Vec<_>>();
+    let primary_metrics = metrics
+        .iter()
+        .filter(|metric| !is_change_metric(metric))
+        .collect::<Vec<_>>();
+    if primary_metrics.len() == 1 && !change_metrics.is_empty() {
+        let mut labels = vec![display_identity_metric(primary_metrics[0])];
+        labels.extend(
+            change_metrics
+                .iter()
+                .map(|metric| display_identity_metric(metric)),
+        );
+        labels.dedup();
+        let combined = labels.join("与");
+        if combined.chars().count() <= 48 {
+            return combined;
+        }
+        let change = if change_metrics.iter().any(|metric| metric.contains("环比")) {
+            "环比变化"
+        } else if change_metrics.iter().any(|metric| metric.contains("同比")) {
+            "同比变化"
+        } else {
+            "变化趋势"
+        };
+        return format!("{}与{change}", display_identity_metric(primary_metrics[0]));
+    }
+    if metrics.len() > 1 && metrics.iter().all(|metric| is_business_metric(metric)) {
+        return "经营业绩指标".to_string();
+    }
+    if metrics.len() > 1 && metrics.iter().all(|metric| is_reliability_metric(metric)) {
+        return "系统运行质量指标".to_string();
+    }
+    if metrics.len() > 1 && metrics.iter().all(|metric| is_resource_metric(metric)) {
+        return "资源使用与容量指标".to_string();
+    }
+    if let Some(metric) = primary_metrics.first().copied().or_else(|| metrics.first()) {
+        let metric = display_identity_metric(metric);
+        if has_comparison {
+            format!("{metric}对比")
+        } else if metrics.len() == 1 {
+            metric
+        } else {
+            let mut labels = metrics
+                .iter()
+                .take(3)
+                .map(|value| display_identity_metric(value))
+                .collect::<Vec<_>>();
+            labels.dedup();
+            let combined = labels.join("与");
+            if combined.chars().count() <= 36 {
+                combined
+            } else {
+                format!("{metric}等指标")
+            }
+        }
+    } else {
+        "数据指标概况".to_string()
+    }
+}
+
+fn semantic_subject(
+    statement: &str,
+    semantic_context: &str,
+    rows: &[SemanticMetricRow],
+) -> SemanticSubject {
+    let statement_lower = statement.to_lowercase();
+    let normalized_statement = normalize_identity_text(statement);
+    let requires_subject = rows_require_subject(rows);
+
+    let is_application_resource = !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| is_bare_application_resource_metric(&row.metric))
+        && [
+            "观察到",
+            "系统提示",
+            "资源占用",
+            "用量高",
+            "占用",
+            "使用量",
+            "负载",
+            "压力",
+        ]
+        .iter()
+        .any(|marker| statement_lower.contains(marker));
+    if is_application_resource {
+        if let Some(application) = semantic_context_value(semantic_context, "application:") {
+            let application = clip_text(application, 48);
+            return SemanticSubject {
+                display: application.clone(),
+                identity: application,
+            };
+        }
+    }
+
+    if let Some(explicit_subject) = explicit_product_subject(statement) {
+        return SemanticSubject {
+            display: explicit_subject.clone(),
+            identity: explicit_subject,
+        };
+    }
+
+    if let Some(previous_subject) = semantic_context_value(semantic_context, "previous_subject:")
+        .and_then(reliable_subject_label)
+        .filter(|subject| !subject_matches_document_window(subject, semantic_context))
+        .filter(|subject| normalized_statement.contains(&normalize_identity_text(subject.as_str())))
+    {
+        let normalized_subject = normalize_identity_text(&previous_subject);
+        let identity = if !normalized_subject.is_empty() {
+            previous_subject.clone()
+        } else {
+            String::new()
+        };
+        return SemanticSubject {
+            display: previous_subject,
+            identity,
+        };
+    }
+
+    if let Some(category_subject) = semantic_category_subject(statement, semantic_context, rows) {
+        return SemanticSubject {
+            display: category_subject.clone(),
+            identity: category_subject,
+        };
+    }
+
+    // 只有当前事实本身明确提到 AIGC 时才使用该主题，避免旧主题通过
+    // previous_subject 污染 OfoxAI、Doro AI 等无关页面的数据。
+    let raw_context_mentions_aigc = semantic_context.lines().any(|line| {
+        ![
+            "window_title:",
+            "timeline_topic:",
+            "application:",
+            "previous_subject:",
+        ]
+        .iter()
+        .any(|prefix| line.trim().starts_with(prefix))
+            && line.to_lowercase().contains("aigc")
+    });
+    if statement_lower.contains("aigc") {
+        let (display, explicitly_named) = if statement_lower.contains("垂类场景") {
+            ("AIGC 垂类场景", true)
+        } else if statement_lower.contains("推理成本") && statement_lower.contains("视频") {
+            ("AIGC 视频生成", statement_lower.contains("aigc"))
+        } else {
+            ("AIGC", statement_lower.contains("aigc"))
+        };
+        return SemanticSubject {
+            display: display.to_string(),
+            identity: if explicitly_named {
+                display.to_string()
+            } else {
+                String::new()
+            },
+        };
+    }
+
+    let timeline_title = stable_timeline_topic(semantic_context);
+    if raw_context_mentions_aigc && timeline_title.is_none() {
+        let display = if statement_lower.contains("垂类场景") {
+            "AIGC 垂类场景"
+        } else if statement_lower.contains("推理成本") && statement_lower.contains("视频") {
+            "AIGC 视频生成"
+        } else {
+            "AIGC"
+        };
+        return SemanticSubject {
+            display: display.to_string(),
+            identity: if statement_lower.contains("垂类场景") {
+                display.to_string()
+            } else {
+                String::new()
+            },
+        };
+    }
+
+    if let Some(explicit_subject) = explicit_metric_subject(statement, rows) {
+        return SemanticSubject {
+            display: explicit_subject.clone(),
+            identity: explicit_subject,
+        };
+    }
+
+    // 指标已经明确包含对象时，不再把页面或文档名称硬塞进标题。来源名称仍保留在
+    // data_sources/source_window_title、关联关系和 provenance 中用于追溯与召回。
+    if !requires_subject {
+        return SemanticSubject::default();
+    }
+
+    // “耗时 5 分钟”无法说明究竟是哪一步或哪项任务。即使时间线有一个宽泛主题，
+    // 也不能把该主题硬拼成业务对象；只有“同步请求耗时”等原文明示对象的指标才保留。
+    if rows.iter().all(|row| {
+        matches!(
+            canonical_identity_metric(&row.metric).as_str(),
+            "耗时" | "总耗时"
+        )
+    }) {
+        return SemanticSubject::default();
+    }
+
+    // 非文档型页面（产品台、报表页等）的稳定页面名可以作为业务对象；云文档、
+    // 周报、月会等标题只是来源载体，不能进入可复用标题和描述。
+    if !semantic_context_has_document_window(semantic_context) {
+        if let Some(source_title) = stable_window_title(semantic_context) {
+            return SemanticSubject {
+                display: source_title.clone(),
+                identity: source_title,
+            };
+        }
+    }
+
+    if !semantic_context_has_document_window(semantic_context) {
+        if let Some(source_title) = timeline_title {
+            return SemanticSubject {
+                display: contextual_subject_title(&source_title, rows),
+                identity: String::new(),
+            };
+        }
+    }
+
+    SemanticSubject::default()
+}
+
+fn semantic_context_has_document_window(semantic_context: &str) -> bool {
+    let Some(window_title) = semantic_context_value(semantic_context, "window_title:") else {
+        return false;
+    };
+    let normalized = normalize_identity_text(window_title);
+    window_title.contains("云文档")
+        || window_title.contains("在线文档")
+        || matches!(normalized.as_str(), "docs" | "googledocs")
+}
+
+fn subject_matches_document_window(subject: &str, semantic_context: &str) -> bool {
+    let Some(window_title) = stable_window_title(semantic_context) else {
+        return false;
+    };
+    let subject = normalize_identity_text(subject);
+    let window_title = normalize_identity_text(&window_title);
+    !subject.is_empty()
+        && !window_title.is_empty()
+        && (subject.starts_with(&window_title) || window_title.starts_with(&subject))
+}
+
+fn semantic_category_subject(
+    statement: &str,
+    semantic_context: &str,
+    rows: &[SemanticMetricRow],
+) -> Option<String> {
+    if !rows_describe_category_distribution(rows) {
         return None;
     }
-    rows.truncate(120);
-    accepted_statements.truncate(80);
-    Some(SemanticDataView {
-        summary: clip_text(&best_summary, 220),
-        rows,
-        statements: accepted_statements,
+    let context = format!("{statement}\n{semantic_context}").to_lowercase();
+    let metrics = rows
+        .iter()
+        .map(|row| normalize_identity_text(&row.metric))
+        .collect::<Vec<_>>()
+        .join("|");
+    let describes_generation_and_understanding =
+        metrics.contains("生成") && (metrics.contains("理解") || metrics.contains("音视频"));
+    if context.contains("ai") && describes_generation_and_understanding {
+        let subject = if context.contains("建设资产") {
+            "AI 建设资产分类"
+        } else if context.contains("能力") {
+            "AI 能力分类"
+        } else {
+            "AI 资产分类"
+        };
+        return Some(subject.to_string());
+    }
+    None
+}
+
+fn stable_window_title(semantic_context: &str) -> Option<String> {
+    semantic_context_value(semantic_context, "window_title:").and_then(reliable_source_title)
+}
+
+fn stable_timeline_topic(semantic_context: &str) -> Option<String> {
+    semantic_context_value(semantic_context, "timeline_topic:").and_then(reliable_topic_title)
+}
+
+fn explicit_product_subject(statement: &str) -> Option<String> {
+    // “智能风控体系RiskOS”这类写法中，产品名位于体系/系统/平台等载体词之后。
+    // 优先恢复这个显式对象，避免把相邻的 HC -300、HITL 等数值片段或方法论
+    // 缩写误当成数据主题。
+    let mut ascii_span_start = None;
+    for (index, ch) in statement
+        .char_indices()
+        .chain(std::iter::once((statement.len(), ' ')))
+    {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            ascii_span_start.get_or_insert(index);
+            continue;
+        }
+        let Some(start) = ascii_span_start.take() else {
+            continue;
+        };
+        let candidate = &statement[start..index];
+        if candidate.chars().count() < 4
+            || !candidate
+                .chars()
+                .any(|candidate_ch| candidate_ch.is_ascii_alphabetic())
+        {
+            continue;
+        }
+        let prefix = statement[..start].trim_end_matches(|prefix_ch: char| {
+            prefix_ch.is_whitespace() || "，,。；;：:（）()【】[]".contains(prefix_ch)
+        });
+        let suffix = statement[index..].trim_start_matches(|suffix_ch: char| {
+            suffix_ch.is_whitespace() || "，,。；;：:（）()【】[]".contains(suffix_ch)
+        });
+        if ["体系", "系统", "平台", "项目", "产品", "服务"]
+            .iter()
+            .any(|marker| prefix.ends_with(marker) || suffix.starts_with(marker))
+        {
+            return Some(candidate.to_string());
+        }
+    }
+
+    for suffix in ["平台", "系统"] {
+        let Some(position) = statement.find(suffix) else {
+            continue;
+        };
+        let prefix = statement[..position].trim();
+        let candidate = ["切换至", "切换到", "进入", "使用", "打开", "在"]
+            .iter()
+            .filter_map(|marker| {
+                prefix
+                    .rfind(marker)
+                    .map(|index| (index, &prefix[index + marker.len()..]))
+            })
+            .max_by_key(|(index, _)| *index)
+            .map(|(_, candidate)| candidate)
+            .unwrap_or(prefix)
+            .trim_matches(|ch: char| ch.is_whitespace() || "，,。；;：:（）()".contains(ch));
+        let normalized = normalize_identity_text(candidate);
+        if candidate.chars().count() >= 3
+            && candidate.chars().count() <= 24
+            && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+            && !["用户", "该", "这个", "当前"]
+                .iter()
+                .any(|generic| normalized == *generic)
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn explicit_metric_subject(statement: &str, rows: &[SemanticMetricRow]) -> Option<String> {
+    if rows.iter().any(|row| row.metric.contains("视频推理成本")) {
+        return Some("视频推理".to_string());
+    }
+
+    let mut candidates = statement
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+        .filter(|candidate| candidate.chars().count() >= 4)
+        .filter(|candidate| {
+            candidate
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic())
+        })
+        .filter(|candidate| {
+            let uppercase_count = candidate
+                .chars()
+                .filter(|ch| ch.is_ascii_uppercase())
+                .count();
+            candidate.contains('-') || uppercase_count >= 2
+        })
+        .filter(|candidate| {
+            ![
+                "AIGC", "GPU", "CPU", "GMV", "TOKEN", "COT", "YOY", "QPS", "GPUTL", "SMACC",
+                "SMACT", "SMOCC",
+            ]
+            .iter()
+            .any(|generic| candidate.to_uppercase() == *generic)
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(2);
+    match candidates.as_slice() {
+        [] => None,
+        [only] => Some(only.clone()),
+        [first, second] => Some(format!("{first} 与 {second}")),
+        _ => None,
+    }
+}
+
+fn semantic_context_for_source(
+    source: &DataSourceRecord,
+    observed_title: Option<&str>,
+    previous_subject: Option<&str>,
+) -> String {
+    let mut context = source.title.trim().to_string();
+    if !source.title.trim().is_empty() {
+        context.push_str(&format!("\ntimeline_topic:{}", source.title.trim()));
+    }
+    if let Some(window_title) = observed_title
+        .or(source.source_window_title.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        context.push_str(&format!("\nwindow_title:{window_title}"));
+    }
+    if let Some(application) = source
+        .source_app_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        context.push_str(&format!("\napplication:{application}"));
+    }
+    if let Some(previous_subject) = previous_subject
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        context.push_str(&format!("\nprevious_subject:{previous_subject}"));
+    }
+    context
+}
+
+fn contextual_subject_title(source_title: &str, rows: &[SemanticMetricRow]) -> String {
+    if rows_describe_category_distribution(rows) {
+        let suffix = "中的类别分布";
+        let max_base_chars = 48usize.saturating_sub(suffix.chars().count());
+        let base = source_title
+            .trim()
+            .chars()
+            .take(max_base_chars)
+            .collect::<String>();
+        format!("{base}{suffix}")
+    } else {
+        clip_text(source_title, 48)
+    }
+}
+
+fn semantic_context_value<'a>(context: &'a str, prefix: &str) -> Option<&'a str> {
+    context.lines().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix(prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn reliable_subject_label(value: &str) -> Option<String> {
+    let value = value.trim();
+    let normalized = normalize_identity_text(value);
+    if normalized.is_empty()
+        || normalized.chars().count() < 2
+        || value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '-'))
+        || generic_metric_family(value).is_some()
+    {
+        None
+    } else {
+        Some(clip_text(value, 48))
+    }
+}
+
+fn reliable_source_title(value: &str) -> Option<String> {
+    let mut title = value.trim().to_string();
+    for suffix in [
+        " - Google Chrome",
+        " — Google Chrome",
+        " - Chrome",
+        " — Chrome",
+        " - Safari",
+        " — Safari",
+        " - 云文档",
+        " — 云文档",
+        " - 飞书云文档",
+        " — 飞书云文档",
+        "（副本）",
+        " (副本)",
+        " - 副本",
+        " 副本",
+    ] {
+        if let Some(stripped) = title.strip_suffix(suffix) {
+            title = stripped.trim().to_string();
+        }
+    }
+    if title.contains('|') {
+        let mut breadcrumbs = Vec::new();
+        for part in title
+            .split('|')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            let normalized_part = normalize_identity_text(part);
+            if matches!(normalized_part.as_str(), "personalhome" | "home" | "首页")
+                || breadcrumbs.last().is_some_and(|previous: &String| {
+                    normalize_identity_text(previous) == normalized_part
+                })
+            {
+                continue;
+            }
+            breadcrumbs.push(part.to_string());
+        }
+        if !breadcrumbs.is_empty() {
+            title = breadcrumbs.join(" | ");
+        }
+    }
+    let normalized = normalize_identity_text(&title);
+    let generic_titles = [
+        "chatgpt",
+        "kimi",
+        "googlechrome",
+        "chrome",
+        "safari",
+        "memorybread",
+        "terminal",
+        "iterm",
+        "访达",
+        "finder",
+        "docs",
+        "googledocs",
+        "知识库",
+        "新标签页",
+        "无标题",
+    ];
+    if normalized.is_empty()
+        || normalized.chars().count() < 4
+        || generic_platform_scope(&normalized)
+        || generic_titles
+            .iter()
+            .any(|candidate| normalized == *candidate)
+        || generic_metric_family(&title).is_some()
+    {
+        None
+    } else {
+        Some(clip_text(&title, 48))
+    }
+}
+
+fn reliable_topic_title(value: &str) -> Option<String> {
+    let mut title = value.trim().trim_end_matches('…').trim().to_string();
+    for prefix in [
+        "用户参与了关于",
+        "用户正在推进",
+        "用户正在设计",
+        "用户正在处理",
+        "用户成功解决了",
+        "记录了",
+    ] {
+        if let Some(stripped) = title.strip_prefix(prefix) {
+            title = stripped.trim().to_string();
+            break;
+        }
+    }
+    if let Some(position) = title.find("的会议讨论") {
+        title.truncate(position);
+    } else if let Some(position) = title.find(['，', '。']) {
+        title.truncate(position);
+    }
+    title = title
+        .trim_matches(|ch: char| ch.is_whitespace() || "，,。；;：:".contains(ch))
+        .to_string();
+    let normalized = normalize_identity_text(&title);
+    if normalized.is_empty()
+        || normalized.chars().count() < 4
+        || generic_platform_scope(&normalized)
+        || generic_metric_family(&title).is_some()
+    {
+        None
+    } else {
+        Some(clip_text(&title, 48))
+    }
+}
+
+fn generic_platform_scope(normalized: &str) -> bool {
+    [
+        "projectsgitlab",
+        "gitlabprojects",
+        "mediaplayer",
+        "视频会议主窗口",
+    ]
+    .iter()
+    .any(|scope| normalized.contains(scope))
+}
+
+fn rows_require_subject(rows: &[SemanticMetricRow]) -> bool {
+    let all_generic = !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| generic_metric_family(&row.metric).is_some())
+        && !rows
+            .iter()
+            .any(|row| dimension_names_object(&row.dimension));
+    all_generic
+        || rows
+            .iter()
+            .any(|row| metric_requires_parent_scope(&row.metric))
+}
+
+fn metric_requires_parent_scope(metric: &str) -> bool {
+    let normalized = normalize_identity_text(&canonical_metric_label(metric));
+    let deictic = ["其中", "两者", "上述", "该类", "这类", "前两类"]
+        .iter()
+        .any(|marker| normalized.starts_with(marker))
+        || matches!(normalized.as_str(), "两类合计占比" | "两类合计比例");
+    let generic_ai_capability_pair = rows_metric_is_category_distribution(&normalized)
+        && normalized.contains("生成")
+        && (normalized.contains("理解") || normalized.contains("音视频"))
+        && !normalized.contains("ai建设资产分类");
+    deictic || generic_ai_capability_pair
+}
+
+fn rows_describe_category_distribution(rows: &[SemanticMetricRow]) -> bool {
+    !rows.is_empty()
+        && rows.iter().all(|row| {
+            rows_metric_is_category_distribution(&normalize_identity_text(&canonical_metric_label(
+                &row.metric,
+            )))
+        })
+}
+
+fn rows_metric_is_category_distribution(normalized_metric: &str) -> bool {
+    (normalized_metric.contains("占比") || normalized_metric.contains("比例"))
+        && ((normalized_metric.contains('类')
+            && (normalized_metric.contains("合计")
+                || normalized_metric.contains("两类")
+                || normalized_metric.contains("三类")
+                || normalized_metric.contains("各类")))
+            || normalized_metric.contains('与')
+            || normalized_metric.contains('和'))
+}
+
+fn dimension_names_object(dimension: &str) -> bool {
+    let dimension = dimension.trim();
+    !dimension.is_empty()
+        && !matches!(
+            dimension,
+            "本周"
+                | "上周"
+                | "前一周"
+                | "上一周"
+                | "本月"
+                | "上月"
+                | "本季度"
+                | "上季度"
+                | "今年"
+                | "去年"
+                | "当前"
+                | "此前"
+                | "之前"
+                | "昨日"
+                | "今日"
+                | "日峰"
+                | "峰值"
+                | "平均"
+                | "整体"
+                | "目标"
+                | "基准"
+                | "优化前"
+                | "优化后"
+        )
+}
+
+fn is_bare_application_resource_metric(metric: &str) -> bool {
+    matches!(
+        generic_metric_family(metric).as_deref(),
+        Some("内存") | Some("cpu") | Some("存储") | Some("负载")
+    ) || ["浏览器内存", "浏览器CPU", "浏览器存储", "浏览器负载"]
+        .iter()
+        .any(|resource| normalize_identity_text(metric) == normalize_identity_text(resource))
+}
+
+fn generic_metric_family(metric: &str) -> Option<String> {
+    let identity = canonical_identity_metric(metric);
+    let family = match identity.as_str() {
+        "gmv" => "gmv",
+        "收入" => "收入",
+        "营收" => "营收",
+        "成本" => "成本",
+        "利润" => "利润",
+        "毛利" => "毛利",
+        "订单" | "订单数" => "订单",
+        "销量" => "销量",
+        "销售额" => "销售额",
+        "库存" => "库存",
+        "预算" => "预算",
+        "金额" => "金额",
+        "余额" | "api余额" => "余额",
+        "用户数" => "用户数",
+        "客户数" => "客户数",
+        "内存" | "内存占用" => "内存",
+        "cpu" | "cpu占用" | "cpu使用率" => "cpu",
+        "存储" | "存储占用" => "存储",
+        "负载" => "负载",
+        "容量" => "容量",
+        "用量" => "用量",
+        "耗时" | "总耗时" => "耗时",
+        "token规模" | "token总量" | "token用量" => "token规模",
+        "qps" => "qps",
+        "pv" => "pv",
+        "uv" => "uv",
+        "dau" => "dau",
+        "mau" => "mau",
+        _ => return None,
+    };
+    Some(family.to_string())
+}
+
+fn display_identity_metric(metric: &str) -> String {
+    let normalized = metric.trim();
+    for prefix in [
+        "本周",
+        "上周",
+        "前一周",
+        "上一周",
+        "本月",
+        "上月",
+        "本季度",
+        "上季度",
+        "今年",
+        "去年",
+        "当前",
+        "整体",
+        "平均",
+        "日均",
+    ] {
+        if let Some(stripped) = normalized.strip_prefix(prefix) {
+            let stripped = stripped.trim();
+            if !stripped.is_empty() {
+                return stripped.to_string();
+            }
+        }
+    }
+    normalized.to_string()
+}
+
+fn is_change_metric(metric: &str) -> bool {
+    ["同比", "环比", "增幅", "降幅", "增长率", "下降率"]
+        .iter()
+        .any(|marker| metric.contains(marker))
+}
+
+fn is_business_metric(metric: &str) -> bool {
+    [
+        "收入",
+        "营收",
+        "GMV",
+        "销售",
+        "订单",
+        "销量",
+        "客单价",
+        "成本",
+        "利润",
+        "毛利",
+    ]
+    .iter()
+    .any(|marker| metric.to_lowercase().contains(&marker.to_lowercase()))
+        || is_change_metric(metric)
+}
+
+fn is_reliability_metric(metric: &str) -> bool {
+    [
+        "错误",
+        "成功",
+        "失败",
+        "请求",
+        "工单",
+        "告警",
+        "延迟",
+        "耗时",
+        "响应时间",
+        "QPS",
+    ]
+    .iter()
+    .any(|marker| metric.to_lowercase().contains(&marker.to_lowercase()))
+}
+
+fn is_resource_metric(metric: &str) -> bool {
+    [
+        "CPU",
+        "GPU",
+        "内存",
+        "存储",
+        "容量",
+        "用量",
+        "负载",
+        "利用率",
+        "SMACC",
+        "SMACT",
+        "SMOCC",
+        "GPUTL",
+    ]
+    .iter()
+    .any(|marker| metric.to_lowercase().contains(&marker.to_lowercase()))
+}
+
+fn semantic_summary(title: &str, rows: &[SemanticMetricRow], insight: Option<&str>) -> String {
+    let row_summary = summarize_rows(rows, insight);
+    if row_summary.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}：{row_summary}")
+    }
+}
+
+fn semantic_view_content(view: &SemanticDataView) -> String {
+    view.statements
+        .iter()
+        .filter_map(|item| item.get("statement").and_then(Value::as_str))
+        .filter(|statement| !statement.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rejected_semantic_view_json(reason: &str) -> Value {
+    json!({
+        "extraction_version": DATA_MEMORY_VERSION,
+        "title": "",
+        "summary": "",
+        "semantic_subject": "",
+        "semantic_identity": "",
+        "metric_rows": [],
+        "metric_statements": [],
+        "rejection_reason": reason,
     })
 }
 
 fn semantic_view_to_json(view: SemanticDataView) -> Value {
     json!({
-        "extraction_version": "data-memory.v2",
+        "extraction_version": DATA_MEMORY_VERSION,
+        "title": view.title,
         "summary": view.summary,
+        "semantic_subject": view.subject,
+        "semantic_identity": view.identity,
         "metric_rows": view.rows.into_iter().map(|row| json!({
             "dimension": row.dimension,
             "metric": row.metric,
@@ -811,42 +2482,73 @@ fn semantic_view_to_json(view: SemanticDataView) -> Value {
     })
 }
 
-fn semantic_view_for_snapshot(snapshot: &DataSnapshotRecord) -> Option<Value> {
-    if let Some(existing) = semantic_view_from_existing_v2(&snapshot.structured_data) {
-        return Some(semantic_view_to_json(existing));
-    }
+fn semantic_view_for_snapshot(
+    snapshot: &DataSnapshotRecord,
+    semantic_context: &str,
+) -> Option<Value> {
+    semantic_view_for_content(
+        &snapshot.content_text,
+        &snapshot.structured_data,
+        snapshot.observed_at,
+        semantic_context,
+    )
+    .map(semantic_view_to_json)
+}
 
-    let mut statements = snapshot
-        .structured_data
+fn semantic_view_for_content(
+    content_text: &str,
+    structured_data: &Value,
+    observed_at: Option<i64>,
+    semantic_context: &str,
+) -> Option<SemanticDataView> {
+    semantic_views_for_content(content_text, structured_data, observed_at, semantic_context)
+        .into_iter()
+        .max_by_key(|view| view.rows.len() * 100 + view.summary.chars().count().min(260))
+}
+
+fn semantic_views_for_content(
+    content_text: &str,
+    structured_data: &Value,
+    observed_at: Option<i64>,
+    semantic_context: &str,
+) -> Vec<SemanticDataView> {
+    if let Some(existing) = semantic_view_from_existing_v3(structured_data) {
+        return vec![existing];
+    }
+    let mut statements = structured_data
         .get("metric_statements")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if let Some(labels) = snapshot
-        .structured_data
+    if let Some(labels) = structured_data
         .get("metric_labels")
         .and_then(Value::as_array)
     {
         statements.extend(labels.iter().cloned());
     }
     statements.extend(
-        snapshot
-            .content_text
+        content_text
             .split(['\n', '。', '；', ';'])
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .take(160)
-            .map(|statement| json!({"statement": statement, "observed_at": snapshot.observed_at})),
+            .map(|statement| json!({"statement": statement, "observed_at": observed_at})),
     );
-    if let Some(view) = semantic_view_from_statements(&statements) {
-        return Some(semantic_view_to_json(view));
+    let views = semantic_views_from_statements(&statements, semantic_context);
+    if !views.is_empty() {
+        return views;
     }
 
-    semantic_view_from_tables(&snapshot.structured_data, snapshot.observed_at)
-        .map(semantic_view_to_json)
+    semantic_view_from_tables(structured_data, observed_at)
+        .into_iter()
+        .collect()
 }
 
-fn semantic_view_from_existing_v2(structured: &Value) -> Option<SemanticDataView> {
+fn semantic_view_from_existing_v3(structured: &Value) -> Option<SemanticDataView> {
+    if structured.get("extraction_version").and_then(Value::as_str) != Some(DATA_MEMORY_VERSION) {
+        return None;
+    }
+    let title = structured.get("title").and_then(Value::as_str)?.trim();
     let summary = structured.get("summary").and_then(Value::as_str)?.trim();
     let raw_rows = structured.get("metric_rows")?.as_array()?;
     let rows = raw_rows
@@ -888,15 +2590,33 @@ fn semantic_view_from_existing_v2(structured: &Value) -> Option<SemanticDataView
     if rows.is_empty() {
         return None;
     }
-    Some(SemanticDataView {
+    let subject = structured
+        .get("semantic_subject")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let identity = structured
+        .get("semantic_identity")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| semantic_identity_for_rows(&rows, &subject));
+    let view = SemanticDataView {
+        title: title.to_string(),
+        subject,
+        identity,
         summary: summary.to_string(),
+        latest_observed_at: rows.iter().filter_map(|row| row.observed_at).max(),
         rows,
         statements: structured
             .get("metric_statements")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default(),
-    })
+    };
+    semantic_view_is_self_contained(&view).then_some(view)
 }
 
 fn semantic_view_from_tables(
@@ -966,11 +2686,18 @@ fn semantic_view_from_tables(
         return None;
     }
     semantic_rows.truncate(120);
-    let summary = summarize_rows(&semantic_rows, None);
+    let subject = String::new();
+    let title = semantic_title_for_rows(&semantic_rows, &subject);
+    let identity = semantic_identity_for_rows(&semantic_rows, &subject);
+    let summary = semantic_summary(&title, &semantic_rows, None);
     Some(SemanticDataView {
+        title,
+        subject,
+        identity,
         summary,
         rows: semantic_rows,
         statements: Vec::new(),
+        latest_observed_at: observed_at,
     })
 }
 
@@ -1078,6 +2805,51 @@ fn normalize_identity_text(value: &str) -> String {
         .filter(|ch| !ch.is_whitespace() && !ch.is_ascii_punctuation())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn semantic_source_scope(
+    window_title: Option<&str>,
+    app_name: Option<&str>,
+    fallback: &str,
+) -> String {
+    let mut title = window_title.unwrap_or_default().trim().to_string();
+    for suffix in [
+        " - Google Chrome",
+        " — Google Chrome",
+        " - Chrome",
+        " — Chrome",
+        " - Safari",
+        " — Safari",
+    ] {
+        if let Some(stripped) = title.strip_suffix(suffix) {
+            title = stripped.trim().to_string();
+            break;
+        }
+    }
+    let normalized = normalize_identity_text(&title);
+    let normalized_app = normalize_identity_text(app_name.unwrap_or_default());
+    let generic_titles = [
+        "chatgpt",
+        "kim",
+        "googlechrome",
+        "chrome",
+        "safari",
+        "memorybread",
+        "terminal",
+        "iterm",
+        "访达",
+        "finder",
+        "知识库",
+    ];
+    let is_generic = normalized.is_empty()
+        || normalized.chars().count() < 4
+        || normalized == normalized_app
+        || generic_titles.iter().any(|value| normalized == *value);
+    if is_generic {
+        fallback.to_string()
+    } else {
+        format!("window:{normalized}")
+    }
 }
 
 fn freshness_for(source_kind: &str, age_seconds: i64) -> (&'static str, f64) {
@@ -1205,6 +2977,7 @@ struct NumericToken {
     start: usize,
     end: usize,
     value: String,
+    has_explicit_unit: bool,
 }
 
 fn semantic_statement(
@@ -1228,13 +3001,21 @@ fn semantic_statement(
         "saved to cloud",
         "type '/' for",
     ];
-    if ui_noise.iter().any(|marker| lower.contains(marker)) {
+    if ui_noise.iter().any(|marker| lower.contains(marker))
+        || statement_looks_like_navigation_noise(&lower)
+        || statement_has_corrupted_numeric_shorthand(&lower)
+    {
+        return None;
+    }
+    if !statement_is_data_assertion(&lower) {
         return None;
     }
     let mut rows = Vec::new();
     let mut inherited_metric = String::new();
     let mut inherited_dimension = String::new();
-    for clause in normalized.split(['，', ',', '；', ';']) {
+    for clause in split_metric_clauses(&normalized) {
+        // 维度只在同一分句内继承，避免“此前规模”污染下一分句的“单位成本”。
+        inherited_dimension.clear();
         let clause = clause.trim();
         if clause.is_empty() {
             continue;
@@ -1265,12 +3046,24 @@ fn semantic_statement(
             });
         }
     }
+    normalize_semantic_rows(&normalized, &mut rows);
+    rows.retain(semantic_metric_row_is_plausible);
     rows.dedup_by(|left, right| {
         left.dimension.eq_ignore_ascii_case(&right.dimension)
             && left.metric.eq_ignore_ascii_case(&right.metric)
             && left.value.eq_ignore_ascii_case(&right.value)
     });
     if rows.is_empty() {
+        return None;
+    }
+    let has_ambiguous_values = rows.iter().enumerate().any(|(index, row)| {
+        rows.iter().skip(index + 1).any(|other| {
+            other.dimension.eq_ignore_ascii_case(&row.dimension)
+                && other.metric.eq_ignore_ascii_case(&row.metric)
+                && other.value != row.value
+        })
+    });
+    if has_ambiguous_values {
         return None;
     }
     let insight = extract_statement_insight(&normalized);
@@ -1281,14 +3074,443 @@ fn semantic_statement(
     (!summary.trim().is_empty()).then_some((rows, summary))
 }
 
+fn split_metric_clauses(text: &str) -> Vec<&str> {
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    let indices = text.char_indices().collect::<Vec<_>>();
+    for (position, (byte_index, ch)) in indices.iter().enumerate() {
+        if !matches!(ch, '，' | ',' | '；' | ';') {
+            continue;
+        }
+        let is_number_separator = *ch == ','
+            && position > 0
+            && position + 1 < indices.len()
+            && indices[position - 1].1.is_ascii_digit()
+            && indices[position + 1].1.is_ascii_digit();
+        if is_number_separator {
+            continue;
+        }
+        clauses.push(&text[start..*byte_index]);
+        start = *byte_index + ch.len_utf8();
+    }
+    clauses.push(&text[start..]);
+    clauses
+}
+
+fn statement_looks_like_navigation_noise(lower: &str) -> bool {
+    let navigation_marker_count = [
+        "返回首页",
+        "个人中心",
+        "查看订单",
+        "查看明细",
+        "返回我的",
+        "预约成功",
+        "keyboard shortcuts",
+    ]
+    .iter()
+    .filter(|marker| lower.contains(**marker))
+    .count();
+    navigation_marker_count >= 2
+}
+
+fn statement_has_corrupted_numeric_shorthand(lower: &str) -> bool {
+    let chars = lower.chars().collect::<Vec<_>>();
+    chars
+        .windows(3)
+        .any(|window| window[0].is_ascii_digit() && window[1] == 'w' && window[2].is_ascii_digit())
+}
+
+fn statement_is_data_assertion(lower: &str) -> bool {
+    let assertion = lower
+        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '•' | '-' | '*' | '·'));
+    // 缺少比较主体的残句无法独立解释。“约为 X 的 N 倍”只有参照物、没有
+    // 被比较对象，强行提炼会把 X 错写成指标主体。
+    if ["约为", "约等于", "相当于"]
+        .iter()
+        .any(|marker| assertion.starts_with(marker))
+    {
+        return false;
+    }
+
+    const NEGATED_OR_HYPOTHETICAL: &[&str] = &[
+        "并不是",
+        "并非",
+        "不是文档中的",
+        "不属于",
+        "而不是",
+        "而非",
+        "仅用于举例",
+        "示例数据",
+        "数字来自另一",
+        "错误拼接",
+        "例如",
+        "比如",
+        "譬如",
+        "举例",
+        "示例",
+        "假设",
+        "数据库副本验证",
+        "测试夹具",
+        "test fixture",
+    ];
+    if NEGATED_OR_HYPOTHETICAL
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+
+    // 这些词表达建议、命令、禁止或待执行配置，而不是已发生/已观测的数据事实。
+    const DIRECTIVE_OR_MODAL: &[&str] = &[
+        "不要",
+        "别把",
+        "别将",
+        "应当",
+        "应该",
+        "不应",
+        "不得",
+        "请将",
+        "请把",
+        "需将",
+        "需把",
+        "需要将",
+        "需要把",
+        "务必",
+        "必须将",
+        "必须把",
+        "可以将",
+        "可以把",
+        "可将",
+        "可把",
+    ];
+    if DIRECTIVE_OR_MODAL
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+
+    const ADVISORY_MARKERS: &[&str] = &["建议", "最好"];
+    const CONFIGURATION_ACTIONS: &[&str] = &[
+        "把",
+        "将",
+        "设置",
+        "设为",
+        "设成",
+        "设定",
+        "调整",
+        "调到",
+        "改为",
+        "改成",
+        "降到",
+        "降至",
+        "提高到",
+        "提升到",
+        "控制在",
+        "限制为",
+    ];
+    !ADVISORY_MARKERS.iter().any(|advisory| {
+        lower.find(advisory).is_some_and(|position| {
+            let remainder = &lower[position + advisory.len()..];
+            CONFIGURATION_ACTIONS
+                .iter()
+                .any(|action| remainder.contains(action))
+        })
+    })
+}
+
+fn explicit_first_two_category_metric(statement: &str) -> Option<String> {
+    let reference_position = statement
+        .find("其中前两类")
+        .or_else(|| statement.find("前两类合计"))?;
+    let prefix = &statement[..reference_position];
+    let list_start = ["分为", "划分为", "包括", "包含"]
+        .iter()
+        .filter_map(|marker| prefix.rfind(marker).map(|position| position + marker.len()))
+        .max()?;
+    let category_list = prefix[list_start..].replace('和', "、");
+    let categories = category_list
+        .split(['、', '，', ','])
+        .filter_map(|item| {
+            let label = item
+                .split(['（', '('])
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|ch: char| {
+                    ch.is_whitespace() || "，,。；;：:（）()【】[]".contains(ch)
+                });
+            (label.chars().count() >= 2
+                && label.chars().count() <= 18
+                && !label.chars().any(|ch| ch.is_ascii_digit()))
+            .then(|| label.to_string())
+        })
+        .take(2)
+        .collect::<Vec<_>>();
+    match categories.as_slice() {
+        [first, second] => Some(format!("{first}与{second}两类合计占比")),
+        _ => None,
+    }
+}
+
+fn normalize_semantic_rows(statement: &str, rows: &mut Vec<SemanticMetricRow>) {
+    let first_two_categories = explicit_first_two_category_metric(statement);
+    for row in rows.iter_mut() {
+        if row.metric.contains("前两类合计占比") {
+            if let Some(metric) = first_two_categories.as_ref() {
+                row.metric = metric.clone();
+            }
+        }
+        if (row.value.contains('%') || row.value.contains('％'))
+            && row.metric.contains("生成")
+            && (row.metric.contains("理解") || row.metric.contains("音视频"))
+            && !row.metric.contains('类')
+        {
+            if let Some(prefix) = row.metric.strip_suffix("占比") {
+                row.metric = format!("{}两类合计占比", prefix.trim_end_matches("合计"));
+            } else if let Some(prefix) = row.metric.strip_suffix("比例") {
+                row.metric = format!("{}两类合计比例", prefix.trim_end_matches("合计"));
+            }
+        }
+        if row.metric.contains("本地模型分析") && row.metric.contains("同步耗时") {
+            row.metric = "本地模型分析同步耗时".to_string();
+        }
+        if (row.value.contains('%') || row.value.contains('％'))
+            && statement.to_lowercase().contains("llm")
+            && statement.contains("成本浪费")
+        {
+            row.metric = "LLM 成本浪费比例".to_string();
+        }
+        if (row.value.contains('%') || row.value.contains('％'))
+            && statement.contains("按订单金额")
+            && statement.contains("收取")
+        {
+            row.metric = "订单金额收费比例".to_string();
+        }
+        if statement.contains("GPU成本年化减少") {
+            row.metric = "GPU 成本年化节省金额".to_string();
+        }
+        if statement.contains("整轮")
+            && statement.contains("模型上游推理")
+            && ["毫秒", "秒", "分钟", "小时"]
+                .iter()
+                .any(|unit| row.value.contains(unit))
+        {
+            if row.metric == "耗时" || row.metric == "总耗时" {
+                row.metric = "整轮耗时".to_string();
+            } else if row.metric.contains("消耗") || row.metric.contains("推理") {
+                row.metric = "模型上游推理耗时".to_string();
+            }
+        }
+        if (row.value.contains('%') || row.value.contains('％'))
+            && statement.contains("批次预算")
+            && row.metric.contains("预算")
+        {
+            row.metric = "批次预算占比".to_string();
+        }
+        if row.metric.contains("垂类场景")
+            && (row.metric.contains("效率") || row.metric.contains("增幅"))
+        {
+            row.dimension = "目标".to_string();
+            row.metric = "优化效率增幅".to_string();
+        }
+        if row.value.trim().ends_with('人')
+            && row.metric.contains("成本")
+            && (statement.contains("降低人力成本") || statement.contains("人力成本降低"))
+        {
+            row.dimension = "目标".to_string();
+            row.metric = "人力缩减目标".to_string();
+        }
+        if (row.value.contains('%') || row.value.contains('％'))
+            && row.metric.contains("成本")
+            && ["压低", "降低", "下降"]
+                .iter()
+                .any(|marker| statement.contains(marker))
+        {
+            row.metric = format!("{}降幅", row.metric.trim_end_matches("降幅"));
+        }
+        if (row.value.contains('%') || row.value.contains('％'))
+            && row.metric.contains("成本")
+            && statement.to_lowercase().contains("yoy")
+        {
+            row.metric = format!("{}同比降幅", row.metric.trim_end_matches("降幅"));
+        }
+        if (row.value.contains('%') || row.value.contains('％'))
+            && statement.contains("视频推理成本")
+            && statement.contains("降幅")
+        {
+            row.dimension = "目标".to_string();
+            row.metric = "视频推理成本降幅".to_string();
+        }
+        if row.dimension == "目标" && row.metric.contains("目标") {
+            row.dimension.clear();
+        }
+        if let Some(metric) = row.metric.strip_prefix("浏览器") {
+            if !metric.trim().is_empty() && generic_metric_family(metric.trim()).is_some() {
+                row.metric = metric.trim().to_string();
+            }
+        }
+        if !row.dimension.is_empty() {
+            if let Some(metric) = row.metric.strip_prefix(&row.dimension) {
+                if !metric.trim().is_empty() && metric_is_meaningful(metric.trim()) {
+                    row.metric = metric.trim().to_string();
+                }
+            }
+        }
+    }
+
+    let budget_transition = statement.contains("输出预算")
+        && statement.contains('从')
+        && (statement.contains("降到") || statement.contains("降至"));
+    if budget_transition {
+        let mut budget_index = 0usize;
+        for row in rows.iter_mut().filter(|row| row.metric.contains("预算")) {
+            row.metric = "输出预算".to_string();
+            row.dimension = if budget_index == 0 {
+                "调整前".to_string()
+            } else {
+                "调整后".to_string()
+            };
+            budget_index += 1;
+        }
+    } else if statement.contains("后续重试") && statement.contains("预算") {
+        for row in rows.iter_mut().filter(|row| row.metric.contains("预算")) {
+            row.metric = "后续重试输出预算".to_string();
+        }
+    }
+
+    if statement.contains("人审量降低比例") && rows.len() >= 2 {
+        let mut ratio_index = 0usize;
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.value.contains('%') || row.value.contains('％'))
+        {
+            row.metric = "人审量降低比例".to_string();
+            row.dimension = if ratio_index == 0 {
+                "当前".to_string()
+            } else {
+                "目标".to_string()
+            };
+            ratio_index += 1;
+        }
+    }
+
+    let has_previous_token_scale = rows.iter().any(|row| {
+        row.metric.contains("Token 规模")
+            && !row.metric.ends_with("增幅")
+            && matches!(row.dimension.as_str(), "之前" | "此前")
+    });
+    if has_previous_token_scale {
+        for row in rows.iter_mut().filter(|row| {
+            row.metric.contains("Token 规模")
+                && !row.metric.ends_with("增幅")
+                && row.dimension.trim().is_empty()
+        }) {
+            row.dimension = "当前".to_string();
+        }
+    }
+    for row in rows.iter_mut().filter(|row| {
+        row.metric.contains("Token 规模")
+            && row.metric.ends_with("增幅")
+            && row.value.ends_with('倍')
+    }) {
+        row.dimension.clear();
+    }
+
+    let Some(cost_start) = statement.find("推理成本") else {
+        return;
+    };
+    let cost_clause = &statement[cost_start..];
+    let Some(from_start) = cost_clause.find('从') else {
+        return;
+    };
+    let before_transition = &cost_clause[..from_start];
+    let transition = &cost_clause[from_start + '从'.len_utf8()..];
+    let Some(to_start) = transition.find("降至") else {
+        return;
+    };
+    let before_text = transition[..to_start].trim();
+    let after_text = transition[to_start + "降至".len()..].trim();
+    let Some(before_token) = numeric_tokens(before_text).into_iter().next() else {
+        return;
+    };
+    let Some(after_token) = numeric_tokens(after_text).into_iter().next() else {
+        return;
+    };
+    let rate = numeric_tokens(before_transition)
+        .into_iter()
+        .rev()
+        .find(|token| token.value.contains('%') || token.value.contains('％'));
+    let scope = if cost_clause.contains("视频") {
+        "视频推理成本"
+    } else {
+        "推理成本"
+    };
+    let unit_suffix = if after_text[after_token.end..]
+        .trim_start()
+        .starts_with("/秒")
+    {
+        "/秒"
+    } else {
+        ""
+    };
+    let after_unit = after_token
+        .value
+        .chars()
+        .skip_while(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ','))
+        .collect::<String>();
+    let before_value = if before_token.has_explicit_unit {
+        format!("{}{}", before_token.value, unit_suffix)
+    } else {
+        format!("{}{}{}", before_token.value, after_unit, unit_suffix)
+    };
+    let after_value = format!("{}{}", after_token.value, unit_suffix);
+
+    rows.retain(|row| !row.metric.contains("成本"));
+    if let Some(rate) = rate {
+        rows.push(SemanticMetricRow {
+            dimension: "目标".to_string(),
+            metric: format!("{scope}降幅"),
+            value: rate.value,
+            note: String::new(),
+            statement: statement.to_string(),
+            observed_at: rows.first().and_then(|row| row.observed_at),
+        });
+    }
+    let observed_at = rows.first().and_then(|row| row.observed_at);
+    rows.push(SemanticMetricRow {
+        dimension: "优化前".to_string(),
+        metric: scope.to_string(),
+        value: before_value,
+        note: String::new(),
+        statement: statement.to_string(),
+        observed_at,
+    });
+    rows.push(SemanticMetricRow {
+        dimension: "优化后".to_string(),
+        metric: scope.to_string(),
+        value: after_value,
+        note: String::new(),
+        statement: statement.to_string(),
+        observed_at,
+    });
+}
+
 fn numeric_tokens(text: &str) -> Vec<NumericToken> {
     const UNITS: &[&str] = &[
         "个百分点",
+        "/百万token",
+        "/百万 token",
+        "tokens",
+        "token",
+        "元/秒",
         "万元",
         "亿元",
+        "万张",
         "毫秒",
         "分钟",
         "小时",
+        "人民币",
+        "美元",
         "％",
         "%",
         "gb",
@@ -1296,6 +3518,8 @@ fn numeric_tokens(text: &str) -> Vec<NumericToken> {
         "mb",
         "kb",
         "qps",
+        "亿",
+        "万",
         "元",
         "核",
         "个",
@@ -1304,6 +3528,7 @@ fn numeric_tokens(text: &str) -> Vec<NumericToken> {
         "类",
         "人",
         "集",
+        "倍",
         "秒",
     ];
     let chars = text.char_indices().collect::<Vec<_>>();
@@ -1311,7 +3536,10 @@ fn numeric_tokens(text: &str) -> Vec<NumericToken> {
     let mut index = 0;
     while index < chars.len() {
         let (start, ch) = chars[index];
-        if !ch.is_ascii_digit() || (index > 0 && chars[index - 1].1.is_ascii_digit()) {
+        if !ch.is_ascii_digit()
+            || (index > 0
+                && (chars[index - 1].1.is_ascii_alphanumeric() || chars[index - 1].1 == '.'))
+        {
             index += 1;
             continue;
         }
@@ -1337,16 +3565,24 @@ fn numeric_tokens(text: &str) -> Vec<NumericToken> {
         let whitespace_len = text[number_end..].len() - text[number_end..].trim_start().len();
         let unit_start = number_end + whitespace_len;
         let unit_tail = text[unit_start..].to_lowercase();
+        let quantity_modifier = ["多", "余"]
+            .iter()
+            .find(|modifier| unit_tail.starts_with(**modifier))
+            .copied()
+            .unwrap_or_default();
+        let unit_search_tail = unit_tail
+            .strip_prefix(quantity_modifier)
+            .unwrap_or(&unit_tail);
         let unit = UNITS
             .iter()
-            .filter(|unit| unit_tail.starts_with(**unit))
+            .filter(|unit| unit_search_tail.starts_with(**unit))
             .max_by_key(|unit| unit.len())
             .copied()
             .unwrap_or_default();
         let mut end = if unit.is_empty() {
             number_end
         } else {
-            unit_start + unit.len()
+            unit_start + quantity_modifier.len() + unit.len()
         };
         let range_tail = text[end..].trim_start();
         if matches!(range_tail.chars().next(), Some('-' | '~' | '～')) {
@@ -1380,8 +3616,22 @@ fn numeric_tokens(text: &str) -> Vec<NumericToken> {
             }
         }
         let value = text[start..end].trim().to_string();
-        if !value.is_empty() {
-            tokens.push(NumericToken { start, end, value });
+        let suffix = text[end..].trim_start();
+        let looks_like_list_ordinal =
+            unit.is_empty() && matches!(suffix.chars().next(), Some('、' | ')' | '）'));
+        let looks_like_identifier = unit.is_empty()
+            && (suffix
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic())
+                || text[..start].ends_with('+'));
+        if !value.is_empty() && !looks_like_list_ordinal && !looks_like_identifier {
+            tokens.push(NumericToken {
+                start,
+                end,
+                value,
+                has_explicit_unit: !unit.is_empty(),
+            });
         }
         while index < chars.len() && chars[index].0 < end {
             index += 1;
@@ -1398,6 +3648,48 @@ fn metric_for_token(
 ) -> Option<String> {
     let prefix = clause[..token.start].trim_end();
     let suffix = clause[token.end..].trim_start();
+    for (marker, change) in [
+        ("下降约", "降幅"),
+        ("降低约", "降幅"),
+        ("下降了", "降幅"),
+        ("降低了", "降幅"),
+        ("下降", "降幅"),
+        ("降低", "降幅"),
+        ("降了", "降幅"),
+        ("增长约", "增幅"),
+        ("增加约", "增幅"),
+        ("提升约", "增幅"),
+        ("增长了", "增幅"),
+        ("增加了", "增幅"),
+        ("提升了", "增幅"),
+        ("增长", "增幅"),
+        ("增加", "增幅"),
+        ("提升", "增幅"),
+    ] {
+        if let Some(raw_metric) = prefix.strip_suffix(marker) {
+            let raw_metric = clean_metric_label(raw_metric, dimension);
+            if matches!(raw_metric.as_str(), "同比" | "环比") {
+                continue;
+            }
+            if metric_is_meaningful(&raw_metric) {
+                return Some(format!("{}{change}", canonical_metric_label(&raw_metric)));
+            }
+            if let Some(known_metric) =
+                known_metric_near(&raw_metric, raw_metric.len(), raw_metric.len())
+            {
+                return Some(format!(
+                    "{}{change}",
+                    canonical_metric_label(&known_metric).trim_end_matches(change)
+                ));
+            }
+            if !inherited_metric.is_empty() {
+                return Some(format!(
+                    "{}{change}",
+                    canonical_metric_label(inherited_metric).trim_end_matches(change)
+                ));
+            }
+        }
+    }
     if ["需达到", "目标", "基准", "要求达到"]
         .iter()
         .any(|marker| prefix.ends_with(marker))
@@ -1406,11 +3698,35 @@ fn metric_for_token(
         return Some(format!("{}目标", inherited_metric.trim_end_matches("目标")));
     }
 
-    if let Some(metric) = known_metric_near(suffix, 0, 14) {
-        return Some(metric);
+    if token.has_explicit_unit
+        && !["并", "和", "及", "同时", "且", "、"]
+            .iter()
+            .any(|marker| suffix.starts_with(marker))
+    {
+        if let Some(metric) = known_metric_near(suffix, 0, 14) {
+            return Some(metric);
+        }
     }
 
-    let relation_markers = ["被认为", "仅为", "约为", "达到", "约", "为", "占", "是"];
+    let relation_markers = [
+        "压低最多",
+        "降低至",
+        "下降至",
+        "被认为",
+        "要求达到",
+        "高于",
+        "超过",
+        "仅为",
+        "只有",
+        "约为",
+        "达到",
+        "最多",
+        "近",
+        "约",
+        "为",
+        "占",
+        "是",
+    ];
     for relation in relation_markers {
         let Some(index) = prefix.rfind(relation) else {
             continue;
@@ -1430,7 +3746,14 @@ fn metric_for_token(
         }
     }
 
-    if let Some(metric) = known_metric_near(clause, token.start, 36) {
+    if let Some(metric) = known_metric_near(prefix, prefix.len(), 36) {
+        let contextual = clean_metric_label(prefix, dimension);
+        if contextual.chars().count() <= 36
+            && metric_is_meaningful(&contextual)
+            && normalize_identity_text(&contextual).contains(&normalize_identity_text(&metric))
+        {
+            return Some(canonical_metric_label(&contextual));
+        }
         return Some(metric);
     }
     if (!dimension.is_empty()
@@ -1448,6 +3771,9 @@ fn known_metric_near(text: &str, token_start: usize, max_distance: usize) -> Opt
     const MARKERS: &[(&str, &str)] = &[
         ("gpu 利用率", "GPU 利用率"),
         ("gpu利用率", "GPU 利用率"),
+        ("gpu 等待时间", "GPU 等待时间"),
+        ("gpu等待时间", "GPU 等待时间"),
+        ("等待时间", "等待时间"),
         ("smacc", "SMACC"),
         ("smact", "SMACT"),
         ("smocc", "SMOCC"),
@@ -1459,6 +3785,7 @@ fn known_metric_near(text: &str, token_start: usize, max_distance: usize) -> Opt
         ("转化率", "转化率"),
         ("完成率", "完成率"),
         ("达成率", "达成率"),
+        ("完成度", "任务完成度"),
         ("增长率", "增长率"),
         ("下降率", "下降率"),
         ("利用率", "利用率"),
@@ -1467,6 +3794,7 @@ fn known_metric_near(text: &str, token_start: usize, max_distance: usize) -> Opt
         ("成功率", "成功率"),
         ("命中率", "命中率"),
         ("留存率", "留存率"),
+        ("准确率", "准确率"),
         ("占比", "占比"),
         ("比例", "比例"),
         ("销售额", "销售额"),
@@ -1485,6 +3813,17 @@ fn known_metric_near(text: &str, token_start: usize, max_distance: usize) -> Opt
         ("响应时间", "响应时间"),
         ("处理时长", "处理时长"),
         ("执行时长", "执行时长"),
+        ("token 总量", "Token 规模"),
+        ("token总量", "Token 规模"),
+        ("token 规模", "Token 规模"),
+        ("token规模", "Token 规模"),
+        ("挽回资损", "资损挽回金额"),
+        ("资损挽回", "资损挽回金额"),
+        ("挽损", "资损挽回金额"),
+        ("资损", "资损挽回金额"),
+        ("账户余额", "账户余额"),
+        ("累计消耗", "累计消耗"),
+        ("消耗", "累计消耗"),
         ("收入", "收入"),
         ("营收", "营收"),
         ("成本", "成本"),
@@ -1531,10 +3870,18 @@ fn known_metric_near(text: &str, token_start: usize, max_distance: usize) -> Opt
 
 fn detect_dimension(prefix: &str) -> Option<String> {
     const DIMENSIONS: &[&str] = &[
+        "优化前",
+        "优化后",
+        "目标",
+        "基准",
+        "方案一",
+        "方案二",
         "国内",
         "海外",
         "本周",
         "上周",
+        "前一周",
+        "上一周",
         "本月",
         "上月",
         "本季度",
@@ -1548,6 +3895,8 @@ fn detect_dimension(prefix: &str) -> Option<String> {
         "峰值",
         "平均",
         "整体",
+        "之前",
+        "此前",
     ];
     DIMENSIONS
         .iter()
@@ -1558,17 +3907,23 @@ fn detect_dimension(prefix: &str) -> Option<String> {
 
 fn clean_metric_label(raw: &str, dimension: &str) -> String {
     let mut label = raw
-        .trim_matches(|ch: char| ch.is_whitespace() || "：:|/（）()【】[]".contains(ch))
+        .trim_matches(|ch: char| ch.is_whitespace() || "：:|/（）()【】[]•●".contains(ch))
         .to_string();
     for prefix in [
         "背景显示",
         "数据显示",
         "数据表明",
         "结果显示",
+        "显示",
         "对比发现",
         "其中",
         "其次",
         "另外",
+        "此外还提及了",
+        "此外，还提及了",
+        "此外还涉及了",
+        "此外，还涉及了",
+        "还涉及了",
     ] {
         if label.starts_with(prefix) {
             label = label[prefix.len()..].trim().to_string();
@@ -1613,8 +3968,14 @@ fn metric_is_meaningful(value: &str) -> bool {
     let lower = value.to_lowercase();
     if matches!(
         lower.as_str(),
-        "背景" | "数据显示" | "数据" | "类别" | "类型" | "类"
+        "id" | "ip" | "背景" | "数据显示" | "数据" | "类别" | "类型" | "类"
     ) {
+        return false;
+    }
+    if ["地址", "端口", "步骤", "文件", "第几", "编号", "版本"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
         return false;
     }
     const SEMANTIC_HINTS: &[&str] = &[
@@ -1630,8 +3991,6 @@ fn metric_is_meaningful(value: &str) -> bool {
         "销量",
         "销售额",
         "客单价",
-        "用户",
-        "客户",
         "活跃",
         "留存",
         "同比",
@@ -1670,26 +4029,201 @@ fn metric_is_meaningful(value: &str) -> bool {
         "smact",
         "smocc",
         "gputl",
+        "token",
+        "完成度",
+        "消耗",
     ];
     SEMANTIC_HINTS.iter().any(|hint| lower.contains(hint))
-        || (value.chars().all(|ch| ch.is_ascii_alphabetic()) && value.len() >= 2)
 }
 
 fn canonical_metric_label(value: &str) -> String {
+    let normalized_action = strip_metric_action_affixes(value);
+    let trimmed = normalized_action.trim();
+    for change in ["同比降幅", "环比降幅", "同比增幅", "环比增幅"] {
+        if let Some(base) = trimmed.strip_suffix(change) {
+            let base = canonical_metric_label(base);
+            if !base.is_empty() {
+                return format!("{base}{change}");
+            }
+        }
+    }
+    for change in ["降幅", "增幅"] {
+        if let Some(base) = trimmed.strip_suffix(change) {
+            let base = canonical_metric_label(base);
+            if !base.is_empty() {
+                return format!("{base}{change}");
+            }
+        }
+    }
+    if let Some(exact) = canonical_metric_label_exact(trimmed) {
+        return exact;
+    }
+    if let Some(known) = known_metric_near(trimmed, trimmed.len(), trimmed.len()) {
+        let compact = compact_contextual_metric(trimmed, &known);
+        let normalized = strip_metric_action_affixes(&compact);
+        return canonical_metric_label_exact(&normalized).unwrap_or(normalized);
+    }
+    trimmed.to_string()
+}
+
+fn strip_metric_action_affixes(value: &str) -> String {
+    let mut label = value.trim().to_string();
+    const ACTION_PREFIXES: &[&str] = &[
+        "累计产生",
+        "累计实现",
+        "累计达成",
+        "累计贡献",
+        "已经产生",
+        "已经实现",
+        "已经达成",
+        "已经贡献",
+        "已产生",
+        "已实现",
+        "已达成",
+        "已贡献",
+        "共产生",
+        "共实现",
+        "共达成",
+        "共贡献",
+        "产生",
+        "实现",
+        "达成",
+        "贡献",
+        "创造",
+        "带来",
+        "取得",
+        "同时把",
+        "同时将",
+        "把",
+        "将",
+    ];
+    loop {
+        let Some(stripped) = ACTION_PREFIXES
+            .iter()
+            .find_map(|prefix| label.strip_prefix(prefix))
+            .map(str::trim)
+            .filter(|remainder| metric_tail_is_recognizable(remainder))
+        else {
+            break;
+        };
+        label = stripped.to_string();
+    }
+    label
+}
+
+fn metric_tail_is_recognizable(value: &str) -> bool {
+    canonical_metric_label_exact(value).is_some()
+        || known_metric_near(value, value.len(), value.len()).is_some()
+}
+
+fn compact_contextual_metric(value: &str, known_metric: &str) -> String {
+    let mut label = value
+        .trim_matches(|ch: char| {
+            ch.is_whitespace() || "：:|/（）()【】[]“”\"'，,。；;".contains(ch)
+        })
+        .to_string();
+    if let Some(position) = label.rfind(|ch| matches!(ch, '：' | ':')) {
+        let separator_len = label[position..].chars().next().unwrap().len_utf8();
+        let before = label[..position].trim();
+        let after = label[position + separator_len..].trim();
+        label = if normalize_identity_text(before).contains(&normalize_identity_text(known_metric))
+        {
+            before.to_string()
+        } else {
+            after.to_string()
+        };
+    }
+    for marker in [
+        "背景显示",
+        "数据显示",
+        "数据表明",
+        "结果显示",
+        "对比发现",
+        "观察到",
+        "注意到",
+        "查看到",
+        "发现",
+    ] {
+        if let Some(position) = label.rfind(marker) {
+            label = label[position + marker.len()..].trim().to_string();
+        }
+    }
+    loop {
+        let previous = label.clone();
+        for prefix in [
+            "经过优化后",
+            "系统提示",
+            "指出",
+            "显示",
+            "表明",
+            "说明",
+            "可见",
+            "其中",
+            "其次",
+            "另外",
+            "约为",
+            "约",
+            "但",
+        ] {
+            if let Some(stripped) = label.strip_prefix(prefix) {
+                label = stripped
+                    .trim_matches(|ch: char| ch.is_whitespace() || "：:，,。；;“”\"'".contains(ch))
+                    .to_string();
+                break;
+            }
+        }
+        if label == previous {
+            break;
+        }
+    }
+    if label.starts_with("包括") {
+        if let Some(position) = label.rfind('、') {
+            let candidate = label[position + '、'.len_utf8()..].trim();
+            if normalize_identity_text(candidate).contains(&normalize_identity_text(known_metric)) {
+                label = candidate.to_string();
+            }
+        }
+    }
+    let lower = label.to_lowercase();
+    let marker = known_metric.to_lowercase();
+    if let Some(position) = lower.rfind(&marker) {
+        let end = position + marker.len();
+        if label.is_char_boundary(end) {
+            label.truncate(end);
+        }
+    }
+    if !normalize_identity_text(&label).contains(&normalize_identity_text(known_metric))
+        && known_metric.chars().count() >= 4
+    {
+        return known_metric.to_string();
+    }
+    label = label
+        .trim_matches(|ch: char| {
+            ch.is_whitespace() || "：:|/（）()【】[]“”\"'，,。；;的".contains(ch)
+        })
+        .to_string();
+    if label.is_empty() || label.chars().count() > 24 {
+        known_metric.to_string()
+    } else {
+        canonical_metric_label_exact(&label).unwrap_or(label)
+    }
+}
+
+fn canonical_metric_label_exact(value: &str) -> Option<String> {
     match value.trim().to_lowercase().as_str() {
-        "cpu" => "CPU".to_string(),
-        "gpu" | "gpu利用率" | "gpu 利用率" => "GPU 利用率".to_string(),
-        "dau" => "DAU".to_string(),
-        "mau" => "MAU".to_string(),
-        "gmv" => "GMV".to_string(),
-        "qps" => "QPS".to_string(),
-        "pv" => "PV".to_string(),
-        "uv" => "UV".to_string(),
-        "smacc" => "SMACC".to_string(),
-        "smact" => "SMACT".to_string(),
-        "smocc" => "SMOCC".to_string(),
-        "gputl" => "GPUTL".to_string(),
-        _ => value.trim().to_string(),
+        "cpu" => Some("CPU".to_string()),
+        "gpu" | "gpu利用率" | "gpu 利用率" => Some("GPU 利用率".to_string()),
+        "dau" => Some("DAU".to_string()),
+        "mau" => Some("MAU".to_string()),
+        "gmv" => Some("GMV".to_string()),
+        "qps" => Some("QPS".to_string()),
+        "pv" => Some("PV".to_string()),
+        "uv" => Some("UV".to_string()),
+        "smacc" => Some("SMACC".to_string()),
+        "smact" => Some("SMACT".to_string()),
+        "smocc" => Some("SMOCC".to_string()),
+        "gputl" => Some("GPUTL".to_string()),
+        _ => None,
     }
 }
 
@@ -1704,6 +4238,12 @@ fn extract_statement_insight(statement: &str) -> Option<String> {
     insight = insight
         .replace("存在掩盖低效的事实", "可能掩盖实际低效")
         .replace("存在掩盖低效的情况", "可能掩盖实际低效");
+    if ["的实", "的情", "的状", "以及", "并且"]
+        .iter()
+        .any(|ending| insight.ends_with(ending))
+    {
+        return None;
+    }
     (!insight.is_empty()).then_some(clip_text(&insight, 120))
 }
 
@@ -1725,6 +4265,22 @@ fn summarize_rows(rows: &[SemanticMetricRow], insight: Option<&str>) -> String {
                     .collect::<Vec<_>>()
                     .join("，")
             );
+            let extras = rows
+                .iter()
+                .filter(|row| row.metric != first.metric)
+                .take(3)
+                .map(|row| {
+                    if row.dimension.is_empty() {
+                        format!("{} {}", row.metric, row.value)
+                    } else {
+                        format!("{}{} {}", row.dimension, row.metric, row.value)
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !extras.is_empty() {
+                summary.push_str("，");
+                summary.push_str(&extras.join("，"));
+            }
         }
     }
     if summary.is_empty() {
@@ -1867,7 +4423,7 @@ fn source_id_for_key(conn: &Connection, key: &str) -> Result<i64, StorageError> 
 
 fn latest_snapshot(
     conn: &Connection,
-    source_id: i64,
+    source: &DataSourceRecord,
 ) -> Result<Option<DataSnapshotRecord>, StorageError> {
     let mut snapshot = conn
         .query_row(
@@ -1876,7 +4432,7 @@ fn latest_snapshot(
                 source_capture_ids, source_timeline_ids, status
          FROM data_snapshots WHERE source_id = ?1
          ORDER BY collected_at DESC, id DESC LIMIT 1",
-            [source_id],
+            [source.id],
             |row| {
                 Ok(DataSnapshotRecord {
                     id: row.get(0)?,
@@ -1903,7 +4459,7 @@ fn latest_snapshot(
              WHERE source_id = ?1
              ORDER BY observed_at DESC, id DESC",
         )?;
-        let links = stmt.query_map([source_id], |row| {
+        let links = stmt.query_map([source.id], |row| {
             Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?))
         })?;
         for link in links {
@@ -1919,9 +4475,17 @@ fn latest_snapshot(
         snapshot.source_capture_ids.dedup();
         snapshot.source_timeline_ids.sort_unstable();
         snapshot.source_timeline_ids.dedup();
-        if let Some(semantic) = semantic_view_for_snapshot(snapshot) {
-            merge_semantic_view(&mut snapshot.structured_data, semantic);
-        }
+        let semantic_context = semantic_context_for_source(
+            source,
+            None,
+            snapshot
+                .structured_data
+                .get("semantic_subject")
+                .and_then(Value::as_str),
+        );
+        let semantic = semantic_view_for_snapshot(snapshot, &semantic_context)
+            .unwrap_or_else(|| rejected_semantic_view_json("no_semantic_metric"));
+        merge_semantic_view(&mut snapshot.structured_data, semantic);
     }
     Ok(snapshot)
 }
@@ -1938,13 +4502,24 @@ fn merge_semantic_view(structured: &mut Value, semantic: Value) {
     };
     for key in [
         "extraction_version",
+        "title",
         "summary",
+        "semantic_subject",
+        "semantic_identity",
         "metric_rows",
         "metric_statements",
+        "rejection_reason",
     ] {
         if let Some(value) = fields.get(key) {
             target.insert(key.to_string(), value.clone());
         }
+    }
+    if fields
+        .get("metric_rows")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| !rows.is_empty())
+    {
+        target.remove("rejection_reason");
     }
 }
 
@@ -2033,6 +4608,391 @@ mod tests {
     }
 
     #[test]
+    fn preserves_stable_source_scope_for_parent_dependent_metrics() {
+        let views = semantic_views_from_statements(
+            &[json!({
+                "statement": "总体上，生成与理解两类合计占76%，作为跨BU复用的第一阶段主战场，文本推理类则以框架共享、知识隔离和效果评测为主要抓手",
+                "observed_at": 1785813798828_i64,
+            })],
+            "针对商业化、电商及本地生活三大业务线制定 AI 建设资产复用方案，将能力按最终产出归为生成式、音视频理解和文本推理三类\nwindow_title:商业体系-AI建设资产复用方案 - 云文档\napplication:Google Chrome",
+        );
+
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert_eq!(view.subject, "AI 建设资产分类");
+        assert_eq!(view.title, "AI 建设资产分类中生成与理解两类合计占比");
+        assert!(!view.summary.contains("商业体系-AI建设资产复用方案"));
+        assert!(view.summary.contains("生成与理解两类合计占比 76%"));
+        assert!(semantic_view_is_self_contained(view));
+
+        let compact_wording = semantic_views_from_statements(
+            &[json!({
+                "statement": "生成与理解占76%，是跨BU复用的首要抓手",
+                "observed_at": 1785813798828_i64,
+            })],
+            "window_title:商业体系-AI建设资产复用方案 - 云文档",
+        );
+        assert_eq!(compact_wording.len(), 1);
+        assert_eq!(compact_wording[0].subject, "AI 建设资产分类");
+        assert_eq!(
+            compact_wording[0].title,
+            "AI 建设资产分类中生成与理解两类合计占比"
+        );
+
+        let resolved_reference = semantic_views_from_statements(
+            &[json!({
+                "statement": "方案将 AI 能力分为生成式（9类）、音视频理解（7类）和文本推理（5类），其中前两类合计占比76%，作为复用主战场",
+                "observed_at": 1785813798828_i64,
+            })],
+            "window_title:商业体系-AI建设资产复用方案 - 云文档",
+        );
+        assert_eq!(resolved_reference.len(), 1);
+        assert_eq!(
+            resolved_reference[0].rows[0].metric,
+            "生成式与音视频理解两类合计占比"
+        );
+        assert!(resolved_reference[0]
+            .title
+            .contains("生成式与音视频理解两类合计占比"));
+        assert!(!resolved_reference[0]
+            .title
+            .contains("商业体系-AI建设资产复用方案"));
+
+        let cross_domain = semantic_views_from_statements(
+            &[json!({
+                "statement": "直营与代理两类合计占68%",
+                "observed_at": 1785813798828_i64,
+            })],
+            "window_title:渠道策略复盘 - 云文档",
+        );
+        assert_eq!(cross_domain.len(), 1);
+        assert_eq!(cross_domain[0].subject, "");
+        assert_eq!(cross_domain[0].title, "直营与代理两类合计占比");
+
+        let ordinary_metric = semantic_views_from_statements(
+            &[json!({
+                "statement": "工单成功率为92%",
+                "observed_at": 1785813798828_i64,
+            })],
+            "window_title:客服质量周报 - 云文档",
+        );
+        assert_eq!(ordinary_metric.len(), 1);
+        assert_eq!(ordinary_metric[0].subject, "");
+        assert_eq!(ordinary_metric[0].title, "工单成功率");
+
+        let self_contained_metric = semantic_views_from_statements(
+            &[json!({
+                "statement": "AI 图生成功能每日产出约 6 万张图片",
+                "observed_at": 1785819162753_i64,
+            })],
+            "timeline_topic:用户查阅了商业体系 AI 建设资产复用方案的云文档\nwindow_title:商业体系-AI建设资产复用方案 - 云文档\napplication:Google Chrome\nprevious_subject:商业体系-AI建设资产复用方案",
+        );
+        assert_eq!(self_contained_metric.len(), 1);
+        assert_eq!(self_contained_metric[0].subject, "");
+        assert_eq!(self_contained_metric[0].title, "AI 图生成功能每日产出");
+        assert_eq!(
+            self_contained_metric[0].summary,
+            "AI 图生成功能每日产出：AI 图生成功能每日产出 6 万张"
+        );
+
+        let missing_scope = semantic_views_from_statements(
+            &[json!({
+                "statement": "总体上，生成与理解两类合计占76%",
+                "observed_at": 1785813798828_i64,
+            })],
+            "application:Google Chrome",
+        );
+        assert!(missing_scope.is_empty());
+    }
+
+    #[test]
+    fn repairs_discourse_metrics_and_rejects_unit_or_navigation_noise() {
+        assert_eq!(
+            generic_metric_family("Token 规模").as_deref(),
+            Some("token规模")
+        );
+        let token_scale = semantic_views_from_statements(
+            &[json!({
+                "statement": "此外，还涉及了 token@鲜嘉麒的数据更新请求以及马达关于 Token 总量同比变化的汇报（前一周为 2000 多亿）",
+                "observed_at": 1785816879736_i64,
+            })],
+            "timeline_topic:用户参与了关于 AIGC 工程突击和商业化架构的会议讨论，并查看了相关文档\nwindow_title:Kim\nprevious_subject:AIGC",
+        );
+        assert_eq!(token_scale.len(), 1);
+        assert_eq!(token_scale[0].subject, "AIGC 工程突击和商业化架构");
+        assert_eq!(token_scale[0].rows[0].metric, "Token 规模");
+        assert_eq!(token_scale[0].rows[0].value, "2000 多亿");
+        assert_eq!(token_scale[0].title, "AIGC 工程突击和商业化架构 Token 规模");
+
+        let risk_recovery = semantic_views_from_statements(
+            &[json!({
+                "statement": "此外还提及了 RiskOS 风控体系建设以降低人力成本并挽回资损超过 3.96 亿的目标",
+                "observed_at": 1785817532850_i64,
+            })],
+            "timeline_topic:记录了商业化技术部 AI 业务月会纪要，总结了效果投放、线索广告及品牌营销\nwindow_title:商业化技术部AI业务月会-2026年7月 副本 - 云文档",
+        );
+        assert_eq!(risk_recovery.len(), 1);
+        assert_eq!(risk_recovery[0].subject, "RiskOS");
+        assert_eq!(risk_recovery[0].rows[0].metric, "资损挽回金额");
+        assert_eq!(risk_recovery[0].rows[0].value, "3.96 亿");
+        assert_eq!(risk_recovery[0].title, "RiskOS 资损挽回金额");
+
+        let workforce = semantic_views_from_statements(
+            &[json!({
+                "statement": "RiskOS 预计降低人力成本超 300 人并挽回资损近 4 亿元",
+                "observed_at": 1785817532850_i64,
+            })],
+            "window_title:商业化技术部AI业务月会-2026年7月 - 云文档",
+        );
+        assert_eq!(workforce.len(), 1);
+        assert!(workforce[0]
+            .rows
+            .iter()
+            .any(|row| row.metric == "人力缩减目标" && row.value == "300 人"));
+        assert!(workforce[0]
+            .rows
+            .iter()
+            .any(|row| row.metric == "资损挽回金额" && row.value == "4 亿元"));
+        assert!(!workforce[0].summary.contains("目标人力缩减目标"));
+
+        let explicit_system = semantic_views_from_statements(
+            &[json!({
+                "statement": "O2 建设行业领先的大模型+Agent智能风控体系RiskOS，推动人机协同（HITL）范式变革，全年HC降低>300，商业化年度成本资损挽回>3.96亿KR1：【KwaiBLM】商审大模型，统一内容理解+生成，构建Deepfake检测能力，账户/投中/复审全机审，HC -300，人+机总成本yoy-1%",
+                "observed_at": 1785817532850_i64,
+            })],
+            "window_title:Docs\napplication:Google Chrome",
+        );
+        assert_eq!(explicit_system.len(), 1);
+        assert_eq!(explicit_system[0].subject, "RiskOS");
+        assert_eq!(
+            explicit_system[0].title,
+            "RiskOS 资损挽回金额与人+机总成本同比降幅"
+        );
+
+        let missing_comparison_subject = semantic_views_from_statements(
+            &[json!({
+                "statement": "约为 OR-LLM-Agent 成本的7倍、耗时的3",
+                "observed_at": 1785817532850_i64,
+            })],
+            "timeline_topic:MemoryBread 项目的数据模块设计与采集工具落地工作\nwindow_title:ChatGPT",
+        );
+        assert!(missing_comparison_subject.is_empty());
+
+        let application_memory = semantic_views_from_statements(
+            &[json!({
+                "statement": "用户阅读过程中注意到浏览器内存占用较高（1.0GB）",
+                "observed_at": 1785817532850_i64,
+            })],
+            "window_title:商业体系-AI建设资产复用方案 - 云文档\napplication:Google Chrome",
+        );
+        assert_eq!(application_memory.len(), 1);
+        assert_eq!(application_memory[0].subject, "Google Chrome");
+        assert_eq!(application_memory[0].rows[0].metric, "内存");
+
+        let storage_capacity = semantic_views_from_statements(
+            &[json!({
+                "statement": "规格方面选用了2核4GB通用型实例，存储空间暂定为60GB",
+                "observed_at": 1785817532850_i64,
+            })],
+            "timeline_topic:MemoryBread 的数据采集与服务端架构\nwindow_title:ChatGPT\nprevious_subject:60GB",
+        );
+        assert_eq!(storage_capacity.len(), 1);
+        assert_eq!(
+            storage_capacity[0].subject,
+            "MemoryBread 的数据采集与服务端架构"
+        );
+        assert!(!storage_capacity[0].title.contains("60GB"));
+
+        let breadcrumb_title = semantic_views_from_statements(
+            &[json!({
+                "statement": "登录后系统显示新账户已创建但处于初始状态：API余额为0美元",
+                "observed_at": 1785817532850_i64,
+            })],
+            "window_title:Personal Home | OfoxAI | OfoxAI",
+        );
+        assert_eq!(breadcrumb_title.len(), 1);
+        assert_eq!(breadcrumb_title[0].subject, "OfoxAI");
+        assert_eq!(breadcrumb_title[0].title, "OfoxAI API余额");
+
+        let batch_budget = semantic_views_from_statements(
+            &[json!({
+                "statement": "近期优先只控制数据索引进度，最多75%批次预算处理新增记录，其余持续回填历史",
+                "observed_at": 1785817532850_i64,
+            })],
+            "timeline_topic:MemoryBread 的数据采集与服务端架构\nwindow_title:ChatGPT",
+        );
+        assert_eq!(batch_budget.len(), 1);
+        assert_eq!(batch_budget[0].rows[0].metric, "批次预算占比");
+
+        let conflicting_unit = semantic_views_from_statements(
+            &[json!({
+                "statement": "石山团队自部署模型的压测成本测算（约800 RH/10秒）",
+                "observed_at": 1785817532850_i64,
+            })],
+            "window_title:Kim",
+        );
+        assert!(conflicting_unit.is_empty());
+
+        let navigation = semantic_views_from_statements(
+            &[json!({
+                "statement": "体检预约成功，请您按时体检！返回首页 查看订单 个人中心 1",
+                "observed_at": 1785817532850_i64,
+            })],
+            "window_title:订单确认",
+        );
+        assert!(navigation.is_empty());
+
+        let decimal_rate = semantic_views_from_statements(
+            &[json!({
+                "statement": "图可达性任务上的准确率对比：Coconut（连续潜在推理）达到 0.98，明显超过 CoT（0.76）、加长版 CoT*（0.83）和完全不推理的 No CoT（0.75）",
+                "observed_at": 1785817532850_i64,
+            })],
+            "window_title:vedio-aigc",
+        );
+        assert_eq!(decimal_rate.len(), 1);
+        assert_eq!(decimal_rate[0].rows[0].metric, "图可达性任务上的准确率");
+        assert_eq!(decimal_rate[0].rows[0].value, "0.98");
+
+        let token_progress = semantic_views_from_statements(
+            &[json!({
+                "statement": "马达团队提供的关键指标：电商单日 Token 规模达到 3732.62 亿（从之前的 778 亿增长约 5 倍），单位 Token 成本下降 80.7%",
+                "observed_at": 1785817532850_i64,
+            })],
+            "timeline_topic:AIGC 工程突击和商业化架构\nwindow_title:Kim",
+        );
+        assert_eq!(token_progress.len(), 1);
+        assert!(token_progress[0].rows.iter().any(|row| {
+            row.dimension == "当前"
+                && row.metric == "电商单日 Token 规模"
+                && row.value == "3732.62 亿"
+        }));
+        assert!(token_progress[0].rows.iter().any(|row| {
+            row.dimension == "之前" && row.metric == "电商单日 Token 规模" && row.value == "778 亿"
+        }));
+        assert!(token_progress[0]
+            .rows
+            .iter()
+            .any(|row| row.metric == "Token 规模增幅" && row.value == "5 倍"));
+        assert!(token_progress[0]
+            .rows
+            .iter()
+            .any(|row| { row.metric == "单位 Token 成本降幅" && row.value == "80.7%" }));
+        assert!(token_progress[0].title.contains("单位 Token 成本降幅"));
+        assert!(token_progress[0].summary.contains("5 倍"));
+        assert!(token_progress[0].summary.contains("80.7%"));
+    }
+
+    #[test]
+    fn normalizes_recent_noisy_metrics_without_inventing_source_subjects() {
+        let category = semantic_views_from_statements(
+            &[json!({
+                "statement": "其中生成式和音视频理解能力合计占76%，被视为跨BU复用的主战场",
+                "observed_at": 1_i64,
+            })],
+            "window_title:商业体系-AI建设资产复用方案 - 云文档",
+        );
+        assert_eq!(category.len(), 1);
+        assert_eq!(
+            category[0].title,
+            "AI 建设资产分类中生成式和音视频理解能力两类合计占比"
+        );
+        assert!(!category[0].title.contains("合计两类合计"));
+
+        let budget = semantic_views_from_statements(
+            &[json!({
+                "statement": "后两次紧凑重试把输出预算从8192降到 4096，连续撞到长度上限",
+                "observed_at": 1_i64,
+            })],
+            "window_title:商业体系-AI建设资产复用方案 - 云文档",
+        );
+        assert_eq!(budget.len(), 1);
+        assert_eq!(budget[0].rows.len(), 2);
+        assert!(budget[0].rows.iter().any(|row| {
+            row.dimension == "调整前" && row.metric == "输出预算" && row.value == "8192"
+        }));
+        assert!(budget[0].rows.iter().any(|row| {
+            row.dimension == "调整后" && row.metric == "输出预算" && row.value == "4096"
+        }));
+
+        let retry_budget = semantic_views_from_statements(
+            &[json!({
+                "statement": "具体表现为首次调用即无效，后续重试将预算降至 4096 后连续撞上限",
+                "observed_at": 1_i64,
+            })],
+            "window_title:商业体系-AI建设资产复用方案 - 云文档",
+        );
+        assert_eq!(retry_budget.len(), 1);
+        assert_eq!(retry_budget[0].title, "后续重试输出预算");
+
+        let request_timing = semantic_views_from_statements(
+            &[json!({
+                "statement": "本地模型分析实际成功但因同步耗时过长（79-136秒）导致Webview连接中断",
+                "observed_at": 1_i64,
+            })],
+            "window_title:Kim",
+        );
+        assert_eq!(request_timing.len(), 1);
+        assert_eq!(request_timing[0].title, "本地模型分析同步耗时");
+
+        let fee = semantic_views_from_statements(
+            &[json!({"statement": "按订单金额的0.4%收取", "observed_at": 1_i64})],
+            "window_title:Kim",
+        );
+        assert_eq!(fee.len(), 1);
+        assert_eq!(fee[0].title, "订单金额收费比例");
+
+        let review_target = semantic_views_from_statements(
+            &[json!({
+                "statement": "将人审量降低比例由当前 16% 提升至 30% 左右",
+                "observed_at": 1_i64,
+            })],
+            "window_title:Kim",
+        );
+        assert_eq!(review_target.len(), 1);
+        assert_eq!(review_target[0].title, "人审量降低比例对比");
+        assert!(review_target[0]
+            .rows
+            .iter()
+            .any(|row| row.dimension == "目标" && row.value == "30%"));
+
+        let llm_waste = semantic_views_from_statements(
+            &[json!({
+                "statement": "一次任务，34 个 LLM turn，总输入 42.6 万 tokens，其中出现了约 96% 的成本浪费",
+                "observed_at": 1_i64,
+            })],
+            "window_title:Projects · GitLab",
+        );
+        assert_eq!(llm_waste.len(), 1);
+        assert_eq!(llm_waste[0].title, "LLM 成本浪费比例");
+        assert!(!llm_waste[0].title.contains("GitLab"));
+
+        let gpu_savings = semantic_views_from_statements(
+            &[json!({
+                "statement": "会议明确了北极星指标为GPU成本年化减少3533.4万元",
+                "observed_at": 1_i64,
+            })],
+            "window_title:MediaPlayer",
+        );
+        assert_eq!(gpu_savings.len(), 1);
+        assert_eq!(gpu_savings[0].title, "GPU 成本年化节省金额");
+
+        let unattributed_resources = semantic_views_from_statements(
+            &[json!({
+                "statement": "CPU、内存及各类资源的获取量与饱和度均为 0%",
+                "observed_at": 1_i64,
+            })],
+            "window_title:组织管理",
+        );
+        assert!(unattributed_resources.is_empty());
+
+        let bare_duration = semantic_views_from_statements(
+            &[json!({"statement": "耗时约 5 分钟", "observed_at": 1_i64})],
+            "timeline_topic:用户正在设计 MemoryBread 的数据采集与服务端架构\nwindow_title:ChatGPT",
+        );
+        assert!(bare_duration.is_empty());
+    }
+
+    #[test]
     fn builds_explainable_gpu_summary_and_metric_table() {
         let statement = "背景显示国内日均 GPU 利用率为 42%，海外为 47%，但 GPUTL 无法反映硅片内 SM 的实际使用情况，存在掩盖低效的事实";
         let (rows, summary) = semantic_statement(statement, Some(1700000000000)).unwrap();
@@ -2048,6 +5008,15 @@ mod tests {
             summary,
             "日均 GPU 利用率：国内 42%，海外 47%；GPUTL 无法反映硅片内 SM 的实际使用情况，可能掩盖实际低效"
         );
+
+        let (clipped_rows, clipped_summary) = semantic_statement(
+            "显示国内日均GPU 利用率为42%，海外为47%，但GPUTL 无法反映硅片内SM的实",
+            Some(1700000000000),
+        )
+        .unwrap();
+        assert_eq!(clipped_rows[0].metric, "日均GPU 利用率");
+        assert_eq!(clipped_rows[1].metric, "日均GPU 利用率");
+        assert!(!clipped_summary.contains("硅片内SM的实"));
     }
 
     #[test]
@@ -2059,6 +5028,513 @@ mod tests {
         assert_eq!(rows[0].value, "1200");
         assert_eq!(rows[1].metric, "环比增长");
         assert_eq!(rows[1].value, "8%");
+    }
+
+    #[test]
+    fn builds_value_free_title_and_explanatory_summary() {
+        let views = semantic_views_from_statements(
+            &[json!({
+                "statement": "背景显示国内日均 GPU 利用率为 42%，海外为 47%，但 GPUTL 可能掩盖实际低效",
+                "observed_at": 1700000000000_i64,
+            })],
+            "",
+        );
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].title, "GPU 利用率对比");
+        assert!(!views[0].title.chars().any(|ch| ch.is_ascii_digit()));
+        assert!(views[0].summary.starts_with("GPU 利用率对比："));
+        assert!(views[0].summary.contains("国内 42%"));
+        assert!(views[0].summary.contains("海外 47%"));
+        let structured = semantic_view_to_json(views[0].clone());
+        assert_eq!(structured["semantic_subject"], "");
+        assert_eq!(structured["extraction_version"], DATA_MEMORY_VERSION);
+        assert_eq!(structured["title"], "GPU 利用率对比");
+    }
+
+    #[test]
+    fn normalizes_sentence_fragments_into_concise_metric_titles() {
+        let views = semantic_views_from_statements(
+            &[json!({
+                "statement": "数据显示电商单日 Token 用量从年初的 700，同比增长率高达 55.75%",
+                "observed_at": 1700000000000_i64,
+            })],
+            "",
+        );
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].title, "电商单日 Token 用量与同比增长率");
+        assert!(!views[0].title.contains("数据显示"));
+        assert!(!views[0].title.contains("从年初"));
+        assert!(views[0].summary.contains("700"));
+        assert!(views[0].summary.contains("55.75%"));
+
+        let cost = semantic_views_from_statements(
+            &[json!({
+                "statement": "单位 Token 成本降了 80.7%",
+            })],
+            "",
+        );
+        assert_eq!(cost[0].title, "单位 Token 成本降幅");
+    }
+
+    #[test]
+    fn separates_result_actions_from_metric_identity_for_deduplication() {
+        let views = semantic_views_from_statements(
+            &[
+                json!({
+                    "statement": "近一周日均发布素材约19.97万条，产生GMV 42.14万元",
+                    "observed_at": 2_i64,
+                }),
+                json!({
+                    "statement": "相关素材近一周日均发布19.97万、日均GMV 42.14万元",
+                    "observed_at": 1_i64,
+                }),
+            ],
+            "AI 基座中心 AIGC 绩效\napplication:Google Chrome",
+        );
+
+        let gmv_views = views
+            .iter()
+            .filter(|view| view.identity == "gmv")
+            .collect::<Vec<_>>();
+        assert_eq!(gmv_views.len(), 1);
+        assert_eq!(gmv_views[0].title, "AIGC GMV");
+        assert_eq!(gmv_views[0].rows[0].metric, "GMV");
+
+        for (actionized, canonical) in [
+            ("实现营收", "营收"),
+            ("达成订单数", "订单数"),
+            ("贡献利润", "利润"),
+        ] {
+            assert_eq!(
+                canonical_identity_metric(actionized),
+                canonical_identity_metric(canonical)
+            );
+        }
+    }
+
+    #[test]
+    fn adds_application_subject_to_generic_resource_titles() {
+        let views = semantic_views_from_statements(
+            &[json!({
+                "statement": "用户因多人在线编辑切换至只读模式，期间还观察到内存占用较高（约1GB）",
+                "observed_at": 1_i64,
+            })],
+            "商业体系 AI 建设资产复用方案\napplication:Google Chrome",
+        );
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].subject, "Google Chrome");
+        assert_eq!(views[0].title, "Google Chrome 内存占用");
+    }
+
+    #[test]
+    fn requires_a_reliable_subject_for_bare_metrics() {
+        let rejected = semantic_views_from_statements(
+            &[json!({"statement": "内存约1GB", "observed_at": 1_i64})],
+            "application:Google Chrome",
+        );
+        assert!(rejected.is_empty());
+
+        let from_document_name_only = semantic_views_from_statements(
+            &[json!({
+                "statement": "日均GMV 42.14万元",
+                "observed_at": 1_i64,
+            })],
+            "window_title:AI基座中心绩效26年H1 - 云文档\napplication:Google Chrome",
+        );
+        assert!(from_document_name_only.is_empty());
+
+        let generic_window = semantic_views_from_statements(
+            &[json!({"statement": "日均GMV 42.14万元", "observed_at": 1_i64})],
+            "window_title:ChatGPT\napplication:Google Chrome",
+        );
+        assert!(generic_window.is_empty());
+    }
+
+    #[test]
+    fn replaces_document_subject_with_reusable_business_scope_in_place() {
+        let storage = StorageManager::open_in_memory().unwrap();
+        storage
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO data_sources (
+                        id, canonical_key, title, source_kind, access_mode, refresh_policy,
+                        realtime_level, source_app_name, source_window_title, tags,
+                        first_seen_at, last_seen_at, last_collected_at, last_success_at,
+                        status, created_at, updated_at
+                    ) VALUES (
+                        62, 'memory:semantic:data-memory.v7:legacy',
+                        '审阅商业体系 AI 建设资产复用方案并分析三类资产占比',
+                        'work_memory', 'memory_only', 'never', 'observed', 'Google Chrome',
+                        '商业体系-AI建设资产复用方案 - 云文档', '["work_memory"]',
+                        1, 2, 2, 2, 'active', 1, 2
+                    );
+                    INSERT INTO data_snapshots (
+                        source_id, collected_at, observed_at, collector, content_text,
+                        structured_data, content_hash, freshness_ttl_seconds, provenance,
+                        source_capture_ids, source_timeline_ids, status, created_at
+                    ) VALUES (
+                        62, 2, 2, 'memory_extract',
+                        '总体上，生成与理解两类合计占76%，作为跨BU复用的第一阶段主战场',
+                        '{"extraction_version":"data-memory.v7","title":"商业体系 AI 建设资产分类 生成与理解两类合计占比","summary":"商业体系 AI 建设资产分类 生成与理解两类合计占比：生成与理解两类合计占比 76%","semantic_subject":"商业体系 AI 建设资产分类","semantic_identity":"生成与理解两类合计占比","metric_rows":[{"dimension":"","metric":"生成与理解两类合计占比","value":"76%","note":"","statement":"总体上，生成与理解两类合计占76%，作为跨BU复用的第一阶段主战场","observed_at":2}],"metric_statements":[{"statement":"总体上，生成与理解两类合计占76%，作为跨BU复用的第一阶段主战场","observed_at":2}]}',
+                        'legacy', 0, '{}', '[]', '[2378]', 'success', 2
+                    );
+                    "#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let extraction = storage.regenerate_historical_data_memories(100).unwrap();
+        let source = storage.get_data_source(62).unwrap().unwrap();
+        let structured = &source.latest_snapshot.as_ref().unwrap().structured_data;
+
+        assert_eq!(extraction.historical_regenerated_count, 1);
+        assert_eq!(source.id, 62);
+        assert_eq!(structured["extraction_version"], DATA_MEMORY_VERSION);
+        assert_eq!(structured["semantic_subject"], "AI 建设资产分类");
+        assert_eq!(
+            structured["title"],
+            "AI 建设资产分类中生成与理解两类合计占比"
+        );
+        assert!(!structured["summary"]
+            .as_str()
+            .unwrap()
+            .contains("商业体系-AI建设资产复用方案"));
+        assert!(structured["summary"]
+            .as_str()
+            .unwrap()
+            .contains("生成与理解两类合计占比 76%"));
+        assert_eq!(
+            storage
+                .regenerate_historical_data_memories(100)
+                .unwrap()
+                .historical_regenerated_count,
+            0
+        );
+    }
+
+    #[test]
+    fn gives_aigc_cost_data_an_explicit_subject_and_unambiguous_dimensions() {
+        let statement = "项目背景部分阐述了为突破通用模型效果瓶颈和高推理成本阻碍而发起专项建设的必要性，整体目标包括构建垂类场景优化效率提升50%+、建立标准化评测体系以及通过步数蒸馏等技术实现推理成本下降90%（视频从 0.2降至 0.02元/秒）";
+        let views = semantic_views_from_statements(
+            &[json!({"statement": statement, "observed_at": 1785665801543_i64})],
+            "万擎与电商商业化 AIGC 创新专项",
+        );
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert_eq!(view.subject, "AIGC 垂类场景");
+        assert!(view.title.starts_with("AIGC 垂类场景"));
+        assert!(view.identity.starts_with("aigc垂类场景|"));
+        assert!(view.rows.iter().any(|row| {
+            row.dimension == "目标" && row.metric == "优化效率增幅" && row.value == "50%"
+        }));
+        assert!(view.rows.iter().any(|row| {
+            row.dimension == "目标" && row.metric == "视频推理成本降幅" && row.value == "90%"
+        }));
+        assert!(view.rows.iter().any(|row| {
+            row.dimension == "优化前" && row.metric == "视频推理成本" && row.value == "0.2元/秒"
+        }));
+        assert!(view.rows.iter().any(|row| {
+            row.dimension == "优化后" && row.metric == "视频推理成本" && row.value == "0.02元/秒"
+        }));
+        let structured = semantic_view_to_json(view.clone());
+        assert_eq!(structured["semantic_subject"], "AIGC 垂类场景");
+        assert_eq!(
+            view.rows
+                .iter()
+                .filter(|row| row.metric == "视频推理成本")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_same_metric_and_dimension_with_conflicting_values() {
+        assert!(semantic_statement("整体成本为 0.2 元，整体成本为 0.3 元", None).is_none());
+    }
+
+    #[test]
+    fn rejects_negated_examples_and_list_ordinals_from_data_memory() {
+        assert!(!is_concrete_data_statement(
+            "例如年度额度1,747、已交付1,736，并不是文档中的 GPU 利用率 42%、47%、约 25% 等数据"
+        ));
+        assert!(!is_concrete_data_statement(
+            "21、aigc gmv从不到十万，干到了百万"
+        ));
+        assert!(!is_concrete_data_statement("全域巡检机器人：2商业化收入⋯"));
+        assert!(!is_concrete_data_statement("GPU 利用率 42%、47%、25%"));
+        assert!(!is_concrete_data_statement(
+            "比如背景显示国内日均 GPU 利用率为 42%，海外为 47%"
+        ));
+        assert!(!is_concrete_data_statement("协议同时支持 IPv4 和 IPv6"));
+        assert!(!is_concrete_data_statement("ID 440"));
+        assert!(!is_concrete_data_statement(
+            "随后用户点击进入了一份名为 2026-07-29 的文档"
+        ));
+        assert!(!is_concrete_data_statement(
+            "truncated_json：不要把输出预算直接降到4096"
+        ));
+        assert!(!is_concrete_data_statement("建议把重试次数调到3次"));
+        assert!(!is_concrete_data_statement("内存不应超过1GB"));
+        assert!(!is_concrete_data_statement("请将并发数设置为32"));
+        assert!(is_concrete_data_statement("当前输出预算为4096"));
+        assert!(is_concrete_data_statement("AI 建议采纳率为80%"));
+    }
+
+    #[test]
+    fn same_semantic_data_from_different_timelines_updates_one_latest_snapshot() {
+        let storage = StorageManager::open_in_memory().unwrap();
+        storage
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO captures (
+                        id, ts, app_name, win_title, event_type, ax_text,
+                        is_sensitive, pii_scrubbed
+                    ) VALUES
+                        (1, 1700000000000, 'Docs', 'GPU 周报', 'manual',
+                         '国内日均 GPU 利用率为 42%，海外为 47%', 0, 0),
+                        (2, 1700000060000, 'Docs', 'GPU 周报', 'manual',
+                         '国内日均 GPU 利用率为 55%，海外为 60%', 0, 0);
+                    INSERT INTO timelines (
+                        id, capture_id, summary, overview, details, entities, category,
+                        importance, created_at_ms, updated_at_ms
+                    ) VALUES
+                        (11, 1, '容器云 GPU 周报', '国内日均 GPU 利用率为 42%，海外为 47%',
+                         '', '[]', 'work', 4, 1700000000000, 1700000000000),
+                        (12, 2, '容器云 GPU 周报', '国内日均 GPU 利用率为 55%，海外为 60%',
+                         '', '[]', 'work', 4, 1700000060000, 1700000060000);
+                    UPDATE captures SET timeline_id = 10 + id WHERE id IN (1, 2);
+                    "#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let extraction = storage.extract_data_candidates(100).unwrap();
+        let (sources, total) = storage.list_data_sources(None, 20, 0).unwrap();
+
+        assert_eq!(total, 1);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(extraction.source_created_count, 1);
+        assert_eq!(extraction.source_updated_count, 1);
+        let snapshot = sources[0].latest_snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.structured_data["title"], "GPU 利用率对比");
+        assert_eq!(sources[0].source_window_title.as_deref(), Some("GPU 周报"));
+        assert!(snapshot.structured_data["summary"]
+            .as_str()
+            .unwrap()
+            .contains("国内 55%"));
+        assert_eq!(snapshot.source_timeline_ids, vec![11, 12]);
+    }
+
+    #[test]
+    fn regenerates_and_merges_historical_v2_data() {
+        let storage = StorageManager::open_in_memory().unwrap();
+        storage
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO data_sources (
+                        id, canonical_key, title, source_kind, access_mode, refresh_policy,
+                        realtime_level, source_window_title, tags, first_seen_at, last_seen_at, status,
+                        created_at, updated_at
+                    ) VALUES
+                        (1, 'memory:timeline:11', '旧 GPU 数据', 'work_memory', 'memory_only',
+                         'never', 'observed', 'GPU 周报', '["work_memory"]', 1, 1, 'active', 1, 1),
+                        (2, 'memory:timeline:12', '新 GPU 数据', 'work_memory', 'memory_only',
+                         'never', 'observed', 'GPU 周报', '["work_memory"]', 2, 2, 'active', 2, 2),
+                        (3, 'memory:timeline:13', '误识别数据', 'work_memory', 'memory_only',
+                         'never', 'observed', 'GPU 周报', '["work_memory"]', 3, 3, 'active', 3, 3);
+                    INSERT INTO data_snapshots (
+                        source_id, collected_at, observed_at, collector, content_text,
+                        structured_data, content_hash, freshness_ttl_seconds, provenance,
+                        source_capture_ids, source_timeline_ids, status, created_at
+                    ) VALUES
+                        (1, 1, 1, 'memory_extract', '国内日均 GPU 利用率为 42%，海外为 47%',
+                         '{"extraction_version":"data-memory.v2","metric_statements":[{"statement":"国内日均 GPU 利用率为 42%，海外为 47%","observed_at":1}]}',
+                         'old', 0, '{}', '[]', '[11]', 'success', 1),
+                        (2, 2, 2, 'memory_extract', '国内日均 GPU 利用率为 55%，海外为 60%',
+                         '{"extraction_version":"data-memory.v2","metric_statements":[{"statement":"国内日均 GPU 利用率为 55%，海外为 60%","observed_at":2}]}',
+                         'new', 0, '{}', '[]', '[12]', 'success', 2),
+                        (3, 3, 3, 'memory_extract', '并不是文档中的 GPU 利用率 42%、47%、25% 等数据；旧内容提到 data-memory.v3',
+                         '{"extraction_version":"data-memory.v2","metric_statements":[{"statement":"并不是文档中的 GPU 利用率 42%、47%、25% 等数据；旧内容提到 data-memory.v3","observed_at":3}]}',
+                         'noise', 0, '{}', '[]', '[13]', 'success', 3);
+                    "#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let extraction = storage.extract_data_candidates(100).unwrap();
+        let (sources, total) = storage.list_data_sources(None, 20, 0).unwrap();
+        let rejected_version = storage
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT json_extract(structured_data, '$.extraction_version')
+                     FROM data_snapshots WHERE source_id = 3",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap();
+
+        assert_eq!(extraction.historical_regenerated_count, 3);
+        assert_eq!(extraction.historical_merged_count, 1);
+        assert_eq!(extraction.historical_rejected_count, 1);
+        assert_eq!(total, 1);
+        assert_eq!(sources.len(), 1);
+        assert!(
+            sources[0].latest_snapshot.as_ref().unwrap().structured_data["summary"]
+                .as_str()
+                .unwrap()
+                .contains("国内 55%")
+        );
+        assert_eq!(rejected_version, DATA_MEMORY_VERSION);
+
+        let second_extraction = storage.extract_data_candidates(100).unwrap();
+        assert_eq!(second_extraction.historical_regenerated_count, 0);
+        assert_eq!(second_extraction.historical_merged_count, 0);
+        assert_eq!(second_extraction.historical_rejected_count, 0);
+    }
+
+    #[test]
+    fn optional_regenerates_data_memory_e2e_database() {
+        let Ok(db_path) = std::env::var("MEMORY_BREAD_DATA_REGEN_E2E_DB") else {
+            return;
+        };
+        let storage = StorageManager::open(std::path::Path::new(&db_path)).unwrap();
+        let (_, visible_before) = storage.list_data_sources(None, 5000, 0).unwrap();
+        let mut regenerated = 0;
+        let mut merged = 0;
+        let mut rejected = 0;
+        for _ in 0..20 {
+            let summary = storage.regenerate_historical_data_memories(5000).unwrap();
+            regenerated += summary.historical_regenerated_count;
+            merged += summary.historical_merged_count;
+            rejected += summary.historical_rejected_count;
+            if summary.historical_regenerated_count == 0 {
+                break;
+            }
+        }
+        let (records, total) = storage.list_data_sources(None, 5000, 0).unwrap();
+        let invalid_count = records
+            .iter()
+            .filter(|source| {
+                source
+                    .latest_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.structured_data.get("title"))
+                    .and_then(Value::as_str)
+                    .map(str::is_empty)
+                    .unwrap_or(true)
+            })
+            .count();
+        println!(
+            "data-memory-v11 e2e: regenerated={} merged={} rejected={} visible_before={} visible_after={} invalid_visible={}",
+            regenerated,
+            merged,
+            rejected,
+            visible_before,
+            total,
+            invalid_count,
+        );
+        assert_eq!(invalid_count, 0);
+    }
+
+    #[test]
+    fn optional_regenerates_selected_data_memory_sources() {
+        let Ok(db_path) = std::env::var("MEMORY_BREAD_DATA_REGEN_SELECTED_DB") else {
+            return;
+        };
+        let raw_ids = std::env::var("MEMORY_BREAD_DATA_REGEN_SELECTED_IDS")
+            .expect("selected regeneration requires explicit source ids");
+        let mut source_ids = raw_ids
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.parse::<i64>().expect("source id must be an integer"))
+            .collect::<Vec<_>>();
+        assert!(!source_ids.is_empty() && source_ids.len() <= 50);
+        let original_len = source_ids.len();
+        let mut seen = HashSet::new();
+        source_ids.retain(|source_id| seen.insert(*source_id));
+        assert_eq!(source_ids.len(), original_len, "source ids must be unique");
+
+        let storage = StorageManager::open(std::path::Path::new(&db_path)).unwrap();
+        let summary = storage
+            .with_conn(|conn| {
+                let existing_count = source_ids.iter().try_fold(0usize, |count, source_id| {
+                    let exists = conn.query_row(
+                        "SELECT COUNT(*) > 0 FROM data_sources WHERE id = ?1 AND deleted_at IS NULL",
+                        [source_id],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                    Ok::<_, StorageError>(count + usize::from(exists))
+                })?;
+                if existing_count != source_ids.len() {
+                    return Err(StorageError::NotFound(
+                        "one or more selected data sources are missing or deleted".to_string(),
+                    ));
+                }
+
+                conn.execute_batch("SAVEPOINT regenerate_selected_data_memory")?;
+                for source_id in &source_ids {
+                    conn.execute(
+                        "UPDATE data_snapshots
+                         SET structured_data = json_set(
+                             structured_data,
+                             '$.extraction_version',
+                             'data-memory.force-selected-regeneration'
+                         )
+                         WHERE source_id = ?1",
+                        [source_id],
+                    )?;
+                }
+                match regenerate_legacy_data_memories_inner(conn, &source_ids) {
+                    Ok(summary) => {
+                        for source_id in &source_ids {
+                            conn.execute(
+                                "UPDATE data_snapshots
+                                 SET structured_data = json_set(
+                                     structured_data,
+                                     '$.extraction_version',
+                                     ?2
+                                 )
+                                 WHERE source_id = ?1
+                                   AND json_extract(
+                                       structured_data,
+                                       '$.extraction_version'
+                                   ) = 'data-memory.force-selected-regeneration'",
+                                params![source_id, DATA_MEMORY_VERSION],
+                            )?;
+                        }
+                        conn.execute_batch("RELEASE SAVEPOINT regenerate_selected_data_memory")?;
+                        Ok(summary)
+                    }
+                    Err(error) => {
+                        let _ = conn.execute_batch(
+                            "ROLLBACK TO SAVEPOINT regenerate_selected_data_memory;
+                             RELEASE SAVEPOINT regenerate_selected_data_memory;",
+                        );
+                        Err(error)
+                    }
+                }
+            })
+            .unwrap();
+        println!(
+            "selected data-memory-v11 regeneration: requested={} regenerated={} merged={} rejected={}",
+            source_ids.len(),
+            summary.regenerated_count,
+            summary.merged_count,
+            summary.rejected_count,
+        );
+        assert_eq!(summary.regenerated_count, source_ids.len());
     }
 
     #[test]

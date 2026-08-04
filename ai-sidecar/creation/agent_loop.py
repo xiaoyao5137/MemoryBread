@@ -12,7 +12,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Any, Optional, Union, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 from uuid import uuid4
 
 from .service import CreationOptions, CreationService, ReferenceDocument
@@ -234,7 +234,7 @@ class CreationAgentLoop:
         session_id: Optional[str] = None,
         run_id: Optional[str] = None,
         confirmed: bool = False,
-        resume_state: dict[str, Any] | None = None,
+        resume_state: Optional[dict[str, Any]] = None,
         model_result: Optional[str] = None,
         creation_model: Optional[str] = None,
         creation_api_key: Optional[str] = None,
@@ -406,8 +406,38 @@ class CreationAgentLoop:
             for item in state.environment.get("quality_soft_warnings", [])
         ]
         quality_warnings = [*hard_failures, *soft_warnings]
+        document = str(state.environment.get("document") or state.current_document)
+        document, citation_audit = self._guard_data_citations(
+            document,
+            [
+                item
+                for item in state.environment.get("data_results", [])
+                if isinstance(item, dict)
+            ],
+        )
+        if citation_audit:
+            state.environment["document"] = document
+            state.current_document = document
+            state.environment["data_citation_audit"] = citation_audit
+            unsupported_count = sum(
+                1 for item in citation_audit if item.get("status") == "unsupported"
+            )
+            if unsupported_count:
+                quality_warnings.append(
+                    f"{unsupported_count} 处数据引用没有逐项匹配到可用证据，已改为待核验"
+                )
+            yield self._event(
+                state,
+                "document.citations.validated",
+                (
+                    f"已校正 {len(citation_audit) - unsupported_count} 处数据来源，"
+                    f"{unsupported_count} 处无证据引用已标为待核验"
+                ),
+                status="completed",
+                data={"content": document, "audit": citation_audit},
+            )
         document, applied_evidence = self._apply_creation_evidence_cards(
-            str(state.environment.get("document") or state.current_document),
+            document,
             [
                 item
                 for item in state.environment.get("creation_evidence", [])
@@ -610,7 +640,7 @@ class CreationAgentLoop:
         self,
         message: str,
         existing_titles: list[str],
-    ) -> str | None:
+    ) -> Optional[str]:
         targets = self._find_target_sections(message, existing_titles)
         return targets[0] if targets else None
 
@@ -663,7 +693,7 @@ class CreationAgentLoop:
         cls,
         target: str,
         existing_titles: list[str],
-    ) -> str | None:
+    ) -> Optional[str]:
         normalized_target = cls._normalize_section_name(target)
         for title in existing_titles:
             normalized_title = cls._normalize_section_name(title)
@@ -756,7 +786,7 @@ class CreationAgentLoop:
             # 数据检索与记忆/互联网检索同属证据探针。网页刷新和数据分析是
             # 依赖反馈的动作，不在初始计划中预置固定流水线。
             normalized_plan: list[dict[str, Any]] = []
-            data_search_step: dict[str, Any] | None = None
+            data_search_step: Optional[dict[str, Any]] = None
             for item in plan:
                 step_id = str(item.get("id") or "")
                 if step_id in {WEBPAGE_SCRAPE_TOOL_ID, "data_analysis_agent"}:
@@ -818,7 +848,7 @@ class CreationAgentLoop:
         *,
         status: str,
         error_code: Optional[str] = None,
-    ) -> dict[str, Any] | None:
+    ) -> Optional[dict[str, Any]]:
         """Harness 只依据可观察 Tool 反馈追加下一步，不预演固定链路。"""
         step_id = str(step.get("id") or "")
         step_key = self._step_schedule_key(step)
@@ -900,7 +930,7 @@ class CreationAgentLoop:
         ]
         if status != "completed":
             reason_code = "quality_review_failed"
-            candidates: list[dict[str, Any] | None] = []
+            candidates: list[Optional[dict[str, Any]]] = []
         elif not issues:
             reason_code = "quality_gate_passed"
             candidates = []
@@ -1054,7 +1084,7 @@ class CreationAgentLoop:
         self,
         agent_id: str,
         cycle: int,
-    ) -> dict[str, Any] | None:
+    ) -> Optional[dict[str, Any]]:
         step = self._agent_plan_step(agent_id)
         if not step:
             return None
@@ -1081,7 +1111,7 @@ class CreationAgentLoop:
     @staticmethod
     def _insert_harness_steps(
         state: LoopState,
-        candidates: list[dict[str, Any] | None],
+        candidates: list[Optional[dict[str, Any]]],
     ) -> list[dict[str, Any]]:
         completed = set(state.environment.get("harness_completed_step_ids", []))
         future_ids = {
@@ -1192,7 +1222,7 @@ class CreationAgentLoop:
         return plan
 
     @staticmethod
-    def _tool_plan_step(tool_id: str) -> dict[str, Any] | None:
+    def _tool_plan_step(tool_id: str) -> Optional[dict[str, Any]]:
         definitions = {
             MEMORY_SEARCH_TOOL_ID: ("记忆搜索 Tool", "memory_search"),
             INTERNET_SEARCH_TOOL_ID: ("互联网检索 Tool", "internet_search"),
@@ -1216,7 +1246,7 @@ class CreationAgentLoop:
         }
 
     @staticmethod
-    def _agent_plan_step(agent_id: str) -> dict[str, Any] | None:
+    def _agent_plan_step(agent_id: str) -> Optional[dict[str, Any]]:
         definitions = {
             "industry_research_agent": (
                 "行业调研 Agent",
@@ -1525,12 +1555,43 @@ class CreationAgentLoop:
             return
 
         if action == WEBPAGE_SCRAPE_TOOL_ID:
+            preview_sources = [
+                item
+                for item in list(state.environment.get("data_results") or [])
+                if item.get("source_kind") == "report_url"
+                and item.get("source_url")
+                and item.get("source_id") is not None
+            ][:5]
+            previews = [
+                {
+                    "id": str(uuid4()),
+                    "source_id": int(item["source_id"]),
+                    "title": str(item.get("title") or "实时数据页面")[:160],
+                }
+                for item in preview_sources
+            ]
+            for preview in previews:
+                preview["image_url"] = (
+                    f"/api/creation/browser-previews/{preview['id']}/image"
+                )
+            if previews:
+                yield self._event(
+                    state,
+                    "browser.preview.started",
+                    f"已在后台打开 {len(previews)} 个数据页面，前台操作不会被切走",
+                    actor=actor,
+                    data={"previews": previews},
+                )
             outcome = await self.service.scrape_data_context(
                 list(state.environment.get("data_results") or []),
                 self._step_context_query(state, step),
                 state.environment["requirement"],
                 run_id=state.run_id,
                 session_id=state.session_id,
+                preview_ids={
+                    int(preview["source_id"]): str(preview["id"])
+                    for preview in previews
+                },
             )
             scrapes = list(outcome.get("scrapes") or [])
             refreshed = list(outcome.get("refreshed_data") or [])
@@ -1551,34 +1612,95 @@ class CreationAgentLoop:
             failed_count = sum(
                 1 for item in scrapes if item.get("status") in {"failed", "rejected"}
             )
+            scrape_summaries = [
+                {
+                    "source_id": item.get("source_id"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "status": item.get("status"),
+                    "collector": item.get("collector"),
+                    "collected_at": item.get("collected_at"),
+                    "error_code": item.get("error_code"),
+                    "validation_reason": item.get("validation_reason"),
+                    "verified_claim_count": item.get("verified_claim_count", 0),
+                }
+                for item in scrapes
+                if isinstance(item, dict)
+            ]
             state.environment.setdefault("tool_results", []).append(
                 {
                     "tool_id": WEBPAGE_SCRAPE_TOOL_ID,
                     "status": "completed",
                     "result_count": completed_count,
                     "failed_count": failed_count,
+                    "attempted_count": len(scrapes),
                 }
             )
             self._update_goal(state)
+            if completed_count:
+                summary = (
+                    f"浏览器访问 {len(scrapes)} 个报表，"
+                    f"{completed_count} 个来源的数据与截图通过校验"
+                )
+            elif scrapes:
+                summary = (
+                    f"浏览器访问 {len(scrapes)} 个报表，但没有指标通过截图校验，"
+                    "本轮不采用这些页面的数值"
+                )
+            else:
+                summary = "没有可实时刷新的报表 URL，保留可用工作记忆及其采集时间"
             yield self._event(
                 state,
                 "tool.completed",
-                (
-                    f"网页数据刷新完成，更新 {completed_count} 个报表来源"
-                    if scrapes
-                    else "没有可实时刷新的报表 URL，保留工作记忆数据与采集时间"
-                ),
+                summary,
                 status="completed",
                 actor=actor,
                 environment_patch={
+                    "attempted_source_count": len(scrapes),
                     "scraped_source_count": completed_count,
                     "failed_source_count": failed_count,
+                    "sources": scrape_summaries,
                 },
                 data={
+                    "attempted_count": len(scrapes),
                     "result_count": completed_count,
                     "failed_count": failed_count,
+                    "sources": scrape_summaries,
                 },
             )
+            if previews:
+                scrape_by_source = {
+                    int(item["source_id"]): item
+                    for item in scrapes
+                    if item.get("source_id") is not None
+                }
+                completed_previews = []
+                for preview in previews:
+                    scrape = scrape_by_source.get(int(preview["source_id"])) or {}
+                    evidence = scrape.get("evidence")
+                    completed_previews.append(
+                        {
+                            **preview,
+                            "title": str(scrape.get("title") or preview["title"])[:160],
+                            "status": str(scrape.get("status") or "failed"),
+                            "browser": scrape.get("browser"),
+                            "interaction_mode": scrape.get("interaction_mode"),
+                            "image_url": (
+                                evidence.get("image_url")
+                                if isinstance(evidence, dict)
+                                and evidence.get("image_url")
+                                else preview["image_url"]
+                            ),
+                        }
+                    )
+                yield self._event(
+                    state,
+                    "browser.preview.completed",
+                    "后台页面采集已结束，缩略预览保留在执行记录中",
+                    status="completed",
+                    actor=actor,
+                    data={"previews": completed_previews},
+                )
             return
 
         if action == GITHUB_SEARCH_TOOL_ID:
@@ -1942,7 +2064,7 @@ class CreationAgentLoop:
 
         short_sections = self._short_detail_sections(document)
         placeholder_count = len(
-            re.findall(r"(?i)\b(?: Union[TODO, TBD])\b|待补充|此处补充|后续完善", prose)
+            re.findall(r"(?i)\b(?:TODO|TBD)\b|待补充|此处补充|后续完善", prose)
         )
         detail_incomplete = (
             len(document.strip()) >= 500
@@ -2034,7 +2156,7 @@ class CreationAgentLoop:
             )
 
         has_diagram = bool(
-            re.search(r"```\s*(?: Union[plantuml, mermaid])\b", document, re.IGNORECASE)
+            re.search(r"```\s*(?:plantuml|mermaid)\b", document, re.IGNORECASE)
         )
         visual_expected = bool(
             state.environment.get("requirement", {}).get("needs_images")
@@ -2656,7 +2778,7 @@ class CreationAgentLoop:
         return True
 
     @classmethod
-    def _section_order_rank(cls, title: str) -> int | None:
+    def _section_order_rank(cls, title: str) -> Optional[int]:
         normalized = cls._normalize_section_name(title)
         for rank, markers in SECTION_ORDER_RULES:
             if any(
@@ -2692,7 +2814,7 @@ class CreationAgentLoop:
         cls,
         target: str,
         spans: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
+    ) -> Optional[dict[str, Any]]:
         normalized_target = cls._normalize_section_name(target)
         exact = [
             span
@@ -2714,7 +2836,7 @@ class CreationAgentLoop:
         text = result.strip()
         if not text:
             return ""
-        fenced = re.fullmatch(r"```(?: Union[markdown, md])?\s*\n([\s\S]*?)\n```", text)
+        fenced = re.fullmatch(r"```(?:markdown|md)?\s*\n([\s\S]*?)\n```", text)
         if fenced:
             text = fenced.group(1).strip()
 
@@ -2806,7 +2928,7 @@ class CreationAgentLoop:
             system = """你是 MemoryBread 的文档撰写 Agent。请依据目标、子 Agent 结论、Tool 证据和 Skill 规则，输出完整 Markdown 文档。
 章节设计 Agent 已给出章节蓝图时，以蓝图作为初稿骨架；如证据不足，只能标记缺口，不能用套话把章节撑满。
 对于已安装的技能，优先复刻 title_design_style 中的子标题句式、writing_design 中的行文推进、voice_style 中的惯用话术和 image_generation 中的代码生图方式；field_examples 与 example_document 只用于学习写法，不得照抄主题或事实。不要把这些鲜明特征稀释成通用公文。
-要求：保留可验证事实；不编造政策编号、指标或来源；对外部信息给出链接；数据、文档、知识、操作和互联网线索是平权证据，不因所属模块获得额外优先级，按相关性、可靠性、时效和口径适配度取舍；使用数据时写明统计周期和采集时间，`can_use=false` 或陈旧快照只能作为待核验线索；环境包含 PlantUML 画图约束时必须输出对应的 ```plantuml 代码块，否则技术关系优先使用 Mermaid；只输出文档正文。"""
+要求：保留可验证事实；不编造政策编号、指标或来源；对外部信息给出链接；数据、文档、知识、操作和互联网线索是平权证据，不因所属模块获得额外优先级，按相关性、可靠性、时效和口径适配度取舍；使用数据时写明统计周期和采集时间，`can_use=false` 或陈旧快照只能作为待核验线索；数据来源名称、URL 与采集时间只能逐字取自同一条可用数据结果，不能根据相邻参考资料猜测或拼接，页面筛选日期只能写成统计周期，不能冒充浏览器采集时间；无法确认归属时不要输出“数据来源”行，改写为待核验；环境包含 PlantUML 画图约束时必须输出对应的 ```plantuml 代码块，否则技术关系优先使用 Mermaid；只输出文档正文。"""
             if state.mode == "revision":
                 intent = state.environment.get("edit_intent", {})
                 targets = [str(item) for item in intent.get("target_sections", [])]
@@ -2820,7 +2942,7 @@ class CreationAgentLoop:
 3. 一轮可以新增、修改或删除多个章节；不要为了“局部更新”而忽略必要的跨章节修改；
 4. 保留未受影响且仍有效的内容，避免无意义改写；
 5. 本轮明确修改优先于冲突的原始约束，其余原始约束继续生效；
-6. 保留可验证事实，不编造政策编号、指标或来源；外部结论保留链接；数据、文档、知识、操作和互联网线索按相关性、可靠性、时效和口径适配度平权取舍；数据结论写明统计周期和采集时间，`can_use=false` 或陈旧快照只能标为待核验。
+6. 保留可验证事实，不编造政策编号、指标或来源；外部结论保留链接；数据、文档、知识、操作和互联网线索按相关性、可靠性、时效和口径适配度平权取舍；数据结论写明统计周期和采集时间，`can_use=false` 或陈旧快照只能标为待核验；来源名称、URL 与采集时间必须来自支持该数字的同一条数据结果，筛选日期不是采集时间，无法逐项匹配时不得输出“数据来源”行。
 只输出最终完整文档正文，不要输出 JSON 或修订说明；不要用代码围栏包裹整篇文档，但 Tool 要求的 PlantUML 或 Mermaid 图示代码块必须保留。"""
         elif step["action"] == "polisher":
             common = """请基于当前完整文档做一次有边界的二次编辑，并输出润色后的完整 Markdown 文档。
@@ -2839,7 +2961,7 @@ class CreationAgentLoop:
             )
         else:
             role_instructions = {
-                "data_analysis_agent": "优先使用网页实时采集后的数据，其次使用数据检索中 can_use=true 的快照。逐项核对采集时间、指标口径和统计周期；不同周期或口径不得直接合并。工作记忆只能按 observed_at 加权，陈旧数据必须标注。禁止编造数字，输出可验证结论与证据缺口。",
+                "data_analysis_agent": "优先使用网页实时采集后且截图校验通过的数据，其次使用数据检索中 can_use=true 的工作记忆。每个数字都要与同一结果中的 source_id、title、source_url、collected_at/observed_at 绑定；页面筛选日期是统计周期，不是采集时间。不同来源、周期或口径不得擅自拼接。工作记忆只能按 observed_at 加权，陈旧数据必须标注。禁止编造数字或来源，按‘结论—指标—统计周期—采集时间—来源—证据缺口’输出。",
                 "industry_research_agent": "综合互联网检索结果，提炼行业现状、趋势、约束与待核验事实。每条外部结论保留来源 URL。",
                 "solution_design_agent": "围绕目标、约束和证据设计可落地方案，明确边界、关键决策、组件关系、实施步骤、风险和验证方式。",
                 "chapter_design_agent": "先设计章节，再交给文档撰写 Agent。结合目标、读者、文档类型、证据和 Skill，输出有顺序的章节蓝图；每章写明目的、要回答的问题、可用证据、建议表达形式和完成标准。章节必须互斥且共同覆盖目标，不写正文，不补造事实。",
@@ -3008,6 +3130,213 @@ class CreationAgentLoop:
             result["content_excerpt"] = None
             result["structured_data"] = None
             result["provenance"] = None
+
+    @classmethod
+    def _guard_data_citations(
+        cls,
+        document: str,
+        data_results: list[dict[str, Any]],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """用可用证据重建数据引用，阻止 Writer 自由拼接来源与采集时间。"""
+        if not document.strip() or not data_results:
+            return document, []
+        sources = cls._citation_sources(data_results)
+        citation_line = re.compile(
+            r"(?m)^\s*(?:\*|_)?\s*数据来源\s*[:：].*?(?:\*|_)?\s*$"
+        )
+        blocks = re.split(r"(\n\s*\n)", document)
+        audit: list[dict[str, Any]] = []
+        for index in range(0, len(blocks), 2):
+            block = blocks[index]
+            matches = list(citation_line.finditer(block))
+            if not matches:
+                continue
+            local_context = citation_line.sub("", block).strip()
+            if not local_context:
+                previous_index = index - 2
+                while previous_index >= 0 and not blocks[previous_index].strip():
+                    previous_index -= 2
+                local_context = blocks[previous_index] if previous_index >= 0 else ""
+                heading_index = previous_index - 2
+                while heading_index >= 0 and previous_index - heading_index <= 6:
+                    heading = blocks[heading_index].strip()
+                    if heading.startswith("#"):
+                        local_context = f"{heading}\n{local_context}"
+                        break
+                    heading_index -= 2
+            claim_values = cls._extract_numeric_claim_values(local_context)
+            if not claim_values:
+                continue
+            ranked = sorted(
+                (
+                    (cls._citation_source_score(local_context, claim_values, source), source)
+                    for source in sources
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            best_score, best_source = ranked[0] if ranked else (0.0, None)
+            original_line = matches[0].group(0).strip()
+            if best_source is not None and best_score >= 0.82:
+                replacement = cls._format_data_citation(best_source)
+                status = "corrected"
+                source_id = best_source.get("source_id")
+            else:
+                replacement = (
+                    "*数据状态：以上数字未与本轮可用证据逐项匹配，"
+                    "已移除来源归属并标记为待核验。*"
+                )
+                status = "unsupported"
+                source_id = None
+            blocks[index] = citation_line.sub(replacement, block)
+            audit.append(
+                {
+                    "status": status,
+                    "source_id": source_id,
+                    "claim_values": sorted(claim_values),
+                    "original": original_line,
+                    "replacement": replacement,
+                }
+            )
+        return "".join(blocks), audit
+
+    @classmethod
+    def _citation_sources(
+        cls,
+        data_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        sources: list[dict[str, Any]] = []
+        for result in data_results:
+            if result.get("can_use") is not True:
+                continue
+            source_kind = str(result.get("source_kind") or "")
+            evidence = result.get("creation_evidence")
+            if source_kind == "report_url":
+                if (
+                    not isinstance(evidence, dict)
+                    or evidence.get("validation_status") != "verified"
+                ):
+                    continue
+                validation = evidence.get("validation") or {}
+                claims = [
+                    claim
+                    for claim in validation.get("verified_claims", [])
+                    if isinstance(claim, dict)
+                ]
+                support_text = "\n".join(
+                    str(claim.get("statement") or "") for claim in claims
+                )
+                periods = sorted(
+                    {
+                        str(claim.get("statistical_period") or "").strip()
+                        for claim in claims
+                        if str(claim.get("statistical_period") or "").strip()
+                    }
+                )
+                collected_at = evidence.get("captured_at") or result.get("collected_at")
+                title = evidence.get("page_title") or result.get("title")
+                source_url = evidence.get("source_url") or result.get("source_url")
+                evidence_verified = True
+            else:
+                support_text = "\n".join(
+                    (
+                        str(result.get("content_excerpt") or ""),
+                        str(result.get("structured_data") or ""),
+                    )
+                )
+                periods = []
+                collected_at = result.get("collected_at") or result.get("observed_at")
+                title = result.get("title")
+                source_url = result.get("source_url")
+                evidence_verified = False
+            values = cls._extract_numeric_claim_values(support_text)
+            if not values:
+                continue
+            sources.append(
+                {
+                    "source_id": result.get("source_id"),
+                    "source_kind": source_kind,
+                    "title": str(title or "数据来源").strip(),
+                    "source_url": str(source_url or "").strip(),
+                    "collected_at": int(collected_at or 0),
+                    "statistical_periods": periods,
+                    "support_text": support_text,
+                    "values": values,
+                    "evidence_verified": evidence_verified,
+                }
+            )
+        return sources
+
+    @staticmethod
+    def _extract_numeric_claim_values(value: str) -> set[str]:
+        # Markdown 标题编号属于文档结构，不是被引用的数据值。
+        value = "\n".join(
+            line for line in value.splitlines() if not line.lstrip().startswith("#")
+        )
+        without_dates = re.sub(
+            r"\b20\d{2}[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?\b",
+            " ",
+            value,
+        )
+        values: set[str] = set()
+        for match in re.findall(
+            r"(?<![\w])([+-]?\d[\d,]*(?:\.\d+)?(?:%|亿|万|千|百|卡|个|次|元|秒|ms|s)?)",
+            without_dates,
+            flags=re.IGNORECASE,
+        ):
+            normalized = match.replace(",", "").lower().strip()
+            if normalized in {"0", "0.0", "0%", "0.0%"}:
+                continue
+            values.add(normalized)
+        return values
+
+    @classmethod
+    def _citation_source_score(
+        cls,
+        context: str,
+        claim_values: set[str],
+        source: dict[str, Any],
+    ) -> float:
+        source_values = set(source.get("values") or set())
+        coverage = len(claim_values & source_values) / max(1, len(claim_values))
+        if coverage < 0.8:
+            return coverage
+        context_tokens = set(cls._evidence_match_tokens(context))
+        title_tokens = set(cls._evidence_match_tokens(str(source.get("title") or "")))
+        title_matches = bool(context_tokens & title_tokens)
+        evidence_bonus = 0.10 if source.get("evidence_verified") else 0.0
+        title_bonus = 0.10 if title_matches else 0.0
+        indirect_penalty = 0.20 if not source.get("evidence_verified") and not title_matches else 0.0
+        return min(
+            1.0,
+            coverage + title_bonus + evidence_bonus - indirect_penalty,
+        )
+
+    @staticmethod
+    def _format_data_citation(source: dict[str, Any]) -> str:
+        title = str(source.get("title") or "数据来源").replace("|", "｜").replace("]", "）")
+        source_url = str(source.get("source_url") or "").strip()
+        source_label = f"[{title}](<{source_url}>)" if source_url else title
+        parts = [f"数据来源：{source_label}"]
+        periods = [
+            str(item).strip()
+            for item in source.get("statistical_periods", [])
+            if str(item).strip()
+        ]
+        if periods:
+            parts.append(f"统计周期：{'、'.join(periods[:3])}")
+        collected_at = int(source.get("collected_at") or 0)
+        if collected_at > 0:
+            collected_label = datetime.fromtimestamp(collected_at / 1000).astimezone().strftime(
+                "%Y-%m-%d %H:%M:%S %Z"
+            )
+            time_name = (
+                "浏览器采集时间"
+                if source.get("source_kind") == "report_url"
+                else "工作记忆采集时间"
+            )
+            parts.append(f"{time_name}：{collected_label}")
+        return f"*{'；'.join(parts)}*"
 
     @classmethod
     def _apply_creation_evidence_cards(
@@ -3193,9 +3522,9 @@ class CreationAgentLoop:
         summary: str,
         *,
         status: str = "running",
-        actor: dict[str, str] | None = None,
-        environment_patch: dict[str, Any] | None = None,
-        data: dict[str, Any] | None = None,
+        actor: Optional[dict[str, str]] = None,
+        environment_patch: Optional[dict[str, Any]] = None,
+        data: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         state.sequence += 1
         return {

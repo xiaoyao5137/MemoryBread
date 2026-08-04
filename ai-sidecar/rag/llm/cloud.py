@@ -11,7 +11,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
-from typing import Callable
+from typing import Callable, Optional
 
 from .base import LlmBackend, LlmResponse
 
@@ -51,7 +51,7 @@ class CloudChatBackend(LlmBackend):
         self,
         prompt: str,
         system: str = "",
-        on_delta: Callable[[str], None] | None = None,
+        on_delta: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> LlmResponse:
         if "claude" in self._model.lower() or "anthropic.com" in self._base_url:
@@ -121,7 +121,7 @@ class CloudChatBackend(LlmBackend):
         self,
         prompt: str,
         system: str = "",
-        on_delta: Callable[[str], None] | None = None,
+        on_delta: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> LlmResponse:
         base_url = self._base_url or self._default_base_url()
@@ -171,7 +171,7 @@ class CloudChatBackend(LlmBackend):
         self,
         prompt: str,
         system: str = "",
-        on_delta: Callable[[str], None] | None = None,
+        on_delta: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> LlmResponse:
         url = self._anthropic_messages_url(self._base_url)

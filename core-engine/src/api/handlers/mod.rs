@@ -10,6 +10,7 @@ pub mod data;
 pub mod debug;
 pub mod diary;
 pub mod health;
+pub mod integration_skill;
 pub mod knowledge;
 pub mod monitor;
 pub mod notification_channels;

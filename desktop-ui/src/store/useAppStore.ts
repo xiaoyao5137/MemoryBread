@@ -54,6 +54,15 @@ export interface CreationReferencePreview {
   references: CreationReferenceItem[]
 }
 
+export interface CreationDataReferenceItem {
+  source_id: number
+  title: string
+  source_kind: string
+  freshness_class: string
+  refresh_required: boolean
+  can_use: boolean
+}
+
 export interface CreationChatMessage {
   id: string
   role: 'user' | 'assistant'
@@ -105,6 +114,7 @@ export interface CreationDraft {
   formatWeight: number
   freshnessWeight: number
   referencePreview: CreationReferencePreview | null
+  dataReferences: CreationDataReferenceItem[]
   sessionId: string | null
   rootRequest: string
   conversation: CreationChatMessage[]
@@ -460,6 +470,7 @@ const initialCreationDraft: CreationDraft = {
   formatWeight: 10,
   freshnessWeight: 5,
   referencePreview: null,
+  dataReferences: [],
   sessionId: null,
   rootRequest: '',
   conversation: [],

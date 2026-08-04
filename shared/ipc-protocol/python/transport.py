@@ -18,7 +18,7 @@ import logging
 import platform
 import struct
 import time
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 from pydantic import TypeAdapter
 
@@ -98,7 +98,7 @@ class IpcServer:
 
     def __init__(self, dispatch_fn: DispatchFn) -> None:
         self._dispatch = dispatch_fn
-        self._server: asyncio.Server | None = None
+        self._server: Optional[asyncio.Server] = None
 
     # ── 启动/停止 ─────────────────────────────────────────────────────────────
 

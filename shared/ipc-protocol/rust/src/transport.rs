@@ -28,9 +28,19 @@ use crate::{
 /// 单条消息最大字节数（16 MB）
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
-/// macOS/Linux Unix Socket 路径
+/// macOS/Linux Unix Socket 默认路径；安装版可通过环境变量隔离实例。
 #[cfg(unix)]
 pub const UNIX_SOCKET_PATH: &str = "/tmp/memory-bread-sidecar.sock";
+#[cfg(unix)]
+const IPC_SOCKET_ENV: &str = "MEMORY_BREAD_IPC_SOCKET";
+
+#[cfg(unix)]
+fn unix_socket_path() -> String {
+    std::env::var(IPC_SOCKET_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| UNIX_SOCKET_PATH.to_string())
+}
 
 /// Windows TCP 端口
 pub const TCP_PORT: u16 = 17071;
@@ -85,7 +95,8 @@ impl IpcClient {
     pub async fn connect_default() -> Result<Self, IpcError> {
         #[cfg(unix)]
         {
-            Self::connect_unix(UNIX_SOCKET_PATH).await
+            let socket_path = unix_socket_path();
+            Self::connect_unix(&socket_path).await
         }
         #[cfg(windows)]
         {

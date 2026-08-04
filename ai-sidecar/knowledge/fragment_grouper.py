@@ -256,9 +256,20 @@ class FragmentGrouper:
             logger.warning(f"向量化失败，退化为关键词判断: {ex}")
             return None
 
+    @staticmethod
+    def _capture_text(capture: dict) -> str:
+        """按可访问性、OCR、用户输入、音频转写的顺序选择可提炼文本。"""
+        return str(
+            capture.get('ax_text')
+            or capture.get('ocr_text')
+            or capture.get('input_text')
+            or capture.get('audio_text')
+            or ''
+        )
+
     def _get_semantic_text(self, capture: dict) -> str:
         """提取用于语义判断的文本，过滤短行噪声"""
-        text = capture.get('ax_text') or capture.get('ocr_text') or ''
+        text = self._capture_text(capture)
         lines = [l.strip() for l in text.split('\n') if len(l.strip()) > 10]
         return ' '.join(lines)[:512]
 
@@ -319,7 +330,7 @@ class FragmentGrouper:
     def _looks_like_history_review(self, capture: dict) -> bool:
         app_name = (capture.get('app_name') or '').lower()
         title = (capture.get('window_title') or '').lower()
-        text = ((capture.get('ax_text') or '') + '\n' + (capture.get('ocr_text') or '')).lower()
+        text = self._capture_text(capture).lower()
         if not any(keyword in app_name or keyword in title for keyword in _HISTORY_APP_KEYWORDS):
             return False
         return any(pattern in text or pattern in title for pattern in _HISTORY_TEXT_PATTERNS)
@@ -351,10 +362,10 @@ class FragmentGrouper:
 
         # 2. 关键词重叠（只看最近5条，避免早期内容干扰）
         recent_text = ' '.join(
-            c.get('ax_text') or c.get('ocr_text') or ''
+            self._capture_text(c)
             for c in current_group[-5:]
         )
-        new_text = new_capture.get('ax_text') or new_capture.get('ocr_text') or ''
+        new_text = self._capture_text(new_capture)
 
         group_kw = self._extract_keywords(recent_text)
         new_kw = self._extract_keywords(new_text)

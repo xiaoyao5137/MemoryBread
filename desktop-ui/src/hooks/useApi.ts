@@ -864,6 +864,7 @@ export interface BakeOverviewResponse {
     start_ts: number
     end_ts: number
     memory_count: number
+    data_count?: number
     knowledge_count: number
     template_count: number
     sop_count: number
@@ -888,6 +889,16 @@ export function useFetchDataSources() {
     if (params.limit != null) url.searchParams.set('limit', String(params.limit))
     if (params.offset != null) url.searchParams.set('offset', String(params.offset))
     const resp = await fetchWithLocalhostFallback(url.toString())
+    if (!resp.ok) throw new Error(await parseApiErrorMessage(resp, `data source fetch failed: ${resp.status}`))
+    return resp.json()
+  }, [apiBaseUrl])
+}
+
+export function useFetchDataSource() {
+  const apiBaseUrl = useAppStore((s) => s.apiBaseUrl)
+
+  return useCallback(async (sourceId: number): Promise<DataSource> => {
+    const resp = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/data/sources/${sourceId}`)
     if (!resp.ok) throw new Error(await parseApiErrorMessage(resp, `data source fetch failed: ${resp.status}`))
     return resp.json()
   }, [apiBaseUrl])
@@ -922,7 +933,7 @@ export function useRefreshDataSource() {
       source_id: number
       collector: string
       browser?: 'chrome' | 'chrome_canary' | 'edge' | 'brave' | 'chromium' | 'vivaldi' | 'safari' | null
-      interaction_mode?: 'background_tab' | 'none'
+      interaction_mode?: 'background_tab' | 'background_browser_window' | 'temporary_foreground_tab' | 'none'
       collected_at: number
       title: string
       url: string
@@ -957,6 +968,7 @@ export function useFetchBakeOverview() {
 export interface BakeListQueryParams {
   q?: string
   bucket?: BakeBucket
+  sort?: 'recent' | 'heat'
   from?: number
   to?: number
   limit?: number
@@ -1019,6 +1031,7 @@ export function useFetchBakeKnowledge() {
     const url = new URL(`${apiBaseUrl}/api/bake/knowledge`)
     if (params.q) url.searchParams.set('q', params.q)
     if (params.bucket) url.searchParams.set('bucket', params.bucket)
+    if (params.sort) url.searchParams.set('sort', params.sort)
     if (params.from != null) url.searchParams.set('from', String(params.from))
     if (params.to != null) url.searchParams.set('to', String(params.to))
     if (params.limit != null) url.searchParams.set('limit', String(params.limit))

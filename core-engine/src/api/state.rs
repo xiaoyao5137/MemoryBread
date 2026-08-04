@@ -84,6 +84,17 @@ pub struct RagJobRecord {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CreationSkillAnalysisJobRecord {
+    pub id: String,
+    pub status: String,
+    pub result: Option<Value>,
+    pub error_code: Option<String>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 /// 所有 Handler 共享的应用状态。
 ///
 /// 使用 `Arc<AppState>` 确保零拷贝跨线程共享。
@@ -91,9 +102,12 @@ pub struct RagJobRecord {
 pub struct AppState {
     pub storage: StorageManager,
     pub sidecar_url: String,
+    pub creation_sidecar_url: String,
     pub debug_log_specs: Vec<DebugLogSpec>,
     pub rag_jobs: Arc<Mutex<HashMap<String, RagJobRecord>>>,
     pub rag_job_seq: Arc<AtomicU64>,
+    pub creation_skill_analysis_jobs: Arc<Mutex<HashMap<String, CreationSkillAnalysisJobRecord>>>,
+    pub creation_skill_analysis_job_seq: Arc<AtomicU64>,
     pub capture_enabled: Arc<AtomicBool>,
 }
 
@@ -101,12 +115,30 @@ impl AppState {
     pub fn new(storage: StorageManager) -> Arc<Self> {
         let sidecar_url =
             std::env::var("SIDECAR_URL").unwrap_or_else(|_| "http://127.0.0.1:7071".to_string());
-        Self::with_config(storage, sidecar_url, default_debug_log_specs())
+        let creation_sidecar_url = std::env::var("CREATION_SIDECAR_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        Self::with_service_urls(
+            storage,
+            sidecar_url,
+            creation_sidecar_url,
+            default_debug_log_specs(),
+        )
     }
 
     pub fn with_config(
         storage: StorageManager,
         sidecar_url: String,
+        debug_log_specs: Vec<DebugLogSpec>,
+    ) -> Arc<Self> {
+        let creation_sidecar_url = std::env::var("CREATION_SIDECAR_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        Self::with_service_urls(storage, sidecar_url, creation_sidecar_url, debug_log_specs)
+    }
+
+    pub fn with_service_urls(
+        storage: StorageManager,
+        sidecar_url: String,
+        creation_sidecar_url: String,
         debug_log_specs: Vec<DebugLogSpec>,
     ) -> Arc<Self> {
         match storage.fail_orphaned_running_bake_runs_on_startup() {
@@ -149,9 +181,12 @@ impl AppState {
         Arc::new(Self {
             storage,
             sidecar_url,
+            creation_sidecar_url,
             debug_log_specs,
             rag_jobs: Arc::new(Mutex::new(HashMap::new())),
             rag_job_seq: Arc::new(AtomicU64::new(1)),
+            creation_skill_analysis_jobs: Arc::new(Mutex::new(HashMap::new())),
+            creation_skill_analysis_job_seq: Arc::new(AtomicU64::new(1)),
             capture_enabled: Arc::new(AtomicBool::new(capture_enabled)),
         })
     }

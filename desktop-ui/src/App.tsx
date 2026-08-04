@@ -20,6 +20,7 @@ import ScheduledTasksPanel    from './components/ScheduledTasksPanel'
 import MonitorPanel           from './components/MonitorPanel'
 import BakePanel              from './components/BakePanel'
 import DiaryPanel             from './components/DiaryPanel'
+import IntegrationPanel       from './components/IntegrationPanel'
 import OnboardingWizard       from './components/OnboardingWizard'
 import AuthPanel              from './components/AuthPanel'
 import AchievementCelebration from './components/AchievementCelebration'
@@ -648,6 +649,7 @@ const App: React.FC = () => {
         {windowMode === 'monitor'   && <MonitorPanel />}
         {windowMode === 'bake'      && <BakePanel />}
         {windowMode === 'diary'     && <DiaryPanel />}
+        {windowMode === 'integration' && <IntegrationPanel />}
         {windowMode === 'about'     && <AboutPanel />}
         {(windowMode === 'account' || windowMode === 'messages') && (
           <AuthPanel

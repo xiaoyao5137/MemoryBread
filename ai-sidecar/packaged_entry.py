@@ -7,12 +7,16 @@ import asyncio
 import logging
 import multiprocessing
 import os
+import sys
 import threading
 
 
 def run_sidecar() -> None:
     import main as sidecar_main
 
+    # packaged_entry 使用第一个位置参数选择 helper 内承载的服务，
+    # Sidecar 自己还会再次解析 sys.argv；不要把外层的 "sidecar" 子命令传进去。
+    sys.argv = [sys.argv[0], *sys.argv[2:]]
     asyncio.run(sidecar_main._main())
 
 

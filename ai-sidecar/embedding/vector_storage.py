@@ -10,7 +10,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -314,7 +314,7 @@ class VectorStorage:
             )
             return False
 
-    def drain_deletion_queue(self, limit: int = 256) -> dict[str, int | str]:
+    def drain_deletion_queue(self, limit: int = 256) -> dict[str, Union[int, str]]:
         """Drain the SQLite deletion outbox into Qdrant idempotently."""
         now_ms = int(time.time() * 1000)
         try:

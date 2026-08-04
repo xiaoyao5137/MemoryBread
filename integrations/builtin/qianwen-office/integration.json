@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "memorybread.integration-skill.v1",
+  "id": "qianwen-office",
+  "version": "1.0.0",
+  "direction": "output",
+  "executor": "context_export",
+  "format": "qianwen-office-markdown",
+  "fields": ["query", "limit"],
+  "modes": ["execute"],
+  "source": "core-engine/src/integration/mod.rs"
+}

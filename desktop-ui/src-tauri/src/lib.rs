@@ -47,6 +47,11 @@ static QUITTING: AtomicBool = AtomicBool::new(false);
 static FULL_SHUTDOWN_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static LAST_FLOATING_ASSIST_TEMP_CLEANUP_MS: AtomicI64 = AtomicI64::new(0);
 static PACKAGED_RUNTIME_HOME: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(unix)]
+static PACKAGED_IPC_SOCKET_PATH: OnceLock<PathBuf> = OnceLock::new();
+const IPC_SOCKET_ENV: &str = "MEMORY_BREAD_IPC_SOCKET";
+#[cfg(unix)]
+const DEFAULT_IPC_SOCKET_PATH: &str = "/tmp/memory-bread-sidecar.sock";
 const FLOATING_ASSIST_LABEL: &str = "floating-assist";
 #[cfg(debug_assertions)]
 const SUPERVISOR_SHUTDOWN_MARKER: &str = "supervisor-shutdown-in-progress";
@@ -868,11 +873,29 @@ fn run_floating_assist_ocr(paths: &[PathBuf]) -> Result<IpcOcrResult, String> {
 }
 
 #[cfg(unix)]
+fn ipc_socket_path() -> PathBuf {
+    PACKAGED_IPC_SOCKET_PATH
+        .get()
+        .cloned()
+        .or_else(|| {
+            std::env::var_os(IPC_SOCKET_ENV)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IPC_SOCKET_PATH))
+}
+
+#[cfg(unix)]
 fn connect_ipc_stream() -> Result<Box<dyn ReadWrite>, String> {
     use std::os::unix::net::UnixStream;
 
-    let stream = UnixStream::connect("/tmp/memory-bread-sidecar.sock")
-        .map_err(|error| format!("无法连接 OCR sidecar：{error}"))?;
+    let socket_path = ipc_socket_path();
+    let stream = UnixStream::connect(&socket_path).map_err(|error| {
+        format!(
+            "无法连接 OCR sidecar（{}）：{error}",
+            socket_path.display()
+        )
+    })?;
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .map_err(|error| error.to_string())?;
@@ -990,6 +1013,7 @@ fn spawn_bundled_backend(
     args: &[&str],
     runtime_home: &PathBuf,
     log_dir: &PathBuf,
+    ipc_socket_path: &PathBuf,
 ) -> Result<BundledBackendProcess, String> {
     let log_path = log_dir.join(format!("{name}.log"));
     let log = OpenOptions::new()
@@ -1006,6 +1030,7 @@ fn spawn_bundled_backend(
         .current_dir(working_directory)
         .env("HOME", runtime_home)
         .env("MEMORY_BREAD_PACKAGED", "1")
+        .env(IPC_SOCKET_ENV, ipc_socket_path)
         .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -1034,6 +1059,15 @@ fn start_bundled_backends(app: &AppHandle) -> Result<(), String> {
     let log_dir = runtime_home.join(".memory-bread").join("logs");
     fs::create_dir_all(&log_dir).map_err(|error| error.to_string())?;
     let _ = PACKAGED_RUNTIME_HOME.set(runtime_home.clone());
+    #[cfg(unix)]
+    let ipc_socket_path = std::env::temp_dir().join(format!(
+        "memory-bread-sidecar-{}.sock",
+        std::process::id()
+    ));
+    #[cfg(not(unix))]
+    let ipc_socket_path = PathBuf::new();
+    #[cfg(unix)]
+    let _ = PACKAGED_IPC_SOCKET_PATH.set(ipc_socket_path.clone());
 
     let ai = bundled_helper_path("memory-bread-ai")?;
     let core = bundled_helper_path("memory-bread-core")?;
@@ -1046,7 +1080,14 @@ fn start_bundled_backends(app: &AppHandle) -> Result<(), String> {
 
     let mut started = Vec::with_capacity(services.len());
     for (name, executable, args) in services {
-        match spawn_bundled_backend(name, executable, args, &runtime_home, &log_dir) {
+        match spawn_bundled_backend(
+            name,
+            executable,
+            args,
+            &runtime_home,
+            &log_dir,
+            &ipc_socket_path,
+        ) {
             Ok(child) => started.push(child),
             Err(error) => {
                 for process in started.iter_mut().rev() {

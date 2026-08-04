@@ -11,8 +11,8 @@ use crate::storage::document_identity::canonical_document_identity;
 use crate::storage::models::CaptureRecord;
 use crate::storage::{
     now_ms, BakeActivityRecord, BakeDocumentRecord, BakeKnowledgeRecord, BakeMemorySourceRecord,
-    BakeOverviewRecord, BakeRunRecord, NewBakeDocument, NewBakeKnowledge, NewBakeRun, NewBakeSop,
-    NewTimeline, StorageError, StorageManager, TimelineRecord,
+    BakeOverviewRecord, BakeRunRecord, DataSourceRecord, NewBakeDocument, NewBakeKnowledge,
+    NewBakeRun, NewBakeSop, NewTimeline, StorageError, StorageManager, TimelineRecord,
 };
 
 const BAKE_STYLE_CONFIG_KEY: &str = "bake.style.config";
@@ -78,6 +78,14 @@ pub struct BakeListFilter {
     pub to_ts: Option<i64>,
     pub limit: usize,
     pub offset: usize,
+    pub sort: BakeListSort,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BakeListSort {
+    #[default]
+    Recent,
+    Heat,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -285,6 +293,7 @@ pub struct BakeInventoryTrendBucketPayload {
     pub start_ts: i64,
     pub end_ts: i64,
     pub memory_count: i64,
+    pub data_count: i64,
     pub knowledge_count: i64,
     pub template_count: i64,
     pub sop_count: i64,
@@ -897,7 +906,7 @@ impl BakeService {
         let records = self
             .storage
             .list_bake_knowledge_paginated(filter.q.as_deref(), 5000, 0)?;
-        let filtered = records
+        let mut filtered = records
             .into_iter()
             .filter(is_current_bake_entry)
             .filter(|record| matches_entry_bucket(record, filter.bucket))
@@ -909,6 +918,16 @@ impl BakeService {
             .filter(|record| filter.to_ts.map_or(true, |to| record.created_at_ms <= to))
             .map(map_bake_knowledge_record)
             .collect::<Vec<_>>();
+        if filter.sort == BakeListSort::Heat {
+            filtered.sort_by(|left, right| {
+                right
+                    .occurrence_count
+                    .cmp(&left.occurrence_count)
+                    .then(right.importance.cmp(&left.importance))
+                    .then(right.updated_at_ms.cmp(&left.updated_at_ms))
+                    .then(left.id.cmp(&right.id))
+            });
+        }
         let total = filtered.len() as i64;
         let items = filtered
             .into_iter()
@@ -2768,19 +2787,14 @@ impl BakeService {
             .collect::<Vec<_>>();
         let latest_run = self.storage.get_latest_bake_run()?;
         let memory_count = self.storage.count_timelines(None)?;
-        let data_count = self.storage.with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM data_sources WHERE status = 'active'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(StorageError::Sqlite)
-        })?;
+        let data_sources = self.storage.list_data_sources(None, 5000, 0)?.0;
+        let data_count = data_sources.len() as i64;
         let inventory_trend = build_inventory_trend(
             &memory_entries,
             &knowledge_entries,
             &templates,
             &sop_entries,
+            &data_sources,
         );
 
         let pending_candidates = 0;
@@ -4346,6 +4360,7 @@ fn build_inventory_trend(
     knowledge_entries: &[TimelineRecord],
     documents: &[BakeDocumentRecord],
     sops: &[TimelineRecord],
+    data_sources: &[DataSourceRecord],
 ) -> Vec<BakeInventoryTrendBucketPayload> {
     const DAY_MS: i64 = 86_400_000;
     const MAX_BUCKETS: i64 = 8;
@@ -4356,6 +4371,7 @@ fn build_inventory_trend(
         .chain(knowledge_entries.iter().map(|record| record.created_at_ms))
         .chain(documents.iter().map(|record| record.created_at))
         .chain(sops.iter().map(|record| record.created_at_ms))
+        .chain(data_sources.iter().map(|record| record.created_at))
         .filter(|ts| *ts > 0)
         .collect::<Vec<_>>();
 
@@ -4391,6 +4407,11 @@ fn build_inventory_trend(
                 },
                 memory_count: count_records_in_bucket(
                     memories.iter().map(|record| record.created_at_ms),
+                    start_ts,
+                    raw_end_ts,
+                ),
+                data_count: count_records_in_bucket(
+                    data_sources.iter().map(|record| record.created_at),
                     start_ts,
                     raw_end_ts,
                 ),
@@ -4831,6 +4852,53 @@ fn default_style_config() -> BakeStyleConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn data_source_for_trend(created_at: i64) -> DataSourceRecord {
+        DataSourceRecord {
+            id: created_at,
+            title: "趋势测试数据".to_string(),
+            source_kind: "work_memory".to_string(),
+            source_url: None,
+            access_mode: "memory_only".to_string(),
+            refresh_policy: "never".to_string(),
+            realtime_level: "observed".to_string(),
+            source_app_name: None,
+            source_window_title: None,
+            tags: Vec::new(),
+            first_seen_at: created_at,
+            last_seen_at: created_at,
+            last_collected_at: Some(created_at),
+            last_success_at: Some(created_at),
+            last_error_code: None,
+            status: "active".to_string(),
+            created_at,
+            updated_at: created_at,
+            latest_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn test_inventory_trend_counts_data_sources_by_creation_time() {
+        const DAY_MS: i64 = 86_400_000;
+        let first_day = (1_710_000_000_000 / DAY_MS) * DAY_MS;
+        let data_sources = vec![
+            data_source_for_trend(first_day + 1_000),
+            data_source_for_trend(first_day + DAY_MS + 1_000),
+        ];
+
+        let buckets = build_inventory_trend(&[], &[], &[], &[], &data_sources);
+
+        assert_eq!(
+            buckets.iter().map(|bucket| bucket.data_count).sum::<i64>(),
+            2
+        );
+        assert!(buckets.iter().all(|bucket| {
+            bucket.memory_count == 0
+                && bucket.knowledge_count == 0
+                && bucket.template_count == 0
+                && bucket.sop_count == 0
+        }));
+    }
 
     #[test]
     fn test_candidate_failures_use_bounded_retry_classification() {
@@ -5455,6 +5523,62 @@ mod tests {
         let second = service.initialize_memories(10).expect("二次初始化失败");
         assert_eq!(second.created_count, 0);
         assert_eq!(second.skipped_count, 1);
+    }
+
+    #[test]
+    fn test_list_knowledge_by_heat_uses_source_timeline_occurrences() {
+        let service = make_service();
+        let cold_capture = seed_capture(&service, 1_710_000_000_000, "Code", "低热度来源");
+        let hot_capture = seed_capture(&service, 1_710_000_010_000, "Code", "高热度来源");
+        let cold_timeline = seed_knowledge(&service, "meeting", cold_capture, 5, 1);
+        let hot_timeline = seed_knowledge(&service, "meeting", hot_capture, 3, 12);
+
+        for (timeline_id, title) in [(cold_timeline, "低热度知识"), (hot_timeline, "高热度知识")]
+        {
+            service
+                .storage
+                .insert_bake_knowledge(&NewBakeKnowledge {
+                    timeline_id,
+                    title: title.to_string(),
+                    summary: title.to_string(),
+                    content: Some(r#"{"status":"confirmed"}"#.to_string()),
+                    detailed_content: None,
+                    entities: "[]".to_string(),
+                    importance: 3,
+                    source_capture_ids: None,
+                })
+                .expect("插入 bake knowledge 失败");
+        }
+
+        let response = service
+            .list_knowledge_paginated(BakeListFilter {
+                q: None,
+                bucket: None,
+                from_ts: None,
+                to_ts: None,
+                limit: 1,
+                offset: 0,
+                sort: BakeListSort::Heat,
+            })
+            .expect("按热度查询 knowledge 失败");
+
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].summary, "高热度知识");
+        assert_eq!(response.items[0].occurrence_count, 12);
+
+        let searched = service
+            .list_knowledge_paginated(BakeListFilter {
+                q: Some("低热度".to_string()),
+                bucket: None,
+                from_ts: None,
+                to_ts: None,
+                limit: 10,
+                offset: 0,
+                sort: BakeListSort::Recent,
+            })
+            .expect("搜索 knowledge 失败");
+        assert_eq!(searched.items.len(), 1);
+        assert_eq!(searched.items[0].summary, "低热度知识");
     }
 
     #[test]

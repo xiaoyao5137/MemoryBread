@@ -1,12 +1,15 @@
 import React, { useMemo, useState } from 'react'
 import type { BakeInventoryTrendBucket, BakeOverview } from '../../types'
-import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './BakeShared'
+import BakeMemoryGraph from './BakeMemoryGraph'
+import type { MemoryGraphAssets, MemoryGraphNode } from './memoryGraph'
+import { BakeButton, BakeCard, BakeSectionHeader } from './BakeShared'
 
 const trendSeries = [
   { key: 'memoryCount', label: '时间线', color: '#007AFF' },
   { key: 'knowledgeCount', label: '知识', color: '#34C759' },
   { key: 'templateCount', label: '文档', color: '#FF9500' },
   { key: 'sopCount', label: '操作', color: '#AF52DE' },
+  { key: 'dataCount', label: '数据', color: '#FF2D55' },
 ] as const
 
 const DAY_MS = 86_400_000
@@ -19,6 +22,13 @@ const trendRangeOptions = [
 ] as const
 
 type TrendRangeKey = typeof trendRangeOptions[number]['key']
+
+const emptyOverviewGraphAssets: MemoryGraphAssets = {
+  knowledge: [],
+  documents: [],
+  operations: [],
+  data: [],
+}
 
 const parseLocalDate = (year: string, month: string, day: string) => (
   new Date(Number(year), Number(month) - 1, Number(day)).getTime()
@@ -92,6 +102,7 @@ const createDailyBucket = (dayStart: number): BakeInventoryTrendBucket => ({
   startTs: dayStart,
   endTs: addLocalDays(dayStart, 1) - 1,
   memoryCount: 0,
+  dataCount: 0,
   knowledgeCount: 0,
   templateCount: 0,
   sopCount: 0,
@@ -99,6 +110,7 @@ const createDailyBucket = (dayStart: number): BakeInventoryTrendBucket => ({
 
 const addBucketCounts = (target: BakeInventoryTrendBucket, source: BakeInventoryTrendBucket) => {
   target.memoryCount += source.memoryCount
+  target.dataCount += source.dataCount
   target.knowledgeCount += source.knowledgeCount
   target.templateCount += source.templateCount
   target.sopCount += source.sopCount
@@ -203,7 +215,7 @@ const InventoryTrendChart: React.FC<{ overview: BakeOverview }> = ({ overview })
     <BakeCard>
       <BakeSectionHeader
         title="记忆生产历程"
-        subtitle="按年月日观察时间线、知识、文档和操作的生产分布"
+        subtitle="按年月日观察时间线、知识、文档、操作和数据的生产分布"
         right={(
           <div className="bake-trend-header-tools">
             <div className="bake-trend-range" role="radiogroup" aria-label="趋势时间范围">
@@ -366,10 +378,25 @@ const InventoryTrendChart: React.FC<{ overview: BakeOverview }> = ({ overview })
 
 const BakeOverviewTab: React.FC<{
   overview: BakeOverview
+  graphAssets?: MemoryGraphAssets
+  graphLoading?: boolean
+  graphError?: string | null
   onOpenTab: (tab: 'knowledge' | 'templates' | 'sop' | 'data') => void
   onOpenRepository: (tab: 'memory' | 'capture') => void
-  footer?: React.ReactNode
-}> = ({ overview, onOpenTab, onOpenRepository, footer }) => {
+  onRetryGraph?: () => void
+  onOpenGraphNode?: (node: MemoryGraphNode) => void
+  onSearchGraph?: (query: string) => Promise<MemoryGraphAssets>
+}> = ({
+  overview,
+  graphAssets = emptyOverviewGraphAssets,
+  graphLoading,
+  graphError,
+  onOpenTab,
+  onOpenRepository,
+  onRetryGraph,
+  onOpenGraphNode,
+  onSearchGraph,
+}) => {
 
   return (
     <div style={{ display: 'grid', gap: 16 }}>
@@ -383,27 +410,15 @@ const BakeOverviewTab: React.FC<{
 
       <InventoryTrendChart overview={overview} />
 
-      <BakeCard>
-        <BakeSectionHeader title="生产关系" subtitle="时间线可提炼为文档、知识、操作与数据；实时数据网址在使用时刷新" right={<BakePill text="时间线 → 文档 / 知识 / 操作 / 数据" />} />
-        <div className="bake-list">
-          <div className="bake-list-item">
-            <div className="bake-inline-meta">
-              <div style={{ minWidth: 0 }}>
-                <div className="bake-list-item__title">采集导航</div>
-                <div className="bake-muted" style={{ lineHeight: 1.7 }}>在记忆里继续做文档/知识/操作提炼；在采集里浏览时间线与采集记录，回溯原始上下文。</div>
-              </div>
-            </div>
-            <div className="bake-actions--secondary" style={{ marginTop: 12 }}>
-              <BakeButton compact onClick={() => onOpenRepository('memory')}>时间线</BakeButton>
-              <BakeButton compact onClick={() => onOpenRepository('capture')}>采集记录</BakeButton>
-              <BakeButton compact onClick={() => onOpenTab('templates')}>文档</BakeButton>
-              <BakeButton compact onClick={() => onOpenTab('knowledge')}>知识</BakeButton>
-              <BakeButton compact onClick={() => onOpenTab('sop')}>操作</BakeButton>
-              <BakeButton compact onClick={() => onOpenTab('data')}>数据</BakeButton>
-            </div>
-          </div>
-        </div>
-      </BakeCard>
+      <BakeMemoryGraph
+        assets={graphAssets}
+        loading={graphLoading}
+        error={graphError}
+        mode="overview"
+        onRetry={onRetryGraph}
+        onOpenNode={onOpenGraphNode}
+        onSearchAssets={onSearchGraph}
+      />
 
       <div className="bake-split-overview">
         <BakeCard>
@@ -479,8 +494,6 @@ const BakeOverviewTab: React.FC<{
           </BakeCard>
         </div>
       </div>
-
-      {footer}
     </div>
   )
 }

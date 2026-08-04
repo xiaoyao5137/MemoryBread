@@ -26,6 +26,7 @@ import threading
 import re
 import queue
 from pathlib import Path
+from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 IPC_PYTHON_DIR = PROJECT_ROOT.parent / "shared" / "ipc-protocol" / "python"
@@ -330,7 +331,7 @@ def _extract_floating_assist_question(ocr_text: str) -> str:
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     question_markers = ('?', '？', '是什么', '怎么样', '多少', '如何', '怎么', '哪些', '为什么', '有没有', '能否')
-    domain_pattern = re.compile(r'(?i)(?:^|[\s/])[\w.-]+\.(?: Union[com, cn, net, org, io, dev, app, local])(?:[/:?#]|$)')
+    domain_pattern = re.compile(r'(?i)(?:^|[\s/])[\w.-]+\.(?:com|cn|net|org|io|dev|app|local)(?:[/:?#]|$)')
     noise_tokens = (
         '显示器 ', 'http://', 'https://', '发送/', '换行', '发送', '搜索', '登录', '注册账号',
         '安全与隐私', '用户控制台', '菜单', '窗口', '帮助', 'File', 'Edit', 'View', 'Window'
@@ -394,7 +395,7 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
-def _parse_json_object(text: str) -> dict | None:
+def _parse_json_object(text: str) -> Optional[dict]:
     raw = (text or '').strip()
     if raw.startswith('```'):
         raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
@@ -569,7 +570,7 @@ def _runtime_model_name(model_id: str) -> str:
     return model.model_id if model is not None else model_id
 
 
-def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[dict], latency_ms: int, metadata: Optional[dict] = None, model: Optional[str] = None) -> int | None:
+def _save_rag_session(query: str, prompt_used: str, answer: str, contexts: list[dict], latency_ms: int, metadata: Optional[dict] = None, model: Optional[str] = None) -> Optional[int]:
     try:
         metadata = metadata or {}
         saved_contexts = _with_floating_assist_context(contexts, metadata)

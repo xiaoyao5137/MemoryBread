@@ -23,6 +23,52 @@ logger = logging.getLogger(__name__)
 
 _NOISE_OVERVIEW_PREFIX = "低价值工作片段（"
 _MAX_FALLBACK_TERMS = 12
+_RAW_CAPTURE_PRIORITY_LIMIT = 8
+_RAW_CAPTURE_QUERY_MODIFIERS = (
+    "软件版本",
+    "版本更新",
+    "更新日志",
+    "更新记录",
+    "发布记录",
+    "变更记录",
+    "帮我查一下",
+    "帮我找一下",
+    "请提供",
+    "请查找",
+    "请查询",
+    "获取",
+    "查看",
+    "查找",
+    "查询",
+    "搜索",
+    "召回",
+    "相关",
+    "关于",
+    "软件",
+    "产品",
+    "项目",
+    "版本",
+    "更新",
+    "日志",
+    "记录",
+    "历史",
+    "详情",
+    "信息",
+    "文档",
+    "资料",
+    "内容",
+)
+_RAW_CAPTURE_ASCII_MODIFIERS = frozenset(
+    {
+        "changelog",
+        "history",
+        "log",
+        "notes",
+        "release",
+        "update",
+        "version",
+    }
+)
 
 
 @dataclass
@@ -104,6 +150,61 @@ def _build_like_clauses(expression: str, terms: list[str]) -> tuple[str, list[st
     clause = "(" + " OR ".join(f"{expression} LIKE ?" for _ in terms) + ")"
     params = [f"%{term.lower()}%" for term in terms]
     return clause, params
+
+
+def _raw_capture_priority_terms(
+    cursor: sqlite3.Cursor,
+    query: str,
+    entity_terms: Optional[list[str]],
+) -> list[tuple[str, float]]:
+    """提取原始 capture 候选排序所需的实体词和区分词。
+
+    capture LIKE 兜底仍可用宽松 n-gram 扩大覆盖面，但 SQL 截断前必须先把
+    明确实体和稀有词排在前面，避免旧的精确命中被大量近期“版本/更新”记录挤掉。
+    """
+    weighted: dict[str, float] = {}
+
+    def add(term: str, weight: float) -> None:
+        normalized = str(term or "").strip().lower()
+        if len(normalized) < 2:
+            return
+        weighted[normalized] = max(weighted.get(normalized, 0.0), float(weight))
+
+    for term in entity_terms or []:
+        add(term, 2_000.0)
+
+    anchor_text = str(query or "").lower()
+    for modifier in sorted(_RAW_CAPTURE_QUERY_MODIFIERS, key=len, reverse=True):
+        anchor_text = anchor_text.replace(modifier, " ")
+    for token in re.findall(r"[a-z0-9._:/+-]+|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+", anchor_text):
+        if token in _RAW_CAPTURE_ASCII_MODIFIERS:
+            continue
+        anchor_terms = _extract_query_terms(token)
+        for term in sorted(anchor_terms, key=len, reverse=True)[:4]:
+            add(term, 1_000.0 + min(len(term), 6))
+
+    try:
+        plan = build_artifact_query_plan(cursor, query, entity_terms)
+    except sqlite3.Error:
+        plan = None
+    if plan is not None:
+        for term in (*plan.discriminative_terms, *plan.fallback_terms):
+            add(term.text, term.idf)
+
+    if not weighted:
+        fallback_terms = sorted(
+            _bounded_fallback_terms(_extract_query_terms(query)),
+            key=len,
+            reverse=True,
+        )
+        for term in fallback_terms[:_RAW_CAPTURE_PRIORITY_LIMIT]:
+            add(term, float(len(term)))
+
+    return sorted(
+        weighted.items(),
+        key=lambda item: (item[1], len(item[0])),
+        reverse=True,
+    )[:_RAW_CAPTURE_PRIORITY_LIMIT]
 
 
 
@@ -188,6 +289,24 @@ def _is_link_lookup_query(query: str) -> bool:
     return any(term in lowered for term in ("url", "链接", "地址", "网址", "文档地址", "页面"))
 
 
+def _looks_like_durable_document_url(url: Optional[str]) -> bool:
+    lowered = str(url or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "/d/home/",
+            "/s/home/",
+            "/k/home/",
+            "/document/",
+            "/wiki/",
+            "docs.google.",
+            "feishu.",
+            "notion.",
+            "yuque.",
+        )
+    )
+
+
 def _merge_chunks(chunks: list["RetrievedChunk"], limit: int, prefer_url: bool = False) -> list["RetrievedChunk"]:
     unique: list[RetrievedChunk] = []
     seen: set[str] = set()
@@ -257,7 +376,7 @@ class RetrievedChunk:
     text: str
     score: float = 0.0
     source: str = "unknown"  # vector / fts5 / knowledge / merged
-    metadata: dict[str, Any] | None = None
+    metadata: Optional[dict[str, Any]] = None
     doc_key: Optional[str] = None
 
     def __post_init__(self):
@@ -289,7 +408,7 @@ class VectorRetriever:
         self._use_internal_http: Optional[bool] = None  # None=未探测
 
     @staticmethod
-    def _filters_to_payload(filters: Optional[VectorSearchFilter]) -> dict[str, Any] | None:
+    def _filters_to_payload(filters: Optional[VectorSearchFilter]) -> Optional[dict[str, Any]]:
         if filters is None:
             return None
         return {
@@ -568,7 +687,19 @@ class Fts5Retriever:
                 entity_terms=entity_terms,
             )
             conn.close()
-            chunks = _merge_chunks([*chunks, *fallback_chunks], top_k, prefer_url=_is_link_lookup_query(query))
+            combined_chunks = [*chunks, *fallback_chunks]
+            combined_chunks.sort(
+                key=lambda chunk: (
+                    bool((chunk.metadata or {}).get("lexical_entity_match")),
+                    bool((chunk.metadata or {}).get("durable_document_url")),
+                ),
+                reverse=True,
+            )
+            chunks = _merge_chunks(
+                combined_chunks,
+                top_k,
+                prefer_url=_is_link_lookup_query(query),
+            )
             logger.debug(f"Capture 字段回退检索返回 {len(chunks)} 条结果")
             return chunks
         except Exception as e:
@@ -636,6 +767,8 @@ class Fts5Retriever:
         if not terms:
             return []
 
+        priority_terms = _raw_capture_priority_terms(cursor, query, entity_terms)
+
         sql = """
             SELECT
                 c.id as capture_id,
@@ -666,14 +799,66 @@ class Fts5Retriever:
         )
         sql += f" AND {clause}"
         params.extend(clause_params)
-        sql += " ORDER BY c.ts DESC LIMIT ?"
+        priority_expression = (
+            "LOWER(COALESCE(c.app_name, '') || ' ' || COALESCE(c.win_title, '') || ' ' || "
+            "COALESCE(c.webpage_title, '') || ' ' || COALESCE(c.url, '') || ' ' || "
+            "COALESCE(c.ocr_text, '') || ' ' || COALESCE(c.ax_text, '') || ' ' || "
+            "COALESCE(c.input_text, '') || ' ' || COALESCE(c.audio_text, ''))"
+        )
+        if priority_terms:
+            score_expression = " + ".join(
+                f"CASE WHEN {priority_expression} LIKE ? THEN ? ELSE 0.0 END"
+                for _ in priority_terms
+            )
+            sql += (
+                f" ORDER BY ({score_expression}) DESC, "
+                "CASE WHEN LOWER(COALESCE(c.url, '')) LIKE '%/d/home/%' "
+                "       OR LOWER(COALESCE(c.url, '')) LIKE '%/s/home/%' "
+                "       OR LOWER(COALESCE(c.url, '')) LIKE '%/k/home/%' "
+                "       OR LOWER(COALESCE(c.url, '')) LIKE '%/document/%' "
+                "       OR LOWER(COALESCE(c.url, '')) LIKE '%/wiki/%' "
+                "     THEN 1 ELSE 0 END DESC, "
+                "c.ts DESC LIMIT ?"
+            )
+            for term, weight in priority_terms:
+                params.extend((f"%{term}%", weight))
+        else:
+            sql += " ORDER BY c.ts DESC LIMIT ?"
         candidate_limit = max(top_k * 50, 200)
         params.append(candidate_limit)
         cursor.execute(sql, params)
 
         rows = cursor.fetchall()
-        chunks = [self._row_to_chunk(row, float(len(terms)), source="fts5") for row in rows]
-        return _rank_keyword_chunks(chunks, terms, prefer_url=_is_link_lookup_query(query))[:top_k]
+        chunks = []
+        for row in rows:
+            chunk = self._row_to_chunk(row, 1.0, source="fts5")
+            lowered_text = chunk.text.lower()
+            priority_score = sum(
+                weight for term, weight in priority_terms if term in lowered_text
+            )
+            chunk.score = max(1.0, priority_score)
+            chunk.metadata["lexical_priority_score"] = priority_score
+            chunk.metadata["lexical_entity_match"] = any(
+                weight >= 1_000.0 and term in lowered_text
+                for term, weight in priority_terms
+            )
+            chunk.metadata["durable_document_url"] = _looks_like_durable_document_url(
+                chunk.metadata.get("url")
+            )
+            chunks.append(chunk)
+        ranked_chunks = _rank_keyword_chunks(
+            chunks,
+            terms,
+            prefer_url=_is_link_lookup_query(query),
+        )
+        ranked_chunks.sort(
+            key=lambda chunk: (
+                bool((chunk.metadata or {}).get("lexical_entity_match")),
+                bool((chunk.metadata or {}).get("durable_document_url")),
+            ),
+            reverse=True,
+        )
+        return ranked_chunks[:top_k]
 
     def _row_to_chunk(self, row: sqlite3.Row, score: float, source: str = "fts5") -> RetrievedChunk:
         doc_key = _capture_doc_key(row["capture_id"])
@@ -814,6 +999,98 @@ class KnowledgeFts5Retriever:
         except Exception as e:
             logger.error(f"知识库检索失败: {e}")
             return []
+
+    def promote_documents_linked_to_knowledge(
+        self,
+        chunks: list[RetrievedChunk],
+        query: str,
+        top_k: int = 10,
+        entity_terms: Optional[list[str]] = None,
+    ) -> list[RetrievedChunk]:
+        """把知识命中反向映射为 ``linked_knowledge_ids`` 对应的持久文档。"""
+        ranked_ids: dict[str, tuple[int, float]] = {}
+        for rank, chunk in enumerate(chunks):
+            metadata = chunk.metadata or {}
+            source_type = metadata.get("source_type") or chunk.source
+            if source_type not in {"knowledge", "bake_knowledge"}:
+                continue
+
+            knowledge_ids: list[str] = []
+            knowledge_id = metadata.get("knowledge_id")
+            if knowledge_id is not None:
+                knowledge_ids.append(str(knowledge_id))
+            source_timeline_ids = metadata.get("source_timeline_ids")
+            if isinstance(source_timeline_ids, list):
+                knowledge_ids.extend(
+                    str(item) for item in source_timeline_ids if item is not None
+                )
+            elif isinstance(source_timeline_ids, str):
+                knowledge_ids.extend(re.findall(r"\d+", source_timeline_ids))
+
+            for value in knowledge_ids:
+                current = ranked_ids.get(value)
+                candidate = (rank, float(chunk.score or 0.0))
+                if current is None or candidate[0] < current[0]:
+                    ranked_ids[value] = candidate
+
+        if not ranked_ids or top_k <= 0:
+            return []
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='bake_documents'"
+            )
+            if not cursor.fetchone():
+                return []
+
+            knowledge_ids = list(ranked_ids)
+            placeholders = ", ".join("?" for _ in knowledge_ids)
+            cursor.execute(
+                f"""
+                SELECT
+                    d.id, d.title, d.doc_type, d.summary, d.full_content,
+                    d.sections_json, d.source_url, d.source_memory_ids,
+                    d.linked_knowledge_ids, d.updated_at
+                FROM bake_documents d
+                WHERE d.deleted_at IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM json_each(
+                          CASE
+                              WHEN json_valid(d.linked_knowledge_ids)
+                              THEN d.linked_knowledge_ids
+                              ELSE '[]'
+                          END
+                      ) linked
+                      WHERE CAST(linked.value AS TEXT) IN ({placeholders})
+                  )
+                """,
+                knowledge_ids,
+            )
+            rows = cursor.fetchall()
+            plan = build_artifact_query_plan(cursor, query, entity_terms)
+        finally:
+            conn.close()
+
+        promoted: list[tuple[int, int, RetrievedChunk]] = []
+        for row in rows:
+            linked_ids = self._json_ids(row["linked_knowledge_ids"])
+            matched_ids = [value for value in linked_ids if value in ranked_ids]
+            if not matched_ids:
+                continue
+            source_rank = min(ranked_ids[value][0] for value in matched_ids)
+            source_score = max(ranked_ids[value][1] for value in matched_ids)
+            chunk = self._document_row_to_chunk(row, plan)
+            chunk.metadata["retrieval_method"] = "linked_knowledge"
+            chunk.metadata["promoted_by_knowledge_ids"] = matched_ids
+            chunk.metadata["linked_knowledge_score"] = source_score
+            promoted.append((source_rank, -int(row["updated_at"] or 0), chunk))
+
+        promoted.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in promoted[:top_k]]
 
     def _search_by_fts(
         self,

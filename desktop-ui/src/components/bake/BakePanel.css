@@ -1457,54 +1457,16 @@ button.bake-list-item.bake-list-item--active {
   font-size: 11px;
 }
 
-.bake-data-overview {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.bake-data-overview__item {
-  min-width: 0;
-  display: grid;
-  gap: 5px;
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: #F8F9FB;
-  border: 1px solid rgba(0, 0, 0, 0.06);
-}
-
-.bake-data-overview__item span {
-  color: #6E6E73;
-  font-size: 11px;
-}
-
-.bake-data-overview__item strong {
-  color: #111111;
-  font-size: 20px;
-  line-height: 1.2;
-}
-
-.bake-data-overview__item .bake-data-overview__time {
-  font-size: 12px;
-  line-height: 1.45;
-}
-
 .bake-data-list-card,
 .bake-data-detail-card {
   min-height: 480px;
 }
 
-.bake-data-list-sections,
 .bake-data-list-group,
 .bake-data-list-group__heading,
-.bake-data-pending__list,
 .bake-data-detail-heading,
 .bake-data-facts {
   display: grid;
-}
-
-.bake-data-list-sections {
-  gap: 16px;
 }
 
 .bake-data-list-group {
@@ -1520,8 +1482,7 @@ button.bake-list-item.bake-list-item--active {
   font-weight: 700;
 }
 
-.bake-data-list-group__heading span:last-child,
-.bake-data-pending > summary span {
+.bake-data-list-group__heading span:last-child {
   min-width: 24px;
   padding: 2px 7px;
   border-radius: 999px;
@@ -1538,11 +1499,17 @@ button.bake-list-item.bake-list-item--active {
   text-align: left;
 }
 
-.bake-data-record-item__summary {
+.bake-data-record-item__title {
   color: #111111;
   font-size: 14px;
   font-weight: 700;
   line-height: 1.45;
+}
+
+.bake-data-record-item__summary {
+  color: #3A3A3C;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .bake-data-record-item__eyebrow {
@@ -1557,33 +1524,12 @@ button.bake-list-item.bake-list-item--active {
   font-size: 11px;
 }
 
-.bake-data-pending {
-  padding-top: 12px;
-  border-top: 1px solid rgba(0, 0, 0, 0.06);
-}
-
-.bake-data-pending > summary,
 .bake-data-disclosure > summary {
   cursor: pointer;
   color: #3A3A3C;
   font-size: 12px;
   font-weight: 700;
   list-style-position: inside;
-}
-
-.bake-data-pending > summary span {
-  display: inline-block;
-  margin-left: 4px;
-}
-
-.bake-data-pending__list {
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.bake-data-source-item {
-  width: 100%;
-  text-align: left;
 }
 
 .bake-data-detail-heading {
@@ -1597,11 +1543,18 @@ button.bake-list-item.bake-list-item--active {
   font-weight: 700;
 }
 
-.bake-data-detail-heading__summary {
+.bake-data-detail-heading__title {
   color: #111111;
   font-size: 20px;
   font-weight: 750;
   line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.bake-data-detail-heading__summary {
+  color: #3A3A3C;
+  font-size: 13px;
+  line-height: 1.6;
   overflow-wrap: anywhere;
 }
 
@@ -1667,6 +1620,12 @@ button.bake-list-item.bake-list-item--active {
   font-variant-numeric: tabular-nums;
   font-weight: 800;
   white-space: nowrap;
+}
+
+.bake-data-table-note {
+  margin-top: 7px;
+  font-size: 11px;
+  text-align: right;
 }
 
 .bake-data-timeline-links {
@@ -2091,7 +2050,6 @@ button.bake-list-item.bake-list-item--active {
 
 @media (max-width: 768px) {
   .bake-grid-4,
-  .bake-data-overview,
   .bake-data-facts,
   .bake-data-source-meta,
   .bake-split-list-detail,
@@ -2392,13 +2350,11 @@ button.bake-list-item.bake-list-item--active {
     box-shadow: 0 12px 28px rgba(10, 132, 255, 0.18);
   }
 
-  .bake-data-overview__item,
   .bake-data-disclosure {
     background: #232326;
     border-color: rgba(255, 255, 255, 0.08);
   }
 
-  .bake-data-overview__item span,
   .bake-data-detail-heading__label,
   .bake-data-record-item__source,
   .bake-data-fact__label,
@@ -2407,9 +2363,9 @@ button.bake-list-item.bake-list-item--active {
     color: #9CA3AF;
   }
 
-  .bake-data-overview__item strong,
+  .bake-data-record-item__title,
+  .bake-data-detail-heading__title,
   .bake-data-record-item__summary,
-  .bake-data-detail-heading__summary,
   .bake-data-fact__value,
   .bake-data-source-meta dd,
   .bake-data-content,
@@ -2417,19 +2373,20 @@ button.bake-list-item.bake-list-item--active {
     color: #F3F4F6;
   }
 
+  .bake-data-detail-heading__summary {
+    color: #D1D5DB;
+  }
+
   .bake-data-list-group__heading,
-  .bake-data-pending > summary,
   .bake-data-disclosure > summary {
     color: #D1D5DB;
   }
 
-  .bake-data-list-group__heading span:last-child,
-  .bake-data-pending > summary span {
+  .bake-data-list-group__heading span:last-child {
     background: rgba(255, 255, 255, 0.08);
     color: #D1D5DB;
   }
 
-  .bake-data-pending,
   .bake-data-source-note {
     border-color: rgba(255, 255, 255, 0.08);
   }
@@ -2585,3 +2542,731 @@ button.bake-list-item.bake-list-item--active {
 .bake-related-skills__list strong { color: #4f321b; font-size: 12px; }
 .bake-related-skills__list small { color: #7b6a59; font-size: 11px; line-height: 1.45; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bake-related-skills__list em { flex: 0 0 auto; color: #a15f28; font-size: 10px; font-style: normal; font-weight: 700; }
+
+/* Memory knowledge graph */
+.bake-tabs-shell {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.bake-tabs-shell .bake-tabs {
+  flex: 1 1 auto;
+}
+
+.bake-graph-toggle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 10px;
+  background: #FFFFFF;
+  color: #2C2C2E;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+}
+
+.bake-graph-toggle:hover,
+.bake-graph-toggle[aria-pressed="true"] {
+  border-color: rgba(0, 122, 255, 0.34);
+  background: rgba(0, 122, 255, 0.08);
+  color: #0066CC;
+}
+
+.bake-graph-toggle:focus-visible,
+.bake-graph-tool:focus-visible,
+.bake-graph-filter:focus-visible,
+.bake-graph-retry:focus-visible,
+.bake-graph-search:focus-within,
+.bake-memory-graph__inspector button:focus-visible {
+  outline: 3px solid rgba(0, 122, 255, 0.28);
+  outline-offset: 2px;
+}
+
+.bake-graph-workspace {
+  min-width: 0;
+}
+
+.bake-graph-workspace--open {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(370px, 42%);
+  align-items: start;
+  gap: 16px;
+}
+
+.bake-graph-workspace > .bake-tab-content {
+  min-width: 0;
+}
+
+@media (min-width: 1121px) {
+  .bake-graph-workspace--open .bake-split-list-detail,
+  .bake-graph-workspace--open .bake-split-list-detail--knowledge,
+  .bake-graph-workspace--open .bake-split-list-detail--templates,
+  .bake-graph-workspace--open .bake-split-list-detail--sop {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .bake-graph-workspace--open .bake-split-list-detail > .bake-knowledge-list-card {
+    display: none;
+  }
+}
+
+.bake-memory-graph {
+  --graph-ink: #111111;
+  --graph-muted: #6E6E73;
+  --graph-paper: #FFFFFF;
+  --graph-paper-strong: #FFFFFF;
+  --graph-accent: #007AFF;
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 14px;
+  background: var(--graph-paper);
+  color: var(--graph-ink);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04);
+  isolation: isolate;
+}
+
+.bake-memory-graph::before {
+  display: none;
+}
+
+.bake-memory-graph--overview {
+  min-height: 520px;
+}
+
+.bake-memory-graph--dock {
+  position: sticky;
+  top: 0;
+  height: min(720px, calc(100vh - 126px));
+  min-height: 520px;
+}
+
+.bake-memory-graph--fullscreen {
+  position: fixed;
+  inset: 14px;
+  z-index: 1200;
+  width: auto;
+  height: auto;
+  min-height: 0;
+  border-radius: 18px;
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.24), 0 0 0 200vmax rgba(0, 0, 0, 0.42);
+}
+
+.bake-memory-graph__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(14px);
+}
+
+.bake-memory-graph__heading {
+  min-width: 0;
+}
+
+.bake-memory-graph__eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #007AFF;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.bake-memory-graph__heading h2 {
+  margin: 4px 0 0;
+  font-size: 18px;
+  line-height: 1.25;
+  color: var(--graph-ink);
+  letter-spacing: -0.02em;
+}
+
+.bake-memory-graph__heading p {
+  margin: 5px 0 0;
+  max-width: 580px;
+  color: var(--graph-muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.bake-memory-graph__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.bake-graph-tool {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 9px;
+  background: #FFFFFF;
+  color: #3A3A3C;
+  cursor: pointer;
+}
+
+.bake-graph-tool:hover {
+  border-color: rgba(0, 122, 255, 0.3);
+  background: rgba(0, 122, 255, 0.08);
+  color: #007AFF;
+}
+
+.bake-memory-graph__filters {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 46px;
+  padding: 8px 18px;
+  overflow-x: auto;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+  background: #F8F9FB;
+  scrollbar-width: none;
+}
+
+.bake-memory-graph__filters::-webkit-scrollbar {
+  display: none;
+}
+
+.bake-graph-search {
+  flex: 0 0 190px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+  background: #FFFFFF;
+  color: #8E8E93;
+}
+
+.bake-graph-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #1C1C1E;
+  font: inherit;
+  font-size: 11px;
+}
+
+.bake-graph-search input::placeholder {
+  color: #8E8E93;
+}
+
+.bake-graph-search input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.bake-graph-search button {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #8E8E93;
+  cursor: pointer;
+}
+
+.bake-graph-search button:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: #3A3A3C;
+}
+
+.bake-graph-filter {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: #6E6E73;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.bake-graph-filter:hover {
+  background: #FFFFFF;
+}
+
+.bake-graph-filter--active {
+  border-color: rgba(0, 0, 0, 0.1);
+  background: #FFFFFF;
+  color: #111111;
+  font-weight: 700;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.04);
+}
+
+.bake-graph-filter__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.bake-graph-filter__count {
+  color: #8E8E93;
+  font-variant-numeric: tabular-nums;
+}
+
+.bake-memory-graph__coverage {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: #8E8E93;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bake-memory-graph__canvas {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 350px;
+  overflow: hidden;
+  background: #FFFFFF;
+}
+
+.bake-memory-graph--overview .bake-memory-graph__canvas {
+  min-height: 390px;
+}
+
+.bake-memory-graph--fullscreen .bake-memory-graph__canvas {
+  min-height: 0;
+}
+
+.bake-memory-graph__svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: inherit;
+  touch-action: none;
+  cursor: grab;
+  user-select: none;
+}
+
+.bake-memory-graph__svg:active {
+  cursor: grabbing;
+}
+
+.bake-memory-graph__grid-dot {
+  fill: rgba(60, 60, 67, 0.12);
+}
+
+.bake-memory-graph__edge {
+  stroke: rgba(60, 60, 67, 0.44);
+  stroke-width: 1.6;
+  vector-effect: non-scaling-stroke;
+  cursor: pointer;
+  transition: opacity 160ms ease, stroke 160ms ease, stroke-width 160ms ease;
+}
+
+.bake-memory-graph__edge--references {
+  stroke: rgba(44, 44, 46, 0.72);
+  stroke-width: 2;
+}
+
+.bake-memory-graph__edge--shared_source {
+  stroke: rgba(142, 142, 147, 0.58);
+}
+
+.bake-memory-graph__edge--semantic {
+  stroke: rgba(0, 122, 255, 0.64);
+  stroke-dasharray: 7 6;
+}
+
+.bake-memory-graph__edge--selected,
+.bake-memory-graph__edge:focus-visible {
+  outline: none;
+  stroke: #007AFF;
+  stroke-width: 3.2;
+  opacity: 1;
+}
+
+.bake-memory-graph__edge--muted {
+  opacity: 0.14;
+}
+
+.bake-memory-graph__arrow {
+  fill: #3A3A3C;
+}
+
+.bake-memory-graph__node {
+  cursor: grab;
+  outline: none;
+  transition: opacity 160ms ease;
+}
+
+.bake-memory-graph__node:active {
+  cursor: grabbing;
+}
+
+.bake-memory-graph__node--muted {
+  opacity: 0.24;
+}
+
+.bake-memory-graph__node-shape {
+  stroke: rgba(255, 255, 255, 0.95);
+  stroke-width: 2.2;
+  filter: drop-shadow(0 4px 7px rgba(0, 0, 0, 0.14));
+  transition: filter 160ms ease, stroke-width 160ms ease;
+}
+
+.bake-memory-graph__node--selected .bake-memory-graph__node-shape,
+.bake-memory-graph__node:focus-visible .bake-memory-graph__node-shape {
+  stroke: #FFFFFF;
+  stroke-width: 4;
+  filter: drop-shadow(0 0 0.55rem rgba(0, 122, 255, 0.36));
+}
+
+.bake-memory-graph__node--search-match .bake-memory-graph__node-shape {
+  stroke-width: 4;
+  filter: drop-shadow(0 0 0.55rem rgba(0, 122, 255, 0.32));
+}
+
+.bake-memory-graph__focus-ring {
+  fill: rgba(0, 122, 255, 0.07);
+  stroke: rgba(0, 122, 255, 0.5);
+  stroke-width: 1.5;
+  stroke-dasharray: 3 4;
+  vector-effect: non-scaling-stroke;
+}
+
+.bake-memory-graph__node-glyph {
+  fill: #FFFFFF;
+  font-size: 8px;
+  font-weight: 900;
+  pointer-events: none;
+}
+
+.bake-memory-graph__node-label {
+  fill: #2C2C2E;
+  paint-order: stroke;
+  stroke: rgba(255, 255, 255, 0.96);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+  font-size: 10px;
+  font-weight: 650;
+  pointer-events: none;
+}
+
+.bake-memory-graph__inspector {
+  position: absolute;
+  left: 14px;
+  bottom: 14px;
+  width: min(340px, calc(100% - 28px));
+  display: grid;
+  gap: 5px;
+  padding: 12px 13px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.94);
+  color: #2C2C2E;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
+  backdrop-filter: blur(14px);
+}
+
+.bake-memory-graph__inspector-type {
+  color: #007AFF;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.bake-memory-graph__inspector strong {
+  overflow: hidden;
+  color: #111111;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bake-memory-graph__inspector > span:not(.bake-memory-graph__inspector-type),
+.bake-memory-graph__inspector small {
+  display: -webkit-box;
+  overflow: hidden;
+  color: #6E6E73;
+  font-size: 10px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.bake-memory-graph__inspector small {
+  color: #8E8E93;
+}
+
+.bake-memory-graph__inspector button,
+.bake-graph-retry {
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 3px;
+  padding: 5px 8px;
+  border: 1px solid #007AFF;
+  border-radius: 8px;
+  background: #007AFF;
+  color: #FFFFFF;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.bake-memory-graph__state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 28px;
+  color: #6E6E73;
+  text-align: center;
+}
+
+.bake-memory-graph__state strong {
+  color: #2C2C2E;
+  font-size: 13px;
+}
+
+.bake-memory-graph__state span {
+  max-width: 440px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.bake-memory-graph__loader {
+  width: 24px;
+  height: 24px;
+  border: 2px solid rgba(0, 122, 255, 0.18);
+  border-top-color: #007AFF;
+  border-radius: 50%;
+  animation: bake-graph-spin 900ms linear infinite;
+}
+
+@keyframes bake-graph-spin {
+  to { transform: rotate(360deg); }
+}
+
+.bake-memory-graph__footer {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 16px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  background: #FBFBFD;
+  color: #6E6E73;
+  font-size: 9px;
+}
+
+.bake-memory-graph__legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.bake-memory-graph__legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.bake-graph-line {
+  width: 22px;
+  height: 0;
+  display: inline-block;
+  border-top: 2px solid #3A3A3C;
+}
+
+.bake-graph-line--shared {
+  border-color: #8E8E93;
+  border-top-width: 1px;
+}
+
+.bake-graph-line--semantic {
+  border-color: #007AFF;
+  border-top-style: dashed;
+}
+
+.bake-memory-graph__hint {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.bake-memory-graph__hidden {
+  color: #0066CC;
+  white-space: nowrap;
+}
+
+@media (max-width: 1120px) {
+  .bake-graph-workspace--open {
+    display: block;
+  }
+
+  .bake-memory-graph--dock:not(.bake-memory-graph--fullscreen) {
+    position: fixed;
+    inset: 16px 16px 16px auto;
+    z-index: 900;
+    width: min(620px, calc(100vw - 32px));
+    height: auto;
+    min-height: 0;
+    box-shadow: 0 24px 72px rgba(0, 0, 0, 0.26), 0 0 0 200vmax rgba(0, 0, 0, 0.2);
+  }
+}
+
+@media (max-width: 720px) {
+  .bake-tabs-shell {
+    align-items: flex-start;
+  }
+
+  .bake-graph-toggle {
+    margin-top: 6px;
+    padding-inline: 9px;
+  }
+
+  .bake-graph-toggle span {
+    display: none;
+  }
+
+  .bake-memory-graph--fullscreen {
+    inset: 0;
+    border-radius: 0;
+  }
+
+  .bake-memory-graph__header {
+    padding: 12px;
+  }
+
+  .bake-memory-graph__filters {
+    padding-inline: 12px;
+  }
+
+  .bake-graph-search {
+    flex-basis: 150px;
+  }
+
+  .bake-memory-graph__coverage,
+  .bake-memory-graph__hint {
+    display: none;
+  }
+
+  .bake-memory-graph__footer {
+    overflow-x: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bake-memory-graph__edge,
+  .bake-memory-graph__node,
+  .bake-memory-graph__node-shape {
+    transition: none;
+  }
+
+  .bake-memory-graph__loader {
+    animation: none;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .bake-graph-toggle,
+  .bake-memory-graph {
+    background: #1C1C1E;
+    color: #F5F5F7;
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .bake-graph-toggle {
+    color: #F5F5F7;
+  }
+
+  .bake-graph-toggle:hover,
+  .bake-graph-toggle[aria-pressed="true"] {
+    background: rgba(10, 132, 255, 0.16);
+    color: #0A84FF;
+  }
+
+  .bake-memory-graph {
+    --graph-ink: #F5F5F7;
+    --graph-muted: #A1A1A6;
+    --graph-paper: #1C1C1E;
+    --graph-paper-strong: #1C1C1E;
+  }
+
+  .bake-memory-graph__header,
+  .bake-memory-graph__footer,
+  .bake-memory-graph__inspector {
+    background: rgba(44, 44, 46, 0.94);
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  .bake-memory-graph__filters {
+    background: #232326;
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  .bake-graph-filter--active,
+  .bake-graph-tool,
+  .bake-graph-search {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.1);
+    color: #F5F5F7;
+  }
+
+  .bake-graph-search input {
+    color: #F5F5F7;
+  }
+
+  .bake-memory-graph__canvas {
+    background: #1C1C1E;
+  }
+
+  .bake-memory-graph__grid-dot {
+    fill: rgba(255, 255, 255, 0.1);
+  }
+
+  .bake-memory-graph__node-label {
+    fill: #F5F5F7;
+    stroke: rgba(28, 28, 30, 0.94);
+  }
+
+  .bake-memory-graph__inspector strong,
+  .bake-memory-graph__state strong {
+    color: #F5F5F7;
+  }
+
+  .bake-memory-graph__inspector > span:not(.bake-memory-graph__inspector-type),
+  .bake-memory-graph__inspector small,
+  .bake-memory-graph__state,
+  .bake-memory-graph__footer {
+    color: #A1A1A6;
+  }
+}

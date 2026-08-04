@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from 'react'
-import type { DataExtractionSummary, DataSnapshot, DataSource } from '../../types'
+import React, { useState } from 'react'
+import type { DataSnapshot, DataSource } from '../../types'
 import { BakeButton, BakeCard, BakePill, BakeSectionHeader } from './BakeShared'
 
 type DataMetricRow = {
@@ -10,6 +10,7 @@ type DataMetricRow = {
 }
 
 type DataPresentation = {
+  title: string
   summary: string
   rows: DataMetricRow[]
 }
@@ -47,6 +48,16 @@ const normalizeText = (value: unknown) => {
   return ''
 }
 
+const fallbackDataTitle = (rows: DataMetricRow[]) => {
+  const metrics = [...new Set(rows.map(row => row.metric).filter(Boolean))]
+  if (metrics.length === 0) return '数据指标概况'
+  if (metrics.length === 1) {
+    const comparisonCount = new Set(rows.map(row => row.dimension).filter(Boolean)).size
+    return `${metrics[0]}${comparisonCount >= 2 ? '对比' : '数据概况'}`
+  }
+  return `${metrics.slice(0, 2).join('与')}指标`
+}
+
 const presentSnapshot = (snapshot: DataSnapshot): DataPresentation => {
   const structured = snapshot.structured_data ?? {}
   const rows = Array.isArray(structured.metric_rows)
@@ -65,6 +76,7 @@ const presentSnapshot = (snapshot: DataSnapshot): DataPresentation => {
       })
     : []
   return {
+    title: normalizeText(structured.title) || fallbackDataTitle(rows),
     summary: normalizeText(structured.summary) || '这条数据尚未形成可理解的摘要',
     rows,
   }
@@ -77,80 +89,53 @@ const sourcePresentation = (source?: DataSource | null) => (
 const BakeDataTab: React.FC<{
   items: DataSource[]
   total: number
-  pendingItems?: DataSource[]
-  pendingTotal?: number
   limit: number
   offset: number
   draftQuery: string
   selectedId: number | null
   loading: boolean
-  extracting: boolean
   refreshingId: number | null
   deletingId?: number | null
-  lastExtraction?: DataExtractionSummary | null
   onDraftQueryChange: (query: string) => void
   onSearch: () => void
   onClearSearch: () => void
   onSelect: (id: number) => void
   onPageChange: (offset: number) => void
   onLimitChange: (limit: number) => void
-  onExtract: () => void
   onRefresh: (id: number) => void
   onDelete?: (id: number) => void
   onViewTimeline?: (timelineId: number) => void
 }> = ({
   items,
   total,
-  pendingItems = [],
-  pendingTotal = pendingItems.length,
   limit,
   offset,
   draftQuery,
   selectedId,
   loading,
-  extracting,
   refreshingId,
   deletingId,
-  lastExtraction,
   onDraftQueryChange,
   onSearch,
   onClearSearch,
   onSelect,
   onPageChange,
   onLimitChange,
-  onExtract,
   onRefresh,
   onDelete,
   onViewTimeline,
 }) => {
-  const allSelectableItems = useMemo(() => [...items, ...pendingItems], [items, pendingItems])
-  const selected = allSelectableItems.find(item => item.id === selectedId) ?? items[0] ?? pendingItems[0]
+  const selected = items.find(item => item.id === selectedId) ?? items[0]
   const selectedPresentation = sourcePresentation(selected)
   const selectedTimelineIds = selected?.latest_snapshot?.source_timeline_ids ?? []
   const page = Math.floor(offset / limit) + 1
   const totalPages = Math.max(1, Math.ceil(total / limit))
   const [pageInput, setPageInput] = useState('')
-  const pageRowCount = useMemo(
-    () => items.reduce((sum, item) => sum + (sourcePresentation(item)?.rows.length ?? 0), 0),
-    [items],
-  )
-  const latestCollectedAt = useMemo(
-    () => items.reduce((latest, item) => Math.max(latest, item.latest_snapshot?.collected_at ?? 0), 0),
-    [items],
-  )
 
   return (
     <div style={{ display: 'grid', gap: 16 }}>
       <BakeCard>
-        <BakeSectionHeader
-          title="数据"
-          subtitle="每个数据来源只保留一份最新快照；新采集会覆盖旧值。每条数据都说明指标含义，无法解释含义的孤立数字不会保留。"
-          right={(
-            <BakeButton primary disabled={extracting} onClick={onExtract}>
-              {extracting ? '提取中…' : '从记忆提取数据'}
-            </BakeButton>
-          )}
-        />
+        <BakeSectionHeader title="数据" />
         <form
           className="bake-list-toolbar bake-list-toolbar--repository"
           onSubmit={(event) => {
@@ -176,93 +161,43 @@ const BakeDataTab: React.FC<{
             </div>
           </div>
         </form>
-
-        <div className="bake-data-overview" aria-label="本页数据概况">
-          <div className="bake-data-overview__item">
-            <span>本页数据记录</span>
-            <strong>{items.length}</strong>
-          </div>
-          <div className="bake-data-overview__item">
-            <span>本页指标行</span>
-            <strong>{pageRowCount}</strong>
-          </div>
-          <div className="bake-data-overview__item">
-            <span>最近采集</span>
-            <strong className="bake-data-overview__time">{formatTimestamp(latestCollectedAt)}</strong>
-          </div>
-        </div>
-
-        {lastExtraction && (
-          <div className="bake-muted" style={{ marginTop: 10 }}>
-            最近处理：扫描 {lastExtraction.scanned_count} 条记忆，发现 {lastExtraction.source_created_count} 个新来源，更新 {lastExtraction.source_updated_count} 个来源，更新 {lastExtraction.snapshot_created_count} 份最新数据快照。
-          </div>
-        )}
       </BakeCard>
 
       <div className="bake-split-list-detail bake-split-list-detail--knowledge">
         <BakeCard className="bake-knowledge-list-card bake-data-list-card">
           {loading ? (
             <div className="bake-muted">正在加载数据记录…</div>
-          ) : items.length === 0 && pendingItems.length === 0 ? (
-            <div className="bake-muted">尚未提取到含义明确的数据。浏览包含指标和数值的报表、文档或工作消息后，可重新提取。</div>
+          ) : items.length === 0 ? (
+            <div className="bake-muted">尚未提取到含义明确的数据。</div>
           ) : (
-            <div className="bake-data-list-sections">
-              <section className="bake-data-list-group" aria-labelledby="bake-data-records-title">
-                <div className="bake-data-list-group__heading">
-                  <span id="bake-data-records-title">数据记录</span>
-                  <span>{items.length}</span>
-                </div>
-                {items.length === 0 ? (
-                  <div className="bake-muted">当前没有含义明确的数据记录。</div>
-                ) : (
-                  <div className="bake-list bake-knowledge-list">
-                    {items.map((item) => {
-                      const presentation = sourcePresentation(item)!
-                      return (
-                        <button
-                          key={item.id}
-                          type="button"
-                          onClick={() => onSelect(item.id)}
-                          className={`bake-list-item bake-knowledge-list-item bake-data-record-item ${item.id === selected?.id ? 'bake-list-item--active' : ''}`.trim()}
-                        >
-                          <div className="bake-data-record-item__eyebrow">数据 #{item.id}</div>
-                          <div className="bake-data-record-item__summary bake-line-clamp-3">{presentation.summary}</div>
-                          <div className="bake-data-record-item__source bake-line-clamp-1">来源：{item.title}</div>
-                          <div className="bake-memory-list-item__meta">
-                            <span>{presentation.rows.length} 行指标</span>
-                            <span>{freshnessLabel(item)}</span>
-                            <span>{formatTimestamp(item.latest_snapshot?.collected_at)}</span>
-                          </div>
-                        </button>
-                      )
-                    })}
-                  </div>
-                )}
-              </section>
-
-              {pendingItems.length > 0 && (
-                <details className="bake-data-pending" open={items.length === 0}>
-                  <summary>待采集来源 <span>{pendingTotal}</span></summary>
-                  <div className="bake-list bake-data-pending__list">
-                    {pendingItems.map(item => (
-                      <button
-                        key={item.id}
-                        type="button"
-                        onClick={() => onSelect(item.id)}
-                        className={`bake-list-item bake-knowledge-list-item bake-data-source-item ${item.id === selected?.id ? 'bake-list-item--active' : ''}`.trim()}
-                      >
-                        <div className="bake-data-record-item__eyebrow">来源 #{item.id}</div>
-                        <div className="bake-list-item__title bake-line-clamp-2">{item.title}</div>
-                        <div className="bake-memory-list-item__meta">
-                          <span>{sourceKindLabel(item.source_kind)}</span>
-                          <span>尚无数据快照</span>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </details>
-              )}
-            </div>
+            <section className="bake-data-list-group" aria-labelledby="bake-data-records-title">
+              <div className="bake-data-list-group__heading">
+                <span id="bake-data-records-title">数据记录</span>
+                <span>{items.length}</span>
+              </div>
+              <div className="bake-list bake-knowledge-list">
+                {items.map((item) => {
+                  const presentation = sourcePresentation(item)!
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => onSelect(item.id)}
+                      className={`bake-list-item bake-knowledge-list-item bake-data-record-item ${item.id === selected?.id ? 'bake-list-item--active' : ''}`.trim()}
+                    >
+                      <div className="bake-data-record-item__eyebrow">数据 #{item.id}</div>
+                      <div className="bake-data-record-item__title bake-line-clamp-2">{presentation.title}</div>
+                      <div className="bake-data-record-item__summary bake-line-clamp-3">{presentation.summary}</div>
+                      <div className="bake-data-record-item__source bake-line-clamp-1">来源：{item.title}</div>
+                      <div className="bake-memory-list-item__meta">
+                        <span>{freshnessLabel(item)}</span>
+                        <span>{formatTimestamp(item.latest_snapshot?.collected_at)}</span>
+                      </div>
+                    </button>
+                  )
+                })}
+              </div>
+            </section>
           )}
 
           <div className="bake-pagination bake-pagination--extended">
@@ -310,9 +245,9 @@ const BakeDataTab: React.FC<{
             <div className="bake-kv bake-capture-detail bake-knowledge-detail">
               <div className="bake-data-detail-heading">
                 <div className="bake-data-detail-heading__label">数据 #{selected.id}</div>
+                <div className="bake-data-detail-heading__title">{selectedPresentation.title}</div>
                 <div className="bake-data-detail-heading__summary">{selectedPresentation.summary}</div>
                 <div className="bake-inline-pills" style={{ justifyContent: 'flex-start', marginTop: 8 }}>
-                  <BakePill text={`${selectedPresentation.rows.length} 行指标`} />
                   <BakePill text={freshnessLabel(selected)} />
                   <BakePill text={`数据时间 ${formatTimestamp(selected.latest_snapshot.observed_at ?? selected.latest_snapshot.collected_at)}`} />
                 </div>
@@ -321,28 +256,33 @@ const BakeDataTab: React.FC<{
               <div className="bake-knowledge-detail__section bake-data-detail-section">
                 <div className="bake-kv__title">数据表</div>
                 {selectedPresentation.rows.length > 0 ? (
-                  <div className="bake-data-table-wrap">
-                    <table className="bake-data-table">
-                      <thead>
-                        <tr>
-                          <th scope="col">对象 / 范围</th>
-                          <th scope="col">指标</th>
-                          <th scope="col">数值</th>
-                          <th scope="col">说明</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {selectedPresentation.rows.map((row, index) => (
-                          <tr key={`${row.dimension}-${row.metric}-${row.value}-${index}`}>
-                            <td>{row.dimension || '整体'}</td>
-                            <th scope="row">{row.metric}</th>
-                            <td className="bake-data-table__value">{row.value}</td>
-                            <td>{row.note || '—'}</td>
+                  <>
+                    <div className="bake-data-table-wrap">
+                      <table className="bake-data-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">对象 / 范围</th>
+                            <th scope="col">指标</th>
+                            <th scope="col">数值</th>
+                            <th scope="col">说明</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                        </thead>
+                        <tbody>
+                          {selectedPresentation.rows.map((row, index) => (
+                            <tr key={`${row.dimension}-${row.metric}-${row.value}-${index}`}>
+                              <td>{row.dimension || '整体'}</td>
+                              <th scope="row">{row.metric}</th>
+                              <td className="bake-data-table__value">{row.value}</td>
+                              <td>{row.note || '—'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="bake-muted bake-data-table-note">
+                      该数据表共 {selectedPresentation.rows.length} 行指标。
+                    </div>
+                  </>
                 ) : (
                   <div className="bake-muted">这条数据需要重新提炼，当前不参与有效数据召回。</div>
                 )}
@@ -371,11 +311,11 @@ const BakeDataTab: React.FC<{
                     </button>
                   )) : <span className="bake-muted">暂无</span>}
                 </div>
-                <div className="bake-muted bake-data-source-note">
-                  {selected.source_kind === 'report_url'
-                    ? '需要当前数据时可即时刷新。登录态页面会在原浏览器安全上下文中读取，Cookie 不会保存到记忆面包。'
-                    : '这份数据从本地文档或工作消息中提取，时间较久时应结合来源时间线核对统计周期与口径。'}
-                </div>
+                {selected.source_kind === 'report_url' && (
+                  <div className="bake-muted bake-data-source-note">
+                    需要当前数据时可即时刷新。登录态页面会在原浏览器安全上下文中读取，Cookie 不会保存到记忆面包。
+                  </div>
+                )}
                 {selected.last_error_code && <div className="bake-data-error">最近刷新失败：{selected.last_error_code}</div>}
               </div>
 
@@ -399,40 +339,6 @@ const BakeDataTab: React.FC<{
                 {onDelete && (
                   <BakeButton danger disabled={deletingId === selected.id} onClick={() => onDelete(selected.id)}>
                     {deletingId === selected.id ? '删除中…' : '删除数据'}
-                  </BakeButton>
-                )}
-              </div>
-            </div>
-          ) : selected ? (
-            <div className="bake-kv bake-capture-detail bake-knowledge-detail">
-              <div>
-                <div className="bake-data-record-item__eyebrow">来源 #{selected.id}</div>
-                <div className="bake-title" style={{ fontSize: 18 }}>尚未采集到数据</div>
-                <div className="bake-muted" style={{ marginTop: 6 }}>该地址仅作为待采集来源，不计入数据条数和分页。</div>
-              </div>
-              <div className="bake-knowledge-detail__section bake-data-detail-section">
-                <div className="bake-kv__title">待采集来源</div>
-                <dl className="bake-data-source-meta">
-                  <div><dt>来源 ID</dt><dd>#{selected.id}</dd></div>
-                  <div><dt>来源</dt><dd>{selected.title}</dd></div>
-                  <div><dt>类型</dt><dd>{sourceKindLabel(selected.source_kind)}</dd></div>
-                  <div><dt>访问方式</dt><dd>{accessModeLabel(selected.access_mode)}</dd></div>
-                  <div><dt>发现时间</dt><dd>{formatTimestamp(selected.last_seen_at)}</dd></div>
-                </dl>
-                {selected.source_url && <div className="bake-data-source-url">{selected.source_url}</div>}
-              </div>
-              <div className="bake-actions--primary">
-                {selected.source_kind === 'report_url' && (
-                  <BakeButton primary disabled={refreshingId === selected.id} onClick={() => onRefresh(selected.id)}>
-                    {refreshingId === selected.id ? '采集中…' : '采集数据'}
-                  </BakeButton>
-                )}
-                {selected.source_url && (
-                  <BakeButton onClick={() => window.open(selected.source_url!, '_blank', 'noopener,noreferrer')}>打开原始来源</BakeButton>
-                )}
-                {onDelete && (
-                  <BakeButton danger disabled={deletingId === selected.id} onClick={() => onDelete(selected.id)}>
-                    {deletingId === selected.id ? '删除中…' : '删除来源'}
                   </BakeButton>
                 )}
               </div>

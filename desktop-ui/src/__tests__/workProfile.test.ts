@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { fetchWorkProfile, fetchWorkProfileDay } from '../utils/workProfile'
+import {
+  fetchWorkProfile,
+  fetchWorkProfileDay,
+  hasWorkProfileDayDetails,
+} from '../utils/workProfile'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -105,6 +109,7 @@ describe('fetchWorkProfile', () => {
           date: '2026-07-18',
           minutes: 45,
           capture_count: 6,
+          active_period_count: 2,
           first_capture_at: 1,
           last_capture_at: 2,
           apps: [{ name: 'Code', minutes: 45, capture_count: 6 }],
@@ -120,5 +125,22 @@ describe('fetchWorkProfile', () => {
     expect(requestedUrl.searchParams.get('include_day_details')).toBe('true')
     expect(Number(requestedUrl.searchParams.get('to')))
       .toBeGreaterThan(Number(requestedUrl.searchParams.get('from')))
+  })
+
+  it('不把缺少活跃时段的旧云端首末时间当成完整明细', () => {
+    const staleCloudDay = {
+      date: '2026-08-02',
+      minutes: 393,
+      capture_count: 483,
+      first_capture_at: 1,
+      last_capture_at: 2,
+      apps: [{ name: 'ChatGPT', minutes: 232, capture_count: 196 }],
+    }
+
+    expect(hasWorkProfileDayDetails(staleCloudDay)).toBe(false)
+    expect(hasWorkProfileDayDetails({
+      ...staleCloudDay,
+      active_period_count: 12,
+    })).toBe(true)
   })
 })

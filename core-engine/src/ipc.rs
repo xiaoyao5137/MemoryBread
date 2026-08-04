@@ -11,6 +11,8 @@ use tracing::debug;
 
 const DEFAULT_IPC_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_OCR_IPC_TIMEOUT: Duration = Duration::from_secs(90);
+const DEFAULT_IPC_SOCKET_PATH: &str = "/tmp/memory-bread-sidecar.sock";
+const IPC_SOCKET_ENV: &str = "MEMORY_BREAD_IPC_SOCKET";
 
 /// IPC 客户端错误
 #[derive(Debug, Error)]
@@ -84,10 +86,13 @@ pub struct IpcClient {
 }
 
 impl IpcClient {
-    /// 创建默认客户端（连接到 /tmp/memory-bread-sidecar.sock）
+    /// 创建默认客户端；安装版可通过环境变量使用隔离的 Unix Socket。
     pub fn new() -> Self {
         Self {
-            socket_path: "/tmp/memory-bread-sidecar.sock".to_string(),
+            socket_path: std::env::var(IPC_SOCKET_ENV)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_IPC_SOCKET_PATH.to_string()),
             // OCR 是同步系统调用，客户端超时不能取消服务端正在运行的 Vision 任务。
             // 使用覆盖最慢正常请求的单次截止时间，禁止超时后在后台继续重试。
             timeout: DEFAULT_IPC_TIMEOUT,

@@ -66,7 +66,7 @@ const mockSignedInProfileFetch = () => vi.fn(async (input: RequestInfo | URL, in
             ...(includeDayDetails ? {
               active_period_count: 6,
               first_capture_at: previousDay.getTime() + 8 * 3_600_000 + 35 * 60_000,
-              last_capture_at: previousDay.getTime() + 17 * 3_600_000 + 10 * 60_000,
+              last_capture_at: previousDay.getTime() + 25 * 3_600_000 + 10 * 60_000,
               apps: [
                 { name: 'Figma', minutes: 170, capture_count: 34 },
                 { name: '飞书', minutes: 110, capture_count: 22 },
@@ -380,7 +380,7 @@ describe('AuthPanel', () => {
     expect(within(heatmapCell).getByRole('tooltip')).toHaveTextContent('56 条工作记录')
     fireEvent.click(heatmapCell)
     expect(heatmapCell).toHaveAttribute('aria-pressed', 'true')
-    expect(await screen.findByText('6 段活跃 · 首次 08:35 · 最后 17:10')).toBeInTheDocument()
+    expect(await screen.findByText('6 段活跃 · 首次 08:35 · 最后 次日 01:10')).toBeInTheDocument()
     expect(screen.getByText('4 小时 40 分钟')).toBeInTheDocument()
     const captureLink = screen.getByRole('button', { name: /查看.*56条工作记录/ })
     expect(captureLink).toHaveTextContent('查看 56 条工作记录')

@@ -18,6 +18,10 @@ const MAX_RANGE_DAYS: i64 = 400;
 const IDLE_GAP_CAP_MS: i64 = 5 * 60 * 1000;
 const LAST_CAPTURE_TAIL_MS: i64 = 60 * 1000;
 const OVERNIGHT_END_HOUR: i64 = 6;
+// 采集记录无法直接证明用户已经入睡，因此以 4 小时以上的连续空档作为候选睡眠段；
+// 同一自然日存在多个候选时，后续只采用最长的一段作为当天作息分界。
+const MIN_SLEEP_GAP_MS: i64 = 4 * 60 * 60 * 1000;
+const WORKDAY_CONTEXT_MS: i64 = 2 * DAY_MS;
 const MAX_IM_CAPTURE_SAMPLES: usize = 200;
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +139,29 @@ pub async fn get_work_profile(
     let mood_end = range_end.min(today_end);
     let activity_start = range_start.saturating_sub(IDLE_GAP_CAP_MS);
     let activity_end = range_end.saturating_add(IDLE_GAP_CAP_MS);
+    let includes_today = range_start < today_end && range_end > today_start;
+    let workday_context = if params.include_day_details {
+        Some((
+            range_start.saturating_sub(WORKDAY_CONTEXT_MS),
+            range_end.saturating_add(WORKDAY_CONTEXT_MS),
+        ))
+    } else if includes_today {
+        Some((
+            today_start.saturating_sub(WORKDAY_CONTEXT_MS),
+            today_end.saturating_add(WORKDAY_CONTEXT_MS),
+        ))
+    } else {
+        None
+    };
+    let timestamp_range = match (workday_context, include_achievement_metrics) {
+        (Some((workday_start, workday_end)), true) => Some((
+            workday_start.min(activity_start),
+            workday_end.max(activity_end),
+        )),
+        (Some(range), false) => Some(range),
+        (None, true) => Some((activity_start, activity_end)),
+        (None, false) => None,
+    };
     let storage = state.storage.clone();
     let (rows, im_samples, timestamps) = tokio::task::spawn_blocking(move || {
         let rows = storage.summarize_capture_activity(
@@ -152,11 +179,10 @@ pub async fn get_work_profile(
         } else {
             Vec::new()
         };
-        let timestamps = if include_achievement_metrics {
-            Some(storage.list_capture_activity_timestamps(activity_start, activity_end)?)
-        } else {
-            None
-        };
+        let timestamps = timestamp_range
+            .map(|(start, end)| storage.list_capture_activity_timestamps(start, end))
+            .transpose()?
+            .unwrap_or_default();
         Ok::<_, crate::storage::error::StorageError>((rows, im_samples, timestamps))
     })
     .await
@@ -166,7 +192,8 @@ pub async fn get_work_profile(
     let response = build_response(
         rows,
         mood,
-        timestamps,
+        &timestamps,
+        include_achievement_metrics,
         range_start,
         range_end,
         timezone_offset_ms,
@@ -197,12 +224,14 @@ fn validate_query(params: &WorkProfileQuery) -> Result<(), ApiError> {
 fn build_response(
     rows: Vec<CaptureActivityAggregate>,
     mood: TodayMoodSummary,
-    timestamps: Option<Vec<i64>>,
+    timestamps: &[i64],
+    include_achievement_metrics: bool,
     range_start: i64,
     range_end: i64,
     timezone_offset_ms: i64,
     include_day_details: bool,
 ) -> Result<WorkProfileResponse, ApiError> {
+    let inferred_workdays = infer_workday_time_ranges(timestamps, timezone_offset_ms);
     let mut days: BTreeMap<i64, DayAccumulator> = BTreeMap::new();
     for row in rows {
         let day = days.entry(row.day_index).or_default();
@@ -227,6 +256,7 @@ fn build_response(
     let now_day_index = (Utc::now().timestamp_millis() + timezone_offset_ms) / DAY_MS;
     let today_date = day_index_to_date(now_day_index)?;
     let today_accumulator = days.get(&now_day_index);
+    let today_time_range = inferred_workdays.get(&now_day_index);
     let today = TodayWorkSummary {
         date: today_date,
         total_minutes: today_accumulator
@@ -238,8 +268,12 @@ fn build_response(
         active_period_count: today_accumulator
             .map(|day| day.active_period_count)
             .unwrap_or_default(),
-        first_capture_at: today_accumulator.and_then(|day| day.first_ts),
-        last_capture_at: today_accumulator.and_then(|day| day.last_ts),
+        first_capture_at: today_time_range
+            .map(|range| range.first_ts)
+            .or_else(|| today_accumulator.and_then(|day| day.first_ts)),
+        last_capture_at: today_time_range
+            .map(|range| range.last_ts)
+            .or_else(|| today_accumulator.and_then(|day| day.last_ts)),
         apps: compact_apps(
             today_accumulator
                 .map(|day| day.apps.as_slice())
@@ -253,13 +287,26 @@ fn build_response(
     let day_summaries = days
         .iter()
         .map(|(day_index, day)| {
+            let inferred_time_range = inferred_workdays.get(day_index);
             Ok(WorkDaySummary {
                 date: day_index_to_date(*day_index)?,
                 minutes: round_minutes(day.duration_ms),
                 capture_count: day.capture_count,
                 active_period_count: include_day_details.then_some(day.active_period_count),
-                first_capture_at: include_day_details.then_some(day.first_ts).flatten(),
-                last_capture_at: include_day_details.then_some(day.last_ts).flatten(),
+                first_capture_at: include_day_details
+                    .then(|| {
+                        inferred_time_range
+                            .map(|range| range.first_ts)
+                            .or(day.first_ts)
+                    })
+                    .flatten(),
+                last_capture_at: include_day_details
+                    .then(|| {
+                        inferred_time_range
+                            .map(|range| range.last_ts)
+                            .or(day.last_ts)
+                    })
+                    .flatten(),
                 apps: include_day_details.then(|| compact_apps(&day.apps)),
             })
         })
@@ -270,9 +317,8 @@ fn build_response(
         .map(|day| round_minutes(day.duration_ms))
         .max()
         .unwrap_or_default();
-    let achievement_metrics = timestamps.map(|timestamps| {
-        build_achievement_metrics(&timestamps, range_start, range_end, timezone_offset_ms)
-    });
+    let achievement_metrics = include_achievement_metrics
+        .then(|| build_achievement_metrics(timestamps, range_start, range_end, timezone_offset_ms));
 
     Ok(WorkProfileResponse {
         range_start,
@@ -287,6 +333,93 @@ fn build_response(
         today,
         days: day_summaries,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkdayTimeRange {
+    first_ts: i64,
+    last_ts: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SleepBoundary {
+    gap_ms: i64,
+    timestamp_index: usize,
+}
+
+/// 以“睡眠后的首条记录”作为工作日开始，并让结束时间自然跨过午夜。
+///
+/// 一天内可能同时出现午休、外出和夜间睡眠等多个长空档。这里按唤醒后的本地日期
+/// 只保留最长空档，避免把较短的白天空档误当成新工作日。查询方会额外读取前后两天
+/// 的时间戳，因此自然日零点附近的延续工作也能归入正确的作息周期。
+fn infer_workday_time_ranges(
+    timestamps: &[i64],
+    timezone_offset_ms: i64,
+) -> BTreeMap<i64, WorkdayTimeRange> {
+    let mut ordered = timestamps.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    let Some(&first_timestamp) = ordered.first() else {
+        return BTreeMap::new();
+    };
+
+    let first_day_index = first_timestamp
+        .saturating_add(timezone_offset_ms)
+        .div_euclid(DAY_MS);
+    let mut boundaries = BTreeMap::from([(
+        first_day_index,
+        SleepBoundary {
+            gap_ms: 0,
+            timestamp_index: 0,
+        },
+    )]);
+
+    for (index, window) in ordered.windows(2).enumerate() {
+        let gap_ms = window[1].saturating_sub(window[0]);
+        if gap_ms < MIN_SLEEP_GAP_MS {
+            continue;
+        }
+        let timestamp_index = index + 1;
+        let day_index = window[1]
+            .saturating_add(timezone_offset_ms)
+            .div_euclid(DAY_MS);
+        let candidate = SleepBoundary {
+            gap_ms,
+            timestamp_index,
+        };
+        boundaries
+            .entry(day_index)
+            .and_modify(|current| {
+                if candidate.gap_ms > current.gap_ms
+                    || (candidate.gap_ms == current.gap_ms
+                        && candidate.timestamp_index < current.timestamp_index)
+                {
+                    *current = candidate;
+                }
+            })
+            .or_insert(candidate);
+    }
+
+    let mut ordered_boundaries = boundaries.into_iter().collect::<Vec<_>>();
+    ordered_boundaries.sort_by_key(|(_, boundary)| boundary.timestamp_index);
+    let mut result = BTreeMap::new();
+    for (index, (day_index, boundary)) in ordered_boundaries.iter().enumerate() {
+        let next_start_index = ordered_boundaries
+            .get(index + 1)
+            .map(|(_, next)| next.timestamp_index)
+            .unwrap_or(ordered.len());
+        if boundary.timestamp_index >= next_start_index {
+            continue;
+        }
+        result.insert(
+            *day_index,
+            WorkdayTimeRange {
+                first_ts: ordered[boundary.timestamp_index],
+                last_ts: ordered[next_start_index - 1],
+            },
+        );
+    }
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -662,7 +795,8 @@ mod tests {
         let response = build_response(
             vec![activity(today, "Code", 7), activity(today, "Browser", 1)],
             infer_work_mood(&[]),
-            None,
+            &[],
+            false,
             (today - 1) * DAY_MS,
             (today + 1) * DAY_MS,
             0,
@@ -698,7 +832,8 @@ mod tests {
         let response = build_response(
             vec![activity(today - 1, "Code", 45)],
             infer_work_mood(&[]),
-            None,
+            &[],
+            false,
             (today - 2) * DAY_MS,
             today * DAY_MS,
             0,
@@ -711,6 +846,68 @@ mod tests {
         assert!(response.days[0].last_capture_at.is_none());
         assert!(response.days[0].active_period_count.is_none());
         assert!(response.days[0].apps.is_none());
+    }
+
+    #[test]
+    fn infers_first_capture_after_sleep_and_allows_next_day_end() {
+        let day = 20_000 * DAY_MS;
+        let hours = |value: i64| value * 60 * 60 * 1000;
+        let minutes = |value: i64| value * 60 * 1000;
+        let timestamps = vec![
+            day - hours(2),
+            day,
+            day + hours(2),
+            day + hours(9),
+            day + hours(12),
+            day + hours(17),
+            day + hours(23) + minutes(30),
+            day + DAY_MS + hours(1) + minutes(15),
+            day + DAY_MS + hours(9),
+        ];
+
+        let ranges = infer_workday_time_ranges(&timestamps, 0);
+        let workday = ranges.get(&20_000).unwrap();
+
+        assert_eq!(workday.first_ts, day + hours(9));
+        assert_eq!(workday.last_ts, day + DAY_MS + hours(1) + minutes(15));
+
+        let response = build_response(
+            vec![activity(20_000, "Code", 60)],
+            infer_work_mood(&[]),
+            &timestamps,
+            false,
+            day,
+            day + DAY_MS,
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(response.days[0].first_capture_at, Some(day + hours(9)));
+        assert_eq!(
+            response.days[0].last_capture_at,
+            Some(day + DAY_MS + hours(1) + minutes(15))
+        );
+    }
+
+    #[test]
+    fn longest_daily_gap_wins_over_shorter_daytime_break() {
+        let day = 20_000 * DAY_MS;
+        let hours = |value: i64| value * 60 * 60 * 1000;
+        let timestamps = vec![
+            day - hours(2),
+            day + hours(2),
+            day + hours(9),
+            day + hours(12),
+            day + hours(17),
+            day + hours(22),
+            day + DAY_MS + hours(9),
+        ];
+
+        let ranges = infer_workday_time_ranges(&timestamps, 0);
+        let workday = ranges.get(&20_000).unwrap();
+
+        assert_eq!(workday.first_ts, day + hours(9));
+        assert_eq!(workday.last_ts, day + hours(22));
     }
 
     #[test]

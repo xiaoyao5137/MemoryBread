@@ -38,6 +38,58 @@ BAKE_DOCUMENT_MERGE_EXISTING_CONTEXT_MAX_CHARS = 24_000
 BAKE_DOCUMENT_MERGE_CANDIDATE_CONTEXT_MAX_CHARS = 32_000
 BAKE_ERROR_LOG_PATH = Path.home() / ".memory-bread" / "logs" / "bake_extract_errors.log"
 
+_DOCUMENT_IDENTITY_LIST_FIELDS = (
+    "aliases",
+    "entity_aliases",
+    "product_names",
+    "project_names",
+)
+_DOCUMENT_IDENTITY_COVERAGE_FIELDS = (
+    "title",
+    "summary",
+    "full_content",
+    "tags",
+    "aliases",
+    "entity_aliases",
+    "product_names",
+    "project_names",
+    "entities",
+    "structured_content",
+    "prompt_hint",
+)
+_DOCUMENT_IDENTITY_SUFFIXES = (
+    "系统",
+    "平台",
+    "产品",
+    "项目",
+    "工具",
+    "应用",
+    "服务",
+    "引擎",
+    "模块",
+    "计划",
+    "专项",
+)
+_DOCUMENT_IDENTITY_GENERIC_TERMS = frozenset(
+    {
+        "系统",
+        "平台",
+        "产品",
+        "项目",
+        "工具",
+        "应用",
+        "服务",
+        "引擎",
+        "模块",
+        "计划",
+        "专项",
+        "文档",
+        "页面",
+        "功能",
+        "版本",
+    }
+)
+
 # RAG 查询优先锁:model_api_server 在 RAG 调用期间持有此文件锁。
 # 时间线提炼在调 LLM 前非阻塞 acquire；拿不到则跳过本轮，让 RAG 优先完成。
 _RAG_LOCK_FILE = "/tmp/memory-bread-rag.lock"
@@ -1301,7 +1353,13 @@ class KnowledgeExtractorV2:
         app_name = capture_data.get('app_name', '未知应用')
         window_title = capture_data.get('window_title', '未知窗口')
         timestamp = capture_data.get('timestamp', datetime.now().isoformat())
-        raw_text = capture_data.get('ocr_text') or capture_data.get('ax_text') or ''
+        raw_text = (
+            capture_data.get('ax_text')
+            or capture_data.get('ocr_text')
+            or capture_data.get('input_text')
+            or capture_data.get('audio_text')
+            or ''
+        )
         ocr_text = _sanitize_capture_text(raw_text)
 
         # 限制文本长度，避免超过上下文
@@ -2297,10 +2355,16 @@ class KnowledgeExtractorV2:
         candidate_normalized = self._normalize_document_dedupe_text(candidate_source_text)
         if existing_normalized and candidate_normalized == existing_normalized:
             logger.info("L1去重：可见正文完全匹配 source_timeline_id=%s", candidate.get('source_timeline_id'))
-            return {'no_change': True, 'title': existing_title}
+            merged = {'no_change': True, 'title': existing_title}
+        else:
+            # Layer 2: 任何非完全相同的来源正文都交给补丁合并，避免漏掉小改动。
+            merged = self._merge_with_llm_once(existing_document, candidate, candidate_text)
 
-        # Layer 2: 任何非完全相同的来源正文都交给补丁合并，避免漏掉小改动。
-        return self._merge_with_llm_once(existing_document, candidate, candidate_text)
+        return self._ensure_document_identity_coverage(
+            existing_document,
+            candidate,
+            merged,
+        )
 
     def _merge_with_llm_once(self, existing_document: Dict[str, Any], candidate: Dict[str, Any], candidate_text: str) -> Dict[str, Any]:
         """让 LLM 只返回内容补丁，再在本地合入同一条文档，保证已有正文不会丢失。"""
@@ -2437,6 +2501,195 @@ class KnowledgeExtractorV2:
         existing = str(existing_content or '').strip()
         merged = str(merged_content or '').strip()
         return not existing or existing in merged
+
+    @staticmethod
+    def _document_identity_values(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item) for item in value if item is not None]
+        if isinstance(value, dict):
+            return [str(item) for item in value.values() if item is not None]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            if text[:1] in {'[', '{'}:
+                try:
+                    return KnowledgeExtractorV2._document_identity_values(json.loads(text))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            return [text]
+        return [str(value)]
+
+    @staticmethod
+    def _normalize_document_identity(value: Any) -> str:
+        text = str(value or '').strip()
+        text = re.sub(r"^[\s'\"“”‘’《》【】\[\]（）()]+", "", text)
+        text = re.sub(r"[\s'\"“”‘’《》【】\[\]（）()，。；;：:、]+$", "", text)
+        text = re.sub(r"\s+", " ", text)
+        if not 2 <= len(text) <= 48:
+            return ""
+        if text.casefold() in _DOCUMENT_IDENTITY_GENERIC_TERMS:
+            return ""
+        if re.fullmatch(r"[\d\s./:_-]+", text):
+            return ""
+        if not re.search(r"[A-Za-z\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text):
+            return ""
+        return text
+
+    @staticmethod
+    def _document_identity_base(value: str) -> str:
+        for suffix in _DOCUMENT_IDENTITY_SUFFIXES:
+            if value.endswith(suffix) and len(value) - len(suffix) >= 2:
+                return value[:-len(suffix)]
+        return value
+
+    @classmethod
+    def _extract_document_identities(cls, candidate: Dict[str, Any]) -> List[str]:
+        """从确定性字段和命名句提取产品名、项目名及别名。"""
+        source_fields = (
+            "summary",
+            "overview",
+            "details",
+            "work_item",
+            "capture_ax_text",
+            "capture_ocr_text",
+            "capture_input_text",
+            "capture_audio_text",
+            "capture_webpage_title",
+            "capture_win_title",
+            "url_aggregated_text",
+        )
+        source_text = "\n".join(
+            str(candidate.get(field) or '') for field in source_fields
+        )
+        identities: List[str] = []
+
+        def add(value: Any) -> None:
+            normalized = cls._normalize_document_identity(value)
+            if not normalized:
+                return
+            base = cls._document_identity_base(normalized)
+            for index, existing in enumerate(identities):
+                existing_base = cls._document_identity_base(existing)
+                if existing.casefold() == normalized.casefold():
+                    return
+                if existing_base.casefold() == base.casefold():
+                    if len(normalized) < len(existing):
+                        identities[index] = normalized
+                    return
+            identities.append(normalized)
+
+        for field in _DOCUMENT_IDENTITY_LIST_FIELDS:
+            for value in cls._document_identity_values(candidate.get(field)):
+                add(value)
+
+        naming_pattern = re.compile(
+            r"(?:^|[^A-Za-z0-9_\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])"
+            r"([A-Za-z0-9_.-]{2,40}|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,20})"
+            r"(?=\s*(?:是一款|是一个|是一项|是面向|是用于))",
+            re.IGNORECASE,
+        )
+        for match in naming_pattern.finditer(source_text):
+            add(match.group(1))
+
+        labeled_pattern = re.compile(
+            r"(?:产品名(?:称)?|项目名(?:称)?|系统名(?:称)?|别名|又称|中文名|英文名)"
+            r"\s*(?:是|为|[:：])?\s*[\"'“”‘’《》]?"
+            r"([A-Za-z0-9_.-]{2,40}|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,20})",
+            re.IGNORECASE,
+        )
+        for match in labeled_pattern.finditer(source_text):
+            add(match.group(1))
+
+        for value in cls._document_identity_values(candidate.get("entities")):
+            normalized = cls._normalize_document_identity(value)
+            if not normalized:
+                continue
+            is_named_artifact = normalized.endswith(_DOCUMENT_IDENTITY_SUFFIXES)
+            is_naming_subject = bool(
+                re.search(
+                    re.escape(normalized)
+                    + r"\s*(?:是一款|是一个|是一项|是面向|是用于)",
+                    source_text,
+                    re.IGNORECASE,
+                )
+            )
+            if is_named_artifact or is_naming_subject:
+                add(normalized)
+
+        return identities
+
+    @classmethod
+    def _document_identity_coverage_text(
+        cls,
+        existing_document: Dict[str, Any],
+        merged: Dict[str, Any],
+    ) -> str:
+        values: List[str] = []
+        for payload in (existing_document, merged):
+            for field in _DOCUMENT_IDENTITY_COVERAGE_FIELDS:
+                value = payload.get(field)
+                if value is None:
+                    continue
+                if isinstance(value, (dict, list, tuple, set)):
+                    values.append(json.dumps(value, ensure_ascii=False, default=str))
+                else:
+                    values.append(str(value))
+        return "\n".join(values).casefold()
+
+    @classmethod
+    def _ensure_document_identity_coverage(
+        cls,
+        existing_document: Dict[str, Any],
+        candidate: Dict[str, Any],
+        merged: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """禁止合并结果以 no_change 吞掉来源中的产品名、项目名或别名。"""
+        result = dict(merged or {})
+        identities = cls._extract_document_identities(candidate)
+        if not identities:
+            return result
+
+        coverage_text = cls._document_identity_coverage_text(existing_document, result)
+        missing = []
+        for identity in identities:
+            variants = {identity.casefold(), cls._document_identity_base(identity).casefold()}
+            if not any(value and value in coverage_text for value in variants):
+                missing.append(identity)
+        if not missing:
+            return result
+
+        existing_title = str(existing_document.get('title') or '')
+        final_content = str(
+            result.get('full_content')
+            or existing_document.get('full_content')
+            or ''
+        ).strip()
+        identity_patch = "## 产品、项目与别名\n" + "\n".join(
+            f"- {identity}" for identity in missing
+        )
+        result['title'] = existing_title
+        result['no_change'] = False
+        result['insert_mode'] = 'append'
+        result['full_content'] = cls._append_document_patch(
+            final_content,
+            identity_patch,
+        )
+        result.pop('content_patch', None)
+
+        coverage_note = "确定性补充来源身份词：" + "、".join(missing)
+        existing_evidence = str(result.get('evidence_summary') or '').strip()
+        result['evidence_summary'] = (
+            f"{existing_evidence}；{coverage_note}" if existing_evidence else coverage_note
+        )
+        logger.warning(
+            "文档合并身份词未覆盖，拒绝 no_change 并补入正文 source_timeline_id=%s identities=%s",
+            candidate.get('source_timeline_id'),
+            missing,
+        )
+        return result
 
     @classmethod
     def _append_document_patch(cls, existing_content: str, content_patch: str) -> str:
@@ -2740,7 +2993,13 @@ class KnowledgeExtractorV2:
             # 1. 构建合并 prompt:按时间顺序拼接所有 capture 的文本
             merged_blocks = []
             for c in captures:
-                text = c.get('ocr_text') or c.get('ax_text') or ''
+                text = (
+                    c.get('ax_text')
+                    or c.get('ocr_text')
+                    or c.get('input_text')
+                    or c.get('audio_text')
+                    or ''
+                )
                 sanitized_text = _sanitize_capture_text(text)
                 if not sanitized_text.strip():
                     continue

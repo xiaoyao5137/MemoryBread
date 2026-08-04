@@ -162,7 +162,7 @@ export interface ActionResult {
   action_id:   string
 }
 
-export type WindowMode = 'buddy' | 'rag' | 'creation' | 'knowledge' | 'messages' | 'models' | 'privacy' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake' | 'diary' | 'account' | 'about'
+export type WindowMode = 'buddy' | 'rag' | 'creation' | 'knowledge' | 'messages' | 'models' | 'privacy' | 'settings' | 'debug' | 'tasks' | 'monitor' | 'bake' | 'diary' | 'integration' | 'account' | 'about'
 
 export type ServiceEnvironment = 'production' | 'staging'
 
@@ -441,6 +441,7 @@ export interface DataSource {
   source_window_title?: string | null
   tags: string[]
   first_seen_at: number
+  created_at?: number
   last_seen_at: number
   last_collected_at?: number | null
   last_success_at?: number | null
@@ -454,6 +455,9 @@ export interface DataExtractionSummary {
   source_created_count: number
   source_updated_count: number
   snapshot_created_count: number
+  historical_regenerated_count: number
+  historical_merged_count: number
+  historical_rejected_count: number
   skipped_count: number
 }
 
@@ -462,6 +466,7 @@ export interface BakeInventoryTrendBucket {
   startTs: number
   endTs: number
   memoryCount: number
+  dataCount: number
   knowledgeCount: number
   templateCount: number
   sopCount: number

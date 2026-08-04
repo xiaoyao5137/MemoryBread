@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 import socket
 from pathlib import Path
@@ -35,6 +36,17 @@ async def _wait_for_server(server: IpcServer) -> None:
 def _short_socket_path(label: str) -> Path:
     # macOS 的 sockaddr_un 路径长度上限很短，pytest 的 tmp_path 会超过上限。
     return Path("/tmp") / f"mb-{os.getpid()}-{uuid4().hex[:8]}-{label}.sock"
+
+
+def test_ipc_socket_path_can_be_configured_by_environment(monkeypatch):
+    socket_path = _short_socket_path("env")
+    monkeypatch.setenv("MEMORY_BREAD_IPC_SOCKET", str(socket_path))
+
+    reloaded = importlib.reload(transport)
+
+    assert reloaded.UNIX_SOCKET_PATH == str(socket_path)
+    monkeypatch.delenv("MEMORY_BREAD_IPC_SOCKET")
+    importlib.reload(transport)
 
 
 @pytest.mark.skipif(transport.platform.system() == "Windows", reason="Unix socket only")

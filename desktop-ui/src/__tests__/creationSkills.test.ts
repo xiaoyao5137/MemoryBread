@@ -26,6 +26,7 @@ import {
 import { OFFLINE_CREATION_SKILL_CATEGORIES } from '../data/creationSkillCategories'
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
@@ -392,12 +393,7 @@ describe('技能本地生成与类目容错', () => {
 
   it('分析服务短暂不可用时自动重试并使用服务端结果', async () => {
     vi.useFakeTimers()
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(Response.json({
-        error: 'CREATION_SKILL_ANALYZER_UNAVAILABLE',
-        message: '本地技能分析服务不可用',
-      }, { status: 502 }))
-      .mockResolvedValueOnce(Response.json({
+    const successfulResult = {
         title: '技术架构设计文档',
         summary: '适合梳理系统边界、关键取舍和验证路径。',
         common_titles: ['总体架构与关键取舍'],
@@ -410,7 +406,24 @@ describe('技能本地生成与类目容错', () => {
         field_examples: DEFAULT_CREATION_SKILL_FIELD_EXAMPLES,
         example_document: DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
         analysis_mode: 'local_model',
-      }))
+    }
+    let createCount = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/creation/skills/analyze/jobs' && init?.method === 'POST') {
+        createCount += 1
+        return Response.json({ job_id: `skill-job-${createCount}`, status: 'pending' })
+      }
+      if (url.pathname.endsWith('/skill-job-1')) {
+        return Response.json({
+          id: 'skill-job-1',
+          status: 'failed',
+          error_code: 'CREATION_SKILL_ANALYZER_UNAVAILABLE',
+          error: '本地技能分析服务不可用',
+        })
+      }
+      return Response.json({ id: 'skill-job-2', status: 'succeeded', result: successfulResult })
+    })
     vi.stubGlobal('fetch', fetchMock)
 
     const pending = analyzeCreationSkill('http://127.0.0.1:7070', {
@@ -424,13 +437,15 @@ describe('技能本地生成与类目容错', () => {
     const analysis = await pending
     vi.useRealTimers()
 
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(createCount).toBe(2)
     expect(analysis.analysisMode).toBe('local_model')
     expect(analysis.fallbackReason).toBeUndefined()
   })
 
   it('修复旧分析结果中的短示例、重复占位标题和过短写作指引', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+    vi.useFakeTimers()
+    const result = {
       title: '技术方案文档',
       summary: '适合需要梳理技术方案的协作场景。',
       common_titles: [{ level: '一级标题', pattern: '# [核心主题] + OS/整体技术方案' }],
@@ -464,9 +479,15 @@ describe('技能本地生成与类目容错', () => {
       }],
       suggested_category_keywords: ['技术设计文档'],
       analysis_mode: 'local_model',
-    })))
+    }
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input))
+      return url.pathname === '/api/creation/skills/analyze/jobs'
+        ? Response.json({ job_id: 'skill-job-old-analysis', status: 'pending' })
+        : Response.json({ id: 'skill-job-old-analysis', status: 'succeeded', result })
+    }))
 
-    const analysis = await analyzeCreationSkill('http://127.0.0.1:7070', {
+    const pending = analyzeCreationSkill('http://127.0.0.1:7070', {
       kind: 'bake_document',
       id: 'doc-old-analysis',
       title: 'TieAgent OS 整体技术方案',
@@ -479,6 +500,9 @@ describe('技能本地生成与类目容错', () => {
         '## runtime: TieAgent',
       ].join('\n\n'),
     })
+    await vi.runAllTimersAsync()
+    const analysis = await pending
+    vi.useRealTimers()
 
     expect(analysis.analysisMode).toBe('local_model')
     expect(analysis.fieldExamples.commonTitles.join(' ')).not.toContain('目标对象 目标对象')
@@ -496,24 +520,9 @@ describe('技能本地生成与类目容错', () => {
   })
 
   it('合并同一来源的并发分析，避免开发模式重复占用本地模型', async () => {
+    vi.useFakeTimers()
     let resolveFetch: ((response: Response) => void) | undefined
-    const fetchMock = vi.fn(() => new Promise<Response>(resolve => {
-      resolveFetch = resolve
-    }))
-    vi.stubGlobal('fetch', fetchMock)
-    const source = {
-      kind: 'bake_document' as const,
-      id: 'doc-concurrent',
-      title: '知识交接优化方案',
-      docType: '技术方案',
-      content: '# 背景与目标\n统一知识交接方式，明确责任边界。\n## 方案设计\n按阶段说明输入、输出和验收标准。',
-    }
-
-    const first = analyzeCreationSkill('http://127.0.0.1:7070', source)
-    const second = analyzeCreationSkill('http://127.0.0.1:7070', source)
-
-    expect(fetchMock).toHaveBeenCalledOnce()
-    resolveFetch?.(Response.json({
+    const result = {
       title: '知识交接方案文档',
       summary: '适合需要规范知识交接流程的协作场景。',
       common_titles: ['知识交接优化方案'],
@@ -541,12 +550,47 @@ describe('技能本地生成与类目容错', () => {
       example_document: DEFAULT_CREATION_SKILL_EXAMPLE_DOCUMENT,
       suggested_category_keywords: ['互联网', '企业服务', '软件工程师', '技术设计文档'],
       analysis_mode: 'local_model',
+    }
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/creation/skills/analyze/jobs') {
+        return new Promise<Response>(resolve => {
+          resolveFetch = resolve
+        })
+      }
+      return Promise.resolve(Response.json({
+        id: 'skill-job-concurrent',
+        status: 'succeeded',
+        result,
+      }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const source = {
+      kind: 'bake_document' as const,
+      id: 'doc-concurrent',
+      title: '知识交接优化方案',
+      docType: '技术方案',
+      content: '# 背景与目标\n统一知识交接方式，明确责任边界。\n## 方案设计\n按阶段说明输入、输出和验收标准。',
+    }
+
+    const first = analyzeCreationSkill('http://127.0.0.1:7070', source)
+    const second = analyzeCreationSkill('http://127.0.0.1:7070', source)
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    resolveFetch?.(Response.json({
+      job_id: 'skill-job-concurrent',
+      status: 'pending',
     }))
+    await vi.runAllTimersAsync()
 
     const [firstResult, secondResult] = await Promise.all([first, second])
+    vi.useRealTimers()
     expect(firstResult.analysisMode).toBe('local_model')
     expect(secondResult).toEqual(firstResult)
-    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls.filter(([input]) => (
+      new URL(String(input)).pathname === '/api/creation/skills/analyze/jobs'
+    ))).toHaveLength(1)
   })
 
   it('云端类目接口失败时使用与服务端同 ID 的四级内置类目', async () => {

@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { AtSign, Bot, Check, ChevronDown, ChevronRight, CloudOff, CloudUpload, Copy, ExternalLink, Eye, FileText, Image, Library, Loader2, MessageSquarePlus, PackageCheck, PackagePlus, Paperclip, Pencil, Search, Send, Sparkles, Square, Store, Trash2, Upload, Wrench, X } from 'lucide-react'
 import { serviceEnvironmentHeaders, useAppStore } from '../store/useAppStore'
-import type { CreationAgentEvent, CreationChatMessage, CreationReferenceItem, CreationReferencePreview } from '../store/useAppStore'
+import type { CreationAgentEvent, CreationChatMessage, CreationDataReferenceItem, CreationReferenceItem, CreationReferencePreview } from '../store/useAppStore'
 import { fetchWithLocalhostFallback } from '../hooks/useApi'
 import { useImeCompositionGuard } from '../hooks/useImeCompositionGuard'
 import { getUserDisplayName } from '../utils/accountDisplay'
@@ -49,6 +49,7 @@ import {
   setCreationToolInstalled,
   type CreationToolId,
 } from '../utils/creationTools'
+import type { DataSnapshot, DataSource } from '../types'
 import './CreationPanel.css'
 
 interface CreationPanelProps {
@@ -57,6 +58,7 @@ interface CreationPanelProps {
 
 type ReferenceItem = CreationReferenceItem
 type ReferencePreview = CreationReferencePreview
+type BottomTab = 'reference' | 'data' | 'config'
 interface CreationHistoryItem {
   id: number
   prompt: string
@@ -66,6 +68,7 @@ interface CreationHistoryItem {
   docType: string
   audience: string
   references: CreationReferenceItem[]
+  dataReferences: CreationDataReferenceItem[]
   sessionId?: string | null
   rootRequest: string
   conversation: CreationChatMessage[]
@@ -85,6 +88,15 @@ interface CreationEvidenceItem {
   image_url: string
   validation_status: string
   validation?: Record<string, unknown>
+}
+interface BrowserPreviewItem {
+  id: string
+  source_id: number
+  title: string
+  image_url: string
+  status?: string
+  browser?: string | null
+  interaction_mode?: string | null
 }
 type MarkdownBlock =
   | { type: 'markdown'; content: string; startLine: number; endLine: number }
@@ -201,6 +213,7 @@ const collapseAgentLifecycleEvents = (events: CreationAgentEvent[]) => {
     'tool.completed': 'tool.started',
     'tool.failed': 'tool.started',
     'skill.completed': 'skill.started',
+    'browser.preview.completed': 'browser.preview.started',
   }
   const visible: CreationAgentEvent[] = []
 
@@ -344,6 +357,95 @@ const formatInferenceLatency = (latencyMs?: number | null) => {
   return `${(latencyMs / 1000).toFixed(latencyMs < 10_000 ? 1 : 0)} 秒`
 }
 
+const normalizeDataReferences = (value: unknown): CreationDataReferenceItem[] => {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item): CreationDataReferenceItem[] => {
+    if (!item || typeof item !== 'object') return []
+    const source = item as Record<string, unknown>
+    const sourceId = Number(source.source_id)
+    if (!Number.isFinite(sourceId) || sourceId <= 0) return []
+    return [{
+      source_id: sourceId,
+      title: String(source.title || `数据来源 #${sourceId}`),
+      source_kind: String(source.source_kind || ''),
+      freshness_class: String(source.freshness_class || ''),
+      refresh_required: source.refresh_required === true,
+      can_use: source.can_use !== false,
+    }]
+  })
+}
+
+const dataReferencesFromEvents = (events: CreationAgentEvent[]) => {
+  const latest = [...events].reverse().find(event => (
+    event.type === 'tool.completed'
+    && event.actor?.id === 'data_search'
+    && Array.isArray(event.environment_patch?.data_sources)
+  ))
+  return normalizeDataReferences(latest?.environment_patch?.data_sources)
+}
+
+interface DataMetricRow {
+  dimension: string
+  metric: string
+  value: string
+  note: string
+}
+
+interface DataPresentation {
+  title: string
+  summary: string
+  rows: DataMetricRow[]
+}
+
+const normalizeDataText = (value: unknown) => {
+  if (typeof value === 'string') return value.replace(/\s+/g, ' ').trim()
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return ''
+}
+
+const presentDataSnapshot = (snapshot: DataSnapshot): DataPresentation => {
+  const structured = snapshot.structured_data ?? {}
+  const rows = Array.isArray(structured.metric_rows)
+    ? structured.metric_rows.flatMap((value): DataMetricRow[] => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+        const row = value as Record<string, unknown>
+        const metric = normalizeDataText(row.metric)
+        const metricValue = normalizeDataText(row.value)
+        if (!metric || !metricValue) return []
+        return [{
+          dimension: normalizeDataText(row.dimension),
+          metric,
+          value: metricValue,
+          note: normalizeDataText(row.note),
+        }]
+      })
+    : []
+  return {
+    title: normalizeDataText(structured.title) || '数据指标概况',
+    summary: normalizeDataText(structured.summary)
+      || normalizeDataText(snapshot.content_text).slice(0, 500)
+      || '这条数据尚未形成可理解的摘要',
+    rows,
+  }
+}
+
+const formatDataTimestamp = (timestamp?: number | null) => (
+  timestamp
+    ? new Date(timestamp).toLocaleString('zh-CN', { hour12: false })
+    : '尚未采集'
+)
+
+const hasLegacyDataSearchResults = (events: CreationAgentEvent[]) => events.some(event => (
+  event.type === 'tool.completed'
+  && event.actor?.id === 'data_search'
+  && Number(event.data?.result_count) > 0
+))
+
+const mapDataSearchResults = (value: unknown): CreationDataReferenceItem[] => {
+  if (!value || typeof value !== 'object') return []
+  return normalizeDataReferences((value as { results?: unknown }).results)
+}
+
 const mapCreationHistory = (histories: any[]): CreationHistoryItem[] => histories.map((h: any) => {
   const fullContent = sanitizeGeneratedContent(h.generated_content)
   const rootRequest = String(h.root_request || '')
@@ -354,7 +456,9 @@ const mapCreationHistory = (histories: any[]): CreationHistoryItem[] => historie
   } catch {
     references = []
   }
+  const agentEvents = parseHistoryJson<CreationAgentEvent[]>(h.agent_trace_json, [])
   return {
+
     id: Number(h.id),
     prompt: rootRequest || h.prompt,
     timestamp: new Date(h.updated_at ?? h.created_at).toLocaleString('zh-CN'),
@@ -363,10 +467,12 @@ const mapCreationHistory = (histories: any[]): CreationHistoryItem[] => historie
     docType: h.doc_type || '',
     audience: h.audience || '',
     references,
+    dataReferences: dataReferencesFromEvents(agentEvents),
     sessionId: h.session_id || null,
     rootRequest,
     conversation: parseHistoryJson<CreationChatMessage[]>(h.conversation_json, []),
-    agentEvents: parseHistoryJson<CreationAgentEvent[]>(h.agent_trace_json, []),
+    agentEvents,
+
     revisionNo: Math.max(1, Number(h.revision_no) || 1),
     editOperation: String(h.edit_operation || 'create_document'),
     documentPatch: parseHistoryJson<Record<string, unknown> | null>(h.document_patch_json, null),
@@ -587,6 +693,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     formatWeight,
     freshnessWeight,
     referencePreview,
+    dataReferences,
     sessionId,
     rootRequest,
     conversation,
@@ -612,19 +719,25 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   const setFormatWeight = (v: number) => setCreationDraft({ formatWeight: v })
   const setFreshnessWeight = (v: number) => setCreationDraft({ freshnessWeight: v })
   const setReferencePreview = (v: ReferencePreview | null) => setCreationDraft({ referencePreview: v })
+  const setDataReferences = (v: CreationDataReferenceItem[]) => setCreationDraft({ dataReferences: v })
   const setSessionId = (v: string | null) => setCreationDraft({ sessionId: v })
   const setRootRequest = (v: string) => setCreationDraft({ rootRequest: v.slice(0, 12000) })
   const setConversation = (v: CreationChatMessage[]) => setCreationDraft({ conversation: retainConversationContext(v) })
   const setAgentEvents = (v: CreationAgentEvent[]) => setCreationDraft({ agentEvents: v.slice(-240) })
 
+  const [dataSourcesById, setDataSourcesById] = useState<Record<number, DataSource>>({})
+  const [dataReferencesLoading, setDataReferencesLoading] = useState(false)
+  const [dataReferencesError, setDataReferencesError] = useState('')
+  const [legacyDataReferencesRecovered, setLegacyDataReferencesRecovered] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isPreviewing, setIsPreviewing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copySuccess, setCopySuccess] = useState(false)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [topTab, setTopTab] = useState<'creation' | 'history' | 'skills' | 'tools'>('creation')
-  const [activeBottomTab, setActiveBottomTab] = useState<'reference' | 'config' | null>(null)
-  const toggleBottomTab = (tab: 'reference' | 'config') =>
+  const [activeBottomTab, setActiveBottomTab] = useState<BottomTab | null>(null)
+  const toggleBottomTab = (tab: BottomTab) =>
+
     setActiveBottomTab(prev => prev === tab ? null : tab)
   const [creationTools, setCreationTools] = useState(loadCreationTools)
   const [creationHistory, setCreationHistory] = useState<CreationHistoryItem[]>([])
@@ -670,11 +783,13 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
   } | null>(null)
   const [workspaceSplit, setWorkspaceSplit] = useState(60)
   const contentRef = useRef<HTMLDivElement>(null)
+  const bottomPanelRef = useRef<HTMLDivElement>(null)
   const chatTimelineRef = useRef<HTMLDivElement>(null)
   const workspaceRef = useRef<HTMLElement>(null)
   const workspaceResizeCleanupRef = useRef<(() => void) | null>(null)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const legacyDataRecoveryRef = useRef(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const skillPackageInputRef = useRef<HTMLInputElement>(null)
   const promptInputRef = useRef<HTMLTextAreaElement>(null)
@@ -832,6 +947,16 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     return () => controller.abort()
   }, [loadCreationHistory])
 
+  const openBottomTab = (tab: Extract<BottomTab, 'reference' | 'data'>) => {
+    setActiveBottomTab(tab)
+    window.requestAnimationFrame(() => {
+      bottomPanelRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' })
+      bottomPanelRef.current
+        ?.querySelector<HTMLButtonElement>(`[data-bottom-tab="${tab}"]`)
+        ?.focus()
+    })
+  }
+
   const handleOpenReferenceSource = (item: Pick<ReferenceItem, 'id'>) => {
     const templateId = String(item.id)
     pushBakeNavigationTarget({ windowMode: 'creation' })
@@ -844,7 +969,76 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     setWindowMode('bake')
   }
 
+  useEffect(() => {
+    const sourceIds = [...new Set(dataReferences.map(item => item.source_id))]
+    if (!sourceIds.length) {
+      setDataSourcesById({})
+      return
+    }
+
+    const controller = new AbortController()
+    setDataReferencesLoading(true)
+    setDataReferencesError('')
+    void Promise.allSettled(sourceIds.map(async sourceId => {
+      const response = await fetchWithLocalhostFallback(
+        `${apiBaseUrl}/api/data/sources/${sourceId}`,
+        { signal: controller.signal },
+      )
+      if (!response.ok) throw new Error(`data source fetch failed: ${response.status}`)
+      return response.json() as Promise<DataSource>
+    })).then(results => {
+      if (controller.signal.aborted) return
+      const loaded: Record<number, DataSource> = {}
+      let failedCount = 0
+      results.forEach(result => {
+        if (result.status === 'fulfilled') loaded[result.value.id] = result.value
+        else failedCount += 1
+      })
+      setDataSourcesById(loaded)
+      if (failedCount) {
+        setDataReferencesError(
+          failedCount === sourceIds.length
+            ? '参考数据详情加载失败，请稍后重试。'
+            : `${failedCount} 个参考数据来源暂时无法加载。`,
+        )
+      }
+    }).finally(() => {
+      if (!controller.signal.aborted) setDataReferencesLoading(false)
+    })
+
+    return () => controller.abort()
+  }, [apiBaseUrl, dataReferences])
+
+  const recoverLegacyDataReferences = async (item: CreationHistoryItem) => {
+    if (item.dataReferences.length || !hasLegacyDataSearchResults(item.agentEvents)) return
+    const recoveryId = legacyDataRecoveryRef.current + 1
+    legacyDataRecoveryRef.current = recoveryId
+    setDataReferencesLoading(true)
+    setDataReferencesError('')
+    setLegacyDataReferencesRecovered(false)
+    try {
+      const response = await fetchWithLocalhostFallback(`${apiBaseUrl}/api/tools/data-search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: item.rootRequest || item.prompt, limit: 10 }),
+      })
+      if (!response.ok) throw new Error(`data search failed: ${response.status}`)
+      const recovered = mapDataSearchResults(await response.json())
+      if (legacyDataRecoveryRef.current !== recoveryId) return
+      setDataReferences(recovered)
+      setLegacyDataReferencesRecovered(recovered.length > 0)
+      if (!recovered.length) setDataReferencesError('未能从当前本地数据中恢复这条历史记录的参考数据。')
+    } catch (recoverError) {
+      if (legacyDataRecoveryRef.current !== recoveryId) return
+      console.error('恢复历史参考数据失败:', recoverError)
+      setDataReferencesError('历史记录未保存来源编号，当前数据恢复失败。')
+    } finally {
+      if (legacyDataRecoveryRef.current === recoveryId) setDataReferencesLoading(false)
+    }
+  }
+
   const handleRestoreHistory = (item: typeof creationHistory[0]) => {
+    legacyDataRecoveryRef.current += 1
     setPrompt('')
     setGeneratedContent(item.fullContent)
     setSessionId(item.sessionId || `history-${item.id}`)
@@ -887,7 +1081,13 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
       })
     }
     setAgentEvents(restoredEvents)
+    setDataReferences(item.dataReferences)
+    setDataSourcesById({})
+    setDataReferencesError('')
+    setLegacyDataReferencesRecovered(false)
+    void recoverLegacyDataReferences(item)
     setReferencePreview({
+
       requirement: {
         topic: item.prompt,
         doc_type: item.docType || docType,
@@ -1337,7 +1537,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         request_id: `creation-agent-${Date.now()}-${Math.random().toString(16).slice(2)}`,
         user_id: currentUser?.id || null,
         brand_model_id: 'mbcd-plus-v1',
-        caller: 'creation_agent',
+        caller: 'creation',
         messages,
         stream: false,
         privacy: { content_logging: false, client_scrubbed: true },
@@ -1527,17 +1727,46 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
         data: { evidence: event.data?.evidence },
       }
     }
+    if (event.type === 'tool.completed' && event.actor?.id === 'data_search') {
+      setDataReferences(normalizeDataReferences(event.environment_patch?.data_sources))
+    }
+    if (event.type === 'tool.completed' && event.actor?.id === 'data_search') {
+      setLegacyDataReferencesRecovered(false)
+      setDataReferences(normalizeDataReferences(event.environment_patch?.data_sources))
+    }
     if (event.type === 'run.completed') {
       return {
         ...base,
         data: { evidence: event.data?.evidence },
       }
     }
+    if (event.type === 'browser.preview.started' || event.type === 'browser.preview.completed') {
+      const previews = Array.isArray(event.data?.previews)
+        ? event.data.previews
+          .filter(item => item && typeof item === 'object')
+          .slice(0, 5)
+          .map((item: any) => ({
+            id: item.id,
+            source_id: item.source_id,
+            title: item.title,
+            image_url: item.image_url,
+            status: item.status,
+            browser: item.browser,
+            interaction_mode: item.interaction_mode,
+          }))
+        : []
+      return { ...base, data: { previews } }
+    }
     if (event.type === 'tool.completed' || event.type === 'tool.failed') {
+      const dataSources = event.type === 'tool.completed' && event.actor?.id === 'data_search'
+        ? normalizeDataReferences(event.environment_patch?.data_sources)
+        : []
       return {
         ...base,
+        environment_patch: dataSources.length > 0 ? { data_sources: dataSources } : {},
         data: {
           result_count: event.data?.result_count,
+          refresh_required_count: event.data?.refresh_required_count,
           diagram_type: event.data?.diagram_type,
           error_code: event.data?.error_code,
         },
@@ -2113,6 +2342,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
     prompt.trim()
     || generatedContent.trim()
     || referencePreview
+    || dataReferences.length
     || sessionId
     || conversation.length
     || agentEvents.length
@@ -2125,10 +2355,16 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
 
     activeUserMessageRef.current = ''
     activeUserEntryRef.current = null
+    legacyDataRecoveryRef.current += 1
+    setDataSourcesById({})
+    setDataReferencesLoading(false)
+    setDataReferencesError('')
+    setLegacyDataReferencesRecovered(false)
     setCreationDraft({
       prompt: '',
       generatedContent: '',
       referencePreview: null,
+      dataReferences: [],
       sessionId: null,
       rootRequest: '',
       conversation: [],
@@ -2683,7 +2919,13 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
               <div className="creation-chat-timeline" ref={chatTimelineRef} aria-live="polite">
                 {creationTimeline.map((item) => {
                   if (item.kind === 'trace') {
-                    return <AgentExecutionTrace key={item.key} events={item.events} />
+                    return (
+                      <AgentExecutionTrace
+                        key={item.key}
+                        events={item.events}
+                        onOpenReferences={openBottomTab}
+                      />
+                    )
                   }
 
                   const timestamp = formatCreationMessageTimestamp(item.message.createdAt)
@@ -2980,14 +3222,20 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
           </section>
 
           {/* 底部互斥 Tab */}
-          <div className="creation-bottom-panel" style={{ background: '#fff', borderTop: '1px solid #e1e5ea', flexShrink: 0 }}>
-            <div className="creation-bottom-tabs" style={{ display: 'flex', alignItems: 'center', padding: '0 16px' }}>
+          <div ref={bottomPanelRef} className="creation-bottom-panel" style={{ background: '#fff', borderTop: '1px solid #e1e5ea', flexShrink: 0 }}>
+            <div className="creation-bottom-tabs" role="tablist" aria-label="创作参考与参数" style={{ display: 'flex', alignItems: 'center', padding: '0 16px' }}>
               {([
                 { key: 'reference', label: '参考资料', badge: referencePreview?.references?.length || 0 },
+                { key: 'data', label: '参考数据', badge: dataReferences.length },
                 { key: 'config', label: '创作参数', badge: 0 },
               ] as const).map(({ key, label, badge }) => (
                 <button
                   key={key}
+                  type="button"
+                  role="tab"
+                  data-bottom-tab={key}
+                  aria-selected={activeBottomTab === key}
+                  aria-controls={`creation-bottom-panel-${key}`}
                   onClick={() => toggleBottomTab(key)}
                   style={{
                     padding: '10px 16px',
@@ -3013,7 +3261,7 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
               )}
             </div>
             {activeBottomTab === 'reference' && (
-              <div style={{ padding: 16, maxHeight: 280, overflowY: 'auto', background: '#fafbfc', borderTop: '1px solid #e1e5ea' }}>
+              <div id="creation-bottom-panel-reference" role="tabpanel" aria-label="参考资料" style={{ padding: 16, maxHeight: 280, overflowY: 'auto', background: '#fafbfc', borderTop: '1px solid #e1e5ea' }}>
                 {referencePreview?.references?.length ? (
                   <div style={{ display: 'grid', gap: 10 }}>
                     {referencePreview.references.map((ref: any) => (
@@ -3025,8 +3273,39 @@ const CreationPanel: React.FC<CreationPanelProps> = ({ className = '' }) => {
                 )}
               </div>
             )}
+            {activeBottomTab === 'data' && (
+              <div id="creation-bottom-panel-data" role="tabpanel" aria-label="参考数据" className="creation-data-references">
+                {dataReferencesLoading && (
+                  <div className="creation-data-reference-notice" role="status">
+                    <Loader2 size={14} className="spin" /> 正在加载参考数据详情…
+                  </div>
+                )}
+                {legacyDataReferencesRecovered && (
+                  <div className="creation-data-reference-notice">
+                    该历史版本未保存来源编号，以下内容按原始需求从当前本地数据恢复。
+                  </div>
+                )}
+                {dataReferencesError && (
+                  <div className="creation-data-reference-error" role="alert">{dataReferencesError}</div>
+                )}
+                {dataReferences.length ? (
+                  <div className="creation-data-reference-list">
+                    {dataReferences.map(item => (
+                      <DataReferenceRow
+                        key={item.source_id}
+                        item={item}
+                        source={dataSourcesById[item.source_id]}
+                        loading={dataReferencesLoading && !dataSourcesById[item.source_id]}
+                      />
+                    ))}
+                  </div>
+                ) : !dataReferencesLoading && (
+                  <div className="creation-bottom-empty">暂无参考数据，数据检索完成后会显示召回来源和具体指标。</div>
+                )}
+              </div>
+            )}
             {activeBottomTab === 'config' && (
-              <div style={{ padding: 16, maxHeight: 280, overflowY: 'auto', background: '#fafbfc', borderTop: '1px solid #e1e5ea', display: 'grid', gap: 12 }}>
+              <div id="creation-bottom-panel-config" role="tabpanel" aria-label="创作参数" style={{ padding: 16, maxHeight: 280, overflowY: 'auto', background: '#fafbfc', borderTop: '1px solid #e1e5ea', display: 'grid', gap: 12 }}>
                 <label style={{ display: 'grid', gap: 7, fontSize: 13 }}>
                   文档类型
                   <input value={docType} onChange={(e) => setDocType(e.target.value)} placeholder="建设方案" style={inputStyle} />
@@ -3191,14 +3470,23 @@ const agentEventCapabilityLabel = (value: unknown) =>
 
 const AgentExecutionTrace = ({
   events,
+  onOpenReferences,
 }: {
   events: CreationAgentEvent[]
+  onOpenReferences: (tab: Extract<BottomTab, 'reference' | 'data'>) => void
 }) => {
   const [expanded, setExpanded] = useState(true)
   if (!events.length) return null
   const latestGoal = [...events].reverse().find(event => event.goal)?.goal
   const displayEvents = collapseAgentLifecycleEvents(events)
   const eventGroups = groupConsecutiveAgentEvents(displayEvents)
+  const webpageScrapeTerminalStatus = [...events]
+    .reverse()
+    .find(event => (
+      event.actor?.id === 'webpage_scrape'
+      && ['tool.completed', 'tool.failed'].includes(event.type)
+    ))
+    ?.status
 
   return (
     <section className="creation-agent-trace" aria-label="Agent 执行情况">
@@ -3260,7 +3548,10 @@ const AgentExecutionTrace = ({
                               className="creation-agent-event__update"
                               key={event.event_id || `${event.run_id}-${event.sequence}`}
                             >
-                              <small>{displayAgentText(event.summary)}</small>
+                              <AgentEventSummary
+                                event={event}
+                                onOpenReferences={onOpenReferences}
+                              />
                               {details.length > 0 && (
                                 <dl>
                                   {details.map(detail => (
@@ -3271,6 +3562,10 @@ const AgentExecutionTrace = ({
                                   ))}
                                 </dl>
                               )}
+                              <BrowserPreviewStrip
+                                event={event}
+                                terminalStatus={webpageScrapeTerminalStatus}
+                              />
                             </div>
                           )
                         })}
@@ -3284,6 +3579,138 @@ const AgentExecutionTrace = ({
         </div>
       )}
     </section>
+  )
+}
+
+const AgentEventSummary = ({
+  event,
+  onOpenReferences,
+}: {
+  event: CreationAgentEvent
+  onOpenReferences: (tab: Extract<BottomTab, 'reference' | 'data'>) => void
+}) => {
+  const text = displayAgentText(event.summary)
+  const tab = event.type === 'tool.completed' && event.actor?.id === 'memory_search'
+    ? 'reference'
+    : event.type === 'tool.completed' && event.actor?.id === 'data_search'
+      ? 'data'
+      : null
+  const resultCount = Number(event.data?.result_count)
+  if (!tab || !Number.isFinite(resultCount) || resultCount <= 0) return <small>{text}</small>
+
+  const match = tab === 'reference'
+    ? text.match(/召回\s*\d+\s*条(?:本地)?资料/)
+    : text.match(/召回\s*\d+\s*个来源/)
+  if (!match || match.index == null) return <small>{text}</small>
+
+  const before = text.slice(0, match.index)
+  const after = text.slice(match.index + match[0].length)
+  return (
+    <small>
+      {before}
+      <button
+        type="button"
+        className="creation-agent-reference-link"
+        onClick={() => onOpenReferences(tab)}
+        aria-label={`${match[0]}，打开${tab === 'reference' ? '参考资料' : '参考数据'}`}
+      >
+        {match[0]}
+      </button>
+      {after}
+    </small>
+  )
+}
+
+const BrowserPreviewStrip = ({
+  event,
+  terminalStatus,
+}: {
+  event: CreationAgentEvent
+  terminalStatus?: string
+}) => {
+  if (!['browser.preview.started', 'browser.preview.completed'].includes(event.type)) return null
+  const previews = (Array.isArray(event.data?.previews) ? event.data.previews : [])
+    .filter((item): item is BrowserPreviewItem => Boolean(
+      item
+      && typeof item === 'object'
+      && typeof (item as BrowserPreviewItem).id === 'string'
+      && typeof (item as BrowserPreviewItem).image_url === 'string',
+    ))
+  if (!previews.length) return null
+  const status = event.type === 'browser.preview.completed'
+    ? 'completed'
+    : terminalStatus || 'running'
+
+  return (
+    <div className="creation-browser-previews" aria-label="后台浏览器预览">
+      {previews.map(preview => (
+        <BrowserPreviewCard
+          key={`${event.event_id}-${preview.id}`}
+          preview={preview}
+          status={preview.status || status}
+        />
+      ))}
+    </div>
+  )
+}
+
+const BrowserPreviewCard = ({
+  preview,
+  status,
+}: {
+  preview: BrowserPreviewItem
+  status: string
+}) => {
+  const apiBaseUrl = useAppStore(state => state.apiBaseUrl)
+  const [revision, setRevision] = useState(0)
+  const [loaded, setLoaded] = useState(false)
+  const isRunning = status === 'running'
+
+  useEffect(() => {
+    if (!isRunning) return undefined
+    const timer = window.setInterval(() => setRevision(value => value + 1), 900)
+    return () => window.clearInterval(timer)
+  }, [isRunning])
+
+  const absoluteUrl = preview.image_url.startsWith('/')
+    ? `${apiBaseUrl}${preview.image_url}`
+    : preview.image_url
+  const separator = absoluteUrl.includes('?') ? '&' : '?'
+  const imageUrl = isRunning ? `${absoluteUrl}${separator}preview=${revision}` : absoluteUrl
+  const statusLabel = status === 'completed'
+    ? '采集完成'
+    : status === 'failed'
+      ? '采集未完成'
+      : status === 'rejected'
+        ? '证据待核验'
+        : '后台采集中'
+
+  return (
+    <figure className={`creation-browser-preview is-${status}`}>
+      <div className="creation-browser-preview__viewport">
+        {!loaded && (
+          <span className="creation-browser-preview__loading">
+            {isRunning ? <Loader2 size={15} className="spin" /> : <Eye size={15} />}
+            {isRunning ? '正在等待页面画面…' : '缩略图暂不可用'}
+          </span>
+        )}
+        <img
+          src={imageUrl}
+          alt={`${preview.title || '数据页面'}后台浏览器缩略图`}
+          onLoad={() => setLoaded(true)}
+          onError={() => setLoaded(false)}
+          className={loaded ? 'is-loaded' : ''}
+        />
+        <span className="creation-browser-preview__live">{statusLabel}</span>
+      </div>
+      <figcaption>
+        <strong>{preview.title || '实时数据页面'}</strong>
+        <span>
+          {preview.browser ? `${preview.browser} · ` : ''}
+          不切换前台窗口
+        </span>
+      </figcaption>
+    </figure>
   )
 }
 
@@ -3569,6 +3996,94 @@ const ProgressStrip = ({ label, percent }: { label: string; percent: number }) =
     </div>
   </div>
 )
+
+const dataSourceKindLabels: Record<string, string> = {
+  report_url: '实时报表',
+  timeline_snapshot: '工作记录',
+  memory_snapshot: '本地数据',
+}
+
+const dataFreshnessLabels: Record<string, string> = {
+  fresh: '当前可用',
+  recent: '近期数据',
+  stale: '建议刷新',
+  historical: '历史数据',
+  missing: '待采集',
+}
+
+const DataReferenceRow = ({
+  item,
+  source,
+  loading,
+}: {
+  item: CreationDataReferenceItem
+  source?: DataSource
+  loading: boolean
+}) => {
+  const snapshot = source?.latest_snapshot
+  const presentation = snapshot ? presentDataSnapshot(snapshot) : null
+
+  return (
+    <article className="creation-data-reference-row">
+      <div className="creation-data-reference-row__heading">
+        <div>
+          <span>数据来源 #{item.source_id}</span>
+          <strong>{source?.title || item.title}</strong>
+        </div>
+        <span className={item.can_use ? 'is-available' : 'is-unavailable'}>
+          {item.can_use ? '可用于创作' : '暂不可用'}
+        </span>
+      </div>
+      <div className="creation-data-reference-row__meta">
+        <span>{dataSourceKindLabels[item.source_kind] || item.source_kind || '数据来源'}</span>
+        <span>{item.refresh_required ? '需要刷新' : dataFreshnessLabels[item.freshness_class] || item.freshness_class || '时效未知'}</span>
+        {snapshot && <span>数据时间 {formatDataTimestamp(snapshot.observed_at ?? snapshot.collected_at)}</span>}
+      </div>
+      {loading ? (
+        <div className="creation-data-reference-row__state">正在读取具体数据…</div>
+      ) : presentation && snapshot ? (
+        <div className="creation-data-reference-row__detail">
+          <h4>{presentation.title}</h4>
+          <p>{presentation.summary}</p>
+          {presentation.rows.length ? (
+            <div className="creation-data-reference-table-wrap">
+              <table className="creation-data-reference-table">
+                <thead>
+                  <tr>
+                    <th scope="col">对象 / 范围</th>
+                    <th scope="col">指标</th>
+                    <th scope="col">数值</th>
+                    <th scope="col">说明</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {presentation.rows.map((row, index) => (
+                    <tr key={`${row.dimension}-${row.metric}-${row.value}-${index}`}>
+                      <td>{row.dimension || '整体'}</td>
+                      <th scope="row">{row.metric}</th>
+                      <td className="creation-data-reference-table__value">{row.value}</td>
+                      <td>{row.note || '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="creation-data-reference-row__state">该快照暂无可展示的结构化指标。</div>
+          )}
+          <details className="creation-data-reference-disclosure">
+            <summary>查看完整采集内容</summary>
+            <div>{snapshot.content_text || '暂无完整采集内容'}</div>
+          </details>
+        </div>
+      ) : source ? (
+        <div className="creation-data-reference-row__state">该来源尚未采集到数据快照。</div>
+      ) : (
+        <div className="creation-data-reference-row__state">暂未读取到该来源的具体数据。</div>
+      )}
+    </article>
+  )
+}
 
 const ReferenceRow = ({ item, onOpenSource }: { item: ReferenceItem; onOpenSource: (item: ReferenceItem) => void }) => (
   <div style={{ border: '1px solid #e1e5ea', borderRadius: 8, padding: 12 }}>

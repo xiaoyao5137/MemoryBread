@@ -120,12 +120,134 @@ describe('创作 Agent 多轮 Loop', () => {
     })
   })
 
+  it('在执行轨迹中展示后台浏览器缩略预览且完成后保留最终截图', async () => {
+    const browserTool = { kind: 'tool', id: 'webpage_scrape', name: '网页爬取 Tool' }
+    const previewId = '2d870d80-e2a2-4424-a732-069e174f2796'
+    const started = event(
+      'browser.preview.started',
+      3,
+      '已在后台打开 1 个数据页面，前台操作不会被切走',
+      browserTool,
+      {
+        previews: [{
+          id: previewId,
+          source_id: 7,
+          title: '经营看板',
+          image_url: `/api/creation/browser-previews/${previewId}/image`,
+        }],
+      },
+    )
+    const completed = event(
+      'browser.preview.completed',
+      4,
+      '后台页面采集已结束，缩略预览保留在执行记录中',
+      browserTool,
+      {
+        previews: [{
+          id: previewId,
+          source_id: 7,
+          title: '经营看板',
+          image_url: `/api/creation/evidence/${previewId}/image`,
+          status: 'completed',
+          browser: 'chrome',
+          interaction_mode: 'background_browser_window',
+        }],
+      },
+    )
+    useAppStore.getState().setCreationDraft({
+      sessionId: 'session-agent-test',
+      conversation: [{
+        id: 'message-preview',
+        role: 'user',
+        content: '生成经营周报',
+        createdAt: 1_720_000_000_000,
+        runId: 'run-1',
+      }],
+      agentEvents: [started, completed] as any,
+    })
+    const fetchMock = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/creation/skills') return Response.json([])
+      if (url.pathname === '/api/creation/history') {
+        return Response.json({ items: [], total: 0, limit: 20, offset: 0 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<CreationPanel />)
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const image = screen.getByRole('img', { name: '经营看板后台浏览器缩略图' })
+    expect(image).toHaveAttribute(
+      'src',
+      `http://localhost:7070/api/creation/evidence/${previewId}/image`,
+    )
+    expect(screen.getByText('采集完成')).toBeInTheDocument()
+    expect(screen.getByText('chrome · 不切换前台窗口')).toBeInTheDocument()
+    expect(screen.getAllByRole('img', { name: '经营看板后台浏览器缩略图' })).toHaveLength(1)
+  })
+
   it('开始创作后展示 Agent、Tool、Skill 轨迹，并基于当前文档继续多轮优化', async () => {
     const agentPayloads: any[] = []
     const savedHistories: any[] = []
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input))
       if (url.pathname === '/api/creation/skills') return Response.json([installedStyleSkill])
+      if (url.pathname === '/api/data/sources/7') {
+        return Response.json({
+          id: 7,
+          title: '经营看板',
+          source_kind: 'report_url',
+          access_mode: 'direct_http',
+          refresh_policy: 'on_demand',
+          realtime_level: 'live',
+          tags: [],
+          first_seen_at: 1,
+          last_seen_at: 2,
+          status: 'active',
+          latest_snapshot: {
+            id: 70,
+            source_id: 7,
+            collected_at: 1_720_000_000_000,
+            observed_at: 1_720_000_000_000,
+            collector: 'http',
+            content_text: '国内单位 Token 成本为 0.018 元。',
+            structured_data: {
+              title: '单位 Token 成本对比',
+              summary: '成本优化后，国内单位 Token 成本下降 28%。',
+              metric_rows: [{
+                dimension: '国内',
+                metric: '单位 Token 成本',
+                value: '0.018 元',
+                note: '较基线下降 28%',
+              }],
+            },
+            content_hash: 'hash-7',
+            freshness_ttl_seconds: 3600,
+            provenance: {},
+            source_capture_ids: [],
+            source_timeline_ids: [],
+            status: 'active',
+          },
+        })
+      }
+      if (url.pathname === '/api/data/sources/9') {
+        return Response.json({
+          id: 9,
+          title: '历史经营周报',
+          source_kind: 'work_memory',
+          access_mode: 'memory_only',
+          refresh_policy: 'never',
+          realtime_level: 'observed',
+          tags: [],
+          first_seen_at: 1,
+          last_seen_at: 2,
+          status: 'active',
+          latest_snapshot: null,
+        })
+      }
       if (url.pathname === '/api/creation/history' && (!init?.method || init.method === 'GET')) {
         return Response.json({ items: [], total: 0, limit: 20, offset: 0 })
       }
@@ -230,6 +352,34 @@ describe('创作 Agent 多轮 Loop', () => {
                 usage_count: 3,
                 reason: '主题高度相关',
               }],
+            },
+          ),
+          event(
+            'tool.completed',
+            offset + 2.1,
+            '数据检索完成，召回 2 个来源，其中 1 个需要刷新',
+            { kind: 'tool', id: 'data_search', name: '数据检索 Tool' },
+            { result_count: 2, refresh_required_count: 1 },
+            {
+              data_sources: [
+                {
+                  source_id: 7,
+                  title: '经营看板',
+                  source_kind: 'report_url',
+                  freshness_class: 'fresh',
+                  refresh_required: false,
+                  can_use: true,
+                  ignored_secret: '不会写入历史',
+                },
+                {
+                  source_id: 9,
+                  title: '历史经营周报',
+                  source_kind: 'memory_snapshot',
+                  freshness_class: 'stale',
+                  refresh_required: true,
+                  can_use: true,
+                },
+              ],
             },
           ),
           {
@@ -337,6 +487,25 @@ describe('创作 Agent 多轮 Loop', () => {
     expect(screen.getByLabelText('Agent 执行情况')).toHaveTextContent('原始需求')
     expect(screen.getByLabelText('Agent 执行情况')).toHaveTextContent('当前没有既有文档')
 
+    const memoryResultLink = screen.getByRole('button', { name: '召回 1 条本地资料，打开参考资料' })
+    fireEvent.click(memoryResultLink)
+    expect(screen.getByRole('tab', { name: '参考资料 (1)' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByText('既有架构决策')).toBeInTheDocument()
+
+    const dataResultLink = screen.getByRole('button', { name: '召回 2 个来源，打开参考数据' })
+    fireEvent.click(dataResultLink)
+    expect(screen.getByRole('tab', { name: '参考数据 (2)' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByText('经营看板')).toBeInTheDocument()
+    expect(screen.getByText('历史经营周报')).toBeInTheDocument()
+    expect(await screen.findByText('单位 Token 成本对比')).toBeInTheDocument()
+    expect(screen.getByText('成本优化后，国内单位 Token 成本下降 28%。')).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: '指标' })).toBeInTheDocument()
+    expect(screen.getByRole('rowheader', { name: '单位 Token 成本' })).toBeInTheDocument()
+    expect(screen.getByText('0.018 元')).toBeInTheDocument()
+    expect(screen.getByText('较基线下降 28%')).toBeInTheDocument()
+    expect(screen.getByText('该来源尚未采集到数据快照。')).toBeInTheDocument()
+    expect(screen.getByText('需要刷新')).toBeInTheDocument()
+
     const followUp = screen.getByPlaceholderText(/继续告诉 Agent 如何修改当前文档/)
     fireEvent.change(followUp, { target: { value: '补充质量门禁和多轮测试' } })
     fireEvent.click(screen.getByRole('button', { name: '发送' }))
@@ -422,6 +591,26 @@ describe('创作 Agent 多轮 Loop', () => {
     const storedIntent = savedHistories[1].agent_trace.find((item: any) => item.type === 'intent.interpreted')
     const storedPatch = savedHistories[1].agent_trace.find((item: any) => item.type === 'document.patch.applied')
     const storedHarnessDecision = savedHistories[1].agent_trace.find((item: any) => item.type === 'harness.decision')
+    const storedDataSearch = savedHistories[1].agent_trace.find((item: any) => item.actor?.id === 'data_search')
+    expect(storedDataSearch.environment_patch.data_sources).toEqual([
+      {
+        source_id: 7,
+        title: '经营看板',
+        source_kind: 'report_url',
+        freshness_class: 'fresh',
+        refresh_required: false,
+        can_use: true,
+      },
+      {
+        source_id: 9,
+        title: '历史经营周报',
+        source_kind: 'memory_snapshot',
+        freshness_class: 'stale',
+        refresh_required: true,
+        can_use: true,
+      },
+    ])
+    expect(storedDataSearch.data).toMatchObject({ result_count: 2, refresh_required_count: 1 })
     expect(storedIntent.data).not.toHaveProperty('root_request')
     expect(storedIntent.data).not.toHaveProperty('current_instruction')
     expect(storedPatch.data).not.toHaveProperty('content')
@@ -772,7 +961,7 @@ describe('创作 Agent 多轮 Loop', () => {
     expect(gatewayPayloads).toHaveLength(1)
     expect(gatewayPayloads[0]).toMatchObject({
       brand_model_id: 'mbcd-plus-v1',
-      caller: 'creation_agent',
+      caller: 'creation',
       privacy: { content_logging: false, client_scrubbed: true },
     })
     expect(gatewayPayloads[0]).not.toHaveProperty('provider')

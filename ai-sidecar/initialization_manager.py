@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import psutil
 
@@ -1244,7 +1244,7 @@ class InitializationManager:
     def _models_root(self, mode: str) -> Path:
         return self._workspace_root(mode) / "models"
 
-    def _managed_ollama_executable(self, mode: str) -> Path | None:
+    def _managed_ollama_executable(self, mode: str) -> Optional[Path]:
         version_dir = self._runtime_root(mode) / f"v{MANAGED_OLLAMA_VERSION}"
         manifest_path = version_dir / "manifest.json"
         expected_sha = os.environ.get("MEMORY_BREAD_OLLAMA_SHA256", MANAGED_OLLAMA_SHA256).lower()
@@ -1324,7 +1324,7 @@ class InitializationManager:
             )
 
     @staticmethod
-    def _find_ollama_executable(root: Path) -> Path | None:
+    def _find_ollama_executable(root: Path) -> Optional[Path]:
         for candidate in (root / "bin" / "ollama", root / "ollama"):
             if candidate.is_file():
                 return candidate
@@ -1391,7 +1391,7 @@ class InitializationManager:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             return sock.connect_ex(("127.0.0.1", port)) == 0
 
-    def _resolve_core_executable(self) -> Path | None:
+    def _resolve_core_executable(self) -> Optional[Path]:
         configured = os.environ.get("MEMORY_BREAD_CORE_EXECUTABLE")
         candidates: list[Path] = [Path(configured)] if configured else []
         executable = Path(sys.executable).resolve()
@@ -1509,7 +1509,7 @@ class InitializationManager:
         name: str,
         pid: int,
         executable: Path,
-        metadata: dict[str, Any] | None = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         marker_dir = self._workspace_root(mode) / "processes"
         try:
@@ -1668,7 +1668,7 @@ class InitializationManager:
         }
 
     @staticmethod
-    def _safe_summary(value: Any) -> str | None:
+    def _safe_summary(value: Any) -> Optional[str]:
         if not value:
             return None
         summary = InitializationManager._redact_internal_terms(str(value)).replace(

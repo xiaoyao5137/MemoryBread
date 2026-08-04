@@ -9,6 +9,7 @@ pub mod creation_history;
 pub mod creation_skill;
 pub mod data;
 pub mod diary;
+pub mod integration_skill;
 pub mod knowledge;
 pub mod preferences;
 pub mod privacy;

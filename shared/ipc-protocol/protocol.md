@@ -30,8 +30,10 @@ Core Engine（Rust）与 AI Sidecar（Python）是两个独立进程，通过本
 
 | 平台 | 传输方式 | 地址 |
 |------|---------|------|
-| macOS / Linux | Unix Domain Socket | `/tmp/memory-bread-sidecar.sock` |
+| macOS / Linux | Unix Domain Socket | 默认 `/tmp/memory-bread-sidecar.sock`；安装版由 `MEMORY_BREAD_IPC_SOCKET` 指定隔离路径 |
 | Windows | TCP Loopback | `127.0.0.1:17071` |
+
+Rust 端和 Python 端必须使用同一个 `MEMORY_BREAD_IPC_SOCKET`。未设置时使用默认路径；安装版设置隔离路径，以支持与开发环境并行运行。
 
 Rust 端在运行时自动检测平台，选择对应的连接方式。Python 端同理。
 

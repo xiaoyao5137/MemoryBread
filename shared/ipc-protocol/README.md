@@ -28,8 +28,10 @@ shared/ipc-protocol/
 
 | 平台 | 方式 | 地址 |
 |------|------|------|
-| macOS / Linux | Unix Domain Socket | `/tmp/memory-bread-sidecar.sock` |
+| macOS / Linux | Unix Domain Socket | 默认 `/tmp/memory-bread-sidecar.sock`；安装版由 `MEMORY_BREAD_IPC_SOCKET` 指定隔离路径 |
 | Windows | TCP Loopback | `127.0.0.1:17071` |
+
+Rust 客户端与 Python 服务端必须读取同一个 `MEMORY_BREAD_IPC_SOCKET` 值。未设置时保持默认地址，供开发环境使用；安装版必须设置隔离路径，避免与同时运行的开发 Sidecar 冲突。
 
 帧格式：`[4字节大端 uint32 消息长度] + [N字节 UTF-8 JSON]`
 

@@ -12,7 +12,7 @@ use crate::{
     api::{error::ApiError, state::AppState},
     services::bake_service::{
         BakeBucket, BakeCaptureFilter, BakeCapturePayload, BakeDocumentPayload,
-        BakeExtractResponse, BakeKnowledgePayload, BakeListFilter, BakeMemoryFilter,
+        BakeExtractResponse, BakeKnowledgePayload, BakeListFilter, BakeListSort, BakeMemoryFilter,
         BakeMemoryPayload, BakeOverviewPayload, BakePagedResponse, BakeService, BakeSopPayload,
         BakeStyleConfig, CreateOrUpdateDocumentRequest, InitializeBakeMemoriesResponse,
     },
@@ -27,6 +27,7 @@ pub struct BakePaginationQuery {
     pub source_capture_id: Option<i64>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    pub sort: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -118,6 +119,7 @@ pub async fn list_bake_sops(
         to_ts: params.to,
         limit,
         offset,
+        sort: BakeListSort::Recent,
     };
     let response: BakePagedResponse<BakeSopPayload> =
         tokio::task::spawn_blocking(move || service.list_sops_paginated(filter))
@@ -168,6 +170,7 @@ pub async fn list_bake_documents(
         to_ts: params.to,
         limit,
         offset,
+        sort: BakeListSort::Recent,
     };
     let response: BakePagedResponse<BakeDocumentPayload> =
         tokio::task::spawn_blocking(move || service.list_documents_paginated(filter))
@@ -283,6 +286,15 @@ pub async fn list_bake_knowledge(
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let offset = params.offset.unwrap_or(0);
     let bucket = BakeBucket::from_query(params.bucket.as_deref())?;
+    let sort = match params.sort.as_deref() {
+        None | Some("recent") => BakeListSort::Recent,
+        Some("heat") => BakeListSort::Heat,
+        Some(value) => {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported bake knowledge sort: {value}"
+            )))
+        }
+    };
     let filter = BakeListFilter {
         q: params.q.filter(|value| !value.trim().is_empty()),
         bucket,
@@ -290,6 +302,7 @@ pub async fn list_bake_knowledge(
         to_ts: params.to,
         limit,
         offset,
+        sort,
     };
     let response: BakePagedResponse<BakeKnowledgePayload> =
         tokio::task::spawn_blocking(move || service.list_knowledge_paginated(filter))

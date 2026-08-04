@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import platform
 import struct
 import time
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 from pydantic import TypeAdapter
 
@@ -31,7 +32,10 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024  # 16 MB
-UNIX_SOCKET_PATH  = "/tmp/memory-bread-sidecar.sock"
+DEFAULT_UNIX_SOCKET_PATH = "/tmp/memory-bread-sidecar.sock"
+UNIX_SOCKET_PATH = os.environ.get(
+    "MEMORY_BREAD_IPC_SOCKET", DEFAULT_UNIX_SOCKET_PATH
+)
 TCP_HOST          = "127.0.0.1"
 TCP_PORT          = 17071
 
@@ -98,7 +102,7 @@ class IpcServer:
 
     def __init__(self, dispatch_fn: DispatchFn) -> None:
         self._dispatch = dispatch_fn
-        self._server: asyncio.Server | None = None
+        self._server: Optional[asyncio.Server] = None
 
     # ── 启动/停止 ─────────────────────────────────────────────────────────────
 
@@ -110,7 +114,6 @@ class IpcServer:
             await self._serve_unix()
 
     async def _serve_unix(self) -> None:
-        import os
         # 只有无法连接时才把路径视为崩溃遗留。旧实现无条件 unlink，允许第二个
         # Sidecar 在同一路径重新 bind，旧进程则继续持有一个不可达 socket。
         if os.path.exists(UNIX_SOCKET_PATH):

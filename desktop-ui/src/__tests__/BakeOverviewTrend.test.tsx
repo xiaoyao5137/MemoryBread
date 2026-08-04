@@ -12,6 +12,7 @@ const createBucket = (day: number, memoryCount: number): BakeInventoryTrendBucke
     startTs,
     endTs: startTs + DAY_MS - 1,
     memoryCount,
+    dataCount: day % 5,
     knowledgeCount: day % 3,
     templateCount: day % 2,
     sopCount: day % 4,
@@ -60,6 +61,7 @@ describe('BakeOverviewTab 趋势图', () => {
         startTs: new Date(2026, 5, 1).getTime(),
         endTs: new Date(2026, 5, 13).getTime() - 1,
         memoryCount: 12,
+        dataCount: 2,
         knowledgeCount: 4,
         templateCount: 3,
         sopCount: 2,
@@ -116,24 +118,24 @@ describe('BakeOverviewTab 趋势图', () => {
     fireEvent.mouseMove(chart as HTMLDivElement, { clientX: 720 })
 
     expect(screen.getByText('2026-06-12')).toBeInTheDocument()
-    expect(screen.getByText('合计 12')).toBeInTheDocument()
+    expect(screen.getByText('合计 14')).toBeInTheDocument()
+    expect(container.querySelector('.bake-trend-tooltip')).toHaveTextContent('数据2')
 
     fireEvent.mouseMove(chart as HTMLDivElement, { clientX: 0 })
 
     expect(screen.getByText('2026-06-01')).toBeInTheDocument()
-    expect(screen.getByText('合计 4')).toBeInTheDocument()
+    expect(screen.getByText('合计 5')).toBeInTheDocument()
   })
 
-  it('将记忆备份区域放在总览内容底部', () => {
-    const { container } = render(
+  it('记忆总览不再承载备份与恢复入口', () => {
+    render(
       <BakeOverviewTab
         overview={overview}
         onOpenTab={noop}
         onOpenRepository={noop}
-        footer={<section aria-label="记忆备份">备份功能</section>}
       />,
     )
 
-    expect(container.firstElementChild?.lastElementChild).toHaveAttribute('aria-label', '记忆备份')
+    expect(screen.queryByLabelText('记忆备份')).not.toBeInTheDocument()
   })
 })

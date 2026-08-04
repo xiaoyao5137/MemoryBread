@@ -185,12 +185,32 @@ const formatDuration = (minutes: number) => {
 }
 
 const formatClock = (timestamp: number | null) => {
-  if (!timestamp) return '--:--'
+  if (timestamp == null) return '--:--'
   return new Date(timestamp).toLocaleTimeString('zh-CN', {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
   })
+}
+
+const dateKeyIndex = (dateKey: string) => {
+  const [year, month, day] = dateKey.split('-').map(Number)
+  if (!year || !month || !day) return null
+  return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000)
+}
+
+const formatWorkdayClock = (timestamp: number | null, workdayDate: string) => {
+  const clock = formatClock(timestamp)
+  if (timestamp == null) return clock
+  const workdayIndex = dateKeyIndex(workdayDate)
+  const timestampIndex = dateKeyIndex(toLocalDateKey(new Date(timestamp)))
+  if (workdayIndex == null || timestampIndex == null) return clock
+  const dayOffset = timestampIndex - workdayIndex
+  if (dayOffset === 1) return `次日 ${clock}`
+  if (dayOffset > 1) return `${dayOffset} 日后 ${clock}`
+  if (dayOffset === -1) return `前一日 ${clock}`
+  if (dayOffset < -1) return `${Math.abs(dayOffset)} 日前 ${clock}`
+  return clock
 }
 
 const formatCreatedAt = (value: string) => new Date(value).toLocaleString('zh-CN', {
@@ -966,8 +986,8 @@ const AccountProfile: React.FC<AccountProfileProps> = ({
                             ? '当天工作时段读取失败'
                             : selectedWorkDayHasTimeRange
                           ? selectedWorkDay.activePeriodCount > 0
-                            ? `${selectedWorkDay.activePeriodCount} 段活跃 · 首次 ${formatClock(selectedWorkDay.firstCaptureAt)} · 最后 ${formatClock(selectedWorkDay.lastCaptureAt)}`
-                            : `记录分布于 ${formatClock(selectedWorkDay.firstCaptureAt)} 至 ${formatClock(selectedWorkDay.lastCaptureAt)}（含间歇）`
+                            ? `${selectedWorkDay.activePeriodCount} 段活跃 · 首次 ${formatWorkdayClock(selectedWorkDay.firstCaptureAt, selectedWorkDay.date)} · 最后 ${formatWorkdayClock(selectedWorkDay.lastCaptureAt, selectedWorkDay.date)}`
+                            : `记录分布于 ${formatWorkdayClock(selectedWorkDay.firstCaptureAt, selectedWorkDay.date)} 至 ${formatWorkdayClock(selectedWorkDay.lastCaptureAt, selectedWorkDay.date)}（含间歇）`
                           : (selectedWorkDay?.captureCount ?? 0) > 0
                             ? '当天没有可用的工作时段明细'
                             : '暂无工作时段'}

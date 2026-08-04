@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 import uuid
 from enum import Enum
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
@@ -34,7 +34,7 @@ class AsrRequest(BaseModel):
     type:       Literal["asr"] = "asr"
     capture_id: int
     audio_path: str
-    language:   str | None = None  # None 时模型自动检测
+    language:   Optional[str] = None  # None 时模型自动检测
 
 
 class VlmRequest(BaseModel):
@@ -178,7 +178,7 @@ class IpcResponse(BaseModel):
     # result 实际类型为 ResultPayload | None；使用 Any 规避 Pydantic v2
     # 对复杂 Annotated Union 字段的序列化限制，通过 field_serializer 手动处理
     result:     Any = None
-    error:      str | None           = None
+    error:      Optional[str]         = None
     latency_ms: int                  = 0
 
     @field_serializer("result")

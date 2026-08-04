@@ -33,6 +33,36 @@ async fn data_sources_empty_db_returns_a_page() {
 }
 
 #[tokio::test]
+async fn browser_preview_endpoint_rejects_invalid_ids_before_reading_disk() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = StorageManager::open(&temp_dir.path().join("test.db")).unwrap();
+    let router = create_router(AppState::new(storage));
+
+    let invalid = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/creation/browser-previews/not-a-uuid/image")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let missing = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/creation/browser-previews/2d870d80-e2a2-4424-a732-069e174f2796/image")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn data_page_counts_only_semantic_records_and_supports_delete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let storage = StorageManager::open(&temp_dir.path().join("test.db")).unwrap();
@@ -88,7 +118,11 @@ async fn data_page_counts_only_semantic_records_and_supports_delete() {
     assert_eq!(json["items"][0]["id"], 1);
     assert_eq!(
         json["items"][0]["latest_snapshot"]["structured_data"]["extraction_version"],
-        "data-memory.v2"
+        "data-memory.v11"
+    );
+    assert_eq!(
+        json["items"][0]["latest_snapshot"]["structured_data"]["title"],
+        "GPU 利用率对比"
     );
     assert_eq!(
         json["items"][0]["latest_snapshot"]["structured_data"]["metric_rows"]

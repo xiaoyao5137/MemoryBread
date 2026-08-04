@@ -2,6 +2,7 @@
 pub mod api;
 pub mod capture;
 pub mod executor;
+pub mod integration;
 pub mod ipc;
 pub mod monitor;
 pub mod scheduler;

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "memorybread.integration-skill.v1",
+  "id": "obsidian",
+  "version": "1.0.0",
+  "direction": "input",
+  "executor": "markdown_import",
+  "accept": [".md", ".markdown"],
+  "maxFiles": 512,
+  "maxTotalBytes": 25165824,
+  "modes": ["preview", "execute"],
+  "privacy": { "network": "loopback-only", "logContent": false },
+  "source": "core-engine/src/integration/mod.rs"
+}

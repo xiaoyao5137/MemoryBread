@@ -26,6 +26,14 @@ describe('创作新会话', () => {
         },
         references: [],
       },
+      dataReferences: [{
+        source_id: 7,
+        title: '经营看板',
+        source_kind: 'report_url',
+        freshness_class: 'fresh',
+        refresh_required: false,
+        can_use: true,
+      }],
       sessionId: 'session-existing',
       rootRequest: '设计 Agent 架构方案',
       conversation: [{
@@ -86,6 +94,7 @@ describe('创作新会话', () => {
         prompt: '',
         generatedContent: '',
         referencePreview: null,
+        dataReferences: [],
         sessionId: null,
         rootRequest: '',
         conversation: [],

@@ -219,6 +219,7 @@ pub struct BakeKnowledgeRecord {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub source_capture_ids: Option<String>,
+    pub occurrence_count: i64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

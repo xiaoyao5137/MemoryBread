@@ -1,8 +1,25 @@
 import inspect
 import json
+import sys
 import threading
 
 import main
+import packaged_entry
+
+
+def test_packaged_sidecar_removes_outer_service_argument(monkeypatch):
+    observed_argv = None
+
+    async def fake_main():
+        nonlocal observed_argv
+        observed_argv = list(sys.argv)
+
+    monkeypatch.setattr(main, "_main", fake_main)
+    monkeypatch.setattr(sys, "argv", ["memory-bread-ai", "sidecar", "--log-level", "DEBUG"])
+
+    packaged_entry.run_sidecar()
+
+    assert observed_argv == ["memory-bread-ai", "--log-level", "DEBUG"]
 
 
 def test_runtime_status_heartbeat_is_independent_from_asyncio():

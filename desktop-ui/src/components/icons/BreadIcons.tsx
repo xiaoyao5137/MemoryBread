@@ -8,6 +8,7 @@ export type BreadAppIconName =
   | 'memory'
   | 'capture'
   | 'profile'
+  | 'integration'
   | 'models'
   | 'privacy'
   | 'monitor'
@@ -120,6 +121,16 @@ const renderGlyph = (name: BreadIconName) => {
         <>
           <circle cx="12" cy="10.1" r="2.05" />
           <path d="M8.15 16.45c.46-1.86 1.78-2.78 3.85-2.78s3.39.92 3.85 2.78" />
+        </>
+      )
+    case 'integration':
+      return (
+        <>
+          <rect x="7.35" y="7.4" width="3.2" height="3.2" rx="0.85" />
+          <rect x="13.45" y="13.4" width="3.2" height="3.2" rx="0.85" />
+          <path d="M10.55 9h2.1c1.1 0 2 .9 2 2v2.4" />
+          <path d="m13.25 12.05 1.4 1.4 1.4-1.4" />
+          <circle cx="8.95" cy="15" r="1.45" fill="var(--bread-icon-accent, #d98c38)" opacity="0.42" />
         </>
       )
     case 'models':

@@ -16,6 +16,51 @@
       "type": "string",
       "enum": ["live", "fresh", "aging", "stale", "missing"]
     },
+    "data_memory_v11": {
+      "type": "object",
+      "required": ["extraction_version", "title", "summary", "semantic_subject", "semantic_identity", "metric_rows"],
+      "properties": {
+        "extraction_version": {"const": "data-memory.v11"},
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "不含具体数值、能够说明数据对象与主题的语义标题"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 260,
+          "description": "包含主题、对象/范围、关键指标值及可用结论的概述"
+        },
+        "semantic_subject": {
+          "type": "string",
+          "description": "数据指标所属的对象、业务范围或分类母体；指标自身已完整命名时可为空字符串"
+        },
+        "semantic_identity": {
+          "type": "string",
+          "minLength": 1,
+          "description": "排除具体数值和采集时间后的稳定数据语义身份，与稳定页面/文档范围共同用于跨时间线判重"
+        },
+        "metric_rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["dimension", "metric", "value", "note"],
+            "properties": {
+              "dimension": {"type": "string"},
+              "metric": {"type": "string", "minLength": 1},
+              "value": {"type": "string", "minLength": 1},
+              "note": {"type": "string"},
+              "statement": {"type": "string"},
+              "observed_at": {"type": ["integer", "null"]}
+            }
+          }
+        },
+        "metric_statements": {"type": "array"}
+      }
+    },
     "creation_evidence": {
       "type": "object",
       "required": [
@@ -91,7 +136,10 @@
         "refresh_required": {"type": "boolean"},
         "can_use": {"type": "boolean"},
         "content_excerpt": {"type": ["string", "null"]},
-        "structured_data": {"type": ["object", "array", "null"]},
+        "structured_data": {
+          "type": ["object", "array", "null"],
+          "description": "工作数据使用 data_memory_v11；报表结果可在同一对象中附带原始表格字段"
+        },
         "provenance": {"type": ["object", "null"]}
       }
     },
@@ -117,7 +165,12 @@
         },
         "capture_evidence": {"type": "boolean", "default": false},
         "run_id": {"type": ["string", "null"]},
-        "session_id": {"type": ["string", "null"]}
+        "session_id": {"type": ["string", "null"]},
+        "preview_id": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "本轮后台浏览器缩略预览与最终证据共用的本机标识"
+        }
       },
       "additionalProperties": false
     },
@@ -132,12 +185,15 @@
           "type": ["string", "null"],
           "enum": ["chrome", "chrome_canary", "edge", "brave", "chromium", "vivaldi", "safari", null]
         },
-        "interaction_mode": {"type": "string", "enum": ["background_tab", "temporary_foreground_tab", "none"]},
+        "interaction_mode": {"type": "string", "enum": ["background_tab", "background_browser_window", "temporary_foreground_tab", "none"]},
         "collected_at": {"type": "integer", "minimum": 0},
         "title": {"type": "string"},
         "url": {"type": "string"},
         "content_text": {"type": "string"},
-        "structured_data": {"type": ["object", "array", "null"]},
+        "structured_data": {
+          "type": ["object", "array", "null"],
+          "description": "采集成功后追加 data-memory.v11 的 title、summary、semantic_identity 与 metric_rows"
+        },
         "content_hash": {"type": "string"},
         "evidence": {
           "anyOf": [

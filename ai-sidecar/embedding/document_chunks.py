@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from knowledge.fragment_grouper import _is_document_url
@@ -53,7 +54,7 @@ class BakeDocumentSnapshot:
     chunks: list[str]
 
 
-def _canonicalize_url(url: Optional[str]) -> str | None:
+def _canonicalize_url(url: Optional[str]) -> Optional[str]:
     value = str(url or "").strip()
     if not value:
         return None
@@ -75,7 +76,7 @@ def _canonicalize_url(url: Optional[str]) -> str | None:
     )
 
 
-def canonicalize_document_url(url: Optional[str]) -> str | None:
+def canonicalize_document_url(url: Optional[str]) -> Optional[str]:
     """Return a query/fragment-free URL suitable for document identity."""
     value = str(url or "").strip()
     if not value or not _is_document_url(value):
@@ -229,7 +230,7 @@ def chunk_document(body: str, title: str = "") -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
-def build_document_snapshot(capture: dict) -> DocumentSnapshot | None:
+def build_document_snapshot(capture: dict) -> Optional[DocumentSnapshot]:
     canonical_url = canonicalize_document_url(capture.get("url"))
     if not canonical_url:
         return None
@@ -279,7 +280,7 @@ def _flatten_section_text(value: object) -> list[str]:
     return parts
 
 
-def build_bake_document_snapshot(document: dict) -> BakeDocumentSnapshot | None:
+def build_bake_document_snapshot(document: dict) -> Optional[BakeDocumentSnapshot]:
     """Build a durable vector snapshot directly from ``bake_documents``.
 
     Unlike capture snapshots, this source survives capture retention cleanup and

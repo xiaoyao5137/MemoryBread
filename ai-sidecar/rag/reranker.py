@@ -11,6 +11,7 @@ RRF 公式：score(d) = Σ [ 1 / (k + rank(d, list_i)) ]
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Union
 
 from .retriever import RetrievedChunk
 
@@ -79,7 +80,7 @@ def _normalize_result_list(entry: Union[list[RetrievedChunk], WeightedResultList
     if (
         isinstance(entry, tuple)
         and len(entry) == 2
-        and isinstance(entry[1], int | float)
+        and isinstance(entry[1], (int, float))
     ):
         return entry[0], float(entry[1])
     if isinstance(entry, Sequence):

@@ -120,7 +120,7 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_source_ts ON system_metrics(source, ts)")
 
 
-def _detect_gpu_name() -> str | None:
+def _detect_gpu_name() -> Optional[str]:
     global _GPU_NAME_CACHE
     if _GPU_NAME_CACHE is not False:
         return _GPU_NAME_CACHE or None
@@ -141,7 +141,7 @@ def _detect_gpu_name() -> str | None:
     return gpu_name or None
 
 
-def _detect_ioreg_gpu_class() -> str | None:
+def _detect_ioreg_gpu_class() -> Optional[str]:
     global _GPU_IOREG_CLASS_CACHE
     if _GPU_IOREG_CLASS_CACHE is not False:
         return _GPU_IOREG_CLASS_CACHE or None
@@ -156,7 +156,7 @@ def _detect_ioreg_gpu_class() -> str | None:
     return None
 
 
-def _extract_ioreg_number(output: str, field: str) -> float | None:
+def _extract_ioreg_number(output: str, field: str) -> Optional[float]:
     idx = output.find(f'"{field}"')
     if idx == -1:
         return None
@@ -177,7 +177,7 @@ def _extract_ioreg_number(output: str, field: str) -> float | None:
         return None
 
 
-def _sample_gpu_percent() -> float | None:
+def _sample_gpu_percent() -> Optional[float]:
     global _GPU_PERCENT_CACHE
 
     raw = os.getenv("WORKBUDDY_GPU_PERCENT")
@@ -210,14 +210,14 @@ def _sample_gpu_percent() -> float | None:
     return None
 
 
-def _safe_process(pid: int) -> psutil.Process | None:
+def _safe_process(pid: int) -> Optional[psutil.Process]:
     try:
         return psutil.Process(pid)
     except (psutil.Error, ValueError):
         return None
 
 
-def _read_pid_file(path: Path) -> int | None:
+def _read_pid_file(path: Path) -> Optional[int]:
     try:
         return int(path.read_text().strip())
     except Exception:
@@ -392,7 +392,7 @@ def _aggregate_processes(pids: set[int], target_name: str, scope: str, coverage_
     return metrics
 
 
-def _build_model_series_note(series_key: str) -> str | None:
+def _build_model_series_note(series_key: str) -> Optional[str]:
     if series_key == _MODEL_SERIES_SIDECAR:
         return "sidecar 主进程内承载的本地模型运行时（含 OCR / embedding 等）"
     if series_key == _MODEL_SERIES_MODEL_API:

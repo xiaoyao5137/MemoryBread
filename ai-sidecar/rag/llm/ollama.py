@@ -13,7 +13,7 @@ import logging
 import urllib.request
 import urllib.error
 import urllib.parse
-from typing import Callable
+from typing import Callable, Optional
 
 from inference_queue import (
     current_task_preempt_requested,
@@ -67,7 +67,7 @@ class OllamaBackend(LlmBackend):
         self,
         prompt: str,
         system: str = "",
-        on_delta: Callable[[str], None] | None = None,
+        on_delta: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> LlmResponse:
         raise_if_preempted()

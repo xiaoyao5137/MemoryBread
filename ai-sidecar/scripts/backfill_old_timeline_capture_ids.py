@@ -28,6 +28,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Optional
 
 DEFAULT_DB = Path.home() / ".memory-bread" / "memory-bread.db"
 
@@ -69,7 +70,7 @@ def build_segment(cap_id: int, cap_ts: int, summary: Optional[str]) -> dict:
     }
 
 
-def parse_source_timeline_id(details: Optional[str]) -> int | None:
+def parse_source_timeline_id(details: Optional[str]) -> Optional[int]:
     if not details:
         return None
     try:
@@ -83,7 +84,7 @@ def parse_source_timeline_id(details: Optional[str]) -> int | None:
         return None
 
 
-def normalize_details(details: Optional[str], source_id: Optional[int], source_details: Optional[str]) -> str | None:
+def normalize_details(details: Optional[str], source_id: Optional[int], source_details: Optional[str]) -> Optional[str]:
     if not details:
         return details
     try:
@@ -98,7 +99,7 @@ def normalize_details(details: Optional[str], source_id: Optional[int], source_d
     return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
 
-def load_source_timeline_context(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[list[int], str | None, int, int, str | None, str | None, str | None]:
+def load_source_timeline_context(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[list[int], Optional[str], int, int, Optional[str], Optional[str], Optional[str]]:
     """优先继承 source timeline 的聚合 capture 与语义分段；没有时降级成单条 capture。"""
     fallback_ids = [row["cap_id"]]
     fallback_segment = build_segment(row["cap_id"], row["cap_ts"], row["summary"] or row["overview"])

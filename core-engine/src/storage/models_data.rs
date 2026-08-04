@@ -68,6 +68,9 @@ pub struct DataExtractionSummary {
     pub source_created_count: usize,
     pub source_updated_count: usize,
     pub snapshot_created_count: usize,
+    pub historical_regenerated_count: usize,
+    pub historical_merged_count: usize,
+    pub historical_rejected_count: usize,
     pub skipped_count: usize,
 }
 

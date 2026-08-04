@@ -432,6 +432,58 @@ class TestRagPipeline:
         assert result.contexts[0].doc_key == "document_url:https://docs.corp.kuaishou.com/k/home/example"
         assert deep_keyword in result.contexts[0].text[:800]
 
+    def test_linked_knowledge_document_is_promoted_before_context_selection(self):
+        knowledge_hit = RetrievedChunk(
+            capture_id=18_907,
+            text="稳柱系统版本演进",
+            score=0.61,
+            source="knowledge",
+            doc_key="knowledge:1884",
+            metadata={
+                "source_type": "knowledge",
+                "knowledge_id": 1884,
+                "doc_key": "knowledge:1884",
+            },
+        )
+        promoted_document = RetrievedChunk(
+            capture_id=0,
+            text="文档：[更新日志] Wenz - 广告消耗异动归因系统",
+            score=50.0,
+            source="document",
+            doc_key="document:87",
+            metadata={
+                "source_type": "document",
+                "document_id": 87,
+                "artifact_id": 87,
+                "doc_key": "document:87",
+            },
+        )
+
+        class PromotingKnowledgeRetriever(MockFts5Retriever):
+            def __init__(self):
+                super().__init__([knowledge_hit])
+                self.promote_calls = 0
+
+            def promote_documents_linked_to_knowledge(self, chunks, query, top_k, entity_terms):
+                self.promote_calls += 1
+                assert any(chunk.doc_key == "knowledge:1884" for chunk in chunks)
+                return [promoted_document]
+
+        knowledge_retriever = PromotingKnowledgeRetriever()
+        pipeline = RagPipeline(
+            embedding_model=EmbeddingModel(backend=MockEmbeddingBackend()),
+            vector_retriever=MockVectorRetriever(),  # type: ignore[arg-type]
+            fts5_retriever=MockFts5Retriever(),  # type: ignore[arg-type]
+            knowledge_retriever=knowledge_retriever,  # type: ignore[arg-type]
+            llm=MockLlmBackend(),
+            top_k=3,
+        )
+
+        result = pipeline.query("稳柱软件版本更新记录", references_only=True)
+
+        assert knowledge_retriever.promote_calls == 1
+        assert result.contexts[0].metadata["document_id"] == 87
+
     def test_query_returns_rag_result(self):
         pipeline = _make_pipeline(
             fts_chunks=[_chunk(1, 0.8)],
@@ -1292,6 +1344,123 @@ class TestSqliteRetrievers:
 
         assert [chunk.capture_id for chunk in results] == [1]
         assert "潮汐特性" in results[0].text
+
+    def test_capture_fallback_prioritizes_old_entity_before_recency_cutoff(self, tmp_path):
+        db_path = str(tmp_path / "capture-entity-priority.db")
+        _init_captures_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            INSERT INTO captures
+                (id, ts, app_name, win_title, url, webpage_title, ocr_text, ax_text, input_text, audio_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                1,
+                "Chrome",
+                "Wenz 更新日志",
+                "https://docs.corp.kuaishou.com/d/home/wenz",
+                "Wenz 更新日志",
+                "",
+                "稳柱是一款业务指标异动归因系统，包含 V2.0 到 V2.2 的版本演进。",
+                "",
+                "",
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO captures
+                (id, ts, app_name, win_title, url, webpage_title, ocr_text, ax_text, input_text, audio_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    capture_id,
+                    capture_id,
+                    "Chrome",
+                    f"通用更新记录 {capture_id}",
+                    f"https://docs.example/generic-{capture_id}",
+                    f"通用更新记录 {capture_id}",
+                    "",
+                    "软件版本说明及更新记录，不包含目标产品实体。",
+                    "",
+                    "",
+                )
+                for capture_id in range(2, 302)
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        results = Fts5Retriever(db_path).search("稳柱软件版本更新记录", top_k=5)
+
+        assert 1 in [chunk.capture_id for chunk in results]
+
+    def test_linked_knowledge_promotes_the_corresponding_document(self, tmp_path):
+        db_path = str(tmp_path / "linked-document.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE bake_documents (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                doc_type TEXT NOT NULL,
+                summary TEXT,
+                full_content TEXT,
+                sections_json TEXT NOT NULL DEFAULT '[]',
+                source_url TEXT,
+                source_memory_ids TEXT NOT NULL DEFAULT '[]',
+                linked_knowledge_ids TEXT NOT NULL DEFAULT '[]',
+                deleted_at INTEGER,
+                updated_at INTEGER
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO bake_documents
+                (id, title, doc_type, summary, full_content, source_url,
+                 source_memory_ids, linked_knowledge_ids, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                87,
+                "[更新日志] Wenz - 广告消耗异动归因系统",
+                "技术文档",
+                "记录 Wenz 的版本演进。",
+                "Wenz V2.0、V2.1、V2.2 版本说明。",
+                "https://docs.example/wenz",
+                '["605","1884"]',
+                '["605","1884"]',
+                1_720_000_000_000,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        knowledge_hit = RetrievedChunk(
+            capture_id=18_907,
+            text="稳柱系统的版本演进知识",
+            score=0.61,
+            source="vector",
+            doc_key="knowledge:1884",
+            metadata={
+                "source_type": "knowledge",
+                "knowledge_id": 1884,
+                "doc_key": "knowledge:1884",
+            },
+        )
+        promoted = KnowledgeFts5Retriever(db_path).promote_documents_linked_to_knowledge(
+            [knowledge_hit],
+            "稳柱软件版本更新记录",
+            top_k=5,
+        )
+
+        assert [chunk.metadata["document_id"] for chunk in promoted] == [87]
+        assert promoted[0].metadata["retrieval_method"] == "linked_knowledge"
+        assert promoted[0].metadata["promoted_by_knowledge_ids"] == ["1884"]
 
     def test_artifact_search_returns_document_and_knowledge_for_gpu_metric_doc_query(self, tmp_path):
         db_path = str(tmp_path / "artifacts.db")

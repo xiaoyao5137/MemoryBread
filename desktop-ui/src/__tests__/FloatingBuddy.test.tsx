@@ -44,6 +44,15 @@ describe('FloatingBuddy', () => {
     expect(screen.getByText('记忆')).toBeInTheDocument()
   })
 
+  it('集成菜单紧跟在日记下方', () => {
+    render(<FloatingBuddy />)
+    const buttonTestIds = screen.getAllByRole('button').map(button => button.getAttribute('data-testid'))
+
+    expect(buttonTestIds.indexOf('integration-btn')).toBe(buttonTestIds.indexOf('diary-btn') + 1)
+    fireEvent.click(screen.getByTestId('integration-btn'))
+    expect(useAppStore.getState().windowMode).toBe('integration')
+  })
+
   it('菜单栏不展示环境切换', () => {
     render(<FloatingBuddy />)
 

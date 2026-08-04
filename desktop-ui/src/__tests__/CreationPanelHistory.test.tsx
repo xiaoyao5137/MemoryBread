@@ -88,4 +88,114 @@ describe('创作记录搜索与分页', () => {
       expect(screen.getByText('第 2 / 2 页')).toBeInTheDocument()
     })
   })
+
+  it('为未保存来源编号的旧创作记录重新匹配并展示具体数据', async () => {
+    const dataSearchBodies: Array<Record<string, unknown>> = []
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/creation/skills') return Response.json([])
+      if (url.pathname === '/api/creation/history') {
+        return Response.json({
+          items: [{
+            id: 36,
+            prompt: '写一篇单位Token成本优化的项目总结汇报文档',
+            root_request: '写一篇单位Token成本优化的项目总结汇报文档',
+            generated_content: '# 项目总结',
+            doc_type: '项目总结',
+            audience: '管理层',
+            references_json: '[]',
+            conversation_json: '[]',
+            evidence_json: '[]',
+            agent_trace_json: JSON.stringify([{
+              schema_version: 'creation.agent.v1',
+              event_id: 'legacy-data-search',
+              session_id: 'legacy-session',
+              run_id: 'legacy-run',
+              sequence: 9,
+              timestamp: 1_720_000_000_000,
+              type: 'tool.completed',
+              status: 'completed',
+              actor: { kind: 'tool', id: 'data_search', name: '数据检索 Tool' },
+              summary: '数据检索完成，召回 6 个来源，其中 0 个需要刷新',
+              environment_patch: {},
+              data: { result_count: 6 },
+            }]),
+            created_at: 1_720_000_000_000,
+            updated_at: 1_720_000_100_000,
+          }],
+          total: 1,
+          limit: 20,
+          offset: 0,
+        })
+      }
+      if (url.pathname === '/api/tools/data-search') {
+        dataSearchBodies.push(JSON.parse(String(init?.body || '{}')))
+        return Response.json({
+          schema_version: 'memorybread.data-search.v1',
+          query: '单位Token成本优化',
+          results: [{
+            source_id: 12,
+            title: 'Token 成本经营数据',
+            source_kind: 'memory_snapshot',
+            freshness_class: 'recent',
+            refresh_required: false,
+            can_use: true,
+          }],
+        })
+      }
+      if (url.pathname === '/api/data/sources/12') {
+        return Response.json({
+          id: 12,
+          title: 'Token 成本经营数据',
+          source_kind: 'work_memory',
+          access_mode: 'memory_only',
+          refresh_policy: 'never',
+          realtime_level: 'observed',
+          tags: [],
+          first_seen_at: 1,
+          last_seen_at: 2,
+          status: 'active',
+          latest_snapshot: {
+            id: 120,
+            source_id: 12,
+            collected_at: 1_720_000_000_000,
+            collector: 'memory',
+            content_text: '优化后单位 Token 成本降至 0.018 元。',
+            structured_data: {
+              title: '单位 Token 成本优化结果',
+              summary: '优化项目实现单位 Token 成本下降 28%。',
+              metric_rows: [{
+                dimension: '优化后',
+                metric: '单位 Token 成本',
+                value: '0.018 元',
+                note: '下降 28%',
+              }],
+            },
+            content_hash: 'legacy-hash',
+            freshness_ttl_seconds: 86400,
+            provenance: {},
+            source_capture_ids: [],
+            source_timeline_ids: [],
+            status: 'active',
+          },
+        })
+      }
+      return new Response('{}', { status: 404 })
+    }))
+
+    render(<CreationPanel />)
+    fireEvent.click(await screen.findByRole('button', { name: '创作记录 (1)' }))
+    fireEvent.click(await screen.findByText('写一篇单位Token成本优化的项目总结汇报文档'))
+
+    await waitFor(() => expect(dataSearchBodies).toEqual([{
+      query: '写一篇单位Token成本优化的项目总结汇报文档',
+      limit: 10,
+    }]))
+
+    fireEvent.click(await screen.findByRole('tab', { name: '参考数据 (1)' }))
+    expect(await screen.findByText('单位 Token 成本优化结果')).toBeInTheDocument()
+    expect(screen.getByText('优化项目实现单位 Token 成本下降 28%。')).toBeInTheDocument()
+    expect(screen.getByText('0.018 元')).toBeInTheDocument()
+    expect(screen.getByText('该历史版本未保存来源编号，以下内容按原始需求从当前本地数据恢复。')).toBeInTheDocument()
+  })
 })

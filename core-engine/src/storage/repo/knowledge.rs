@@ -363,7 +363,7 @@ impl StorageManager {
                     .collect())
             }
             "bake_knowledge" => {
-                let knowledge = self.list_bake_knowledge_new(5000, 0)?;
+                let knowledge = self.list_bake_knowledge_new(None, 5000, 0)?;
                 Ok(knowledge
                     .into_iter()
                     .map(|k| TimelineRecord {
@@ -611,7 +611,7 @@ impl StorageManager {
         offset: usize,
     ) -> Result<Vec<TimelineRecord>, StorageError> {
         // 使用新表，但返回旧格式以保持兼容
-        let knowledge = self.list_bake_knowledge_new(limit, offset)?;
+        let knowledge = self.list_bake_knowledge_new(query, limit, offset)?;
         Ok(knowledge
             .into_iter()
             .map(|k| TimelineRecord {
@@ -624,7 +624,7 @@ impl StorageManager {
                 entities: k.entities,
                 category: "bake_knowledge".to_string(),
                 importance: k.importance,
-                occurrence_count: None,
+                occurrence_count: Some(k.occurrence_count),
                 observed_at: None,
                 event_time_start: None,
                 event_time_end: None,
@@ -655,16 +655,45 @@ impl StorageManager {
     /// 新的 bake_knowledge 查询函数（返回新类型）
     fn list_bake_knowledge_new(
         &self,
+        query: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<BakeKnowledgeRecord>, StorageError> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, timeline_id, title, summary, content, detailed_content, entities, importance,
-                        user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms, source_capture_ids
-                 FROM bake_knowledge ORDER BY updated_at_ms DESC LIMIT ? OFFSET ?"
-            )?;
-            let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
+            let mut sql = String::from(
+                "SELECT b.id, b.timeline_id, b.title, b.summary, b.content, b.detailed_content, b.entities, b.importance,
+                        b.user_verified, b.user_edited, b.created_at, b.updated_at, b.created_at_ms, b.updated_at_ms,
+                        b.source_capture_ids,
+                        COALESCE((
+                            SELECT SUM(COALESCE(t.occurrence_count, 1))
+                            FROM bake_artifact_source_links l
+                            JOIN timelines t ON t.id = l.source_timeline_id
+                            WHERE l.artifact_kind = 'knowledge' AND l.artifact_id = b.id
+                        ), (
+                            SELECT COALESCE(t.occurrence_count, 1)
+                            FROM timelines t WHERE t.id = b.timeline_id
+                        ), 1) AS occurrence_count
+                 FROM bake_knowledge b",
+            );
+            let mut bind_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            if let Some(value) = query.map(str::trim).filter(|value| !value.is_empty()) {
+                sql.push_str(
+                    " WHERE (b.summary LIKE ? OR b.title LIKE ? OR COALESCE(b.content, '') LIKE ?
+                              OR COALESCE(b.detailed_content, '') LIKE ? OR COALESCE(b.entities, '') LIKE ?)",
+                );
+                let pattern = format!("%{}%", value);
+                for _ in 0..5 {
+                    bind_values.push(Box::new(pattern.clone()));
+                }
+            }
+            sql.push_str(" ORDER BY b.updated_at_ms DESC LIMIT ? OFFSET ?");
+            bind_values.push(Box::new(limit as i64));
+            bind_values.push(Box::new(offset as i64));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                bind_values.iter().map(|value| value.as_ref()).collect();
+            let rows = stmt.query_map(params.as_slice(), |row| {
                 Ok(row_to_bake_knowledge(row).map_err(|_| rusqlite::Error::InvalidQuery)?)
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::Sqlite)
@@ -1937,9 +1966,19 @@ impl StorageManager {
     pub fn get_bake_knowledge(&self, id: i64) -> Result<Option<BakeKnowledgeRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, timeline_id, title, summary, content, detailed_content, entities, importance,
-                        user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms, source_capture_ids
-                 FROM bake_knowledge WHERE id = ?1"
+                "SELECT b.id, b.timeline_id, b.title, b.summary, b.content, b.detailed_content, b.entities, b.importance,
+                        b.user_verified, b.user_edited, b.created_at, b.updated_at, b.created_at_ms, b.updated_at_ms,
+                        b.source_capture_ids,
+                        COALESCE((
+                            SELECT SUM(COALESCE(t.occurrence_count, 1))
+                            FROM bake_artifact_source_links l
+                            JOIN timelines t ON t.id = l.source_timeline_id
+                            WHERE l.artifact_kind = 'knowledge' AND l.artifact_id = b.id
+                        ), (
+                            SELECT COALESCE(t.occurrence_count, 1)
+                            FROM timelines t WHERE t.id = b.timeline_id
+                        ), 1) AS occurrence_count
+                 FROM bake_knowledge b WHERE b.id = ?1"
             )?;
             match stmt.query_row(params![id], |row| {
                 row_to_bake_knowledge(row).map_err(|_| rusqlite::Error::InvalidQuery)
@@ -1957,9 +1996,19 @@ impl StorageManager {
     ) -> Result<Option<BakeKnowledgeRecord>, StorageError> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, timeline_id, title, summary, content, detailed_content, entities, importance,
-                        user_verified, user_edited, created_at, updated_at, created_at_ms, updated_at_ms, source_capture_ids
-                 FROM bake_knowledge WHERE timeline_id = ?1 ORDER BY updated_at_ms DESC, id DESC LIMIT 1"
+                "SELECT b.id, b.timeline_id, b.title, b.summary, b.content, b.detailed_content, b.entities, b.importance,
+                        b.user_verified, b.user_edited, b.created_at, b.updated_at, b.created_at_ms, b.updated_at_ms,
+                        b.source_capture_ids,
+                        COALESCE((
+                            SELECT SUM(COALESCE(t.occurrence_count, 1))
+                            FROM bake_artifact_source_links l
+                            JOIN timelines t ON t.id = l.source_timeline_id
+                            WHERE l.artifact_kind = 'knowledge' AND l.artifact_id = b.id
+                        ), (
+                            SELECT COALESCE(t.occurrence_count, 1)
+                            FROM timelines t WHERE t.id = b.timeline_id
+                        ), 1) AS occurrence_count
+                 FROM bake_knowledge b WHERE b.timeline_id = ?1 ORDER BY b.updated_at_ms DESC, b.id DESC LIMIT 1"
             )?;
             match stmt.query_row(params![timeline_id], |row| {
                 row_to_bake_knowledge(row).map_err(|_| rusqlite::Error::InvalidQuery)
@@ -2065,6 +2114,7 @@ fn row_to_bake_knowledge(row: &rusqlite::Row<'_>) -> Result<BakeKnowledgeRecord,
         created_at_ms: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
         updated_at_ms: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
         source_capture_ids: row.get(14)?,
+        occurrence_count: row.get::<_, Option<i64>>(15)?.unwrap_or(1),
     })
 }
 

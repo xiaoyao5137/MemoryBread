@@ -87,6 +87,70 @@
   white-space: nowrap;
 }
 
+.monitor-capture-paused {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgb(201 109 47 / 24%);
+  border-radius: 12px;
+  background: rgb(201 109 47 / 8%);
+  color: #6e4a34;
+}
+
+.monitor-capture-paused__copy {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.monitor-capture-paused__copy strong {
+  color: #2e2119;
+  font-size: 13px;
+}
+
+.monitor-capture-paused__copy small {
+  color: #8e725f;
+  font-size: 10px;
+}
+
+.monitor-capture-paused__error {
+  color: #a54332;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.monitor-capture-paused button {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: #c96d2f;
+  color: #fffaf1;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.monitor-capture-paused button:hover:not(:disabled) {
+  background: #ad5827;
+}
+
+.monitor-capture-paused button:focus-visible {
+  outline: 2px solid #007aff;
+  outline-offset: 2px;
+}
+
+.monitor-capture-paused button:disabled {
+  opacity: .58;
+  cursor: progress;
+}
+
 .monitor-metric-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -269,6 +333,15 @@
 }
 
 @container monitor-panel (max-width: 580px) {
+  .monitor-capture-paused {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .monitor-capture-paused button {
+    width: 100%;
+  }
+
   .monitor-range-control__presets {
     flex-wrap: wrap;
     white-space: normal;

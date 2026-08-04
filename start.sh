@@ -78,6 +78,14 @@ CORE_LOG="$LOG_DIR/core.log"
 UI_LOG="$LOG_DIR/ui.log"
 OLLAMA_LOG="$LOG_DIR/ollama.log"
 
+# 首次初始化完成后，Ollama 由 MemoryBread 自己管理。restart 必须继续使用
+# 同一份受管运行时和专属模型目录；否则系统 Ollama.app 会被重新拉起，实时
+# 质检会把已经完成的初始化误判为组件缺失。
+INITIALIZATION_ROOT="$HOME/.memory-bread/initialization"
+MANAGED_OLLAMA_MARKER="$INITIALIZATION_ROOT/processes/ollama.json"
+MANAGED_OLLAMA_RUNTIME_ROOT="$INITIALIZATION_ROOT/runtime/ollama"
+MANAGED_OLLAMA_MODELS_ROOT="$INITIALIZATION_ROOT/models"
+
 CORE_PORT=7070
 MODEL_API_PORT=7071
 CREATION_PORT=8001
@@ -389,10 +397,50 @@ is_ollama_ready() {
     curl -fsS "http://localhost:${OLLAMA_PORT}/api/tags" > /dev/null 2>&1
 }
 
+resolve_managed_ollama_runtime() {
+    [ -f "$MANAGED_OLLAMA_MARKER" ] || return 1
+
+    python3 - \
+        "$MANAGED_OLLAMA_MARKER" \
+        "$MANAGED_OLLAMA_RUNTIME_ROOT" \
+        "$MANAGED_OLLAMA_MODELS_ROOT" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+marker_path = Path(sys.argv[1])
+runtime_root = Path(sys.argv[2]).resolve()
+expected_models_root = Path(sys.argv[3]).resolve()
+
+try:
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    executable = Path(marker["executable"]).resolve()
+    models_root = Path(marker["models_root"]).resolve()
+except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+if runtime_root not in executable.parents:
+    raise SystemExit(1)
+if models_root != expected_models_root:
+    raise SystemExit(1)
+if not executable.is_file() or not os.access(str(executable), os.X_OK):
+    raise SystemExit(1)
+
+print(executable)
+print(models_root)
+PY
+}
+
 ensure_ollama_running() {
-    if ! command -v ollama &> /dev/null; then
-        log_error "未找到 ollama 命令，请先安装 Ollama: https://ollama.com/download"
-        exit 1
+    local managed_config=""
+    local ollama_executable=""
+    local ollama_models_root=""
+
+    managed_config=$(resolve_managed_ollama_runtime 2>/dev/null || true)
+    if [ -n "$managed_config" ]; then
+        ollama_executable=$(printf '%s\n' "$managed_config" | sed -n '1p')
+        ollama_models_root=$(printf '%s\n' "$managed_config" | sed -n '2p')
     fi
 
     if is_ollama_ready; then
@@ -413,8 +461,21 @@ ensure_ollama_running() {
 
     cleanup_port "$OLLAMA_PORT" "Ollama"
 
-    log_info "启动 Ollama 服务..."
-    nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
+    if [ -n "$ollama_executable" ]; then
+        log_info "启动 MemoryBread 托管 Ollama 服务..."
+        OLLAMA_HOST="127.0.0.1:${OLLAMA_PORT}" \
+        OLLAMA_MODELS="$ollama_models_root" \
+        OLLAMA_NO_CLOUD=1 \
+        OLLAMA_NOHISTORY=1 \
+            nohup "$ollama_executable" serve > "$OLLAMA_LOG" 2>&1 &
+    else
+        if ! command -v ollama &> /dev/null; then
+            log_error "未找到可用的 MemoryBread 托管运行时或 ollama 命令，请重新打开应用完成初始化"
+            exit 1
+        fi
+        log_info "启动系统 Ollama 服务（仅用于首次初始化迁移）..."
+        nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
+    fi
     echo $! > "$OLLAMA_PID_FILE"
 
     if wait_for_http "http://localhost:${OLLAMA_PORT}/api/tags" "Ollama" 30 1; then
@@ -662,6 +723,7 @@ show_status() {
 
 # 停止所有服务
 stop_all() {
+    local keep_supervisor_marker=${1:-false}
     log_info "停止所有服务..."
     # Desktop 收到退出事件时会自行派生 stop-after-app。由启动器主动 stop/restart
     # 时先放置短生命周期标记，避免旧 Desktop 的延迟清理误杀刚启动的新实例。
@@ -770,16 +832,27 @@ stop_all() {
         rm -f "$OLLAMA_PID_FILE"
     fi
 
-    rm -f "$SUPERVISOR_SHUTDOWN_MARKER"
+    if [ "$keep_supervisor_marker" != "true" ]; then
+        rm -f "$SUPERVISOR_SHUTDOWN_MARKER"
+    fi
     log_success "所有服务已停止"
 }
 
 # 由菜单栏 App 的“退出”触发：先等待当前窗口进程退出，再清理整套服务。
 stop_after_app() {
     local app_pid=$1
+    local registered_app_pid=""
     if ! [[ "$app_pid" =~ ^[0-9]+$ ]]; then
         log_error "无效的 Desktop UI PID: $app_pid"
         exit 1
+    fi
+
+    if [ -f "$UI_APP_PID_FILE" ]; then
+        registered_app_pid=$(tr -d '[:space:]' < "$UI_APP_PID_FILE")
+    fi
+    if [[ "$registered_app_pid" =~ ^[0-9]+$ ]] && [ "$registered_app_pid" != "$app_pid" ]; then
+        log_info "忽略旧 Desktop UI 派生的延迟清理 (旧 PID: ${app_pid}，新 PID: ${registered_app_pid})"
+        exit 0
     fi
 
     if [ -f "$SUPERVISOR_SHUTDOWN_MARKER" ]; then
@@ -796,6 +869,14 @@ stop_after_app() {
 
     if [ -f "$SUPERVISOR_SHUTDOWN_MARKER" ]; then
         log_info "启动器已接管组件停止，忽略 Desktop 派生的重复清理"
+        exit 0
+    fi
+
+    if [ -f "$UI_APP_PID_FILE" ]; then
+        registered_app_pid=$(tr -d '[:space:]' < "$UI_APP_PID_FILE")
+    fi
+    if [[ "$registered_app_pid" =~ ^[0-9]+$ ]] && [ "$registered_app_pid" != "$app_pid" ]; then
+        log_info "Desktop UI 已换代，忽略旧实例的延迟清理 (旧 PID: ${app_pid}，新 PID: ${registered_app_pid})"
         exit 0
     fi
 
@@ -1158,7 +1239,11 @@ main() {
             parse_start_options "$@"
             log_info "执行全组件 restart（AI Sidecar → Core Engine → Desktop UI）..."
             warn_if_multiple_desktop_apps
-            stop_all
+            # 标记覆盖完整重启窗口，不能在旧进程刚退出时就删除。否则它已经
+            # 派生的 stop-after-app 会在新进程启动后执行，再次停掉整套服务。
+            # EXIT 兜底保证中途构建或启动失败时不会遗留永久抑制清理的标记。
+            trap 'rm -f "$SUPERVISOR_SHUTDOWN_MARKER"' EXIT
+            stop_all true
             sleep 2
             check_path_leaks
             check_dependencies
@@ -1167,6 +1252,8 @@ main() {
             start_creation_service
             start_core
             start_ui
+            rm -f "$SUPERVISOR_SHUTDOWN_MARKER"
+            trap - EXIT
             show_status
             log_info "联调测试前请优先使用 ./start.sh restart，7071 由 model_api_server.py 统一提供 /api/models + /query，避免旧进程状态污染测试结果"
             ;;

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "memorybread.integration-skill.v1",
+  "id": "claude-code",
+  "version": "1.0.0",
+  "direction": "output",
+  "executor": "install_agent_skill",
+  "target": "~/.claude/skills/memory-retrieval",
+  "sourcePackage": "integrations/claude-code/memory-retrieval",
+  "modes": ["preview", "execute"],
+  "source": "core-engine/src/integration/mod.rs"
+}

@@ -32,6 +32,8 @@ def _init_db(db_path: str) -> None:
             win_title TEXT,
             ocr_text TEXT,
             ax_text TEXT,
+            input_text TEXT,
+            audio_text TEXT,
             timeline_id INTEGER,
             url TEXT,
             webpage_title TEXT,
@@ -75,6 +77,62 @@ def _init_db(db_path: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def test_pending_capture_query_includes_input_and_audio_text(tmp_path) -> None:
+    db_path = str(tmp_path / "captures.db")
+    _init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.executemany(
+        """
+        INSERT INTO captures (
+            id, ts, app_name, win_title, ocr_text, ax_text,
+            input_text, audio_text, timeline_id
+        )
+        VALUES (?, ?, 'Code', '工作窗口', ?, ?, ?, ?, NULL)
+        """,
+        [
+            (1, 1000, "", "", "用户输入的需求", ""),
+            (2, 2000, "", "", "", "会议音频转写"),
+            (3, 3000, "OCR 正文", "", "", ""),
+        ],
+    )
+    conn.commit()
+
+    processor = BackgroundProcessor(db_path=db_path)
+    captures = processor._get_unprocessed_captures(conn, limit=10)
+    conn.close()
+
+    assert processor._count_unprocessed_captures() == 3
+    assert [capture["id"] for capture in captures] == [1, 2, 3]
+    assert captures[0]["input_text"] == "用户输入的需求"
+    assert captures[1]["audio_text"] == "会议音频转写"
+
+
+def test_fragment_grouper_uses_input_and_audio_text() -> None:
+    grouper = FragmentGrouper()
+
+    assert grouper._capture_text({"input_text": "用户输入"}) == "用户输入"
+    assert grouper._capture_text({"audio_text": "会议转写"}) == "会议转写"
+    assert grouper._get_semantic_text({"input_text": "这是超过十个字符的用户输入需求正文"})
+
+
+def test_charging_catchup_requires_progress(tmp_path) -> None:
+    db_path = str(tmp_path / "captures.db")
+    _init_db(db_path)
+    processor = BackgroundProcessor(db_path=db_path)
+    profile = type(
+        "_Profile",
+        (),
+        {"mode": "charging", "timeline_batch_size": 20},
+    )()
+
+    assert processor._should_continue_charging_catchup(
+        profile, 122, 34, {"processed_count": 1}
+    ) is True
+    assert processor._should_continue_charging_catchup(
+        profile, 34, 34, {"processed_count": 0, "reason": "idle_not_enough"}
+    ) is False
 
 
 def test_is_self_generated_capture_matches_memory_bread() -> None:

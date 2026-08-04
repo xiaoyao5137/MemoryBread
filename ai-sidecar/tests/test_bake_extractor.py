@@ -878,6 +878,94 @@ def test_merge_document_no_change_keeps_existing_title_when_model_omits_it():
     assert result == {"no_change": True, "title": "已有文档标题"}
 
 
+def test_merge_document_no_change_cannot_drop_wenz_product_alias():
+    extractor = make_raw_extractor()
+    extractor._call_bake_llm = types.MethodType(
+        lambda self, caller_id, system_prompt, user_prompt, response_schema: (
+            {"no_change": True, "title": "[更新日志] Wenz - 广告消耗异动归因系统"},
+            {},
+        ),
+        extractor,
+    )
+    candidate = {
+        **SAMPLE_CANDIDATE,
+        "source_timeline_id": 1884,
+        "summary": "记录广告消耗异动归因系统 Wenz 的更新日志",
+        "details": "文档详细梳理了稳柱系统在 V2.0、V2.1 和 V2.2 的迭代过程。",
+        "capture_ax_text": "📍稳柱是一款面向商业体系的核心业务指标异动归因系统。",
+        "capture_ocr_text": "",
+        "capture_input_text": "",
+        "capture_audio_text": "",
+        "entities": ["Wenz", "稳柱系统"],
+    }
+    existing_content = "# Wenz 更新日志\n\n记录 V2.0 至 V2.2 的版本功能演进。"
+
+    result = extractor.merge_bake_document(
+        {
+            "title": "[更新日志] Wenz - 广告消耗异动归因系统",
+            "summary": "Wenz 版本演进记录",
+            "full_content": existing_content,
+            "sections_json": "[]",
+            "tags": '["Wenz", "更新日志"]',
+        },
+        candidate,
+    )
+
+    assert result["no_change"] is False
+    assert result["full_content"].startswith(existing_content)
+    assert "## 产品、项目与别名" in result["full_content"]
+    assert "- 稳柱" in result["full_content"]
+    assert "稳柱" in result["evidence_summary"]
+
+
+def test_document_identity_extraction_covers_product_project_and_alias_fields():
+    identities = KnowledgeExtractorV2._extract_document_identities(
+        {
+            "capture_ax_text": "产品名：Atlas；项目名称：北斗；该产品又称星图。",
+            "product_names": ["Atlas"],
+            "project_names": ["北斗专项"],
+            "aliases": ["星图"],
+            "entities": [],
+        }
+    )
+
+    assert set(identities) == {"Atlas", "北斗", "星图"}
+
+
+def test_merge_document_accepts_no_change_when_alias_field_covers_source_name():
+    extractor = make_raw_extractor()
+    extractor._call_bake_llm = types.MethodType(
+        lambda self, caller_id, system_prompt, user_prompt, response_schema: (
+            {"no_change": True},
+            {},
+        ),
+        extractor,
+    )
+    candidate = {
+        **SAMPLE_CANDIDATE,
+        "capture_ax_text": "📍稳柱是一款面向商业体系的核心业务指标异动归因系统。",
+        "capture_ocr_text": "",
+        "capture_input_text": "",
+        "capture_audio_text": "",
+        "entities": ["Wenz", "稳柱系统"],
+    }
+
+    result = extractor.merge_bake_document(
+        {
+            "title": "[更新日志] Wenz - 广告消耗异动归因系统",
+            "full_content": "Wenz 更新日志正文",
+            "sections_json": "[]",
+            "entity_aliases": ["稳柱"],
+        },
+        candidate,
+    )
+
+    assert result == {
+        "no_change": True,
+        "title": "[更新日志] Wenz - 广告消耗异动归因系统",
+    }
+
+
 def test_merge_document_keeps_existing_title_when_model_returns_incremental_name():
     extractor = make_raw_extractor()
     extractor._call_bake_llm = types.MethodType(

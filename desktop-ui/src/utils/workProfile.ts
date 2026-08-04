@@ -256,7 +256,8 @@ export const fetchWorkProfile = async (
 export const hasWorkProfileDayDetails = (day: WorkProfileDay) => (
   day.capture_count <= 0
   || (
-    day.first_capture_at != null
+    day.active_period_count != null
+    && day.first_capture_at != null
     && day.last_capture_at != null
     && Array.isArray(day.apps)
     && day.apps.length > 0

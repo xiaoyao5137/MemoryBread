@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "memorybread.integration-skill.v1",
+  "id": "milvus",
+  "version": "1.0.0",
+  "direction": "input",
+  "executor": "record_import",
+  "format": "milvus",
+  "accept": [".json", ".jsonl", ".csv"],
+  "maxFiles": 64,
+  "modes": ["preview", "execute"],
+  "source": "core-engine/src/integration/mod.rs"
+}

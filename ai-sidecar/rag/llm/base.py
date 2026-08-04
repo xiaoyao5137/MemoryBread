@@ -40,7 +40,7 @@ class LlmBackend(ABC):
         self,
         prompt: str,
         system: str = "",
-        on_delta: Callable[[str], None] | None = None,
+        on_delta: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> LlmResponse:
         """流式完成推理。

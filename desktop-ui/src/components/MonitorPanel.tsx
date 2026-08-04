@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import type { ExtractionLive, MonitorOverview, SystemResources } from '../types'
 import { useAppStore } from '../store/useAppStore'
 import { toUserFacingError } from '../utils/userFacingError'
@@ -846,7 +847,7 @@ const InferenceQueueCard: React.FC<{
   )
 }
 
-const PipelineBacklogAlert: React.FC<{
+export const PipelineBacklogAlert: React.FC<{
   capturePending: number
   captureOldestAtMs: number | null | undefined
   bakePending: number
@@ -858,6 +859,9 @@ const PipelineBacklogAlert: React.FC<{
   recentBakeRuns: number
   captureEnabled: boolean
   inferenceQueue: ExtractionLive['inference_queue'] | undefined
+  enablingCapture?: boolean
+  enableCaptureError?: string | null
+  onEnableCapture?: () => void
 }> = ({
   capturePending,
   captureOldestAtMs,
@@ -870,20 +874,26 @@ const PipelineBacklogAlert: React.FC<{
   recentBakeRuns,
   captureEnabled,
   inferenceQueue,
+  enablingCapture = false,
+  enableCaptureError = null,
+  onEnableCapture,
 }) => {
   if (!captureEnabled) {
     return (
-      <div style={{
-        marginBottom: 10,
-        padding: '10px 12px',
-        borderRadius: 10,
-        background: 'rgba(142,142,147,0.08)',
-        border: '1px solid rgba(142,142,147,0.18)',
-        color: '#6E6E73',
-        fontSize: 12,
-        fontWeight: 600,
-      }}>
-        自动采集与提炼已暂停：时间线队列 {capturePending} 条、烘焙队列 {bakePending} 条将在恢复后继续处理，暂停时长不计为流水线故障。
+      <div className="monitor-capture-paused" role="status">
+        <div className="monitor-capture-paused__copy">
+          <strong>自动采集与提炼已暂停</strong>
+          <span>
+            时间线队列 {capturePending} 条、烘焙队列 {bakePending} 条将在恢复后继续处理，暂停时长不计为流水线故障。
+          </span>
+          <small>开启后，记忆面包会在本机采集允许的工作内容并自动整理；你可以随时从菜单栏再次暂停。</small>
+          {enableCaptureError && <span className="monitor-capture-paused__error" role="alert">{enableCaptureError}</span>}
+        </div>
+        {onEnableCapture && (
+          <button type="button" disabled={enablingCapture} onClick={onEnableCapture}>
+            {enablingCapture ? '正在开启…' : '开启自动采集与提炼'}
+          </button>
+        )}
       </div>
     )
   }
@@ -1102,7 +1112,10 @@ const OverviewContent: React.FC<{
   range: OverviewRange
   liveData: ExtractionLive | null
   nowMs: number
-}> = ({ data, range, liveData, nowMs }) => {
+  enablingCapture: boolean
+  enableCaptureError: string | null
+  onEnableCapture: () => void
+}> = ({ data, range, liveData, nowMs, enablingCapture, enableCaptureError, onEnableCapture }) => {
   const token_usage = {
     ...EMPTY_OVERVIEW.token_usage,
     ...(data?.token_usage ?? {}),
@@ -1231,6 +1244,9 @@ const OverviewContent: React.FC<{
         recentBakeRuns={liveData?.recent_bake_run_count ?? 0}
         captureEnabled={knowledge_flow.capture_enabled}
         inferenceQueue={liveData?.inference_queue}
+        enablingCapture={enablingCapture}
+        enableCaptureError={enableCaptureError}
+        onEnableCapture={onEnableCapture}
       />
       <BakeFailureAlert
         retryPending={knowledge_flow.bake_retry_pending_count}
@@ -2152,6 +2168,8 @@ const MonitorPanel: React.FC = () => {
   const [loadingSystem, setLoadingSystem] = useState(false)
   const [overviewError, setOverviewError] = useState<string | null>(null)
   const [systemError, setSystemError] = useState<string | null>(null)
+  const [enablingCapture, setEnablingCapture] = useState(false)
+  const [enableCaptureError, setEnableCaptureError] = useState<string | null>(null)
 
   const load = async () => {
     setLoadingOverview(true)
@@ -2213,6 +2231,27 @@ const MonitorPanel: React.FC = () => {
         systemAbortRef.current = null
       }
       setLoadingSystem(false)
+    }
+  }
+
+  const enableCapture = async () => {
+    setEnablingCapture(true)
+    setEnableCaptureError(null)
+    try {
+      const response = await fetch(`${base}/api/runtime/status`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ capture_enabled: true }),
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const status = await response.json() as { capture_enabled?: boolean }
+      if (status.capture_enabled !== true) throw new Error('本地服务未确认开启状态')
+      await invoke('set_capture_menu_state', { enabled: true }).catch(() => {})
+      await Promise.all([load(), loadLive()])
+    } catch (error) {
+      setEnableCaptureError(toUserFacingError(error, '开启失败，请确认本机服务正常后重试'))
+    } finally {
+      setEnablingCapture(false)
     }
   }
 
@@ -2312,7 +2351,15 @@ const MonitorPanel: React.FC = () => {
       {tab === 'system' && systemError && <ErrorNotice message={`${systemError}，请检查本机服务连接地址或确认应用服务已启动`} />}
 
       {tab === 'overview' && data && (
-        <OverviewContent data={data} range={range} liveData={liveData} nowMs={nowMs} />
+        <OverviewContent
+          data={data}
+          range={range}
+          liveData={liveData}
+          nowMs={nowMs}
+          enablingCapture={enablingCapture}
+          enableCaptureError={enableCaptureError}
+          onEnableCapture={() => void enableCapture()}
+        />
       )}
       {tab === 'overview' && !data && !overviewError && !loadingOverview && (
         <div style={{ color: '#AEAEB2', fontSize: 12, textAlign: 'center', padding: '24px 0' }}>暂无运行数据</div>

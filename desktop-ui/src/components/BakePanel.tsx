@@ -1,12 +1,12 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft } from 'lucide-react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowLeft, Network } from 'lucide-react'
 import {
   useCreateBakeTemplate,
   useDeleteDataSource,
   useDeleteBakeKnowledge,
   useDeleteBakeSop,
   useDeleteBakeTemplate,
-  useExtractDataSources,
+  useFetchDataSource,
   useFetchDataSources,
   useFetchBakeKnowledge,
   useFetchBakeKnowledgeDetail,
@@ -31,7 +31,6 @@ import type {
   BakeInventoryTrendBucket,
   BakeOverview,
   BakeTab,
-  DataExtractionSummary,
   DataSource,
   SopCandidate,
   TimelineItem,
@@ -43,13 +42,29 @@ import BakeSopTab from './bake/BakeSopTab'
 import BakeKnowledgeTab from './bake/BakeKnowledgeTab'
 import BakeDataTab from './bake/BakeDataTab'
 import BakeTabs from './bake/BakeTabs'
+import BakeMemoryGraph from './bake/BakeMemoryGraph'
+import type { MemoryGraphAssets, MemoryGraphNode } from './bake/memoryGraph'
 import { BakeButton } from './bake/BakeShared'
 import { parseDateInputToMs } from './bake/BakeCaptureTab'
-import MemoryBackupSection from './MemoryBackupSection'
 import CreationSkillEditor from './CreationSkillEditor'
 import './bake/BakePanel.css'
 
 const PAGE_SIZE = 20
+const GRAPH_ASSET_LIMIT = 100
+
+const emptyGraphAssets: MemoryGraphAssets = {
+  knowledge: [],
+  documents: [],
+  operations: [],
+  data: [],
+  totals: {},
+}
+
+const mergeUniqueById = <T extends { id: string | number },>(primary: T[], secondary: T[]) => {
+  const merged = new Map<string, T>()
+  ;[...primary, ...secondary].forEach(item => merged.set(String(item.id), item))
+  return Array.from(merged.values())
+}
 
 const getFallbackOffsetAfterRemoval = (currentCount: number, offset: number, limit: number) => (
   currentCount <= 1 && offset > 0 ? Math.max(0, offset - limit) : offset
@@ -103,6 +118,7 @@ const mapBakeOverview = (data: BakeOverviewResponse): BakeOverview => {
     startTs: bucket.start_ts,
     endTs: bucket.end_ts,
     memoryCount: bucket.memory_count,
+    dataCount: bucket.data_count ?? 0,
     knowledgeCount: bucket.knowledge_count,
     templateCount: bucket.template_count,
     sopCount: bucket.sop_count,
@@ -144,12 +160,17 @@ const buildLocalInventoryTrend = (sources: {
   knowledge: BakeKnowledgeItem[]
   templates: ArticleTemplate[]
   sops: SopCandidate[]
+  data: DataSource[]
 }): BakeInventoryTrendBucket[] => {
+  const dataItems = sources.data.map(item => ({
+    createdAtMs: item.created_at ?? item.first_seen_at,
+  }))
   const timestamps = [
     ...sources.memories.map(item => item.createdAtMs),
     ...sources.knowledge.map(item => item.createdAtMs),
     ...sources.templates.map(item => item.createdAtMs ?? 0),
     ...sources.sops.map(item => item.createdAtMs ?? 0),
+    ...dataItems.map(item => item.createdAtMs),
   ].filter(timestamp => timestamp > 0)
 
   if (timestamps.length === 0) return []
@@ -176,6 +197,7 @@ const buildLocalInventoryTrend = (sources: {
       startTs,
       endTs,
       memoryCount: countInBucket(sources.memories, startTs, nextStartTs),
+      dataCount: countInBucket(dataItems, startTs, nextStartTs),
       knowledgeCount: countInBucket(sources.knowledge, startTs, nextStartTs),
       templateCount: countInBucket(sources.templates, startTs, nextStartTs),
       sopCount: countInBucket(sources.sops, startTs, nextStartTs),
@@ -276,8 +298,8 @@ const BakePanel: React.FC = () => {
   const fetchSops = useFetchBakeSops()
   const fetchSop = useFetchBakeSop()
   const deleteSop = useDeleteBakeSop()
+  const fetchDataSource = useFetchDataSource()
   const fetchDataSources = useFetchDataSources()
-  const extractDataSources = useExtractDataSources()
   const refreshDataSource = useRefreshDataSource()
   const deleteDataSource = useDeleteDataSource()
 
@@ -291,18 +313,15 @@ const BakePanel: React.FC = () => {
   const [sopTotal, setSopTotal] = useState(0)
   const [dataItems, setDataItems] = useState<DataSource[]>([])
   const [dataTotal, setDataTotal] = useState(0)
-  const [pendingDataItems, setPendingDataItems] = useState<DataSource[]>([])
-  const [pendingDataTotal, setPendingDataTotal] = useState(0)
   const [dataQuery, setDataQuery] = useState('')
   const [draftDataQuery, setDraftDataQuery] = useState('')
   const [dataOffset, setDataOffset] = useState(0)
   const [dataLimit, setDataLimit] = useState(PAGE_SIZE)
   const [selectedDataId, setSelectedDataId] = useState<number | null>(null)
+  const [dataFocusId, setDataFocusId] = useState<number | null>(null)
   const [dataLoading, setDataLoading] = useState(false)
-  const [dataExtracting, setDataExtracting] = useState(false)
   const [refreshingDataId, setRefreshingDataId] = useState<number | null>(null)
   const [deletingDataId, setDeletingDataId] = useState<number | null>(null)
-  const [lastDataExtraction, setLastDataExtraction] = useState<DataExtractionSummary | null>(null)
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
   const [draftKnowledgeQuery, setDraftKnowledgeQuery] = useState(bakeKnowledgeQuery)
   const [draftKnowledgeFrom, setDraftKnowledgeFrom] = useState(bakeKnowledgeFrom)
@@ -315,7 +334,37 @@ const BakePanel: React.FC = () => {
   const [draftSopTo, setDraftSopTo] = useState(bakeSopTo)
   const [creationSkillEditor, setCreationSkillEditor] = useState<{ source?: CreationSkillSource; initialSkill?: LocalCreationSkill } | null>(null)
   const [relatedTemplateSkills, setRelatedTemplateSkills] = useState<LocalCreationSkill[]>([])
+  const [graphOpen, setGraphOpen] = useState(false)
+  const [graphAssets, setGraphAssets] = useState<MemoryGraphAssets>(emptyGraphAssets)
+  const [graphLoading, setGraphLoading] = useState(false)
+  const [graphError, setGraphError] = useState<string | null>(null)
+  const [graphRevision, setGraphRevision] = useState(0)
   const knowledgeRequestSeqRef = useRef(0)
+
+  const searchOverviewGraph = useCallback(async (query: string): Promise<MemoryGraphAssets> => {
+    const [knowledgeResult, templatesResult, sopsResult, dataResult] = await Promise.allSettled([
+      fetchKnowledge({ q: query, sort: 'heat', limit: GRAPH_ASSET_LIMIT, offset: 0 }),
+      fetchTemplates({ q: query, limit: GRAPH_ASSET_LIMIT, offset: 0 }),
+      fetchSops({ q: query, limit: GRAPH_ASSET_LIMIT, offset: 0 }),
+      fetchDataSources({ q: query, limit: GRAPH_ASSET_LIMIT, offset: 0 }),
+    ])
+    const failedRequests = [knowledgeResult, templatesResult, sopsResult, dataResult]
+      .filter(result => result.status === 'rejected').length
+    if (failedRequests === 4) throw new Error('记忆图谱搜索暂时不可用')
+
+    return {
+      knowledge: knowledgeResult.status === 'fulfilled' ? knowledgeResult.value.items : [],
+      documents: templatesResult.status === 'fulfilled' ? templatesResult.value.items : [],
+      operations: sopsResult.status === 'fulfilled' ? sopsResult.value.items : [],
+      data: dataResult.status === 'fulfilled' ? dataResult.value.items : [],
+      totals: {
+        knowledge: knowledgeResult.status === 'fulfilled' ? knowledgeResult.value.total : 0,
+        document: templatesResult.status === 'fulfilled' ? templatesResult.value.total : 0,
+        operation: sopsResult.status === 'fulfilled' ? sopsResult.value.total : 0,
+        data: dataResult.status === 'fulfilled' ? dataResult.value.total : 0,
+      },
+    }
+  }, [fetchDataSources, fetchKnowledge, fetchSops, fetchTemplates])
 
   useEffect(() => {
     void fetchOverview().then((data) => {
@@ -328,14 +377,16 @@ const BakePanel: React.FC = () => {
   useEffect(() => {
     if (bakeTab !== 'overview') return
     let cancelled = false
+    setGraphLoading(true)
+    setGraphError(null)
 
     const loadOverviewTrend = async () => {
       const [memoriesResult, knowledgeResult, templatesResult, sopsResult, dataResult] = await Promise.allSettled([
         fetchMemories({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
-        fetchKnowledge({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
+        fetchKnowledge({ sort: 'heat', limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
         fetchTemplates({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
         fetchSops({ limit: OVERVIEW_TREND_LIMIT, offset: 0 }),
-        fetchDataSources({ limit: 1, offset: 0 }),
+        fetchDataSources({ limit: GRAPH_ASSET_LIMIT, offset: 0 }),
       ])
       if (cancelled) return
 
@@ -343,11 +394,15 @@ const BakePanel: React.FC = () => {
       const knowledge = knowledgeResult.status === 'fulfilled' ? knowledgeResult.value.items : []
       const templateItems = templatesResult.status === 'fulfilled' ? templatesResult.value.items : []
       const sops = sopsResult.status === 'fulfilled' ? sopsResult.value.items : []
+      const dataItems = dataResult.status === 'fulfilled' ? dataResult.value.items : []
+      const failedGraphRequests = [knowledgeResult, templatesResult, sopsResult, dataResult]
+        .filter(result => result.status === 'rejected').length
       const inventoryTrend = buildLocalInventoryTrend({
         memories,
         knowledge,
         templates: templateItems,
         sops,
+        data: dataItems,
       })
 
       setOverview(prev => ({
@@ -359,39 +414,95 @@ const BakePanel: React.FC = () => {
         dataCount: dataResult.status === 'fulfilled' ? dataResult.value.total : prev.dataCount,
         inventoryTrend: inventoryTrend.length > 0 ? inventoryTrend : prev.inventoryTrend,
       }))
+      setGraphAssets({
+        knowledge,
+        documents: templateItems,
+        operations: sops,
+        data: dataItems,
+        totals: {
+          knowledge: knowledgeResult.status === 'fulfilled' ? knowledgeResult.value.total : knowledge.length,
+          document: templatesResult.status === 'fulfilled' ? templatesResult.value.total : templateItems.length,
+          operation: sopsResult.status === 'fulfilled' ? sopsResult.value.total : sops.length,
+          data: dataResult.status === 'fulfilled' ? dataResult.value.total : dataItems.length,
+        },
+      })
+      if (failedGraphRequests === 4) setGraphError('本地资产暂时无法读取，请稍后重新加载。')
     }
 
-    void loadOverviewTrend().catch(() => {})
+    void loadOverviewTrend()
+      .catch(() => {
+        if (!cancelled) setGraphError('本地资产暂时无法读取，请稍后重新加载。')
+      })
+      .finally(() => {
+        if (!cancelled) setGraphLoading(false)
+      })
     return () => {
       cancelled = true
     }
-  }, [bakeTab, fetchDataSources, fetchKnowledge, fetchMemories, fetchSops, fetchTemplates])
+  }, [bakeTab, fetchDataSources, fetchKnowledge, fetchMemories, fetchSops, fetchTemplates, graphRevision])
+
+  useEffect(() => {
+    if (!graphOpen || bakeTab === 'overview') return
+    let cancelled = false
+    setGraphLoading(true)
+    setGraphError(null)
+
+    void Promise.allSettled([
+      fetchKnowledge({ limit: GRAPH_ASSET_LIMIT, offset: 0 }),
+      fetchTemplates({ limit: GRAPH_ASSET_LIMIT, offset: 0 }),
+      fetchSops({ limit: GRAPH_ASSET_LIMIT, offset: 0 }),
+      fetchDataSources({ limit: GRAPH_ASSET_LIMIT, offset: 0 }),
+    ]).then(([knowledgeResult, templatesResult, sopsResult, dataResult]) => {
+      if (cancelled) return
+      const failedRequests = [knowledgeResult, templatesResult, sopsResult, dataResult]
+        .filter(result => result.status === 'rejected').length
+      setGraphAssets({
+        knowledge: knowledgeResult.status === 'fulfilled' ? knowledgeResult.value.items : [],
+        documents: templatesResult.status === 'fulfilled' ? templatesResult.value.items : [],
+        operations: sopsResult.status === 'fulfilled' ? sopsResult.value.items : [],
+        data: dataResult.status === 'fulfilled' ? dataResult.value.items : [],
+        totals: {
+          knowledge: knowledgeResult.status === 'fulfilled' ? knowledgeResult.value.total : 0,
+          document: templatesResult.status === 'fulfilled' ? templatesResult.value.total : 0,
+          operation: sopsResult.status === 'fulfilled' ? sopsResult.value.total : 0,
+          data: dataResult.status === 'fulfilled' ? dataResult.value.total : 0,
+        },
+      })
+      if (failedRequests === 4) setGraphError('本地资产暂时无法读取，请稍后重新加载。')
+    }).catch(() => {
+      if (!cancelled) setGraphError('本地资产暂时无法读取，请稍后重新加载。')
+    }).finally(() => {
+      if (!cancelled) setGraphLoading(false)
+    })
+
+    return () => { cancelled = true }
+  }, [bakeTab, fetchDataSources, fetchKnowledge, fetchSops, fetchTemplates, graphOpen, graphRevision])
 
   useEffect(() => {
     if (bakeTab !== 'data') return
     let cancelled = false
     setDataLoading(true)
-    void fetchDataSources({
-      q: dataQuery.trim() || undefined,
-      limit: dataLimit,
-      offset: dataOffset,
-    }).then((data) => {
+    const request = dataFocusId !== null
+      ? fetchDataSource(dataFocusId).then(item => ({ items: [item], total: 1 }))
+      : fetchDataSources({
+          q: dataQuery.trim() || undefined,
+          limit: dataLimit,
+          offset: dataOffset,
+        })
+    void request.then((data) => {
       if (cancelled) return
       setDataItems(data.items)
       setDataTotal(data.total)
-      setPendingDataItems(data.pending_items ?? [])
-      setPendingDataTotal(data.pending_total ?? 0)
-      const selectableItems = [...data.items, ...(data.pending_items ?? [])]
-      setSelectedDataId(current => selectableItems.some(item => item.id === current)
+      setSelectedDataId(current => data.items.some(item => item.id === current)
         ? current
-        : (data.items[0]?.id ?? data.pending_items?.[0]?.id ?? null))
+        : (data.items[0]?.id ?? null))
     }).catch((error) => {
       if (!cancelled) setStatusMessage(toUserFacingError(error, '数据来源加载失败'))
     }).finally(() => {
       if (!cancelled) setDataLoading(false)
     })
     return () => { cancelled = true }
-  }, [bakeTab, dataLimit, dataOffset, dataQuery, fetchDataSources])
+  }, [bakeTab, dataFocusId, dataLimit, dataOffset, dataQuery, fetchDataSource, fetchDataSources])
 
   useEffect(() => {
     if (!['templates', 'knowledge', 'sop'].includes(bakeTab)) return
@@ -552,6 +663,37 @@ const BakePanel: React.FC = () => {
   const resolvedKnowledgeItem = knowledgeItems.find(item => item.id === resolvedKnowledgeId)
   const resolvedSopItem = sopCandidates.find(item => item.id === resolvedSopId)
   const memoryTitleById = useMemo(() => new Map(memoryItems.map(item => [item.id, item.title])), [memoryItems])
+  const graphAssetsForRender = useMemo<MemoryGraphAssets>(() => ({
+    knowledge: mergeUniqueById(graphAssets.knowledge, knowledgeItems),
+    documents: mergeUniqueById(graphAssets.documents, templates),
+    operations: mergeUniqueById(graphAssets.operations, sopCandidates),
+    data: mergeUniqueById(graphAssets.data, dataItems),
+    totals: {
+      knowledge: Math.max(graphAssets.totals?.knowledge ?? 0, knowledgeTotal),
+      document: Math.max(graphAssets.totals?.document ?? 0, templateTotal),
+      operation: Math.max(graphAssets.totals?.operation ?? 0, sopTotal),
+      data: Math.max(graphAssets.totals?.data ?? 0, dataTotal),
+    },
+  }), [
+    dataItems,
+    dataTotal,
+    graphAssets,
+    knowledgeItems,
+    knowledgeTotal,
+    sopCandidates,
+    sopTotal,
+    templateTotal,
+    templates,
+  ])
+  const graphFocusNodeId = bakeTab === 'knowledge' && resolvedKnowledgeId
+    ? `knowledge:${resolvedKnowledgeId}`
+    : bakeTab === 'templates' && resolvedTemplateId
+      ? `document:${resolvedTemplateId}`
+      : bakeTab === 'sop' && resolvedSopId
+        ? `operation:${resolvedSopId}`
+        : bakeTab === 'data' && selectedDataId !== null
+          ? `data:${selectedDataId}`
+          : null
 
   useEffect(() => {
     if (!resolvedTemplateId) {
@@ -618,12 +760,9 @@ const BakePanel: React.FC = () => {
     })
     setDataItems(data.items)
     setDataTotal(data.total)
-    setPendingDataItems(data.pending_items ?? [])
-    setPendingDataTotal(data.pending_total ?? 0)
-    const selectableItems = [...data.items, ...(data.pending_items ?? [])]
-    setSelectedDataId(current => selectableItems.some(item => item.id === current)
+    setSelectedDataId(current => data.items.some(item => item.id === current)
       ? current
-      : (data.items[0]?.id ?? data.pending_items?.[0]?.id ?? null))
+      : (data.items[0]?.id ?? null))
   }
 
   const currentNavigationTarget = () => ({
@@ -748,30 +887,16 @@ const BakePanel: React.FC = () => {
   }
 
   const handleSearchData = () => {
+    setDataFocusId(null)
     setDataOffset(0)
     setDataQuery(draftDataQuery)
   }
 
   const handleClearDataSearch = () => {
+    setDataFocusId(null)
     setDraftDataQuery('')
     setDataQuery('')
     setDataOffset(0)
-  }
-
-  const handleExtractData = async () => {
-    setDataExtracting(true)
-    try {
-      const summary = await extractDataSources()
-      setLastDataExtraction(summary)
-      setDataOffset(0)
-      await refreshData(0)
-      await refreshOverview()
-      setStatusMessage(`数据识别完成：新增 ${summary.source_created_count} 个数据源，生成 ${summary.snapshot_created_count} 个快照`)
-    } catch (error) {
-      setStatusMessage(toUserFacingError(error, '数据识别失败'))
-    } finally {
-      setDataExtracting(false)
-    }
   }
 
   const handleRefreshData = async (sourceId: number) => {
@@ -814,6 +939,7 @@ const BakePanel: React.FC = () => {
         await refreshData(nextOffset)
       }
       if (selectedDataId === sourceId) setSelectedDataId(null)
+      if (dataFocusId === sourceId) setDataFocusId(null)
       setStatusMessage('已删除数据')
       await refreshOverview()
     } catch (error) {
@@ -827,6 +953,44 @@ const BakePanel: React.FC = () => {
     if (tab === bakeTab) return
     clearBakeNavigationStack()
     setBakeTab(tab)
+  }
+
+  const handleOpenGraphNode = (node: MemoryGraphNode) => {
+    setGraphOpen(true)
+    clearBakeNavigationStack()
+    if (node.kind === 'knowledge') {
+      setBakeTab('knowledge')
+      setBakeKnowledgeFocusId(node.assetId)
+      useAppStore.setState({
+        bakeKnowledgeFocusId: node.assetId,
+        bakeKnowledgeQuery: '',
+        bakeKnowledgeFrom: '',
+        bakeKnowledgeTo: '',
+        bakeKnowledgeOffset: 0,
+      })
+      setSelectedKnowledgeId(node.assetId)
+    } else if (node.kind === 'document') {
+      setBakeTab('templates')
+      setBakeTemplateFocusId(node.assetId)
+      setBakeTemplateOffset(0)
+      setSelectedTemplateId(node.assetId)
+    } else if (node.kind === 'operation') {
+      setBakeTab('sop')
+      setBakeSopFocusId(node.assetId)
+      setBakeSopOffset(0)
+      setSelectedSopId(node.assetId)
+    } else {
+      const sourceId = Number(node.assetId)
+      if (!Number.isFinite(sourceId)) {
+        setStatusMessage('这条数据的标识无效，无法打开')
+        return
+      }
+      setBakeTab('data')
+      setDataFocusId(sourceId)
+      setDataOffset(0)
+      setSelectedDataId(sourceId)
+    }
+    setStatusMessage(`已从记忆图谱打开「${node.label}」`)
   }
 
   const handleOpenRepositoryFromOverview = (tab: 'memory' | 'capture') => {
@@ -1067,15 +1231,35 @@ const BakePanel: React.FC = () => {
         </div>
       )}
 
-      <BakeTabs current={bakeTab} onChange={handleBakeTabChange} />
+      <div className="bake-tabs-shell">
+        <BakeTabs current={bakeTab} onChange={handleBakeTabChange} />
+        {bakeTab !== 'overview' && (
+          <button
+            type="button"
+            className="bake-graph-toggle"
+            aria-pressed={graphOpen}
+            aria-label={graphOpen ? '关闭记忆图谱' : '展开记忆图谱'}
+            onClick={() => setGraphOpen(current => !current)}
+          >
+            <Network size={15} />
+            <span>记忆图谱</span>
+          </button>
+        )}
+      </div>
 
-      <div className="bake-tab-content">
+      <div className={`bake-graph-workspace ${graphOpen && bakeTab !== 'overview' ? 'bake-graph-workspace--open' : ''}`.trim()}>
+        <div className="bake-tab-content">
         {bakeTab === 'overview' && (
           <BakeOverviewTab
             overview={overview}
+            graphAssets={graphAssetsForRender}
+            graphLoading={graphLoading}
+            graphError={graphError}
             onOpenTab={handleBakeTabChange}
             onOpenRepository={handleOpenRepositoryFromOverview}
-            footer={<MemoryBackupSection />}
+            onRetryGraph={() => setGraphRevision(current => current + 1)}
+            onOpenGraphNode={handleOpenGraphNode}
+            onSearchGraph={searchOverviewGraph}
           />
         )}
         {bakeTab === 'knowledge' && (
@@ -1121,17 +1305,13 @@ const BakePanel: React.FC = () => {
           <BakeDataTab
             items={dataItems}
             total={dataTotal}
-            pendingItems={pendingDataItems}
-            pendingTotal={pendingDataTotal}
             offset={dataOffset}
             limit={dataLimit}
             draftQuery={draftDataQuery}
             selectedId={selectedDataId}
             loading={dataLoading}
-            extracting={dataExtracting}
             refreshingId={refreshingDataId}
             deletingId={deletingDataId}
-            lastExtraction={lastDataExtraction}
             onDraftQueryChange={setDraftDataQuery}
             onSearch={handleSearchData}
             onClearSearch={handleClearDataSearch}
@@ -1141,7 +1321,6 @@ const BakePanel: React.FC = () => {
               setDataLimit(limit)
               setDataOffset(0)
             }}
-            onExtract={handleExtractData}
             onRefresh={handleRefreshData}
             onDelete={handleDeleteData}
             onViewTimeline={(timelineId) => handleViewSourceMemory(String(timelineId))}
@@ -1229,6 +1408,19 @@ const BakePanel: React.FC = () => {
                 setRelatedTemplateSkills(prev => [skill, ...prev.filter(item => item.id !== skill.id)])
               }
             }}
+          />
+        )}
+        </div>
+        {graphOpen && bakeTab !== 'overview' && (
+          <BakeMemoryGraph
+            assets={graphAssetsForRender}
+            focusNodeId={graphFocusNodeId}
+            loading={graphLoading}
+            error={graphError}
+            mode="dock"
+            onClose={() => setGraphOpen(false)}
+            onRetry={() => setGraphRevision(current => current + 1)}
+            onOpenNode={handleOpenGraphNode}
           />
         )}
       </div>

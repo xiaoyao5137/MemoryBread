@@ -3,21 +3,6 @@ import { describe, expect, it, vi } from 'vitest'
 import BakeDataTab from '../components/bake/BakeDataTab'
 import type { DataSource } from '../types'
 
-const pendingSource: DataSource = {
-  id: 1,
-  title: '经营数据看板',
-  source_kind: 'report_url',
-  source_url: 'https://bi.example.com/dashboard',
-  access_mode: 'browser_session',
-  refresh_policy: 'on_demand',
-  realtime_level: 'live',
-  tags: ['report'],
-  first_seen_at: 1,
-  last_seen_at: 2,
-  status: 'active',
-  latest_snapshot: null,
-}
-
 const gpuSource: DataSource = {
   id: 22,
   title: '容器云 GPU 指标采集项目',
@@ -38,7 +23,8 @@ const gpuSource: DataSource = {
     collector: 'memory_extract',
     content_text: '背景显示国内日均 GPU 利用率为 42%，海外为 47%，但 GPUTL 无法反映硅片内 SM 的实际使用情况，存在掩盖低效的事实',
     structured_data: {
-      extraction_version: 'data-memory.v2',
+      extraction_version: 'data-memory.v11',
+      title: 'GPU 利用率对比',
       summary: '日均 GPU 利用率：国内 42%，海外 47%；GPUTL 无法反映 SM 实际使用，可能掩盖实际低效',
       metric_rows: [
         { dimension: '国内', metric: '日均 GPU 利用率', value: '42%', note: 'GPUTL 可能掩盖实际低效' },
@@ -64,7 +50,8 @@ const orderSource: DataSource = {
     source_id: 23,
     content_text: '本周订单 1200，环比增长 8%',
     structured_data: {
-      extraction_version: 'data-memory.v2',
+      extraction_version: 'data-memory.v11',
+      title: '订单规模与环比变化',
       summary: '本周订单 1200，环比增长 8%',
       metric_rows: [
         { dimension: '本周', metric: '订单', value: '1200', note: '' },
@@ -79,14 +66,11 @@ const renderDataTab = (overrides: Partial<React.ComponentProps<typeof BakeDataTa
   const props: React.ComponentProps<typeof BakeDataTab> = {
     items: [gpuSource],
     total: 1,
-    pendingItems: [pendingSource],
-    pendingTotal: 1,
     limit: 20,
     offset: 0,
     draftQuery: '',
     selectedId: 22,
     loading: false,
-    extracting: false,
     refreshingId: null,
     deletingId: null,
     onDraftQueryChange: vi.fn(),
@@ -95,7 +79,6 @@ const renderDataTab = (overrides: Partial<React.ComponentProps<typeof BakeDataTa
     onSelect: vi.fn(),
     onPageChange: vi.fn(),
     onLimitChange: vi.fn(),
-    onExtract: vi.fn(),
     onRefresh: vi.fn(),
     onDelete: vi.fn(),
     onViewTimeline: vi.fn(),
@@ -109,6 +92,7 @@ describe('BakeDataTab', () => {
   it('以可理解的摘要和表格展示数据含义', () => {
     renderDataTab()
 
+    expect(screen.getAllByText('GPU 利用率对比').length).toBeGreaterThanOrEqual(2)
     expect(screen.getAllByText(/日均 GPU 利用率：国内 42%，海外 47%/).length).toBeGreaterThanOrEqual(2)
     const table = screen.getByRole('table')
     expect(within(table).getByRole('columnheader', { name: '对象 / 范围' })).toBeInTheDocument()
@@ -118,6 +102,8 @@ describe('BakeDataTab', () => {
     expect(within(table).getByText('42%')).toBeInTheDocument()
     expect(within(table).getByText('47%')).toBeInTheDocument()
     expect(within(table).getByText('GPUTL 可能掩盖实际低效')).toBeInTheDocument()
+    expect(screen.getByText('该数据表共 2 行指标。')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /GPU 利用率/ })).not.toHaveTextContent('行指标')
   })
 
   it('展示数据 ID，支持跳转来源时间线和删除', () => {
@@ -131,35 +117,33 @@ describe('BakeDataTab', () => {
     expect(props.onDelete).toHaveBeenCalledWith(22)
   })
 
-  it('把未采集地址单列为来源且不计入数据分页', () => {
-    const props = renderDataTab({
-      items: [gpuSource, orderSource],
-      total: 2,
-      pendingItems: [pendingSource],
-      pendingTotal: 1,
-      limit: 10,
-      selectedId: 1,
-    })
-
-    expect(screen.getAllByText('待采集来源').length).toBeGreaterThanOrEqual(1)
-    expect(screen.getAllByText('来源 #1').length).toBeGreaterThanOrEqual(1)
-    expect(screen.getByText('共 2 条数据')).toBeInTheDocument()
-    expect(screen.getByText('第 1/1 页')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '下一页' })).toBeDisabled()
-    fireEvent.click(screen.getByRole('button', { name: '采集数据' }))
-    expect(props.onRefresh).toHaveBeenCalledWith(1)
-  })
-
-  it('当前页统计直接使用后端返回的数据，不再分页后二次过滤', () => {
+  it('不显示数据生成说明、重生成入口、页内概况和待采集报表', () => {
     renderDataTab({
       items: [gpuSource, orderSource],
       total: 2,
-      pendingItems: [],
-      pendingTotal: 0,
+      limit: 10,
     })
 
-    expect(screen.getByLabelText('本页数据概况')).toHaveTextContent('本页数据记录2')
-    expect(screen.getByLabelText('本页数据概况')).toHaveTextContent('本页指标行4')
+    expect(screen.queryByText('每条数据都会生成可检索的主题标题和清晰概述；相同语义的数据合并为一条，并只保留最新快照。')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '重新生成数据' })).not.toBeInTheDocument()
+    expect(screen.queryByText('本页数据记录')).not.toBeInTheDocument()
+    expect(screen.queryByText('最近采集')).not.toBeInTheDocument()
+    expect(screen.queryByText('待采集报表')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('本页数据概况')).not.toBeInTheDocument()
+  })
+
+  it('不再显示本地工作数据的来源核对提示', () => {
+    renderDataTab()
+
+    expect(screen.queryByText('这份数据从本地文档或工作消息中提取，时间较久时应结合来源时间线核对统计周期与口径。')).not.toBeInTheDocument()
+  })
+
+  it('直接展示后端返回的数据记录，不再分页后二次过滤', () => {
+    renderDataTab({
+      items: [gpuSource, orderSource],
+      total: 2,
+    })
+
     expect(screen.getAllByText(/本周订单 1200/).length).toBeGreaterThanOrEqual(1)
   })
 })
